@@ -306,6 +306,11 @@ const EXCLUDED = [
   // breaker es no-op (los reintentos de subida y el error tipado storage_unavailable funcionan igual).
   { file: 'supabase-migration-r83-infra-health.sql', reason: 'r83: staging-only hasta aprobación del owner' },
   { file: 'scripts/migrate-r83-infra-health.js', reason: 'r83: staging-only hasta aprobación del owner' },
+  // r99 («todo error tiene una solución»): tabla nueva cursia_feature_activations (activación + latido, RLS, sin
+  // anon/authenticated). Staging-only hasta aprobación del owner; sin ella el backend usa R99_OWNER_RESUME_SINCE o el
+  // arranque del proceso (nunca retroactivo).
+  { file: 'supabase-migration-r99-activation.sql', reason: 'r99: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r99-activation.js', reason: 'r99: staging-only hasta aprobación del owner' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

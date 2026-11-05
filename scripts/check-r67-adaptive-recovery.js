@@ -702,7 +702,7 @@ async function dbChecks() {
       await assertNoOrphans(R.rid, 'sin ffmpeg');
     });
 
-    // ═══ 15 / R1-bis — escalera agotada → failed_no_strategies, attention unrecoverable, sin bucles ══════════
+    // ═══ 15 / R1-bis — escalera agotada → (r99) pausa como bug de Cursia, attention unrecoverable, sin bucles ══════════
     await check('15 R1-bis (seg-0/seg-1 guardados, falla seg-2): base → instructions → split fuera de banda → AUDIO_STRATEGIES_EXHAUSTED (D, attention unrecoverable, failed_no_strategies); seg-0/seg-1 nunca se re-sintetizan ni se re-cobran; el auto-heal no la reabre', async () => {
       ffCtl('ok');
       const R = await freshRun('r67 agotada');
@@ -715,7 +715,9 @@ async function dbChecks() {
       row = await runAudio(R);
       eq(row.status, 'failed', `failed (${row.error})`);
       assert(/^AUDIO_STRATEGIES_EXHAUSTED/.test(row.error), row.error);
-      eq([row.failure_class, row.attention_reason, row.output_summary.recovery.state], ['D', 'unrecoverable', 'failed_no_strategies'], 'visible a admin/dueño');
+      // r99: la estrategia (escalera A2) se agotó → PAUSA COMO BUG DE CURSIA (paused_cursia_issue): sin intentos ni gasto,
+      // reporte «Falla común» y reanudación automática con el arreglo (antes failed_no_strategies, esperando a un humano).
+      eq([row.failure_class, row.attention_reason, row.output_summary.recovery.state, row.output_summary.bugHold && row.output_summary.bugHold.active], ['D', 'unrecoverable', 'paused_cursia_issue', true], 'visible a admin/dueño');
       const by = callsBy(fakes.st.tts.slice(t0), st);
       eq([by.tgtBase, by.tgtInstr, by.tgtSplit], [1, 1, 2], 'cada estrategia una sola vez');
       eq([...by.other.values()], [1, 1], 'seg-0 y seg-1: una sola síntesis en los 3 intentos');
@@ -724,11 +726,16 @@ async function dbChecks() {
       eq([perChunk['0'], perChunk['1'], perChunk['2']], [1, 1, 4], 'cargos por segmento');
       const dto = await runs.getRun(R.cid, OWNER, 1, R.rid);
       const it = dto.items.find((x) => x.itemKey === R.key);
-      eq([it.recovery.state.state, it.recovery.attentionReason], ['failed_no_strategies', 'unrecoverable'], 'DTO');
+      eq([it.recovery.state.state, it.recovery.attentionReason, !!it.recovery.cursiaIssue], ['paused_cursia_issue', 'unrecoverable', true], 'DTO');
       const t1 = fakes.st.tts.length;
       for (const m of [5, 60, 600]) eq((await runs.autoHealFailedItems({ now: later(m) })).reopened.filter((x) => x.runId === R.rid).length, 0, `sin reapertura (+${m} min)`);
       eq(fakes.st.tts.length - t1, 0, 'sin llamadas');
       await assertNoOrphans(R.rid, 'agotada');
+      // r99 (review P1-2): la salida HUMANA sigue disponible sobre la pausa (opcional): acción de admin + reintento del dueño.
+      const dtoH = await runs.getRun(R.cid, OWNER, 1, R.rid);
+      assert((dtoH.completion.adminActions || []).some((x) => x.itemKey === R.key), 'acción de admin sobre la parte en pausa');
+      const OR99 = loadDist('modules/dynamic-generation/owner-retry.js');
+      eq(OR99.ownerRetryCodeEligibility(OR99.itemFailureVerdict(row)), 'ok', 'el dueño puede reintentarla (opcional)');
       // r67 fix round 1 (F2): un reintento HUMANO reinicia la escalera SOLO del segmento agotado (con auditoría) y
       // conserva los aceptados y la cuarentena → corrección local del segmento (aquí el TTS vuelve a 181 ppm) a costo 0
       // para seg-0/seg-1.
@@ -756,6 +763,28 @@ async function dbChecks() {
       eq([perChunk2['0'], perChunk2['1']], [1, 1], 'seg-0/seg-1: 0 cargos nuevos');
       eq(chB.length - ch0, 1 + by2.other.size, 'un cargo nuevo por llamada nueva (el segmento corregido localmente + los que faltaban)');
       assert(row.output_summary.audioCorrections[segKey], 'corrección local registrada');
+    });
+
+    // ═══ 15b / r99 (review P1-2) — escalera agotada → pausa → build nuevo → la reanudación REINICIA la escalera y llama otra vez ═══
+    await check('15b r99: AUDIO_STRATEGIES_EXHAUSTED en pausa → el barrido (build nuevo) la reabre con la escalera del segmento reiniciada (actor system) → el worker vuelve a sintetizar (no un fallo instantáneo sin llamar)', async () => {
+      ffCtl('ok');
+      const R = await freshRun('r99 audio agotado');
+      const st = paceFor({ k: 2, base: 230, instructions: 230, split: 230 });
+      let row = await runAudio(R);
+      row = await runAudio(R);
+      row = await runAudio(R);
+      assert(/^AUDIO_STRATEGIES_EXHAUSTED/.test(row.error) && row.output_summary.bugHold && row.output_summary.bugHold.active === true, `pausa: ${row.error}`);
+      const s1 = await runs.sweepCursiaIssues({ buildId: 'r99-audio-fix' });
+      assert(s1.resumed.some((x) => x.itemKey === R.key && x.trigger === 'new_build'), JSON.stringify(s1));
+      row = await itemRow(R.rid, R.key);
+      const resets = row.output_summary.audioLadderResets || [];
+      assert(resets.length && resets[resets.length - 1].actor === 'system' && resets[resets.length - 1].trigger === 'new_build', JSON.stringify(resets));
+      assert(!Object.values(row.output_summary.audioRetryStrategy || {}).some((x) => x && x.exhausted === true), 'sin segmentos agotados');
+      st.cfg.base = 181;
+      const t1 = fakes.st.tts.length;
+      row = await runAudio(R);
+      assert(fakes.st.tts.length > t1, 'el worker volvió a llamar al TTS');
+      eq([row.status, row.error], ['completed', null], 'completa tras la reanudación automática');
     });
 
     // ═══ 10/11/2 — run failed → auto-heal reabre (B) → queued; dependiente desbloqueado; reanuda desde segmentos ═══

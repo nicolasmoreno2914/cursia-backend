@@ -28,6 +28,7 @@
  *  - sin validación de servidor (content, activity SCORM, course_plan, exam GIFT): cuentan como
  *    hechos al completarse (sin validación nueva acá — ver el reporte de BE-A).
  */
+import { CURSIA_ISSUE_MESSAGE, bugHoldOf } from '../reliability/bug-hold';
 import { isNonRealLlmMode } from '../artifacts/artifact-type-policy';
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
@@ -162,6 +163,11 @@ export interface RunCompletion {
    * «Recuperando automáticamente» en vez de «necesita atención».
    */
   autoRecovering?: boolean;
+  /**
+   * r99: partes en PAUSA COMO BUG DE CURSIA (bug-hold.ts) — el curso no está listo y continúa solo cuando el arreglo
+   * esté desplegado; el usuario ve `message` (nunca «reintentar»). Ausente si no hay ninguna.
+   */
+  cursiaIssue?: { items: string[]; since: string | null; message: string };
   /**
    * BE-B: estado del último job de paquete FINAL del run (solo cuando la generación está completa):
    * `none` (todavía no hay job), `queued`/`running`/`retrying` (armándose), `completed`, `failed`
@@ -557,6 +563,8 @@ export function adminActionFor(
     return null; // bloqueado por una dependencia: la acción es la de la dependencia
   }
   if (r.status === 'cancelled') return null;
+  // r99 (review P1-2): una parte en pausa como bug de Cursia la reanuda sola el arreglo (sweepCursiaIssues), pero la
+  // salida HUMANA sigue disponible (opcional, nunca necesaria): la acción de admin de siempre se conserva.
   // r62 (M1): frenado por un control de gasto (kill switch / allow-list): el barrido lo reabre solo al revertirse.
   const tickOn0 = autoHealEnabled(process.env);
   if (tickOn0 && autoRecoveryEnabled(process.env) && spendControlHoldOf(err, r.type)) return null;
@@ -667,10 +675,18 @@ export function evaluateRunCompletion(
   };
   // r62 (M1): partes que el servidor está recuperando solo (fallidas sin acción humana, o bloqueadas por una de ellas).
   let autoPending = false;
+  const cursiaIssueItems: string[] = [];
+  let cursiaIssueSince: number | null = null;
   for (const it of manifest.items) {
     const c = classes.get(it.key) as ItemCompletionClass;
     if (c === 'not_done' || c === 'unvalidated') {
       const row = rowsByKey.get(it.key);
+      const held = row && row.status === 'failed' ? bugHoldOf(os(row), row.error ?? null) : null;
+      if (held && c === 'not_done') {
+        cursiaIssueItems.push(it.key);
+        const t = Date.parse(held.heldAt);
+        if (Number.isFinite(t)) cursiaIssueSince = cursiaIssueSince === null ? t : Math.min(cursiaIssueSince, t);
+      }
       const depKey = row ? claimPayloadDependencyKey(row as any) : null;
       const a = adminActionFor(row, c, now, job, depKey ? { dep: rowsByKey.get(depKey) ?? null } : undefined);
       push(a);
@@ -727,6 +743,8 @@ export function evaluateRunCompletion(
     previewComponents,
     adminActions: actions,
     ...(autoRecovering ? { autoRecovering: true } : {}),
+    ...(cursiaIssueItems.length && state !== 'cancelled'
+      ? { cursiaIssue: { items: cursiaIssueItems, since: cursiaIssueSince === null ? null : new Date(cursiaIssueSince).toISOString(), message: CURSIA_ISSUE_MESSAGE } } : {}),
     ...(generationComplete && pkg && pkg.status !== undefined
       ? { packageJob: {
           status: packageReady ? 'completed' : String(pkg.status ?? 'none'),

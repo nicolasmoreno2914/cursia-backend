@@ -7,10 +7,12 @@ import { packageHoldOf } from './stop-after';
 import {
   CommonFailureRow, CommonFailureSignal, REMEDIATION_EXHAUSTED_CODE, REMEDIATION_EXHAUSTED_REASON, commonFailureSignals, remediationBlocksAuto,
 } from '../reliability/remediation-ladder';
+import { BUG_HOLD_RESOLVE_ACTION, BUG_HOLD_RESOLVE_TARGET_TYPE } from '../reliability/bug-hold';
 
 /** r98: acción/target de la marca «resuelto» de una Falla común en admin_audit_log. */
-export const COMMON_FAILURE_RESOLVE_ACTION = 'common_failure.resolve';
-export const COMMON_FAILURE_TARGET_TYPE = 'failure_fingerprint';
+// r99: la misma marca reanuda las partes en pausa con esa huella (bug-hold.ts; barrido de pausas de RunsService).
+export const COMMON_FAILURE_RESOLVE_ACTION = BUG_HOLD_RESOLVE_ACTION;
+export const COMMON_FAILURE_TARGET_TYPE = BUG_HOLD_RESOLVE_TARGET_TYPE;
 /** r98 (review P2-2): vigencia de la señal cacheada para needs-attention. */
 export const COMMON_FAILURES_CACHE_MS = 5 * 60_000;
 
@@ -252,20 +254,54 @@ export class AdminRecoveryService {
    * Ventana de lectura: 7 días. Solo lectura.
    */
   async listCommonFailures(now: Date = new Date()): Promise<CommonFailureSignal[]> {
+    // r99: también las partes en PAUSA COMO BUG DE CURSIA (output_summary.bugHold, umbral 1) y los empaques en pausa
+    // (production_jobs.output_summary.autoPackage.cursiaIssue). Review P2-9: el curso se cuenta por frontend_course_id.
+    // r98.1: `$1` se compara con timestamptz Y con texto (lastAt / heldAt): casts explícitos de cada lado.
     const rows: any[] = await this.dataSource.query(
-      `select g.job_id, g.item_key, g.type, g.output_summary->'remediation' as remediation, pj.course_id
+      `select g.job_id, g.item_key, g.type, g.output_summary->'remediation' as remediation, g.output_summary->'bugHold' as bug_hold,
+              pj.course_id, pj.frontend_course_id
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
-        where g.updated_at >= $1::timestamptz
-          and jsonb_typeof(g.output_summary->'remediation') = 'object'
-          and (g.output_summary->'remediation'->>'lastAt') >= $1::text
+        -- review P2-3: una pausa VIGENTE nunca sale del reporte aunque la fila no se haya tocado en 7 días.
+        where (g.updated_at >= $1::timestamptz or (g.output_summary->'bugHold'->>'active') = 'true')
+          and (
+            (jsonb_typeof(g.output_summary->'remediation') = 'object' and (g.output_summary->'remediation'->>'lastAt') >= $1::text)
+            or (jsonb_typeof(g.output_summary->'bugHold') = 'object'
+                and ((g.output_summary->'bugHold'->>'active') = 'true' or (g.output_summary->'bugHold'->>'lastAt') >= $1::text)))
         order by g.updated_at desc nulls last
         limit 5000`,
       [new Date(now.getTime() - 7 * 86_400_000).toISOString()],
     );
     const input: CommonFailureRow[] = rows
-      .filter((r) => r && r.remediation && typeof r.remediation === 'object')
-      .map((r) => ({ courseId: Number(r.course_id), runId: String(r.job_id), itemKey: String(r.item_key), itemType: r.type ?? null, remediation: r.remediation }));
+      .filter((r) => r && ((r.remediation && typeof r.remediation === 'object') || (r.bug_hold && typeof r.bug_hold === 'object')))
+      .map((r) => ({
+        courseId: Number(r.course_id), courseKey: r.frontend_course_id ? String(r.frontend_course_id) : null, runId: String(r.job_id), itemKey: String(r.item_key),
+        itemType: r.type ?? null, remediation: r.remediation && typeof r.remediation === 'object' ? r.remediation : null,
+        bugHold: r.bug_hold && typeof r.bug_hold === 'object' && typeof r.bug_hold.fingerprint === 'string' ? r.bug_hold : null,
+      }));
+    const pkgRows: any[] = await this.dataSource.query(
+      `select r.id, r.course_id, r.frontend_course_id, r.output_summary->'autoPackage'->'cursiaIssue' as hold
+         from public.production_jobs r
+        where r.execution_mode = 'dynamic_generation'
+          and jsonb_typeof(r.output_summary->'autoPackage'->'cursiaIssue') = 'object'
+          and ((r.output_summary->'autoPackage'->'cursiaIssue'->>'active') = 'true'
+               or (r.output_summary->'autoPackage'->'cursiaIssue'->>'lastAt') >= $1::text)
+        order by r.updated_at desc nulls last
+        limit 1000`,
+      [new Date(now.getTime() - 7 * 86_400_000).toISOString()],
+    ).catch(() => [] as any[]);
+    for (const r of pkgRows) {
+      const h = r?.hold;
+      if (!h || typeof h.fingerprint !== 'string') continue;
+      input.push({
+        courseId: Number(r.course_id), courseKey: r.frontend_course_id ? String(r.frontend_course_id) : null, runId: String(r.id), itemKey: 'package', itemType: 'package',
+        remediation: null,
+        bugHold: { v: 1, active: h.active === true, reason: 'product_bug', code: String(h.code ?? ''), rule: String(h.rule ?? ''), fingerprint: h.fingerprint, itemType: 'package',
+          error: String(h.sampleError ?? ''), sampleError: h.sampleError ?? null, heldAt: String(h.heldAt ?? h.lastAt ?? ''), lastAt: String(h.lastAt ?? h.heldAt ?? ''),
+          count: Number(h.count ?? 1), buildId: String(h.buildId ?? ''), buildResumes: Number(h.buildResumes ?? 0), paidUncertain: false, strategy: 'package_cursia_issue_hold',
+          resumedAt: h.resumedAt ?? null, resumeTrigger: h.resumeTrigger ?? null, history: [] },
+      });
+    }
     return commonFailureSignals(input, await this.commonFailureResolutions(), now);
   }
 

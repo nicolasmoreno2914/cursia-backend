@@ -852,6 +852,11 @@ jobs:
                echo "━━━ [5g] r83: breaker de Storage (infra_health) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r83-infra-health.js
 
+               # r99: activación persistida (cursia_feature_activations, RLS + sin anon/authenticated). Staging-only (EXCLUDED
+               # del plan de producción). Aditiva e idempotente.
+               echo "━━━ [5h] r99: activación (cursia_feature_activations) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r99-activation.js
+
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
                ensure_pm2_process cursia-content-worker-staging start:content-worker
