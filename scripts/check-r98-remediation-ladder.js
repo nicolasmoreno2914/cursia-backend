@@ -380,7 +380,7 @@ function fakeQr(row) {
     const s3 = L.ladderStep(s2.state, verdictOf(LANG(6, 'a')), 'audiobook_chapter', LANG(6, 'a'), at(12), { retryable: true });
     eq([s2.action, s2.grant, s3.action], ['rewrite', true, 'exhausted'], 'r99: vuelve a rung 2 (con intento, el pedido ya corregido) y después agotada');
     const rs = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/runs.service.ts'), 'utf8');
-    assert(/const remediationReset = !auto \|\| auto\.bugResume \? resetRemediationForManualRetry\(remediationOf\(target\.output_summary\)/.test(rs) && /\.\.\.\(remediationReset \? \{ remediation: remediationReset \} : \{\}\)/.test(rs), 'retryItem (manual) lo aplica en la misma escritura');
+    assert(/const remediationReset = !auto \|\| \(auto\.bugResume && auto\.bugResume\.trigger !== 'reprobe'\) \? resetRemediationForManualRetry\(remediationOf\(target\.output_summary\)/.test(rs) && /\.\.\.\(remediationReset \? \{ remediation: remediationReset \} : \{\}\)/.test(rs), 'retryItem (manual) lo aplica en la misma escritura');
   });
   await check('P2-1 tope TOTAL de intentos de la escalera por parte (todas las huellas, reintentos humanos incluidos): nunca se reinicia', async () => {
     eq(L.MAX_LADDER_GRANTS_PER_ITEM, 3, 'tope por parte');
