@@ -26,7 +26,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import type { FailureVerdict } from './failure-classifier';
 import { redactErrorExcerpt } from './attempt-log';
-import { RemediationStrategyId, isCursiaIssueStrategy, remediationStrategyFor } from './remediation-strategies';
+import { RemediationStrategyId, STRATEGY_CATALOG, isCursiaIssueStrategy, remediationStrategyFor } from './remediation-strategies';
 
 export const BUG_HOLD_KEY = 'bugHold';
 /** Marca «resuelto» de una huella en «Falla común» (admin_audit_log; la escribe admin-recovery.service.ts). */
@@ -74,7 +74,15 @@ export type BugHoldReason =
   | 'reconcile_pending' // pago incierto sin conciliación automática que lo tome
   | 'item_budget_exhausted'; // la ronda extra del tope de la parte ya se usó
 
-export type BugHoldResumeTrigger = 'reclassified' | 'resolved' | 'new_build';
+export type BugHoldResumeTrigger = 'reclassified' | 'resolved' | 'new_build' | 'reprobe';
+
+/**
+ * Re-review: una pausa cuya estrategia esperaba una condición EXTERNA (proveedor caído > 6 h, cuota…) no espera al
+ * próximo deploy: cada BUG_HOLD_REPROBE_INTERVAL_SECONDS se vuelve a sondear (USD 0; con la sonda de salud del proveedor
+ * cuando existe) y, si responde, se reabre (esa reapertura sí cuenta en el tope por parte). ≤ BUG_HOLD_REPROBE_MAX_PER_DAY.
+ */
+export const BUG_HOLD_REPROBE_INTERVAL_SECONDS = 2 * 3600;
+export const BUG_HOLD_REPROBE_MAX_PER_DAY = 12;
 
 export interface BugHoldState {
   v: 1;
@@ -106,6 +114,11 @@ export interface BugHoldState {
    * propios — los usa con su backoff; «Falla común» lo ve desde la primera vez. Si se agotan, recién ahí la pausa.
    */
   reportOnly?: boolean;
+  /** Re-review: fallo ORIGINAL (la ventana de 14 días y el backfill cuentan desde acá, no desde la pausa). */
+  originalFailedAt?: string | null;
+  /** Re-review: sondas de una pausa por condición externa (USD 0; no cuentan en el tope si no despachan). */
+  lastProbeAt?: string | null;
+  probes?: { day: string; n: number } | null;
   /** Pago incierto: solo reclassified / resolved (nunca por build). */
   paidUncertain: boolean;
   /** Estrategia que tenía el veredicto al pausar (auditoría). */
@@ -169,9 +182,12 @@ export function nextBugHold(
   reason: BugHoldReason,
   now: Date,
   buildId: string,
+  /** Fallo original (finished_at de la fila); default: ahora. Se conserva entre pausas de la misma parte. */
+  failedAt?: Date | string | null,
 ): BugHoldState {
   const at = now.toISOString();
   const strategy = remediationStrategyFor(v).strategy;
+  const fa = failedAt ? new Date(failedAt as any) : now;
   const history = [...(prev?.history ?? []), { at, event: 'held' as const, reason, buildId }].slice(-BUG_HOLD_HISTORY_MAX);
   return {
     v: 1,
@@ -190,6 +206,9 @@ export function nextBugHold(
     // Las reaperturas se cuentan por PARTE (nunca se reinician: tope duro de gasto).
     buildResumes: Math.max(0, Math.floor(Number(prev?.buildResumes ?? 0)) || 0),
     autoResumes: Math.max(0, Math.floor(Number(prev?.autoResumes ?? prev?.buildResumes ?? 0)) || 0),
+    originalFailedAt: prev?.originalFailedAt ?? (Number.isFinite(fa.getTime()) ? fa.toISOString() : at),
+    lastProbeAt: prev?.lastProbeAt ?? null,
+    probes: prev?.probes ?? null,
     lastResumeAt: prev?.lastResumeAt ?? null,
     reportOnly: false,
     paidUncertain: v.paidRisk === 'uncertain' || v.humanReason === 'duplicate_charge' || reason === 'reconcile_pending',
@@ -212,7 +231,7 @@ export function reportedBugHold(prev: BugHoldState | null, v: FailureVerdict, it
 /** Estado tras una reapertura (automática o humana): la pausa deja de estar vigente (el historial se conserva). */
 export function resumedBugHold(prev: BugHoldState, now: Date, by: string, trigger: BugHoldResumeTrigger | null): BugHoldState {
   const at = now.toISOString();
-  const automatic = trigger === 'new_build' || trigger === 'reclassified';
+  const automatic = trigger === 'new_build' || trigger === 'reclassified' || trigger === 'reprobe';
   return {
     ...prev,
     active: false,
@@ -260,7 +279,8 @@ export function bugHoldResumeDecision(row: { status: string; error: string | nul
   const automaticGate = (): BugHoldResumeDecision | null => {
     if (hold.paidUncertain) return { resume: false, reason: 'paid_uncertain' };
     if (autoUsed >= max) return { resume: false, reason: 'build_resumes_exhausted' };
-    if (now - Date.parse(hold.heldAt) > BUG_HOLD_MAX_AGE_DAYS * 86_400_000) return { resume: false, reason: 'too_old' };
+    // Re-review: la ventana cuenta desde el fallo ORIGINAL (un backfill no reinicia los 14 días).
+    if (now - Date.parse(hold.originalFailedAt ?? hold.heldAt) > BUG_HOLD_MAX_AGE_DAYS * 86_400_000) return { resume: false, reason: 'too_old' };
     if (cooling) return { resume: false, reason: 'cooldown' };
     return null;
   };
@@ -280,6 +300,19 @@ export function bugHoldResumeDecision(row: { status: string; error: string | nul
     const g = automaticGate();
     if (g) return g;
     return { resume: true, trigger: 'new_build', strategy: s.strategy };
+  }
+  // 4) Re-review: pausa por condición EXTERNA (la estrategia al pausar esperaba al proveedor / la red) → re-sonda cada
+  //    2 h (≤ 12 por día). El barrido sondea (USD 0) y solo reabre si el proveedor responde.
+  const external = STRATEGY_CATALOG[String(hold.strategy) as RemediationStrategyId]?.changes === 'external_condition';
+  if (external) {
+    const lastProbe = Math.max(Date.parse(hold.lastProbeAt ?? '') || 0, Date.parse(hold.heldAt) || 0, Number.isFinite(lastAuto) ? lastAuto : 0);
+    const day = ctx.now.toISOString().slice(0, 10);
+    const today = hold.probes && hold.probes.day === day ? hold.probes.n : 0;
+    if (now - lastProbe >= BUG_HOLD_REPROBE_INTERVAL_SECONDS * 1000 && today < BUG_HOLD_REPROBE_MAX_PER_DAY) {
+      const g = automaticGate();
+      if (g) return g;
+      return { resume: true, trigger: 'reprobe', strategy: String(hold.strategy) as RemediationStrategyId };
+    }
   }
   return { resume: false, reason: hold.reason === 'unmapped_code' ? 'still_unmapped' : 'waiting_fix' };
 }
@@ -335,6 +368,13 @@ export function currentBuildId(env: Record<string, string | undefined> = process
 }
 
 /** Solo tests: olvida el build cacheado. */
+/** Re-review: una sonda hecha (USD 0) que NO reabrió la parte: solo se anota (no cuenta en el tope). */
+export function probedBugHold(prev: BugHoldState, now: Date): BugHoldState {
+  const day = now.toISOString().slice(0, 10);
+  const n = prev.probes && prev.probes.day === day ? prev.probes.n : 0;
+  return { ...prev, lastProbeAt: now.toISOString(), probes: { day, n: n + 1 } };
+}
+
 export function resetBuildIdCache(): void {
   cachedBuildId = null;
 }

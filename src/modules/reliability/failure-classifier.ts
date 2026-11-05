@@ -632,7 +632,7 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
   // encima); PACKAGE_OBJECT_CONFLICT = carrera sobre una ruta ya referenciada (el reintento elige ruta nueva). Ambos A.
   // r62 (P, review I1): PACKAGING_V3_CONTENT_MISSING (contenido ausente/vacío en un set de artifacts que no cambia entre
   // reintentos) pasa a `package_component` (B, reparación por item) y ERR_BUFFER_TOO_LARGE (misma entrada, mismo tamaño) a
-  // `package_product` (D): ninguno se arregla reintentando y con r62 lo A se reintenta hasta 72 h.
+  // `package_product` (D): ninguno se arregla reintentando y con r62 lo A se reintenta hasta su ventana total (r99: 6 h).
   { id: 'package_transient', codes: ['package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT', 'storage_unavailable'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
   {
     id: 'package_component',
@@ -822,9 +822,14 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^Respuesta ilegible de la API\b/i, 'llm_empty_response'],
   [/^Generaci[oó]n detenida por el usuario\b/i, 'user_stopped'],
   [/^(fetch failed|network error|socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN)\b/i, 'llm_network'],
-  // r99 (review P1-1): excepciones CRUDAS del navegador que el ejecutor trata como transitorias (_dynMapApiError: sin
-  // `.fatal` → retryable). Red / timeout / abort → A (llm_network, backoff). Salida de la IA con forma inesperada
-  // (JSON.parse, TypeError sobre la respuesta) → B (browser_output_exception: el próximo intento lleva el hallazgo).
+];
+
+/**
+ * r99 (review P1-1 / re-review P2-B): excepciones CRUDAS del ejecutor del NAVEGADOR (_dynMapApiError: sin `.fatal` →
+ * retryable). Solo con `source === 'browser_executor'`: en un worker del servidor el mismo texto (p. ej. Gamma devolviendo
+ * HTML → «Unexpected token <») sigue sin regla → D con pago INCIERTO (nunca se reanuda solo por build).
+ */
+const BROWSER_PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^(?:TypeError:\s*)?(?:Failed to fetch|Load failed|NetworkError when attempting to fetch resource|Network request failed|Request timeout|Request timed out|The operation was aborted|The user aborted a request|signal is aborted|AbortError|TimeoutError|The operation timed out|net::ERR_[A-Z_]+)/i, 'llm_network'],
   [/^(?:SyntaxError:\s*|TypeError:\s*)?(?:Unexpected token\b|Unexpected end of JSON|Unexpected non-whitespace character after JSON|JSON\.parse:|Bad control character in string literal|Expected (?:property name|',' or '[}\]]')|Unterminated string in JSON|Cannot read propert(?:y|ies) of (?:undefined|null)|Cannot convert undefined or null to object|undefined is not an object|null is not an object|[\w$.\[\]'"]+ is not (?:a function|iterable|an object)|[\w$.]+ is undefined\b|[\w$.]+ is null\b)/, 'browser_output_exception'],
 ];
@@ -852,10 +857,11 @@ function httpStatusOf(error: string): number | null {
 }
 
 /** Código estable de un mensaje de error (sin errorCode explícito). */
-export function extractFailureCode(error: string): string {
+export function extractFailureCode(error: string, source?: FailureSource | null): string {
   const e = String(error ?? '').trim();
   if (!e) return 'unknown_error';
   for (const [re, code] of PHRASES) if (re.test(e)) return code;
+  if (source === 'browser_executor') for (const [re, code] of BROWSER_PHRASES) if (re.test(e)) return code;
   const lead = /^([A-Za-z][A-Za-z0-9_]*)(?=$|[\s:(—\-,.])/.exec(e);
   if (lead) {
     const tok = lead[1];
@@ -992,7 +998,7 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
       if (r) return verdictOf(r, m[1], { ...ctxBase, code: m[1] }, {});
     }
     // r62 (P, review I1c): en el scope de PAQUETE, un 4xx de Storage o su falta de configuración NUNCA es transitorio
-    // (con r62 lo A se reintenta hasta 72 h). Se resuelve a un código D antes del respaldo transitorio.
+    // (con r62 lo A se reintenta hasta su ventana total; r99: 6 h). Se resuelve a un código D antes del respaldo transitorio.
     if (scoped === PACKAGE_RULES) {
       const sc = packageStorageDeterministicCode(error);
       if (sc) {
@@ -1101,7 +1107,7 @@ const BROWSER_REPORTABLE_RULES: ReadonlySet<string> = new Set([
 const LLM_HTTP_SOURCES: ReadonlySet<string> = new Set(['browser_executor', 'server_executor', 'llm_gateway']);
 
 function classifyMessage(error: string, ctxBase: Omit<RefineCtx, 'code'>, source: FailureSource | null): FailureVerdict {
-  const code = extractFailureCode(error);
+  const code = extractFailureCode(error, source);
   const rule = ruleFor(ITEM_RULES, code);
   if (rule) return verdictOf(rule, code, { ...ctxBase, code }, withInner(code, error));
   // I4: el status HTTP solo clasifica mensajes de llamadas HTTP de la IA (identificadas por la fuente).

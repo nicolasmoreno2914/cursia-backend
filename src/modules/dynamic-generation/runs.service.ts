@@ -236,20 +236,23 @@ import { remediationOf, resetRemediationForManualRetry } from '../reliability/re
 // r99: pausa como bug de Cursia + reanudación automática con el arreglo.
 import {
   BUG_HOLD_KEY, BugHoldResumeTrigger, bugHoldResumeDecision, CURSIA_ISSUE_MESSAGE, bugHoldSince, bugHoldStateOf, currentBuildId, nextBugHold, resumedBugHold,
-  BugHoldReason, BUG_HOLD_RESOLVE_ACTION, BUG_HOLD_RESOLVE_TARGET_TYPE, BUG_HOLD_RESUME_COOLDOWN_SECONDS, BUG_HOLD_SWEEP_GRACE_SECONDS,
+  BugHoldReason, BUG_HOLD_RESOLVE_ACTION, BUG_HOLD_RESOLVE_TARGET_TYPE, BUG_HOLD_RESUME_COOLDOWN_SECONDS, BUG_HOLD_SWEEP_GRACE_SECONDS, probedBugHold,
 } from '../reliability/bug-hold';
+import { backfillMaxResumesPerHour, ownerDecisionAutoResumeEnabled, r99ActivationAt } from '../reliability/r99-activation';
 import { remediationStrategyFor } from '../reliability/remediation-strategies';
 
 /** r99: estrategia registrada en el log de intentos al reanudar una pausa por bug de Cursia. */
 export const CURSIA_ISSUE_RESUME_STRATEGY = 'cursia_issue_resume';
 /** r99 (decisión del dueño 1): reapertura sola cuando la decisión del dueño que frenaba la parte cambió. */
 export const OWNER_DECISION_RESUME_STRATEGY = 'owner_decision_resume';
-export type OwnerDecisionCause = 'run_budget' | 'user_budget' | 'account_access' | 'platform_freeze';
+export type OwnerDecisionCause = 'run_budget' | 'user_budget' | 'account_access' | 'account_authorization' | 'platform_freeze';
 /** Motivos de pausa del RUN por su presupuesto (los pone el sistema; los reanuda una autorización nueva). */
 export const RUN_BUDGET_PAUSE_REASONS: readonly string[] = Object.freeze(['run_budget_cap', 'run_budget_not_authorized']);
+/** Re-review P3-C: pausas del SISTEMA que una decisión nueva levanta sola (presupuesto del run, suspensión levantada). */
+export const SYSTEM_RESUMABLE_PAUSE_REASONS: readonly string[] = Object.freeze([...RUN_BUDGET_PAUSE_REASONS, 'account_suspended']);
 /** Filtro GRUESO (POSIX, case-insensitive) de los errores de una decisión del dueño; la decisión fina es ownerDecisionCauseOf. */
 export const OWNER_DECISION_ERROR_SQL_REGEX =
-  '^(unexpected_error: )?(budget_exceeded|budget_approval_required|budget_blocked|run_budget_not_authorized|user_budget_insufficient|user_budget_not_assigned|generation_suspended|account_suspended|platform_generation_frozen|tu presupuesto disponible no alcanza|todav[ií]a no tienes presupuesto asignado|tus generaciones est[aá]n suspendidas|tu cuenta est[aá] suspendida|las generaciones nuevas est[aá]n pausadas)';
+  '^(unexpected_error: )?(budget_exceeded|budget_approval_required|budget_blocked|run_budget_not_authorized|user_budget_insufficient|user_budget_not_assigned|generation_suspended|account_suspended|account_not_authorized|platform_generation_frozen|tu cuenta no tiene acceso a cursia|tu presupuesto disponible no alcanza|todav[ií]a no tienes presupuesto asignado|tus generaciones est[aá]n suspendidas|tu cuenta est[aá] suspendida|las generaciones nuevas est[aá]n pausadas)';
 
 function extractFailureCodeOf(error: string): string {
   return classifyFailure({ error, outputSummary: {} }).code;
@@ -260,7 +263,9 @@ export function ownerDecisionCauseOf(error: string, type: string | null | undefi
   const v = classifyFailure({ error, itemType: type ?? null, outputSummary: {}, source: sourceOfItemType(type) });
   if (v.rule === 'budget') return 'run_budget';
   if (v.rule === 'user_budget_denied') return 'user_budget';
-  if (v.rule === 'generation_access_denied') return v.code === 'platform_generation_frozen' ? 'platform_freeze' : 'account_access';
+  if (v.rule === 'generation_access_denied') {
+    return v.code === 'platform_generation_frozen' ? 'platform_freeze' : v.code === 'account_not_authorized' ? 'account_authorization' : 'account_access';
+  }
   return null;
 }
 
@@ -428,6 +433,8 @@ export interface RunDto {
    * false (kill-switch `DYNAMIC_AUTO_HEAL_POLICY=legacy`) → el frontend no arranca el ejecutor solo al abrir.
    */
   autoRecovery: boolean;
+  /** r99: una decisión nueva del dueño (presupuesto, suspensión) reanuda sola esta generación (RunsService.autoResumeOwnerDecisionHolds). */
+  ownerDecisionAutoResume?: boolean;
   /**
    * REL MVP fix round 1 (I3): último claim o finalización de una parte del NAVEGADOR (cualquier ejecutor,
    * cualquier equipo). Obsoleto para decidir: lo reemplaza `executionLease` (se conserva para frontends
@@ -2521,9 +2528,15 @@ export class RunsService {
     blueprintNumber: number,
     runId: string,
     actor?: { id?: string | null; email?: string | null },
+    /**
+     * r99 (re-review P3-D): reanudación del SISTEMA (decisión del dueño): solo si, bajo el lock de la fila, la pausa sigue
+     * siendo del sistema por uno de `reasons` (nunca levanta una pausa del usuario hecha entre la lectura y el lock);
+     * `label` queda como resumedBy.
+     */
+    system?: { reasons: readonly string[]; label: string },
   ): Promise<RunDto> {
-    const actorId = actor?.id ?? ownerId;
-    ownerId = await this.ownerForActor(courseId, ownerId, actor);
+    const actorId = system ? system.label : actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, system ? undefined : actor);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
     // Loop Cost Efficiency: reanudar tras una pausa del DISYUNTOR = el usuario acepta el sobreconsumo hasta ahora;
@@ -2566,9 +2579,12 @@ export class RunsService {
       this.logger.warn(`run ${job.id}: reanudado tras el disyuntor — sobreconsumo aceptado USD ${over.toFixed(2)}`);
     }
     await this.tx(async (qr) => {
-      const [locked] = await qr.query(`select id, status, worker_status from public.production_jobs where id = $1 for update`, [job.id]);
+      const [locked] = await qr.query(`select id, status, worker_status, output_summary->'pause'->>'reason' as pause_reason from public.production_jobs where id = $1 for update`, [job.id]);
       if (!isPausedRun(locked)) {
         throw new ConflictException({ message: `La ejecución ${job.id} no está pausada (${locked.worker_status}); no hay nada que reanudar`, code: 'run_not_paused' });
+      }
+      if (system && !system.reasons.includes(String(locked.pause_reason ?? ''))) {
+        throw new ConflictException({ message: `La ejecución ${job.id} ya no está pausada por el sistema (${locked.pause_reason ?? 'usuario'}): no se reanuda sola`, code: 'run_not_system_paused' });
       }
       // r75: un run pausado sigue reteniendo; reanudarlo exige que quien PAGA no esté suspendido (otro miembro tampoco).
       await this.assertUserBudgetOnReopen(qr, job.id, false);
@@ -2770,7 +2786,7 @@ export class RunsService {
        * r99: reanudación AUTOMÁTICA de una parte en pausa como bug de Cursia (bug-hold.ts) — el arreglo está desplegado
        * (reclasificada / huella resuelta / build nuevo). Re-evaluada bajo lock con bugHoldResumeDecision; nunca reenvía.
        */
-      bugResume?: { trigger: BugHoldResumeTrigger; resolvedAt?: string | null; buildId: string };
+      bugResume?: { trigger: BugHoldResumeTrigger; resolvedAt?: string | null; buildId: string; backfill?: boolean };
       /**
        * r99 (decisión del dueño 1): la DECISIÓN que frenaba la parte cambió (un SuperAdmin aprobó / amplió el presupuesto del
        * run, se asignó o amplió el presupuesto del usuario, se levantó la suspensión o la congelación) DESPUÉS del fallo →
@@ -3439,7 +3455,8 @@ export class RunsService {
       // r99: toda reapertura (automática o humana) deja de estar en pausa como bug; el historial se conserva para el reporte.
       const heldState = bugHoldStateOf(target.output_summary);
       const bugHoldAfter = heldState && heldState.active
-        ? resumedBugHold(heldState, auto?.now ?? new Date(), auto ? 'system' : String(actorId), auto?.bugResume?.trigger ?? null) : null;
+        ? { ...resumedBugHold(heldState, auto?.now ?? new Date(), auto ? 'system' : String(actorId), auto?.bugResume?.trigger ?? null),
+            ...(auto?.bugResume?.backfill ? { backfillResumedAt: (auto.now ?? new Date()).toISOString() } : {}) } : null;
       // r67 (A3): estado explícito de la reapertura (pending_retry) + historial acotado, en la MISMA escritura.
       const r67Reason = auto ? (auto.policy.classAware && autoMeta?.strategy ? `auto_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}` : 'auto') : 'manual_retry';
       const r67Recovery = nextRecoveryEntry(target.output_summary?.recovery, { state: 'pending_retry', reason: r67Reason.slice(0, 64), nextRetryAt: null, automatic: true },
@@ -3676,119 +3693,154 @@ export class RunsService {
    * Nunca reenvía a un proveedor pagado; nada se gasta acá (lo deciden los guards de cada llamada).
    */
   async autoResumeOwnerDecisionHolds(
-    opts: { now?: Date; limit?: number; policy?: AutoHealPolicy } = {},
+    opts: { now?: Date; limit?: number; policy?: AutoHealPolicy; maxCandidates?: number } = {},
   ): Promise<{ resumedRuns: string[]; reopened: Array<{ runId: string; itemKey: string; cause: string }>; skipped: Array<{ runId: string; itemKey?: string; reason: string }> }> {
     const now = opts.now ?? new Date();
     const policy = opts.policy ?? autoHealPolicyFromEnv();
     const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const maxCandidates = Math.max(limit, Math.floor(opts.maxCandidates ?? 1000));
     const out = { resumedRuns: [] as string[], reopened: [] as Array<{ runId: string; itemKey: string; cause: string }>, skipped: [] as Array<{ runId: string; itemKey?: string; reason: string }> };
-    const since = bugHoldSince(process.env).toISOString();
+    // Re-review P2-A: kill switch propio y NUNCA retroactivo — solo cuentan decisiones posteriores a la activación de r99
+    // (las aprobadas bajo D-21 «aprobar no relanza nada» no relanzan nada al desplegar).
+    if (!ownerDecisionAutoResumeEnabled(process.env)) return out;
+    const activation = await r99ActivationAt(this.dataSource);
+    const since = bugHoldSince(process.env, now).toISOString();
     const hasTable = async (t: string) => {
       const [x] = await this.dataSource.query(`select to_regclass($1) is not null as ok`, [`public.${t}`]).catch(() => [{ ok: false }]);
       return !!x?.ok;
     };
-    const auths = await hasTable('cost_budget_authorizations');
-    // ── A) runs pausados por su presupuesto ──
-    if (auths) {
-      const paused: any[] = await this.dataSource.query(
-        `select pj.id, pj.course_id, pj.owner_id, b.blueprint_number, pj.output_summary->'pause' as pause, a.created_at as auth_at
-           from public.production_jobs pj
-           join public.course_generation_manifests m on m.id = (pj.input_payload->>'manifestId')::bigint
-           join public.course_blueprints b on b.id = m.blueprint_id
-           join lateral (select created_at from public.cost_budget_authorizations ca where ca.run_id = pj.id and ca.decision <> 'BLOCKED'
-                           order by created_at desc, id desc limit 1) a on true
-          where pj.execution_mode = 'dynamic_generation' and pj.worker_status = 'paused' and pj.created_at >= $1::timestamptz
-            and (pj.output_summary->'pause'->>'reason') = any($2::text[])
-            and a.created_at > coalesce((pj.output_summary->'pause'->>'autoResumeCheckedAt')::timestamptz, (pj.output_summary->'pause'->>'pausedAt')::timestamptz, pj.updated_at)
-          order by a.created_at desc
-          limit $3`,
-        [since, [...RUN_BUDGET_PAUSE_REASONS], limit],
-      );
-      for (const r of paused) {
-        try {
-          await this.resumeRun(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.id));
-          await this.dataSource.query(
-            `update public.production_jobs set output_summary = jsonb_set(output_summary, '{pause,autoResumedBy}', to_jsonb($2::text), true) where id = $1`,
-            [r.id, `${OWNER_DECISION_RESUME_STRATEGY}:run_budget`],
-          );
-          out.resumedRuns.push(String(r.id));
-          this.logger.warn(`owner-decision: run ${r.id} reanudado solo tras una autorización nueva del presupuesto`);
-        } catch (err) {
-          const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
-          out.skipped.push({ runId: String(r.id), reason: String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80) });
-        }
-        // La autorización ya se evaluó (alcance o no): no se vuelve a mirar hasta que haya una más nueva.
-        await this.dataSource.query(
-          `update public.production_jobs set output_summary = jsonb_set(output_summary, '{pause,autoResumeCheckedAt}', to_jsonb($2::text), true)
-            where id = $1 and jsonb_typeof(output_summary->'pause') = 'object'`,
-          [r.id, new Date(r.auth_at).toISOString()],
-        ).catch(() => undefined);
-      }
-    }
-    // ── B) partes frenadas por una decisión del dueño ──
-    const rows: any[] = await this.dataSource.query(
-      `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
-              pj.course_id, pj.owner_id, coalesce(nullif(pj.input_payload->>'startedBy', ''), pj.owner_id::text) as payer_id, b.blueprint_number
-         from public.generation_item_runs g
-         join public.production_jobs pj on pj.id = g.job_id
-         join public.course_generation_manifests m on m.id = g.manifest_id
-         join public.course_blueprints b on b.id = m.blueprint_id
-        where pj.execution_mode = 'dynamic_generation' and pj.created_at >= $1::timestamptz
-          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview', 'paused')
-          and g.status in ('failed', 'blocked')
-          and ${latestGenerationPredicate('g')}
-          and g.error ~* $2
-          and not exists (
-            select 1 from public.production_jobs pj2
-             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id::text = pj.course_id::text and pj2.id <> pj.id
-               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
-        order by g.finished_at desc nulls last, g.id
-        limit $3`,
-      [since, OWNER_DECISION_ERROR_SQL_REGEX, limit],
-    );
-    const tables = { user_budgets: await hasTable('user_budgets'), user_suspensions: await hasTable('user_suspensions'), platform_controls: await hasTable('platform_controls') };
-    for (const r of rows) {
-      const cause = ownerDecisionCauseOf(String(r.error ?? ''), r.type);
-      if (!cause) continue;
-      if (r.status === 'blocked' && !isBudgetBlocked(r)) continue;
-      let eventAt: Date | null = null;
-      const max = async (sql: string, params: any[]) => { const [x] = await this.dataSource.query(sql, params); return x?.at ? new Date(x.at) : null; };
-      if (cause === 'run_budget' && auths) {
-        eventAt = await max(`select max(created_at) as at from public.cost_budget_authorizations where run_id = $1 and decision <> 'BLOCKED'`, [r.job_id]);
+    const tables = {
+      auths: await hasTable('cost_budget_authorizations'), user_budgets: await hasTable('user_budgets'), user_suspensions: await hasTable('user_suspensions'),
+      platform_controls: await hasTable('platform_controls'), authorized_users: await hasTable('authorized_users'),
+    };
+    const latest = async (sql: string, params: any[]) => { const [x] = await this.dataSource.query(sql, params); return x?.at ? new Date(x.at) : null; };
+    /** Decisión más nueva (≥ activación) que levanta `cause` para el run / el que paga; null = ninguna. */
+    const eventFor = async (cause: OwnerDecisionCause, runId: string, payer: string): Promise<Date | null> => {
+      let at: Date | null = null;
+      if (cause === 'run_budget' && tables.auths) {
+        at = await latest(`select max(created_at) as at from public.cost_budget_authorizations where run_id = $1 and decision <> 'BLOCKED'`, [runId]);
       } else if (cause === 'user_budget' && tables.user_budgets) {
-        eventAt = await max(`select max(created_at) as at from public.user_budgets where user_id::text = $1::text`, [r.payer_id]);
+        at = await latest(`select max(created_at) as at from public.user_budgets where user_id::text = $1::text`, [payer]);
       } else if (cause === 'account_access' && tables.user_suspensions) {
         // Solo si YA no queda ninguna suspensión vigente del que paga.
-        const [act] = await this.dataSource.query(`select count(*)::int as n from public.user_suspensions where user_id::text = $1::text and lifted_at is null`, [r.payer_id]);
-        if (!act || Number(act.n) === 0) eventAt = await max(`select max(lifted_at) as at from public.user_suspensions where user_id::text = $1::text`, [r.payer_id]);
+        const [act] = await this.dataSource.query(`select count(*)::int as n from public.user_suspensions where user_id::text = $1::text and lifted_at is null`, [payer]);
+        if (!act || Number(act.n) === 0) at = await latest(`select max(lifted_at) as at from public.user_suspensions where user_id::text = $1::text`, [payer]);
+      } else if (cause === 'account_authorization' && tables.authorized_users) {
+        // Re-review P3-C: «autorizar usuario» (authorized_users activo del que paga).
+        at = await latest(`select max(created_at) as at from public.authorized_users where user_id::text = $1::text and coalesce(status, 'active') = 'active'`, [payer]);
       } else if (cause === 'platform_freeze' && tables.platform_controls) {
-        eventAt = await max(`select max(updated_at) as at from public.platform_controls where key = 'generation_freeze' and enabled = false`, []);
+        at = await latest(`select max(updated_at) as at from public.platform_controls where key = 'generation_freeze' and enabled = false`, []);
       }
-      const failedAt = new Date(r.finished_at ?? r.updated_at ?? 0);
-      const used = r.output_summary?.ownerDecisionResume?.eventAt ? new Date(String(r.output_summary.ownerDecisionResume.eventAt)) : null;
-      if (!eventAt || !(eventAt.getTime() > failedAt.getTime()) || (used && !(eventAt.getTime() > used.getTime()))) {
-        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'no_new_decision' });
-        continue;
-      }
+      return at && at.getTime() >= activation.getTime() ? at : null;
+    };
+
+    // ── A) runs pausados por el SISTEMA (presupuesto / suspensión) ──
+    const paused: any[] = await this.dataSource.query(
+      `select pj.id, pj.course_id, pj.owner_id, b.blueprint_number, pj.output_summary->'pause' as pause,
+              coalesce(nullif(pj.input_payload->>'startedBy', ''), pj.owner_id::text) as payer_id
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id = (pj.input_payload->>'manifestId')::bigint
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation' and pj.worker_status = 'paused' and pj.created_at >= $1::timestamptz
+          and (pj.output_summary->'pause'->>'reason') = any($2::text[])
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+        order by pj.updated_at asc nulls first, pj.id
+        limit $3`,
+      [since, [...SYSTEM_RESUMABLE_PAUSE_REASONS], maxCandidates],
+    );
+    for (const r of paused) {
+      if (out.resumedRuns.length >= limit) break;
+      const reason = String(r.pause?.reason ?? '');
+      const cause: OwnerDecisionCause = reason === 'account_suspended' ? 'account_access' : 'run_budget';
+      const ev = await eventFor(cause, String(r.id), String(r.payer_id));
+      const pausedAt = r.pause?.pausedAt ? Date.parse(String(r.pause.pausedAt)) : NaN;
+      const checked = r.pause?.autoResumeCheckedAt ? Date.parse(String(r.pause.autoResumeCheckedAt)) : NaN;
+      if (!ev || !(ev.getTime() > (Number.isFinite(pausedAt) ? pausedAt : 0)) || (Number.isFinite(checked) && !(ev.getTime() > checked))) continue;
       try {
-        await this.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.job_id), String(r.item_key), false, false,
-          { policy, now, ownerDecisionResume: { eventAt: eventAt.toISOString(), cause } });
-        out.reopened.push({ runId: r.job_id, itemKey: r.item_key, cause });
-        this.logger.warn(`owner-decision: ${r.item_key} (run ${r.job_id}) reabierta sola (${cause}: decisión ${eventAt.toISOString()})`);
+        // Re-review P3-D: el motivo se re-verifica BAJO el lock y queda resumedBy = system.
+        await this.resumeRun(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.id), undefined,
+          { reasons: SYSTEM_RESUMABLE_PAUSE_REASONS, label: `system:r99:${OWNER_DECISION_RESUME_STRATEGY}:${cause}` });
+        out.resumedRuns.push(String(r.id));
+        this.logger.warn(`owner-decision: run ${r.id} reanudado solo (${cause}: decisión ${ev.toISOString()})`);
       } catch (err) {
         const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
-        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80) });
-        // La decisión ya se evaluó: no se reintenta en cada tick (una más nueva sí).
-        await this.dataSource.query(
-          `update public.generation_item_runs
-              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('ownerDecisionResume',
-                    coalesce(output_summary->'ownerDecisionResume', '{}'::jsonb) || jsonb_build_object('eventAt', $2::text, 'declined', $3::text)),
-                  updated_at = now()
-            where id = $1 and status in ('failed', 'blocked')`,
-          [r.id, eventAt.toISOString(), String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80)],
-        ).catch(() => undefined);
+        out.skipped.push({ runId: String(r.id), reason: String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80) });
       }
+      // La decisión ya se evaluó (alcance o no): no se vuelve a mirar hasta que haya una más nueva.
+      await this.dataSource.query(
+        `update public.production_jobs set output_summary = jsonb_set(output_summary, '{pause,autoResumeCheckedAt}', to_jsonb($2::text), true)
+          where id = $1 and jsonb_typeof(output_summary->'pause') = 'object'`,
+        [r.id, ev.toISOString()],
+      ).catch(() => undefined);
+    }
+
+    // ── B) partes frenadas por una decisión del dueño (cursor: los más viejos primero, sin inanición) ──
+    let cur: { us: string; id: string } | null = null;
+    let seen = 0;
+    while (seen < maxCandidates && out.reopened.length < limit) {
+      const rows: any[] = await this.dataSource.query(
+        `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
+                pj.course_id, pj.owner_id, coalesce(nullif(pj.input_payload->>'startedBy', ''), pj.owner_id::text) as payer_id, b.blueprint_number,
+                (extract(epoch from coalesce(g.finished_at, g.updated_at)) * 1000000)::bigint::text as at_us
+           from public.generation_item_runs g
+           join public.production_jobs pj on pj.id = g.job_id
+           join public.course_generation_manifests m on m.id = g.manifest_id
+           join public.course_blueprints b on b.id = m.blueprint_id
+          where pj.execution_mode = 'dynamic_generation' and pj.created_at >= $1::timestamptz
+            and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview', 'paused')
+            and g.status in ('failed', 'blocked')
+            and ${latestGenerationPredicate('g')}
+            and g.error ~* $2
+            and not exists (
+              select 1 from public.production_jobs pj2
+               where pj2.execution_mode = 'dynamic_generation' and pj2.course_id::text = pj.course_id::text and pj2.id <> pj.id
+                 and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+            and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+            and ($3::bigint is null or ((extract(epoch from coalesce(g.finished_at, g.updated_at)) * 1000000)::bigint, g.id) > ($3::bigint, $4::uuid))
+          order by (extract(epoch from coalesce(g.finished_at, g.updated_at)) * 1000000)::bigint asc, g.id asc
+          limit $5`,
+        [since, OWNER_DECISION_ERROR_SQL_REGEX, cur ? cur.us : null, cur ? cur.id : null, Math.min(200, maxCandidates - seen)],
+      );
+      if (!rows.length) break;
+      seen += rows.length;
+      const last = rows[rows.length - 1];
+      cur = { us: String(last.at_us), id: String(last.id) };
+      for (const r of rows) {
+        if (out.reopened.length >= limit) break;
+        const cause = ownerDecisionCauseOf(String(r.error ?? ''), r.type);
+        if (!cause) continue;
+        if (r.status === 'blocked' && !isBudgetBlocked(r)) continue;
+        const eventAt = await eventFor(cause, String(r.job_id), String(r.payer_id));
+        const failedAt = new Date(r.finished_at ?? r.updated_at ?? 0);
+        const used = r.output_summary?.ownerDecisionResume?.eventAt ? new Date(String(r.output_summary.ownerDecisionResume.eventAt)) : null;
+        if (!eventAt || !(eventAt.getTime() > failedAt.getTime()) || (used && !(eventAt.getTime() > used.getTime()))) {
+          out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'no_new_decision' });
+          continue;
+        }
+        try {
+          await this.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.job_id), String(r.item_key), false, false,
+            { policy, now, ownerDecisionResume: { eventAt: eventAt.toISOString(), cause } });
+          out.reopened.push({ runId: r.job_id, itemKey: r.item_key, cause });
+          this.logger.warn(`owner-decision: ${r.item_key} (run ${r.job_id}) reabierta sola (${cause}: decisión ${eventAt.toISOString()})`);
+        } catch (err) {
+          const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+          const code = String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80);
+          out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+          // La decisión ya se evaluó: no se reintenta en cada tick (una más nueva sí).
+          await this.dataSource.query(
+            `update public.generation_item_runs
+                set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('ownerDecisionResume',
+                      coalesce(output_summary->'ownerDecisionResume', '{}'::jsonb) || jsonb_build_object('eventAt', $2::text, 'declined', $3::text)),
+                    updated_at = now()
+              where id = $1 and status in ('failed', 'blocked')`,
+            [r.id, eventAt.toISOString(), code],
+          ).catch(() => undefined);
+        }
+      }
+    }
+    if (out.resumedRuns.length || out.reopened.length) {
+      this.logger.log(`owner-decision: barrido — runs reanudados ${out.resumedRuns.length}, partes reabiertas ${out.reopened.length}, sin decisión nueva ${out.skipped.filter((x) => x.reason === 'no_new_decision').length}`);
     }
     return out;
   }
@@ -3805,18 +3857,22 @@ export class RunsService {
    *     Un rechazo (presupuesto, run pausado por el usuario, otro run activo…) deja un enfriamiento de 30 min.
    */
   async sweepCursiaIssues(
-    opts: { now?: Date; limit?: number; buildId?: string; policy?: AutoHealPolicy } = {},
-  ): Promise<{ held: Array<{ runId: string; itemKey: string; reason: string }>; resumed: Array<{ runId: string; itemKey: string; trigger: string }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
+    opts: { now?: Date; limit?: number; buildId?: string; policy?: AutoHealPolicy; maxCandidates?: number; probe?: () => Promise<LlmHealthProbeResult> } = {},
+  ): Promise<{ held: Array<{ runId: string; itemKey: string; reason: string }>; resumed: Array<{ runId: string; itemKey: string; trigger: string; backfill?: boolean }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
     const now = opts.now ?? new Date();
     const policy = opts.policy ?? autoHealPolicyFromEnv();
     const buildId = opts.buildId ?? currentBuildId();
     const limit = Math.max(1, Math.floor(opts.limit ?? 100));
-    const out = { held: [] as Array<{ runId: string; itemKey: string; reason: string }>, resumed: [] as Array<{ runId: string; itemKey: string; trigger: string }>,
+    // Re-review (inanición): se recorre con cursor (los más VIEJOS primero) hasta maxCandidates filas por pasada; una fila
+    // que no se toca nunca tapa a una elegible.
+    const maxCandidates = Math.max(limit, Math.floor(opts.maxCandidates ?? 1000));
+    const out = { held: [] as Array<{ runId: string; itemKey: string; reason: string }>, resumed: [] as Array<{ runId: string; itemKey: string; trigger: string; backfill?: boolean }>,
       skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
-    const since = bugHoldSince(process.env).toISOString();
+    const since = bugHoldSince(process.env, now).toISOString();
+    const activation = await r99ActivationAt(this.dataSource);
     // Predicado común: ejecución dinámica VIGENTE del curso (ningún run ni Manifest más nuevo), no terminal.
-    const currentRunSql = `pj.execution_mode = 'dynamic_generation'
-            and pj.created_at >= $1::timestamptz
+    const currentRunSql = (sinceParam: string) => `pj.execution_mode = 'dynamic_generation'
+            and pj.created_at >= ${sinceParam}::timestamptz
             and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
             and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
             and g.status = 'failed'
@@ -3833,64 +3889,62 @@ export class RunsService {
     const cols = `g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.next_retry_at,
               to_jsonb(g)->>'failure_class' as failure_class, to_jsonb(g)->>'attention_reason' as attention_reason,
               (to_jsonb(g)->>'recovery_round')::int as recovery_round,
-              pj.course_id, pj.owner_id, pj.created_at as run_created_at, pj.output_summary as run_output_summary, b.blueprint_number`;
+              pj.course_id, pj.owner_id, pj.created_at as run_created_at, pj.output_summary as run_output_summary, b.blueprint_number,
+              (extract(epoch from g.finished_at) * 1000000)::bigint::text as finished_us`;
     const from = `from public.generation_item_runs g
            join public.production_jobs pj on pj.id = g.job_id
            join public.course_generation_manifests m on m.id = g.manifest_id
            join public.course_blueprints b on b.id = m.blueprint_id`;
+    const cursorSql = `($CUR::bigint is null or ((extract(epoch from g.finished_at) * 1000000)::bigint, g.id) > ($CUR::bigint, $CURID::uuid))`;
+    const page = async (where: string, params: any[], visit: (r: any) => Promise<'stop' | void>): Promise<void> => {
+      let cur: { us: string; id: string } | null = null;
+      let seen = 0;
+      while (seen < maxCandidates) {
+        const n = params.length;
+        const sql = `select ${cols} ${from} where ${where} and ${cursorSql.replace(/\$CURID/g, `$${n + 2}`).replace(/\$CUR/g, `$${n + 1}`)}
+          order by (extract(epoch from g.finished_at) * 1000000)::bigint asc nulls last, g.id asc limit $${n + 3}`;
+        const rows: any[] = await this.dataSource.query(sql, [...params, cur ? cur.us : null, cur ? cur.id : null, Math.min(200, maxCandidates - seen)]);
+        if (!rows.length) return;
+        seen += rows.length;
+        for (const r of rows) if ((await visit(r)) === 'stop') return;
+        const last = rows[rows.length - 1];
+        if (!last.finished_us) return;
+        cur = { us: String(last.finished_us), id: String(last.id) };
+      }
+    };
 
     // ── A) pausa de las estrategias agotadas ──
-    const toHold: any[] = await this.dataSource.query(
-      `select ${cols} ${from}
-        where ${currentRunSql}
-          and not ${heldSql}
-          and g.finished_at <= $2::timestamptz - make_interval(secs => $3::int)
-        order by g.finished_at desc nulls last, g.id
-        limit $4`,
-      [since, now.toISOString(), BUG_HOLD_SWEEP_GRACE_SECONDS, limit],
-    );
-    for (const r of toHold) {
-      const view = recoveryStateOf(r, now);
-      if (view.automatic) continue;
-      const verdict = classifyFailure({ error: String(r.error ?? ''), itemType: r.type, outputSummary: r.output_summary ?? {}, source: sourceOfItemType(r.type) });
-      const strategy = remediationStrategyFor(verdict).strategy;
-      const scope = budgetScopeOf(r, r.run_output_summary?.pause?.reason ?? null);
-      // Decisiones del dueño (pausa, presupuesto del RUN, acceso de la cuenta): no son un bug de Cursia.
-      if (strategy === 'owner_decision' || scope === 'run') { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'owner_decision' }); continue; }
-      const reason: BugHoldReason = scope === 'item' ? 'item_budget_exhausted'
-        : verdict.paidRisk === 'uncertain' || verdict.humanReason === 'duplicate_charge' || view.state === 'waiting_financial_reconciliation' ? 'reconcile_pending'
-          : verdict.unclassified ? 'unmapped_code'
-            : view.state === 'blocked_permanent' && (r.attention_reason === 'config' || verdict.humanReason === 'config') ? 'config'
-              : view.state === 'blocked_permanent' && (r.attention_reason === 'product_bug' || verdict.humanReason === 'product_bug') ? 'product_bug'
-                : 'strategy_exhausted';
-      const state = nextBugHold(bugHoldStateOf(r.output_summary), verdict, r.type, String(r.error ?? ''), reason, now, buildId);
-      const ok = returningRows(await this.dataSource.query(
-        `update public.generation_item_runs
-            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb),
-                next_retry_at = null, updated_at = now()
-          where id = $1 and status = 'failed' and error is not distinct from $3::text
-          returning id`,
-        [r.id, JSON.stringify(state), r.error],
-      ));
-      if (ok.length !== 1) continue;
-      out.held.push({ runId: r.job_id, itemKey: r.item_key, reason });
-      this.logger.error(`cursia-issue: ${r.item_key} (run ${r.job_id}) en pausa como bug de Cursia (${reason}, ${verdict.code}); huella ${state.fingerprint} → «Falla común»`);
-    }
+    await page(`${currentRunSql('$1')} and not ${heldSql} and g.finished_at <= $2::timestamptz - make_interval(secs => $3::int)`,
+      [since, now.toISOString(), BUG_HOLD_SWEEP_GRACE_SECONDS], async (r) => {
+        if (out.held.length >= limit) return 'stop';
+        const view = recoveryStateOf(r, now);
+        if (view.automatic) return;
+        const verdict = classifyFailure({ error: String(r.error ?? ''), itemType: r.type, outputSummary: r.output_summary ?? {}, source: sourceOfItemType(r.type) });
+        const strategy = remediationStrategyFor(verdict).strategy;
+        const scope = budgetScopeOf(r, r.run_output_summary?.pause?.reason ?? null);
+        // Decisiones del dueño (pausa, presupuesto del RUN, acceso de la cuenta): no son un bug de Cursia.
+        if (strategy === 'owner_decision' || scope === 'run') { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'owner_decision' }); return; }
+        const reason: BugHoldReason = scope === 'item' ? 'item_budget_exhausted'
+          : verdict.paidRisk === 'uncertain' || verdict.humanReason === 'duplicate_charge' || view.state === 'waiting_financial_reconciliation' ? 'reconcile_pending'
+            : verdict.unclassified ? 'unmapped_code'
+              : view.state === 'blocked_permanent' && (r.attention_reason === 'config' || verdict.humanReason === 'config') ? 'config'
+                : view.state === 'blocked_permanent' && (r.attention_reason === 'product_bug' || verdict.humanReason === 'product_bug') ? 'product_bug'
+                  : 'strategy_exhausted';
+        const state = nextBugHold(bugHoldStateOf(r.output_summary), verdict, r.type, String(r.error ?? ''), reason, now, buildId, r.finished_at ?? null);
+        const ok = returningRows(await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb),
+                  next_retry_at = null, updated_at = now()
+            where id = $1 and status = 'failed' and error is not distinct from $3::text
+            returning id`,
+          [r.id, JSON.stringify(state), r.error],
+        ));
+        if (ok.length !== 1) return;
+        out.held.push({ runId: r.job_id, itemKey: r.item_key, reason });
+        this.logger.error(`cursia-issue: ${r.item_key} (run ${r.job_id}) en pausa como bug de Cursia (${reason}, ${verdict.code}); huella ${state.fingerprint} → «Falla común»`);
+      });
 
     // ── B) reanudación con el arreglo desplegado ──
-    const held: any[] = await this.dataSource.query(
-      `select ${cols} ${from}
-        where ${currentRunSql}
-          and ${heldSql}
-          and not (case when jsonb_typeof(g.output_summary->'${BUG_HOLD_KEY}'->'skipUntilMs') = 'number'
-                        then (g.output_summary->'${BUG_HOLD_KEY}'->>'skipUntilMs')::numeric > $2::numeric else false end)
-        order by g.finished_at desc nulls last, g.id
-        limit $3`,
-      // Las pausas solo existen desde r99: la reanudación no se corta por la fecha del run (una pausa inmediata de un run
-      // anterior al corte también se reanuda sola).
-      ['1970-01-01T00:00:00Z', now.getTime(), limit],
-    );
-    if (!held.length) return out;
     const resolutions = new Map<string, string>();
     try {
       const rows: any[] = await this.dataSource.query(
@@ -3899,33 +3953,76 @@ export class RunsService {
       );
       for (const x of rows) if (x?.target_id) resolutions.set(String(x.target_id), new Date(x.at).toISOString());
     } catch {
-      // admin_audit_log ausente (entorno sin r75): sin marcas manuales; reclasificación y build nuevo siguen funcionando.
+      // admin_audit_log ausente (entorno sin r75): sin marcas manuales; reclasificación, build nuevo y re-sonda siguen.
     }
-    for (const r of held) {
-      const hold = bugHoldStateOf(r.output_summary);
-      if (!hold) continue;
-      const verdict = classifyFailure({ error: String(r.error ?? ''), itemType: r.type, outputSummary: r.output_summary ?? {}, source: sourceOfItemType(r.type) });
-      const resolvedAt = resolutions.get(hold.fingerprint) ?? null;
-      const d = bugHoldResumeDecision(r, { now, buildId, resolvedAt, verdict, itemType: r.type ?? null });
-      if (d.resume === false) { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason }); continue; }
-      try {
-        await this.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.job_id), String(r.item_key), false, false,
-          { policy, now, bugResume: { trigger: d.trigger, resolvedAt, buildId } });
-        out.resumed.push({ runId: r.job_id, itemKey: r.item_key, trigger: d.trigger });
-        this.logger.warn(`cursia-issue: ${r.item_key} (run ${r.job_id}) reanudada (${d.trigger} → ${d.strategy}); huella ${hold.fingerprint}`);
-      } catch (err) {
-        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
-        const code = String((resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
-        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
-        await this.dataSource.query(
-          `update public.generation_item_runs
-              set output_summary = jsonb_set(output_summary, '{${BUG_HOLD_KEY}}',
-                    (output_summary->'${BUG_HOLD_KEY}') || jsonb_build_object('skipUntilMs', $2::bigint, 'lastSkipReason', $3::text), true),
-                  updated_at = now()
-            where id = $1 and status = 'failed' and jsonb_typeof(output_summary->'${BUG_HOLD_KEY}') = 'object'`,
-          [r.id, now.getTime() + BUG_HOLD_RESUME_COOLDOWN_SECONDS * 1000, code],
-        ).catch((e) => this.logger.warn(`cursia-issue: no se pudo registrar el enfriamiento de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
-      }
+    // Backfill (re-review): reaperturas de pausas cuyo fallo ORIGINAL es anterior a la activación → tope GLOBAL por hora.
+    const backfillCap = backfillMaxResumesPerHour(process.env);
+    const backfillRuns = new Set<string>(
+      (await this.dataSource.query(
+        `select distinct job_id from public.generation_item_runs
+          where jsonb_typeof(output_summary->'${BUG_HOLD_KEY}') = 'object'
+            and (output_summary->'${BUG_HOLD_KEY}'->>'backfillResumedAt') is not null
+            and (output_summary->'${BUG_HOLD_KEY}'->>'backfillResumedAt')::timestamptz > $1::timestamptz - interval '1 hour'`,
+        [now.toISOString()],
+      ).catch(() => [] as any[])).map((x: any) => String(x.job_id)),
+    );
+    let probeHealth: LlmHealthProbeResult | null = null;
+    // Las pausas solo existen desde r99: la reanudación no se corta por la fecha del run.
+    await page(`${currentRunSql('$1')} and ${heldSql}
+          and not (case when jsonb_typeof(g.output_summary->'${BUG_HOLD_KEY}'->'skipUntilMs') = 'number'
+                        then (g.output_summary->'${BUG_HOLD_KEY}'->>'skipUntilMs')::numeric > $2::numeric else false end)`,
+      ['1970-01-01T00:00:00Z', now.getTime()], async (r) => {
+        if (out.resumed.length >= limit) return 'stop';
+        const hold = bugHoldStateOf(r.output_summary);
+        if (!hold) return;
+        const verdict = classifyFailure({ error: String(r.error ?? ''), itemType: r.type, outputSummary: r.output_summary ?? {}, source: sourceOfItemType(r.type) });
+        const resolvedAt = resolutions.get(hold.fingerprint) ?? null;
+        const d = bugHoldResumeDecision(r, { now, buildId, resolvedAt, verdict, itemType: r.type ?? null });
+        if (d.resume === false) { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason }); return; }
+        const backfill = Date.parse(hold.originalFailedAt ?? hold.heldAt) < activation.getTime();
+        if (backfill && !backfillRuns.has(String(r.job_id)) && backfillRuns.size >= backfillCap) {
+          out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'backfill_rate_limited' });
+          return;
+        }
+        // Re-sonda (USD 0): con la sonda de salud de la IA cuando la pausa es de Anthropic; si no responde, solo se anota.
+        if (d.trigger === 'reprobe' && (verdict.provider === 'anthropic' || !verdict.provider) && !AUTO_HEAL_WORKER_ITEM_TYPES.includes(String(r.type))) {
+          probeHealth ??= await (opts.probe ? opts.probe() : llmProviderHealthProbe(this.dataSource, { reachable: () => anthropicReachable() }));
+          if (!probeHealth || !probeHealth.ok) {
+            await this.dataSource.query(
+              `update public.generation_item_runs
+                  set output_summary = jsonb_set(output_summary, '{${BUG_HOLD_KEY}}', $2::jsonb, true), updated_at = now()
+                where id = $1 and status = 'failed' and jsonb_typeof(output_summary->'${BUG_HOLD_KEY}') = 'object'`,
+              [r.id, JSON.stringify(probedBugHold(hold, now))],
+            ).catch(() => undefined);
+            out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'probe_unhealthy' });
+            return;
+          }
+        }
+        try {
+          await this.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.job_id), String(r.item_key), false, false,
+            { policy, now, bugResume: { trigger: d.trigger, resolvedAt, buildId, backfill } });
+          if (backfill) backfillRuns.add(String(r.job_id));
+          out.resumed.push({ runId: r.job_id, itemKey: r.item_key, trigger: d.trigger, ...(backfill ? { backfill: true } : {}) });
+          this.logger.warn(`cursia-issue: ${r.item_key} (run ${r.job_id}) reanudada (${d.trigger} → ${d.strategy}${backfill ? ', backfill' : ''}); huella ${hold.fingerprint}`);
+        } catch (err) {
+          const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+          const code = String((resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+          out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+          await this.dataSource.query(
+            `update public.generation_item_runs
+                set output_summary = jsonb_set(output_summary, '{${BUG_HOLD_KEY}}',
+                      (output_summary->'${BUG_HOLD_KEY}') || jsonb_build_object('skipUntilMs', $2::bigint, 'lastSkipReason', $3::text), true),
+                    updated_at = now()
+              where id = $1 and status = 'failed' and jsonb_typeof(output_summary->'${BUG_HOLD_KEY}') = 'object'`,
+            [r.id, now.getTime() + BUG_HOLD_RESUME_COOLDOWN_SECONDS * 1000, code],
+          ).catch((e) => this.logger.warn(`cursia-issue: no se pudo registrar el enfriamiento de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
+        }
+      });
+    // Re-review: una línea por tick para ver drenar el backlog.
+    const byReason: Record<string, number> = {};
+    for (const x of out.skipped) byReason[x.reason] = (byReason[x.reason] ?? 0) + 1;
+    if (out.held.length || out.resumed.length || out.skipped.length) {
+      this.logger.log(`cursia-issue: barrido — pausadas ${out.held.length}, reanudadas ${out.resumed.length} (backfill ${out.resumed.filter((x) => x.backfill).length}), omitidas ${out.skipped.length} ${JSON.stringify(byReason)}`);
     }
     return out;
   }
@@ -7563,6 +7660,10 @@ export class RunsService {
       completion,
       recoveryState: runRecoveryStateOf(rows),
       autoRecovery: autoRecoveryEnabled(),
+      // r99 (re-review, nit de copy): ¿una decisión nueva del dueño (presupuesto aprobado, suspensión levantada) reanuda
+      // sola esta generación? (tick + kill switch + dentro del corte). El FE solo promete «sigue sola» con esto en true.
+      ownerDecisionAutoResume: autoRecoveryEnabled() && ownerDecisionAutoResumeEnabled() && !!job.created_at
+        && new Date(job.created_at).getTime() >= bugHoldSince(process.env).getTime(),
       lastBrowserActivityAt: lastBrowserActivityOf(rows),
       executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isDispatchableRun(job)),
       paused: isPausedRun(job),

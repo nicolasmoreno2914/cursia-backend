@@ -286,6 +286,38 @@ function strategyOfCode(code, extra = {}) {
     }
   });
 
+  await check('U6b (re-review P2-B) las frases del navegador SOLO con source browser_executor: un worker de Gamma/Videogen con «Unexpected token < in JSON» sigue D con pago INCIERTO → pausa que nunca se reanuda sola por build', async () => {
+    for (const [type, source] of [['presentation', 'provider_worker'], ['video', 'video_worker'], ['audiobook_chapter', 'provider_worker']]) {
+      const e = 'Unexpected token < in JSON at position 0';
+      const v = FC.classifyFailure({ error: e, itemType: type, source, outputSummary: {} });
+      eq([v.class, v.unclassified, v.paidRisk], ['D', true, 'uncertain'], `${type}/${source}`);
+      const hold = BH.nextBugHold(null, v, type, e, BH.holdsImmediately(v).reason, T0, 'build-A');
+      eq(hold.paidUncertain, true, 'pago incierto');
+      eq(BH.bugHoldResumeDecision({ status: 'failed', error: e, output_summary: { bugHold: hold } }, { now: at(60), buildId: 'build-B', verdict: v, itemType: type }),
+        { resume: false, reason: 'paid_uncertain' }, 'nunca por build');
+      const vf = FC.classifyFailure({ error: 'fetch failed', itemType: type, source, outputSummary: {} });
+      assert(vf.code === 'llm_network', 'la frase previa «fetch failed» no cambió');
+      const va = FC.classifyFailure({ error: 'The operation was aborted.', itemType: type, source, outputSummary: {} });
+      assert(va.unclassified && va.paidRisk === 'uncertain', `worker abort: ${JSON.stringify(va)}`);
+    }
+  });
+
+  await check('U6c (re-review) pausa por condición EXTERNA (estrategia wait_backoff al pausar) → re-sonda cada 2 h (≤ 12/día), la ventana de 14 días cuenta desde el fallo ORIGINAL', async () => {
+    const e = '❌ Falló después de 3 intentos: Error del servidor (503)';
+    const v = FC.classifyFailure({ error: e, itemType: 'content', source: 'browser_executor', outputSummary: {} });
+    eq(RS.remediationStrategyFor(v).strategy, 'wait_backoff', 'estrategia');
+    const hold = BH.nextBugHold(null, v, 'content', e, 'strategy_exhausted', T0, 'build-A', at(-60));
+    eq(hold.originalFailedAt, at(-60).toISOString(), 'fallo original');
+    const row = { status: 'failed', error: e, output_summary: { bugHold: hold } };
+    eq(BH.bugHoldResumeDecision(row, { now: at(60), buildId: 'build-A', verdict: v, itemType: 'content' }), { resume: false, reason: 'waiting_fix' }, 'antes de 2 h');
+    eq(BH.bugHoldResumeDecision(row, { now: at(121), buildId: 'build-A', verdict: v, itemType: 'content' }).trigger, 'reprobe', 'a las 2 h');
+    let h = hold;
+    for (let i = 0; i < BH.BUG_HOLD_REPROBE_MAX_PER_DAY; i++) h = BH.probedBugHold(h, at(121 + i));
+    eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: h } }, { now: at(130 + 121), buildId: 'build-A', verdict: v, itemType: 'content' }).resume, false, '≤ 12 por día');
+    const old = BH.nextBugHold(null, v, 'content', e, 'strategy_exhausted', T0, 'build-A', at(-15 * 24 * 60));
+    eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: old } }, { now: at(5), buildId: 'build-B', verdict: v, itemType: 'content' }), { resume: false, reason: 'too_old' }, '14 días desde el fallo original');
+  });
+
   await check('U7 (review P1-1) red de seguridad: un código SIN regla, reintentable y con intentos propios → SIN pausa (usa sus intentos con backoff) pero con REPORTE desde la 1.ª vez; agotados → pausa', async () => {
     const IT = L('modules/dynamic-generation/item-transitions.js');
     const qr = { sqls: [], async query(sql) { this.sqls.push(sql); return []; } };
@@ -598,7 +630,7 @@ function strategyOfCode(code, extra = {}) {
         o = await runs.autoResumeOwnerDecisionHolds();
         assert(o.resumedRuns.includes(run3), JSON.stringify(o));
         const [j] = await ds.query(`select worker_status, output_summary->'pause' as pause from public.production_jobs where id = $1`, [run3]);
-        assert(j.worker_status !== 'paused' && /owner_decision_resume/.test(String(j.pause.autoResumedBy)), JSON.stringify(j));
+        assert(j.worker_status !== 'paused' && /^system:r99:owner_decision_resume/.test(String(j.pause.resumedBy)), JSON.stringify(j));
         // Una pausa del USUARIO nunca se levanta sola.
         await ds.query(`update public.production_jobs set status = 'paused', worker_status = 'paused',
                           output_summary = output_summary || jsonb_build_object('pause', jsonb_build_object('pausedAt', (now() - interval '1 minute')::text, 'pausedBy', $2::text, 'reason', 'user'))
@@ -606,6 +638,98 @@ function strategyOfCode(code, extra = {}) {
         await H.budget.adminAuthorizeRun({ courseId: C3.cid, runId: run3, authorizedBudget: '90', approvedBy: 'sa@cursia.test', reason: 'QA r99 otra' });
         o = await runs.autoResumeOwnerDecisionHolds();
         assert(!o.resumedRuns.includes(run3), 'pausa del usuario: nunca sola');
+      });
+
+      await check('PG11 (re-review P2-A / P3-C / P3-D) nunca retroactivo: una decisión ANTERIOR a la activación no reanuda; kill switch; suspensión levantada → run pausado por la suspensión reanudado (resumedBy system); «autorizar usuario» reabre account_not_authorized; una pausa del usuario nunca se levanta bajo el lock', async () => {
+        const C4 = await H.makeCourse(OWNER, 'Curso r99 activación', 'o99@cliente.test');
+        const run4 = (await runs.startRun(C4.cid, OWNER, 1, MOCK_CTX)).run.id;
+        const its = await ds.query(`select id, item_key, type from public.generation_item_runs where job_id = $1 and type in ('content', 'experience') order by item_key`, [run4]);
+        const ub = 'Tu presupuesto disponible no alcanza para esta generación; solicita autorización. No se hizo la llamada (sin gasto).';
+        await ds.query(`update public.generation_item_runs set status = 'failed', error = $2, finished_at = clock_timestamp() where id = $1`, [its[0].id, ub]);
+        // Decisión «vieja» (bajo D-21): la activación queda DESPUÉS de esa decisión.
+        await H.setBudget(OWNER, 950);
+        process.env.R99_OWNER_RESUME_SINCE = new Date(Date.now() + 60_000).toISOString();
+        let o = await runs.autoResumeOwnerDecisionHolds();
+        assert(!o.reopened.some((x) => x.itemKey === its[0].item_key), 'decisión anterior a la activación: nada');
+        delete process.env.R99_OWNER_RESUME_SINCE;
+        process.env.R99_OWNER_DECISION_AUTORESUME = 'false';
+        await H.setBudget(OWNER, 960);
+        o = await runs.autoResumeOwnerDecisionHolds();
+        eq([o.reopened.length, o.resumedRuns.length], [0, 0], 'kill switch');
+        delete process.env.R99_OWNER_DECISION_AUTORESUME;
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(o.reopened.some((x) => x.itemKey === its[0].item_key), 'con la llave encendida y una decisión posterior: reabre');
+        // account_not_authorized → «autorizar usuario» (authorized_users activo del que paga).
+        await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Tu cuenta no tiene acceso a Cursia; pide acceso al administrador. No se hizo la llamada (sin gasto).', finished_at = clock_timestamp() where id = $1`, [its[1].id]);
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(!o.reopened.some((x) => x.itemKey === its[1].item_key), 'sin autorización todavía');
+        await ds.query(`insert into public.authorized_users (email, user_id, status) values ($1, $2, 'active') on conflict (email) do update set user_id = excluded.user_id, status = 'active'`, ['o99-auth@cliente.test', OWNER]);
+        await ds.query(`update public.authorized_users set created_at = clock_timestamp() where user_id = $1`, [OWNER]);
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(o.reopened.some((x) => x.itemKey === its[1].item_key && x.cause === 'account_authorization'), JSON.stringify(o));
+        // Suspensión: el run pausado POR la suspensión sigue solo cuando se levanta.
+        const sid = (await ds.query(`insert into public.user_suspensions (user_id, kind, reason, created_by) values ($1, 'account', 'QA r99', $1) returning id`, [OWNER]))[0].id;
+        await ds.query(`update public.production_jobs set status = 'paused', worker_status = 'paused',
+                          output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('pause', jsonb_build_object('pausedAt', (now() - interval '1 minute')::text, 'pausedBy', 'system:account_suspended', 'reason', 'account_suspended'))
+                        where id = $1`, [run4]);
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(!o.resumedRuns.includes(run4), 'suspensión vigente: sigue pausado');
+        await ds.query(`update public.user_suspensions set lifted_at = clock_timestamp(), lifted_by = user_id, lift_reason = 'QA' where id = $1`, [sid]);
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(o.resumedRuns.includes(run4), 'suspensión levantada: reanudado ' + JSON.stringify(o));
+        const [j4] = await ds.query(`select worker_status, output_summary->'pause'->>'resumedBy' as by from public.production_jobs where id = $1`, [run4]);
+        assert(j4.worker_status !== 'paused' && /^system:r99:/.test(String(j4.by)), JSON.stringify(j4));
+        // P3-D: bajo el lock, una pausa que ya no es del sistema no se levanta.
+        await ds.query(`update public.production_jobs set status = 'paused', worker_status = 'paused',
+                          output_summary = output_summary || jsonb_build_object('pause', jsonb_build_object('pausedAt', now()::text, 'pausedBy', $2::text))
+                        where id = $1`, [run4, OWNER]);
+        let err = null;
+        try { await runs.resumeRun(C4.cid, OWNER, 1, run4, undefined, { reasons: ['run_budget_cap', 'account_suspended'], label: 'system:r99:test' }); } catch (e) { err = e; }
+        assert(err && /run_not_system_paused/.test(JSON.stringify(err.getResponse ? err.getResponse() : err.message)), 'pausa del usuario: 409 bajo el lock');
+      });
+
+      await check('PG12 (re-review) backfill con tope GLOBAL por hora: pausas con fallo original ANTERIOR a la activación → como mucho R99_BACKFILL_MAX_RESUMES_PER_HOUR runs por hora; re-sonda de una pausa externa: sonda caída → solo se anota (USD 0); sonda sana → reabre', async () => {
+        const IT2 = L('modules/dynamic-generation/item-transitions.js');
+        const prevCap = process.env.R99_BACKFILL_MAX_RESUMES_PER_HOUR;
+        // El tope es GLOBAL (runs distintos en la última hora): las reaperturas de backfill de PG4–PG7 ya cuentan.
+        const [{ n: already }] = await ds.query(`select count(distinct job_id)::int as n from public.generation_item_runs
+          where (output_summary->'bugHold'->>'backfillResumedAt') is not null and (output_summary->'bugHold'->>'backfillResumedAt')::timestamptz > now() - interval '1 hour'`);
+        process.env.R99_BACKFILL_MAX_RESUMES_PER_HOUR = String(already + 1);
+        try {
+          const mkHeld = async (title) => {
+            const K = await H.makeCourse(OWNER, title, 'o99@cliente.test');
+            const rid = (await runs.startRun(K.cid, OWNER, 1, MOCK_CTX)).run.id;
+            const [it] = await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type = 'content' order by item_key limit 1`, [rid]);
+            await ds.query(`update public.generation_item_runs set status = 'failed', error = 'missing_dependency_artifact: x', finished_at = now() - interval '3 days' where id = $1`, [it.id]);
+            return { rid, it };
+          };
+          const a = await mkHeld('Curso r99 backfill A');
+          const b = await mkHeld('Curso r99 backfill B');
+          let s = await runs.sweepCursiaIssues({ buildId: 'bf-1' });
+          assert(s.held.some((x) => x.itemKey === a.it.item_key) && s.held.some((x) => x.itemKey === b.it.item_key), 'backfill: pausadas');
+          const [ha] = await ds.query(`select output_summary->'bugHold' as h from public.generation_item_runs where id = $1`, [a.it.id]);
+          assert(Date.parse(ha.h.originalFailedAt) < Date.now() - 2 * 86_400_000, 'fallo original conservado');
+          s = await runs.sweepCursiaIssues({ buildId: 'bf-2' });
+          const resumedBf = s.resumed.filter((x) => x.backfill && (x.runId === a.rid || x.runId === b.rid));
+          eq(resumedBf.length, 1, 'una reapertura de backfill más dentro del tope global');
+          assert(s.skipped.some((x) => (x.runId === a.rid || x.runId === b.rid) && x.reason === 'backfill_rate_limited'), JSON.stringify(s.skipped));
+        } finally { if (prevCap === undefined) delete process.env.R99_BACKFILL_MAX_RESUMES_PER_HOUR; else process.env.R99_BACKFILL_MAX_RESUMES_PER_HOUR = prevCap; }
+        // Re-sonda.
+        const K = await H.makeCourse(OWNER, 'Curso r99 re-sonda', 'o99@cliente.test');
+        const rid = (await runs.startRun(K.cid, OWNER, 1, MOCK_CTX)).run.id;
+        const [it] = await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type = 'content' order by item_key limit 1`, [rid]);
+        const e = '❌ Falló después de 3 intentos: Error del servidor (503)';
+        const v = FC.classifyFailure({ error: e, itemType: 'content', source: 'browser_executor', outputSummary: {} });
+        const hold = BH.nextBugHold(null, v, 'content', e, 'strategy_exhausted', new Date(Date.now() - 3 * 3600_000), 'rp-1', new Date(Date.now() - 4 * 3600_000));
+        await ds.query(`update public.generation_item_runs set status = 'failed', error = $2, finished_at = now() - interval '4 hours',
+                          output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('bugHold', $3::jsonb) where id = $1`, [it.id, e, JSON.stringify(hold)]);
+        let s = await runs.sweepCursiaIssues({ buildId: 'rp-1', probe: async () => ({ ok: false, reason: 'recent_failures', recentFailures: 2, recentSuccesses: 0 }) });
+        assert(s.skipped.some((x) => x.itemKey === it.item_key && x.reason === 'probe_unhealthy'), JSON.stringify(s));
+        const [p1] = await ds.query(`select status, output_summary->'bugHold' as h from public.generation_item_runs where id = $1`, [it.id]);
+        eq([p1.status, p1.h.active, p1.h.probes && p1.h.probes.n], ['failed', true, 1], 'sonda anotada, sin reabrir');
+        s = await runs.sweepCursiaIssues({ buildId: 'rp-1', now: new Date(Date.now() + 2.1 * 3600_000), probe: async () => ({ ok: true, reason: 'recent_success', recentFailures: 0, recentSuccesses: 1 }) });
+        assert(s.resumed.some((x) => x.itemKey === it.item_key && x.trigger === 'reprobe'), JSON.stringify(s));
+        void IT2;
       });
 
       await check('PG10 (decisión del dueño 4) corte móvil de 30 días: un run fallido de hace 10 días entra a la pausa; uno de hace 40 días no se toca', async () => {

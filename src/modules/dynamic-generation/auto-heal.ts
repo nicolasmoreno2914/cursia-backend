@@ -180,7 +180,7 @@ export function autoHealFirstAt(os: Record<string, any>, failedAt: Date | null):
 }
 
 export const AUTO_HEAL_POLICY_ENV = 'DYNAMIC_AUTO_HEAL_POLICY';
-/** r99: ventana total de la clase A (horas), decisión del dueño pendiente. Default DEFAULT_AUTO_HEAL_POLICY.classATotalHours (72). */
+/** r99 (decisión del dueño 3): ventana total de la clase A (horas). Default DEFAULT_CLASS_A_TOTAL_HOURS (6). */
 export const AUTO_HEAL_CLASS_A_TOTAL_HOURS_ENV = 'DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS';
 
 /** Fila mínima que evalúa la política (generation_item_runs). */
@@ -720,8 +720,8 @@ export function autoHealPolicyFromEnv(env: Record<string, string | undefined> = 
   const maxAgeHours = Number.isFinite(raw) && raw > 0 ? Math.min(max, Math.max(min, raw)) : DEFAULT_AUTO_HEAL_MAX_AGE_HOURS;
   // REL MVP: kill-switch de la política por clase → R16 tal cual.
   const base = String(env[AUTO_HEAL_POLICY_ENV] ?? '').trim().toLowerCase() === 'legacy' ? LEGACY_AUTO_HEAL_POLICY : DEFAULT_AUTO_HEAL_POLICY;
-  // r99: decisión del dueño pendiente (ventana TOTAL de la clase A antes de la pausa por bug, default 72 h): un env, sin
-  // tocar el código. Rango 1…168 h; la alerta queda 24 h antes (o a la mitad si la ventana es corta).
+  // r99 (decisión del dueño 3): ventana TOTAL de la clase A antes de la pausa por bug (default 6 h), cambiable por env sin
+  // tocar el código. Rango 1…168 h; la alerta queda a los 2/3 de la ventana (classAAlertHoursFor).
   const totalRaw = String(env[AUTO_HEAL_CLASS_A_TOTAL_HOURS_ENV] ?? '').trim();
   const total = Number(totalRaw);
   if (base.classAware && totalRaw !== '' && Number.isFinite(total) && total >= 1 && total <= 168) {

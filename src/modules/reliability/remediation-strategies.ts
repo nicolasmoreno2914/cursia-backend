@@ -69,7 +69,7 @@ const REL = 'modules/reliability';
 export const STRATEGY_CATALOG: Readonly<Record<RemediationStrategyId, StrategyDef>> = Object.freeze({
   wait_backoff: {
     id: 'wait_backoff', changes: 'external_condition',
-    what: 'transitorio (red, 5xx/529, lease vencido, worker reiniciado): otro intento tras espera exponencial con jitter; fase extendida acotada (72 h) y después pausa como bug de Cursia',
+    what: 'transitorio (red, 5xx/529, lease vencido, worker reiniciado): otro intento tras espera exponencial con jitter; fase extendida acotada (r99: 6 h, DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS) y después pausa como bug de Cursia con re-sonda cada 2 h',
     codePaths: [{ file: `${DG}/item-transitions.ts`, symbol: 'applyItemFailure' }, { file: `${DG}/auto-heal.ts`, symbol: 'classAwareDecision' }],
   },
   wait_storage_breaker: {
