@@ -113,7 +113,7 @@ async function setupR95Db(label) {
     await withClient(DB, async (c) => { for (const f of ['supabase-migration-dynamic-generation.sql', 'supabase-migration-v21-blueprint-profiles.sql']) await c.query(fs.readFileSync(path.join(REPO, f), 'utf8')); });
     for (const s of ['scripts/migrate-dynamic-generation-v2.js', 'scripts/migrate-invalidation.js', 'scripts/migrate-v21-manifest-v3.js', 'scripts/migrate-v21-finops.js',
       'scripts/migrate-v21-finops-rls.js', 'scripts/migrate-rel-recovery.js', 'scripts/migrate-rel-exec-lease.js', 'scripts/migrate-run-pause.js',
-      'scripts/migrate-r75-access.js', 'scripts/migrate-r75-budgets.js']) {
+      'scripts/migrate-r75-access.js', 'scripts/migrate-r75-budgets.js', 'scripts/migrate-r99-activation.js']) {
       if (!fs.existsSync(path.join(REPO, s))) continue;
       const res = runScript(s, localEnv({ MIGRATION_ENV: 'staging' }));
       if (res.code !== 0) throw new Error(`${s}: exit ${res.code}\n${res.out.slice(-2000)}`);

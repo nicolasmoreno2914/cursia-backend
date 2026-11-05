@@ -192,17 +192,20 @@ async function pureChecks() {
     eq([v2.strategy, v2.humanReason], ['hold_for_human', 'budget'], 'rechazado por presupuesto');
   });
 
-  await check('d2 (punto 4): clase A sin gasto — pasadas 5 rondas sigue con backoff largo (15 min…4 h); alerta a las 48 h; excepción recién a las 72 h; legacy conserva el tope', () => {
+  // r99 (decisión del dueño 3): la ventana total de la clase A bajó de 72 h a 6 h (alerta a las 4 h); después, pausa como bug.
+  await check('d2 (punto 4, r99: ventana 6 h): clase A sin gasto — pasadas 5 rondas sigue con backoff largo (15 min…4 h); alerta a las 4 h; excepción recién a las 6 h; legacy conserva el tope', () => {
+    eq([AH.DEFAULT_AUTO_HEAL_POLICY.classATotalHours, AH.DEFAULT_AUTO_HEAL_POLICY.classAAlertHours], [6, 4], 'ventana por defecto');
+    eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS: '72' }).classATotalHours, 72, 'env (decisión del dueño cambiable)');
     const P = AH.DEFAULT_AUTO_HEAL_POLICY;
     const A = '❌ Falló después de 3 intentos: Error del servidor (503)';
     eq(AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 5 } }, secAgo: 60 }), NOW, P).reason, 'backoff', 'ronda 6 espera');
     const r6 = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 5 } }, secAgo: 1200 }), NOW, P);
     eq([r6.heal, r6.round, r6.extended], [true, 6, true], 'ronda 6 extendida');
-    const r30 = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 20 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P);
+    const r30 = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 3 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P);
     eq([r30.heal, r30.round, !!r30.alert], [true, 31, false], 'ronda 31 (sin tope de rondas)');
-    const al = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 49 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P);
+    const al = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 4.5 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P);
     eq([al.heal, al.alert], [true, true], 'alerta');
-    eq(AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 73 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P).reason, 'recovery_window_exhausted', 'excepción a las 72 h');
+    eq(AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 7 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P).reason, 'recovery_window_exhausted', 'excepción a las 6 h');
     eq(AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 3 } }, secAgo: 3600 }), NOW, AH.LEGACY_AUTO_HEAL_POLICY).reason, 'cap_reached', 'legacy (kill-switch) sin cambios');
     // Un A con riesgo de pago incierto nunca entra (los inciertos tienen su propia regla).
     eq(AH.autoHealDecision(rowOf('prior_call_in_flight: x', 'audio_welcome', { os: { autoHeal: { rounds: 5 } }, secAgo: 3600 }), NOW, P).reason, 'not_allow_listed', 'incierto: no');
@@ -1044,11 +1047,11 @@ async function dbChecks() {
     const failAt = (id, error, secAgo, osSql = null) => ds.query(
       `update public.generation_item_runs set status = 'failed', error = $2, worker_id = null, lease_until = null,
               finished_at = now() - make_interval(secs => $3::int)${osSql ? `, output_summary = ${osSql}` : ''} where id = $1`, [id, error, secAgo]);
-    await check('d2 + d3: un A que ya agotó 5 rondas (antes → humano) se sigue reintentando con espera larga y sus dependientes se desbloquean solos; agotada la ventana de 72 h → excepción registrada', async () => {
+    await check('d2 + d3: un A que ya agotó 5 rondas (antes → humano) se sigue reintentando con espera larga y sus dependientes se desbloquean solos; agotada la ventana (r99: 6 h) → excepción registrada', async () => {
       const R = await freshRun('r62 clase A');
       const key = `content:${R.c1}`;
       const it = await itemRow(R.rid, key);
-      await failAt(it.id, A_ERR, 3600, `'{"autoHeal":{"rounds":5,"firstAt":"${new Date(Date.now() - 10 * 3600e3).toISOString()}"}}'::jsonb`);
+      await failAt(it.id, A_ERR, 3600, `'{"autoHeal":{"rounds":5,"firstAt":"${new Date(Date.now() - 2 * 3600e3).toISOString()}"}}'::jsonb`);
       await runs.tx((qr) => T.blockDependents(qr, R.rid, key));
       const blocked = await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and status = 'blocked' and $2 = any(depends_on)`, [R.rid, key]);
       assert(blocked.length > 0, 'hay dependientes bloqueados');
@@ -1056,7 +1059,7 @@ async function dbChecks() {
       eq(r6.reopened.filter((x) => x.itemKey === key).map((x) => [x.round, !!x.extended]), [[6, true]], 'ronda 6 extendida');
       const still = await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and status = 'blocked' and $2 = any(depends_on)`, [R.rid, key]);
       eq(still.length, 0, 'd3: dependientes desbloqueados con la reapertura');
-      await failAt(it.id, A_ERR, 5 * 3600, `jsonb_set(output_summary, '{autoHeal,firstAt}', to_jsonb('${new Date(Date.now() - 73 * 3600e3).toISOString()}'::text))`);
+      await failAt(it.id, A_ERR, 5 * 3600, `jsonb_set(output_summary, '{autoHeal,firstAt}', to_jsonb('${new Date(Date.now() - 7 * 3600e3).toISOString()}'::text))`);
       const rx = await runs.autoHealFailedItems({ now: new Date() });
       eq(rx.skipped.filter((x) => x.itemKey === key).map((x) => x.reason), ['recovery_window_exhausted'], 'ventana agotada');
       const row = await itemRow(R.rid, key);

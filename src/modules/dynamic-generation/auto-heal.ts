@@ -36,6 +36,8 @@
 // Puro salvo `startAutoHealTimer`.
 // ─────────────────────────────────────────────────────────────────────────────
 import { remediationBlocksAuto } from '../reliability/remediation-ladder';
+// r99: una parte en pausa como bug de Cursia no la toma ningún reintento: la reanuda el arreglo (sweepCursiaIssues).
+import { bugHoldOf } from '../reliability/bug-hold';
 import {
   AUTO_HEAL_ALLOW_LIST,
   AUTO_HEAL_DENY_PATTERNS,
@@ -57,6 +59,12 @@ export const DEFAULT_AUTO_HEAL_INTERVAL_MS = 60_000;
 export const AUTO_HEAL_MAX_AGE_ENV = 'DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS';
 /** Ventana de recencia: un fallo más viejo que esto nunca se reabre solo (run abandonado). */
 export const DEFAULT_AUTO_HEAL_MAX_AGE_HOURS = 24;
+/** r99 (decisión del dueño 3): ventana TOTAL de recuperación automática de la clase A antes de la pausa por bug. */
+export const DEFAULT_CLASS_A_TOTAL_HOURS = 6;
+/** Alerta previa: a los 2/3 de la ventana (6 h → 4 h; 72 h → 48 h como en r62). */
+export function classAAlertHoursFor(total: number): number {
+  return Math.round(total * 2 / 3 * 100) / 100;
+}
 /** Fix m3: rango admitido de la ventana (1 h … 7 días). */
 export const AUTO_HEAL_MAX_AGE_HOURS_RANGE = Object.freeze({ min: 1, max: 168 });
 /**
@@ -137,10 +145,12 @@ export const DEFAULT_AUTO_HEAL_POLICY: AutoHealPolicy = Object.freeze({
   regenMaxRounds: 2,
   regenBackoffSeconds: Object.freeze([30, 120]),
   jitterRatio: 0.2,
-  // r62 (d2): fase extendida de la clase A (15 min, 30 min, 1 h, 2 h y después cada 4 h) hasta 72 h, alerta a las 48 h.
+  // r62 (d2): fase extendida de la clase A (15 min, 30 min, 1 h, 2 h y después cada 4 h). r99 (decisión del dueño 3): la
+  // ventana TOTAL baja de 72 h a 6 h (alerta a las 4 h); después, pausa como bug de Cursia (reporte + reanudación con el
+  // arreglo). Env DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS la cambia sin tocar el código.
   extendedBackoffSeconds: Object.freeze([900, 1800, 3600, 7200, 14400]),
-  classATotalHours: 72,
-  classAAlertHours: 48,
+  classATotalHours: DEFAULT_CLASS_A_TOTAL_HOURS,
+  classAAlertHours: classAAlertHoursFor(DEFAULT_CLASS_A_TOTAL_HOURS),
 });
 
 /** r62 (d2): tope de rondas del SQL del barrido cuando la política tiene fase extendida (lo acota el tiempo total). */
@@ -170,6 +180,8 @@ export function autoHealFirstAt(os: Record<string, any>, failedAt: Date | null):
 }
 
 export const AUTO_HEAL_POLICY_ENV = 'DYNAMIC_AUTO_HEAL_POLICY';
+/** r99 (decisión del dueño 3): ventana total de la clase A (horas). Default DEFAULT_CLASS_A_TOTAL_HOURS (6). */
+export const AUTO_HEAL_CLASS_A_TOTAL_HOURS_ENV = 'DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS';
 
 /** Fila mínima que evalúa la política (generation_item_runs). */
 export interface AutoHealRow {
@@ -207,7 +219,9 @@ export type AutoHealSkipReason =
   // r62 (d2): la clase A agotó su ventana TOTAL de recuperación automática (classATotalHours) → excepción registrada.
   | 'recovery_window_exhausted'
   // r98: la escalera de remediación se agotó con ESTE error (misma huella tras corregir el pedido): solo el dueño reintenta.
-  | 'remediation_exhausted';
+  | 'remediation_exhausted'
+  // r99: pausa como bug de Cursia (bug-hold.ts): la reanuda el barrido sweepCursiaIssues, nunca un reintento.
+  | 'cursia_issue_hold';
 
 /** R16 fix M6: tope de rondas según quién ejecuta el item. */
 export function autoHealMaxRoundsFor(type: string | null | undefined, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): number {
@@ -234,7 +248,7 @@ export function autoRegenRoundsOf(outputSummary: Record<string, any> | null | un
 }
 
 /** Motivos permanentes para ESTE texto de error (el barrido no lo vuelve a mirar hasta que el error cambie). */
-export const AUTO_HEAL_PERMANENT_SKIPS: readonly AutoHealSkipReason[] = Object.freeze(['denied', 'not_allow_listed', 'missing_precondition', 'cap_reached', 'recovery_window_exhausted', 'remediation_exhausted'] as AutoHealSkipReason[]);
+export const AUTO_HEAL_PERMANENT_SKIPS: readonly AutoHealSkipReason[] = Object.freeze(['denied', 'not_allow_listed', 'missing_precondition', 'cap_reached', 'recovery_window_exhausted', 'remediation_exhausted', 'cursia_issue_hold'] as AutoHealSkipReason[]);
 
 function fnv1a(s: string): number {
   let h = 0x811c9dc5;
@@ -470,6 +484,7 @@ export function isAutoHealDenied(error: string): boolean {
 
 /** Decisión pura: ¿se reabre automáticamente este item ahora? */
 export function autoHealDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): AutoHealDecision {
+  if (row.status === 'failed' && bugHoldOf(row.output_summary, row.error)) return { heal: false, reason: 'cursia_issue_hold' };
   // r98: escalera agotada con ESTE error → no se reabre sola. Review P0-1: nunca antes de que la clase B use sus propias
   // rondas de auto-regeneración (regenerate_split / regenerate_targeted ya cambian la entrada).
   // Re-review P2: el re-chequeo usa la MISMA decisión del barrido (clase registrada incluida: p. ej. un ejecutor que subió
@@ -518,6 +533,7 @@ export function safeAutoRetryDecision(row: AutoHealRow, now: Date, policy: AutoH
   const error = String(row.error ?? '').trim();
   if (!error) return { heal: false, reason: 'no_error' };
   if (remediationBlocksAuto(row.output_summary, row.error)) return { heal: false, reason: 'remediation_exhausted' };
+  if (bugHoldOf(row.output_summary, row.error)) return { heal: false, reason: 'cursia_issue_hold' };
   const rule = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(error)) ?? null;
   if (!rule || (row.type && row.type !== rule.type)) return { heal: false, reason: 'not_allow_listed' };
   // La deny-list del auto-healer también gana acá (ambiguo, cuota, presupuesto, configuración…).
@@ -704,6 +720,13 @@ export function autoHealPolicyFromEnv(env: Record<string, string | undefined> = 
   const maxAgeHours = Number.isFinite(raw) && raw > 0 ? Math.min(max, Math.max(min, raw)) : DEFAULT_AUTO_HEAL_MAX_AGE_HOURS;
   // REL MVP: kill-switch de la política por clase → R16 tal cual.
   const base = String(env[AUTO_HEAL_POLICY_ENV] ?? '').trim().toLowerCase() === 'legacy' ? LEGACY_AUTO_HEAL_POLICY : DEFAULT_AUTO_HEAL_POLICY;
+  // r99 (decisión del dueño 3): ventana TOTAL de la clase A antes de la pausa por bug (default 6 h), cambiable por env sin
+  // tocar el código. Rango 1…168 h; la alerta queda a los 2/3 de la ventana (classAAlertHoursFor).
+  const totalRaw = String(env[AUTO_HEAL_CLASS_A_TOTAL_HOURS_ENV] ?? '').trim();
+  const total = Number(totalRaw);
+  if (base.classAware && totalRaw !== '' && Number.isFinite(total) && total >= 1 && total <= 168) {
+    return { ...base, maxAgeHours, classATotalHours: total, classAAlertHours: classAAlertHoursFor(total) };
+  }
   return { ...base, maxAgeHours };
 }
 

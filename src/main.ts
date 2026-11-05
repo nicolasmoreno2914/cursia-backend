@@ -77,6 +77,9 @@ async function bootstrap() {
     { name: 'reapertura de IA en revisión', run: () => runsService.autoReopenLlmPendingReview() },
     // r62 (K3): partes frenadas por el kill switch / la allow-list de FinOps → se reabren solas al revertirlo.
     { name: 'reanudación tras control de gasto', run: () => runsService.autoResumeSpendControlHolds() },
+    // r99 (decisión del dueño 1): presupuesto aprobado / ampliado, suspensión o congelación levantada → la generación
+    // frenada por esa decisión sigue sola (reemplaza D-21 «aprobar no relanza nada»); guards de FinOps de siempre.
+    { name: 'reanudación tras decisión del dueño', run: () => runsService.autoResumeOwnerDecisionHolds() },
     // r65 (R4): una parte de IA que agotó su tope interno → UNA ronda extra (sin streaming, max_tokens × 1,5) si el saldo
     // del run cubre su peor caso y no hay reservas abiertas; si vuelve a agotarlo, queda para el dueño / un humano.
     { name: 'ronda extra por tope de la parte', run: () => runsService.autoExtendItemRecoveryBudget() },
@@ -86,6 +89,11 @@ async function bootstrap() {
     { name: 'sonda de crédito del proveedor', run: () => runsService.autoProbeProviderCredit() },
     // r62 (N2): Videogen/Gamma con resultado conocido (o ambiguo) → conciliación con la evidencia + reenvío acotado.
     { name: 'conciliación de proveedor', run: () => providerReconcile.sweep() },
+    // r99: partes sin estrategia automática (o con la estrategia agotada) → pausa como bug de Cursia (sin gasto, reporte
+    // «Falla común»); y reanudación automática de las pausadas cuando el arreglo está desplegado. Va después de los
+    // demás barridos (que tienen su oportunidad primero) y antes del empaque.
+    { name: 'pausas por bug de Cursia', run: () => runsService.sweepCursiaIssues() },
+    { name: 'empaque: pausas por bug de Cursia', run: () => autoPackage.resumeCursiaIssues() },
     { name: 'empaque automático', run: () => autoPackage.sweep() },
   ]);
 }

@@ -12,6 +12,8 @@ import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoRegenSpe
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 import { applyStopAfterInTx, holdsPackaging, packageHoldReason } from './stop-after';
 import { LadderStep, REMEDIATION_KEY, ladderStep, remediationOf } from '../reliability/remediation-ladder';
+// r99: pausa como bug de Cursia (sin intentos ni gasto) + reporte + reanudación automática con el arreglo.
+import { BUG_HOLD_KEY, BugHoldReason, BugHoldState, bugHoldSince, bugHoldStateOf, currentBuildId, holdsImmediately, nextBugHold, reportedBugHold } from '../reliability/bug-hold';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -167,13 +169,17 @@ export async function applyItemFailure(
   // servidor (drain del worker); un mensaje del navegador siempre es `failed`. Nunca del errorCode reportado.
   const outcome: AttemptOutcome = meta?.outcome
     ?? (meta?.source === 'browser_executor' ? 'failed' : outcomeForFailure(extractFailureCode(error)));
-  // r98: escalera de remediación de un fallo DETERMINISTA (misma huella otra vez → el próximo intento cambia su entrada;
-  // después, aceptación con marca de calidad si el validador es degradable; si no, agotada → el dueño reintenta a mano).
-  await applyRemediationLadder(qr, row, error, retryable, verdict);
-  const maxRoundsToday = maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null);
+  // r98/r99: escalera de remediación de un fallo DETERMINISTA (desde el 1.er rechazo el próximo intento cambia su entrada;
+  // después reescritura con todos los hallazgos; agotada → pausa como bug de Cursia). Nunca aceptación degradada.
+  const step = await applyRemediationLadder(qr, row, error, retryable, verdict);
+  // r99: sin estrategia automática (código sin regla, contrato roto, configuración de Cursia…) desde la PRIMERA vez, o la
+  // escalera agotada → pausa como bug de Cursia: `failed` sin más intentos (nunca un reintento idéntico), sin gasto.
+  const hold = await applyCursiaIssueHold(qr, row, error, verdict, step);
+  const maxRoundsToday = hold ? 0 : maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null);
   // r67 (A3): estado de recuperación explícito + próxima acción automática visible (next_retry_at también en `failed`)
   // + sin huérfanos (failed sin acción programada ni motivo → attention 'unrecoverable').
-  const attentionOverride = await persistFailureRecoveryState(qr, row, error, verdict, maxRoundsToday);
+  const attentionOverride = hold ? 'product_bug' : await persistFailureRecoveryState(qr, row, error, verdict, maxRoundsToday);
+  if (hold) await persistFailureRecoveryState(qr, row, error, verdict, 0);
   await recordItemFailure(qr, {
     itemRunId: row.id, status: row.status, error, verdict, outcome, maxRoundsToday, attentionOverride,
   });
@@ -184,9 +190,9 @@ export async function applyItemFailure(
 /**
  * r98: aplica la escalera (reliability/remediation-ladder.ts) a una parte recién fallada, en la MISMA transacción.
  * Muta `row` (status / output_summary) para que el estado de recuperación y el bloqueo de dependientes vean el resultado.
- *  - feedback / accept con la parte `failed` por intentos agotados → UN intento más (`retrying`, ≤ MAX_LADDER_GRANTS por
+ *  - feedback / rewrite con la parte `failed` por intentos agotados → UN intento más (`retrying`, ≤ MAX_LADDER_GRANTS por
  *    huella), con el backoff base; el intento pasa por los guards de gasto de siempre;
- *  - exhausted → ningún intento extra ni reapertura automática con esa huella (los intentos propios se terminan de usar).
+ *  - exhausted → ningún intento extra ni reapertura automática con esa huella; r99: applyCursiaIssueHold la pausa.
  */
 export async function applyRemediationLadder(
   qr: QueryRunner,
@@ -229,6 +235,60 @@ export async function applyRemediationLadder(
   row.status = status;
   row.output_summary = { ...(row.output_summary ?? {}), [REMEDIATION_KEY]: step.state };
   return step;
+}
+
+/**
+ * r99: ¿esta falla deja la parte en PAUSA COMO BUG DE CURSIA? (misma transacción que el fallo; muta `row`).
+ *  - veredicto sin estrategia automática (remediation-strategies.ts → cursia_issue_hold) → desde la PRIMERA vez;
+ *  - escalera de remediación agotada (rung 3) → la estrategia asignada no alcanzó.
+ * La parte queda `failed` (los intentos que le quedaban NO se usan: serían el mismo pedido), next_retry_at null, sin
+ * gasto. Sus dependientes quedan bloqueados como siempre. La reanuda RunsService.sweepCursiaIssues (bug-hold.ts).
+ */
+export async function applyCursiaIssueHold(
+  qr: QueryRunner,
+  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null; run_created_at?: Date | string | null },
+  error: string,
+  verdict: ReturnType<typeof classifyFailure>,
+  step: LadderStep | null,
+  now: Date = new Date(),
+): Promise<BugHoldState | null> {
+  // Corte de activación ÚNICO (review): la pausa (inmediata y del barrido) solo para runs desde R99_BUG_HOLD_SINCE.
+  const runAt = row.run_created_at ? new Date(row.run_created_at as any).getTime() : NaN;
+  if (Number.isFinite(runAt) && runAt < bugHoldSince(process.env).getTime()) return null;
+  const imm = holdsImmediately(verdict);
+  // Review P1-1: un código SIN regla que el emisor marcó reintentable y todavía tiene intentos propios los usa (con su
+  // backoff): sin pausa, pero con REPORTE para desarrollo desde la primera vez. Contrato / config de Cursia y lo no
+  // reintentable siguen pausando al primer fallo.
+  if (imm.hold && imm.reason === 'unmapped_code' && row.status === 'retrying') {
+    const rep = reportedBugHold(bugHoldStateOf(row.output_summary), verdict, row.type, error, now, currentBuildId());
+    await qr.query(
+      `update public.generation_item_runs
+          set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb), updated_at = now()
+        where id = $1`,
+      [row.id, JSON.stringify(rep)],
+    );
+    row.output_summary = { ...(row.output_summary ?? {}), [BUG_HOLD_KEY]: rep };
+    return null;
+  }
+  // La pausa inmediata NUNCA le gana a un mecanismo automático existente (conciliación de proveedor, reenvío único de
+  // audio, control de gasto, claim incompleto, auto-heal…): solo cuando el sistema de hoy no haría nada solo. Lo que esos
+  // mecanismos terminen declinando lo pausa después el barrido (sweepCursiaIssues).
+  const cur = imm.hold || step?.action === 'exhausted'
+    ? currentRecoveryOf(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null) : 'manual';
+  const noAutomaticPath = cur === 'manual' || cur === 'denied';
+  const reason: BugHoldReason | null = !noAutomaticPath ? null : imm.hold ? imm.reason : step?.action === 'exhausted' ? 'strategy_exhausted' : null;
+  if (!reason) return null;
+  const state = nextBugHold(bugHoldStateOf(row.output_summary), verdict, row.type, error, reason, now, currentBuildId());
+  await qr.query(
+    `update public.generation_item_runs
+        set status = 'failed', next_retry_at = null, finished_at = coalesce(finished_at, now()), updated_at = now(),
+            output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb)
+      where id = $1 and status in ('failed', 'retrying')`,
+    [row.id, JSON.stringify(state)],
+  );
+  row.status = 'failed';
+  row.output_summary = { ...(row.output_summary ?? {}), [BUG_HOLD_KEY]: state };
+  return state;
 }
 
 /** r67: entradas de historial de recuperación que se conservan por parte (output_summary.recovery.history). */

@@ -28,7 +28,7 @@ const SELECT = `select r.*, r.amount_usd::text as amount_t, r.approved_amount_us
 /**
  * r75 (Agente C) — «Solicitar autorización» (01 §5.6). El usuario pide; SOLO el SuperAdmin aprueba o rechaza (v1).
  * Aprobar = `month_adjustment` del mes actual por el monto aprobado (+ opcionalmente la ampliación de la autorización del
- * run), en UNA tx con el lock del usuario y la auditoría. Aprobar NO arranca la generación (D-21). Vencen a los 7 días.
+ * run), en UNA tx con el lock del usuario y la auditoría. Aprobar no ARRANCA una generación nueva (D-21); r99: una generación ya frenada por presupuesto se reanuda sola (RunsService.autoResumeOwnerDecisionHolds). Vencen a los 7 días.
  */
 @Injectable()
 export class BudgetRequestsService {

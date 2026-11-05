@@ -238,8 +238,13 @@ export function findingsFromPackageWarnings(warnings: ReadonlyArray<string> | nu
     if (!m) continue;
     const [, code, layer, kind, cause, recommendation] = m;
     const detail = rest.join(':');
+    // r99 (review P2-6): `quality_accepted:<itemKey>:<códigos>` — el itemKey lleva «:» («content:<uuid>»): los códigos son el
+    // ÚLTIMO segmento y el itemKey es todo lo de en medio (antes se tomaba solo «content»).
+    const qaItemKey = head === 'quality_accepted' && rest.length >= 2 ? rest.slice(0, -1).join(':') : head === 'quality_accepted' ? rest[0] : null;
+    const itemKey = head === 'application_chars_unmapped' ? rest[0] : qaItemKey;
     out.push(finding({
-      code, layer, location: { section: 'package', ...(head === 'application_chars_unmapped' ? { itemKey: rest[0] } : {}) }, evidence: detail ? `${head}: ${detail.replace(/_/g, ' ')}` : head,
+      code, layer, location: { section: 'package', ...(itemKey ? { itemKey } : {}) },
+      evidence: head === 'quality_accepted' && rest.length >= 2 ? `${head}: ${rest[rest.length - 1]}` : detail ? `${head}: ${detail.replace(/_/g, ' ')}` : head,
       rule: { id: head, version: builderVersion }, cause, recommendation, kind,
     }));
   }

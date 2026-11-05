@@ -13,6 +13,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { FailureVerdict, classifyFailure, extractFailureCode } from '../reliability/failure-classifier';
 import { remediationBlocksAuto } from '../reliability/remediation-ladder';
+import { bugHoldOf } from '../reliability/bug-hold';
 
 /** r65: reintentos del dueño por parte en la ventana. */
 export const OWNER_RETRY_MAX = 2;
@@ -63,6 +64,24 @@ export interface OwnerRetryView {
   maxCostUsd: string | null;
   retriesLeft: number;
   windowHours: number;
+  /**
+   * r99 (review P2-7): cuándo vuelve a estar disponible el reintento del dueño (ISO; solo con `owner_retry_limit`): el
+   * reintento más viejo de la ventana + 24 h. null = disponible ya / no aplica.
+   */
+  nextAvailableAt?: string | null;
+}
+
+/**
+ * r99 (review P2-7): cuándo vuelve a haber un reintento del dueño disponible: el (n − OWNER_RETRY_MAX + 1)-ésimo más viejo de
+ * la ventana + OWNER_RETRY_WINDOW_HOURS. null si todavía quedan reintentos.
+ */
+export function ownerRetryNextAvailableAt(os: Record<string, any> | null | undefined, now: Date, windowHours = OWNER_RETRY_WINDOW_HOURS): string | null {
+  const list = os && Array.isArray(os[OWNER_RETRIES_KEY]) ? os[OWNER_RETRIES_KEY] : [];
+  const from = now.getTime() - windowHours * 3600_000;
+  const ts = list.map((x: any) => (x && x.at ? new Date(String(x.at)).getTime() : NaN))
+    .filter((t: number) => Number.isFinite(t) && t > from && t <= now.getTime() + 60_000).sort((a: number, b: number) => a - b);
+  if (ts.length < OWNER_RETRY_MAX) return null;
+  return new Date(ts[ts.length - OWNER_RETRY_MAX] + windowHours * 3600_000).toISOString();
 }
 
 /**
@@ -87,11 +106,13 @@ function sourceOfType(type: string | null | undefined): 'video_worker' | 'provid
 }
 
 /** r65: veredicto del clasificador para la fila (la clase REGISTRADA gana: solo puede ser más severa). */
-export function itemFailureVerdict(r: { error?: string | null; type?: string | null; output_summary?: Record<string, any> | null; failure_class?: string | null; failure_code?: string | null }): FailureVerdict & { recordedClass: string | null; remediationExhausted?: boolean } {
+export function itemFailureVerdict(r: { error?: string | null; type?: string | null; output_summary?: Record<string, any> | null; failure_class?: string | null; failure_code?: string | null }): FailureVerdict & { recordedClass: string | null; remediationExhausted?: boolean; cursiaIssue?: boolean } {
   const v = classifyFailure({ error: String(r.error ?? ''), itemType: r.type ?? null, outputSummary: r.output_summary ?? {}, source: sourceOfType(r.type) });
   // r98: escalera agotada con este error (fallo determinista, sin dinero en el aire) → el dueño puede reintentar.
   const remediationExhausted = remediationBlocksAuto(r.output_summary ?? {}, r.error ?? '');
-  return { ...v, recordedClass: r.failure_class ? String(r.failure_class) : null, ...(remediationExhausted ? { remediationExhausted: true } : {}) };
+  // r99 (review P1-2): parte en pausa como bug de Cursia → el dueño PUEDE reintentarla (opcional), con los guards de dinero.
+  const cursiaIssue = !!bugHoldOf(r.output_summary ?? {}, r.error ?? '');
+  return { ...v, recordedClass: r.failure_class ? String(r.failure_class) : null, ...(remediationExhausted ? { remediationExhausted: true } : {}), ...(cursiaIssue ? { cursiaIssue: true } : {}) };
 }
 
 /** r65 (R1): alcance del motivo de presupuesto del ítem. `runPauseReason` = output_summary.pause.reason del run pausado. */
@@ -107,10 +128,11 @@ export function budgetScopeOf(r: { status?: string | null; error?: string | null
 }
 
 /** r65 (R2.1): ¿el código de fallo permite el reintento del dueño? */
-export function ownerRetryCodeEligibility(v: FailureVerdict & { recordedClass?: string | null; remediationExhausted?: boolean }): 'ok' | 'ambiguous_paid_result' | 'failure_not_owner_retryable' {
+export function ownerRetryCodeEligibility(v: FailureVerdict & { recordedClass?: string | null; remediationExhausted?: boolean; cursiaIssue?: boolean }): 'ok' | 'ambiguous_paid_result' | 'failure_not_owner_retryable' {
   const cls = v.recordedClass && ['A', 'B', 'C', 'D'].includes(v.recordedClass) && v.recordedClass > v.class ? v.recordedClass : v.class;
   if (OWNER_RETRY_NEVER_CODES.has(v.code) || v.paidRisk === 'uncertain' || v.humanReason === 'duplicate_charge') return 'ambiguous_paid_result';
   if (OWNER_RETRY_EXTRA_CODES.has(v.code)) return 'ok';
+  if (v.cursiaIssue) return 'ok';
   if (cls === 'A' || cls === 'B') return 'ok';
   return 'failure_not_owner_retryable';
 }
@@ -148,6 +170,8 @@ export interface OwnerRetryInput {
   /** Lo que queda del primer tope de la política que no alcanza (null = todos caben). */
   policyBlockedBy: string | null;
   ownerRetriesUsed24h: number;
+  /** r99 (P2-7): cuándo vuelve a haber un reintento del dueño (ownerRetryNextAvailableAt); solo se informa con el límite. */
+  nextAvailableAt?: string | null;
 }
 
 /** r65 (R2): veredicto PURO del reintento del dueño. El orden de los motivos va de la seguridad del dinero al límite. */
@@ -159,7 +183,7 @@ export function ownerRetryVerdict(i: OwnerRetryInput): OwnerRetryView {
   if (i.status !== 'failed') return no('not_failed');
   // r65 fix round 1: el límite de 2 reintentos en 24 h va ANTES de la lista de códigos (vale para todo reintento del
   // dueño que reinicia el tope de la parte, también los de códigos fuera de la lista).
-  if (retriesLeft <= 0) return no('owner_retry_limit');
+  if (retriesLeft <= 0) return { ...no('owner_retry_limit'), nextAvailableAt: i.nextAvailableAt ?? null };
   const code = ownerRetryCodeEligibility(i.verdict);
   // r65 fix round 1: la ambigüedad va ANTES que el trabajo externo pagado (gamma_submit_ambiguous,
   // provider_reconciliation_required, videogen_failed… → ambiguous_paid_result, que el servidor rechaza al dueño).

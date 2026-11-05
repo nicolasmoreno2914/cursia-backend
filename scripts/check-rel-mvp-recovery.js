@@ -110,11 +110,11 @@ async function pureChecks() {
     eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 5 } }, secAgo: Math.floor(w6) - 1 }), NOW, P).reason, 'backoff', 'ronda 6 antes de su espera larga');
     const r6 = AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 5 } }, secAgo: Math.ceil(w6) + 1 }), NOW, P);
     eq([r6.heal, r6.round, r6.extended], [true, 6, true], 'ronda 6 (extendida)');
-    // Ventana total: alerta desde las 48 h, excepción pasadas las 72 h (desde la primera ronda).
+    // Ventana total (r99, decisión del dueño 3: 6 h): alerta desde las 4 h, excepción pasadas las 6 h (desde la primera ronda).
     const firstAt = (h) => new Date(NOW.getTime() - h * 3600e3).toISOString();
-    const r48 = AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 12, firstAt: firstAt(50) } }, secAgo: 5 * 3600 }), NOW, P);
-    eq([r48.heal, r48.alert], [true, true], 'alerta a las 48 h');
-    eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 12, firstAt: firstAt(73) } }, secAgo: 5 * 3600 }), NOW, P).reason, 'recovery_window_exhausted', 'excepción a las 72 h');
+    const r48 = AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 12, firstAt: firstAt(4.5) } }, secAgo: 5 * 3600 }), NOW, P);
+    eq([r48.heal, r48.alert], [true, true], 'alerta a las 4 h');
+    eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 12, firstAt: firstAt(7) } }, secAgo: 5 * 3600 }), NOW, P).reason, 'recovery_window_exhausted', 'excepción a las 6 h');
     // Sin fase extendida (legacy / kill-switch): el tope de siempre.
     eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 5 } } }), NOW, { ...P, extendedBackoffSeconds: [] }).reason, 'cap_reached', 'tope 5 sin fase extendida');
     // El jitter cambia entre items (no todos reintentan a la vez).
