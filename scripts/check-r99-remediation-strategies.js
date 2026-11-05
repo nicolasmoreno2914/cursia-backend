@@ -243,7 +243,7 @@ function strategyOfCode(code, extra = {}) {
     eq(BH.bugHoldResumeDecision(row, { now: at(5), buildId: 'build-A', verdict: v, itemType: 'content', resolvedAt: at(4).toISOString() }).trigger, 'resolved', 'huella resuelta');
     eq(BH.bugHoldResumeDecision(row, { now: at(5), buildId: 'build-A', verdict: v, itemType: 'content', resolvedAt: at(-10).toISOString() }).resume, false, 'marca vieja no vale');
     eq(BH.bugHoldResumeDecision(row, { now: at(5), buildId: 'build-B', verdict: v, itemType: 'content' }).trigger, 'new_build', 'build nuevo');
-    const spent = { ...hold, buildResumes: BH.BUG_HOLD_MAX_BUILD_RESUMES };
+    const spent = { ...hold, autoResumes: BH.BUG_HOLD_MAX_BUILD_RESUMES };
     eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: spent } }, { now: at(5), buildId: 'build-B', verdict: v, itemType: 'content' }), { resume: false, reason: 'build_resumes_exhausted' }, 'tope por build');
     const paid = { ...hold, paidUncertain: true };
     eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: paid } }, { now: at(5), buildId: 'build-B', verdict: v, itemType: 'content' }), { resume: false, reason: 'paid_uncertain' }, 'pago incierto nunca por build');
@@ -252,7 +252,76 @@ function strategyOfCode(code, extra = {}) {
     eq([r1.active, r1.buildResumes, r1.history.length], [false, 1, 2], 'reanudada');
     assert(!BH.bugHoldOf({ bugHold: r1 }, UNK), 'ya no está en pausa');
     const again = BH.nextBugHold(r1, v, 'content', UNK, 'unmapped_code', at(7), 'build-B');
-    eq([again.active, again.count, again.buildResumes], [true, 2, 1], 'vuelve a la pausa conservando el tope');
+    eq([again.active, again.count, again.buildResumes, again.autoResumes], [true, 2, 1, 1], 'vuelve a la pausa conservando el tope');
+    // Review P2-2: enfriamiento entre reaperturas automáticas y tope compartido (build + reclasificada).
+    const cool = BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: again } }, { now: at(8), buildId: 'build-C', verdict: v, itemType: 'content' });
+    eq(cool, { resume: false, reason: 'cooldown' }, 'enfriamiento');
+    eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: again } }, { now: at(8 + 31), buildId: 'build-C', verdict: v, itemType: 'content' }).trigger, 'new_build', 'pasado el enfriamiento');
+    eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: { ...hold, autoResumes: 3 } } }, { now: at(5), buildId: 'build-A', verdict: vNow, itemType: 'content' }), { resume: false, reason: 'build_resumes_exhausted' }, 'reclasificada también con tope');
+    eq(BH.bugHoldMaxResumes({}), 3, 'decisión del dueño 2: 3 por parte');
+    eq(BH.bugHoldMaxResumes({ R99_BUG_HOLD_MAX_RESUMES: '5' }), 5, 'cambiable por env');
+  });
+
+  await check('U3b (review P2-2) «reclasificada» SOLO si al pausar la estrategia era de bug (hold.strategy): un crédito agotado con su sonda vencida (config / provider_probe) no se reabre en el mismo barrido', async () => {
+    const err = '❌ Sin disponibilidad de generación. Contacta a soporte de Cursia.';
+    const v = FC.classifyFailure({ error: err, itemType: 'content', source: 'browser_executor', outputSummary: {} });
+    eq(RS.remediationStrategyFor(v).strategy, 'provider_probe', 'estrategia automática');
+    const hold = BH.nextBugHold(null, v, 'content', err, 'config', T0, 'build-A');
+    eq(hold.strategy, 'provider_probe', 'estrategia al pausar');
+    eq(BH.bugHoldResumeDecision({ status: 'failed', error: err, output_summary: { bugHold: hold } }, { now: at(1), buildId: 'build-A', verdict: v, itemType: 'content' }),
+      { resume: false, reason: 'waiting_fix' }, 'sin reclasificación inmediata');
+  });
+
+  await check('U6 (review P1-1) excepciones crudas del navegador: red / timeout / abort → A (wait_backoff); JSON / TypeError sobre la salida → B (prompt_with_findings, el próximo intento lleva el hallazgo)', async () => {
+    for (const e of ['Failed to fetch', 'TypeError: Failed to fetch', 'Load failed', 'Request timeout', 'signal is aborted without reason', 'The operation was aborted.', 'NetworkError when attempting to fetch resource.']) {
+      const v = FC.classifyFailure({ error: e, itemType: 'content', source: 'browser_executor', outputSummary: {} });
+      eq([v.class, v.unclassified, RS.remediationStrategyFor(v).strategy], ['A', false, 'wait_backoff'], e);
+      assert(!BH.holdsImmediately(v).hold, `${e}: sin pausa`);
+    }
+    for (const e of ['Unexpected token < in JSON at position 0', "Cannot read properties of undefined (reading 'map')", 'JSON.parse: unexpected end of data', 'TypeError: x.map is not a function', 'Unexpected end of JSON input']) {
+      const v = FC.classifyFailure({ error: e, itemType: 'content', source: 'browser_executor', outputSummary: {} });
+      eq([v.class, v.code, RS.remediationStrategyFor(v).strategy], ['B', 'browser_output_exception', 'prompt_with_findings'], e);
+      const st = RL.ladderStep(null, v, 'content', e, T0, { retryable: true });
+      assert(st && st.action === 'feedback' && /JSON válido y completo/.test(st.state.feedback), `${e}: feedback ${st && st.state.feedback}`);
+    }
+  });
+
+  await check('U7 (review P1-1) red de seguridad: un código SIN regla, reintentable y con intentos propios → SIN pausa (usa sus intentos con backoff) pero con REPORTE desde la 1.ª vez; agotados → pausa', async () => {
+    const IT = L('modules/dynamic-generation/item-transitions.js');
+    const qr = { sqls: [], async query(sql) { this.sqls.push(sql); return []; } };
+    const v = FC.classifyFailure({ error: UNK, itemType: 'content', source: 'browser_executor', outputSummary: {} });
+    const row = { id: 'i7', status: 'retrying', type: 'content', output_summary: {}, run_created_at: new Date() };
+    eq(await IT.applyCursiaIssueHold(qr, row, UNK, v, null), null, 'sin pausa mientras quedan intentos');
+    eq([row.status, row.output_summary.bugHold.active, row.output_summary.bugHold.reportOnly], ['retrying', false, true], 'reporte sin pausa');
+    const sig = RL.commonFailureSignals([{ courseId: 1, courseKey: 'k', runId: 'r', itemKey: 'content:c', itemType: 'content', bugHold: row.output_summary.bugHold }], new Map(), new Date());
+    eq([sig.length, sig[0].kind, sig[0].status, sig[0].heldItems], [1, 'bug_hold', 'active', 0], '«Falla común» desde la 1.ª vez');
+    const row2 = { ...row, status: 'failed' };
+    const st = await IT.applyCursiaIssueHold(qr, row2, UNK, v, null);
+    eq([st && st.reason, row2.output_summary.bugHold.active], ['unmapped_code', true], 'intentos agotados → pausa');
+    // Contrato roto: pausa al primer fallo aunque queden intentos.
+    const vc = FC.classifyFailure({ error: 'missing_dependency_artifact: x', itemType: 'content', source: 'browser_executor', outputSummary: {} });
+    const row3 = { id: 'i8', status: 'retrying', type: 'content', output_summary: {}, run_created_at: new Date() };
+    eq((await IT.applyCursiaIssueHold(qr, row3, 'missing_dependency_artifact: x', vc, null)).reason, 'product_bug', 'contrato: inmediata');
+    // Corte ÚNICO (decisión del dueño 4): un run anterior a R99_BUG_HOLD_SINCE nunca se pausa.
+    const old = { id: 'i9', status: 'failed', type: 'content', output_summary: {}, run_created_at: new Date(Date.now() - 40 * 86_400_000) };
+    eq(await IT.applyCursiaIssueHold(qr, old, UNK, v, null), null, 'run viejo (> 30 días): sin pausa');
+  });
+
+  await check('U8 (review P2-1) una parte de IA en revisión con su reapertura de 12 min pendiente es AUTOMÁTICA (nunca se pausa ni se reporta); la espera del barrido ≥ esa reapertura', async () => {
+    process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    const LR = L('modules/dynamic-generation/llm-pending-review-reopen.js');
+    const row = { id: 'x', status: 'failed', type: 'content', error: 'llm_pending_review: 2 resultados desconocidos', output_summary: {}, finished_at: new Date(Date.now() - 6 * 60_000), updated_at: new Date(Date.now() - 6 * 60_000), attention_reason: 'duplicate_charge' };
+    const st = REC.recoveryStateOf(row, new Date());
+    eq([st.state, st.automatic], ['pending_retry', true], 'reapertura pendiente');
+    assert(BH.BUG_HOLD_SWEEP_GRACE_SECONDS >= LR.llmReviewReopenDelaySeconds({}), 'espera del barrido ≥ reapertura');
+  });
+
+  await check('U9 decisiones del dueño como constantes / env: ventana de la clase A 6 h (alerta 4 h); corte de la pausa móvil = ahora − 30 días', async () => {
+    eq([AH.DEFAULT_AUTO_HEAL_POLICY.classATotalHours, AH.DEFAULT_AUTO_HEAL_POLICY.classAAlertHours, AH.DEFAULT_CLASS_A_TOTAL_HOURS], [6, 4, 6], 'decisión 3');
+    eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS: '12' }).classATotalHours, 12, 'env');
+    const now = new Date('2026-12-15T00:00:00Z');
+    eq(BH.bugHoldSince({}, now).toISOString(), new Date(now.getTime() - 30 * 86_400_000).toISOString(), 'decisión 4: móvil');
+    eq(BH.bugHoldSince({ R99_BUG_HOLD_SINCE: '2026-11-01T00:00:00Z' }, now).toISOString(), '2026-11-01T00:00:00.000Z', 'env fija el corte');
   });
 
   await check('U5 la pausa inmediata nunca le gana a un mecanismo automático existente (conciliación de proveedor, reenvío único de audio): solo cuando hoy nada la tomaría', async () => {
@@ -271,11 +340,13 @@ function strategyOfCode(code, extra = {}) {
     assert(qr.sqls.some((q) => /set status = 'failed', next_retry_at = null/.test(q)), 'misma transacción');
   });
 
-  await check('U4 la identidad del build es estable en el proceso y CURSIA_BUILD_ID la fija', async () => {
+  await check('U4 la identidad del build es el SHA desplegado (CURSIA_BUILD_ID / DEPLOY_SHA / CFG_DEPLOY_SHA / .release-sha) y si no, estable en el proceso', async () => {
     BH.resetBuildIdCache();
     const a = BH.currentBuildId({}); const b = BH.currentBuildId({});
     assert(a && a === b && /^[0-9a-f]{16}$/.test(a), a);
     eq(BH.currentBuildId({ CURSIA_BUILD_ID: 'deploy-123' }), 'deploy-123', 'explícito');
+    eq(BH.currentBuildId({ DEPLOY_SHA: 'abc1234def' }), 'abc1234def', 'SHA desplegado (review)');
+    eq(BH.currentBuildId({ CFG_DEPLOY_SHA: 'fedcba9876' }), 'fedcba9876', 'SHA desplegado (prod-release)');
   });
 
   // ═══ L: escalera — intento distinto desde el 1.er rechazo, sin entrega degradada ═══
@@ -324,7 +395,8 @@ function strategyOfCode(code, extra = {}) {
       maxCostUsd: 1, runRemainingUsd: 10, policyBlockedBy: null, ownerRetriesUsed24h: 2, nextAvailableAt: 'X' });
     eq([v.allowed, v.reason, v.nextAvailableAt], [false, 'owner_retry_limit', 'X'], 'veredicto');
     const rs = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/runs.service.ts'), 'utf8');
-    assert(!/el equipo de Cursia la revisará/.test(rs) && /Cursia sigue recuperándola sola/.test(rs), '409 sin «el equipo la revisará»');
+    // Review P2-4: «Cursia la sigue recuperando sola» SOLO cuando el estado de recuperación es automático (autoResolving).
+    assert(!/el equipo de Cursia la revisará/.test(rs) && /\$\{autoResolving \? ' Cursia la sigue recuperando sola; no tienes que hacer nada\.' : ''\}/.test(rs), '409 preciso');
   });
 
   // ═══ PG: Postgres 16 real ═══════════════════════════════════════════════════
@@ -362,83 +434,109 @@ function strategyOfCode(code, extra = {}) {
         } catch (e) { await qr.rollbackTransaction(); throw e; } finally { await qr.release(); }
       };
 
-      await check('PG1 applyItemFailure con un código SIN regla (reintentable, intentos disponibles) → `failed` con pausa (nunca `retrying` idéntico); dependientes bloqueados; sin gasto', async () => {
+      await check('PG1 (review P1-1) código SIN regla, reintentable con intentos: sigue `retrying` (sus intentos con backoff) + REPORTE; con los intentos agotados → `failed` en pausa; dependientes bloqueados; sin gasto', async () => {
+        const t0 = await failTx(target.id, UNK, true);
+        eq(t0.status, 'retrying', 'primer fallo: usa sus intentos');
+        let r = await rowOf(target.id);
+        eq([r.output_summary.bugHold.active, r.output_summary.bugHold.reportOnly], [false, true], 'reporte sin pausa');
+        await ds.query(`update public.generation_item_runs set status = 'pending', attempt_count = max_attempts - 1 where id = $1`, [target.id]);
         const t = await failTx(target.id, UNK, true);
-        eq(t.status, 'failed', 'transición');
-        const r = await rowOf(target.id);
+        eq(t.status, 'failed', 'intentos agotados');
+        r = await rowOf(target.id);
         eq([r.status, r.next_retry_at, r.output_summary.bugHold.active, r.output_summary.bugHold.reason, r.output_summary.recovery.state], ['failed', null, true, 'unmapped_code', 'paused_cursia_issue'], 'fila');
-        assert(r.attempt_count < r.max_attempts, 'le quedaban intentos y NO se usaron (serían el mismo pedido)');
         eq(await ledgerCount(), spend0, 'sin gasto');
       });
 
-      await check('PG2 DTO del run: la parte lleva cursiaIssue + estado paused_cursia_issue; completion.cursiaIssue con el mensaje; sin acción de admin por curso', async () => {
+      await check('PG2 DTO del run: la parte lleva cursiaIssue + paused_cursia_issue; completion.cursiaIssue con el mensaje; nunca «Curso listo»; (review P1-2) la salida humana sigue: acción de admin + reintento del dueño habilitado', async () => {
         const dto = await runs.getRun(C.cid, OWNER, 1, runId);
         const it = dto.items.find((x) => x.itemKey === target.item_key);
         eq([it.recovery.state.state, it.recovery.state.automatic, !!it.recovery.cursiaIssue], ['paused_cursia_issue', true, true], 'parte');
         assert(dto.completion.cursiaIssue && dto.completion.cursiaIssue.items.includes(target.item_key) && dto.completion.cursiaIssue.message === BH.CURSIA_ISSUE_MESSAGE, JSON.stringify(dto.completion.cursiaIssue));
-        assert(!dto.completion.adminActions.some((a) => a.itemKey === target.item_key), 'sin acción de admin para la parte en pausa');
+        assert(dto.completion.adminActions.some((a) => a.itemKey === target.item_key), 'acción de admin (opcional) disponible');
+        eq(OR.ownerRetryCodeEligibility(OR.itemFailureVerdict(await rowOf(target.id))), 'ok', 'el dueño puede reintentar (opcional)');
         assert(dto.completion.complete !== true, 'nunca «Curso listo» con una parte en pausa');
       });
 
       const admin = new AdminRecoveryService(ds, {}, runs);
-      let fp = null;
-      await check('PG3 «Falla común» (SQL real): la pausa aparece con UN curso, contado por frontend_course_id', async () => {
-        const list = (await admin.commonFailuresListing(false)).commonFailures;
-        const sig = list.find((x) => x.kind === 'bug_hold' && x.runs.includes(runId));
+      await check('PG3 «Falla común» (SQL real): la pausa aparece con UN curso, contado por frontend_course_id; (review P2-3) una pausa vigente no sale del reporte aunque la fila no se toque en 7 días', async () => {
+        let list = (await admin.commonFailuresListing(false)).commonFailures;
+        let sig = list.find((x) => x.kind === 'bug_hold' && x.runs.includes(runId));
         assert(sig, JSON.stringify(list).slice(0, 400));
         eq([sig.heldItems, sig.courseKeys, sig.status], [1, ['fe-course-r99-uuid'], 'active'], 'señal');
-        fp = sig.fingerprint;
+        const [u] = await ds.query(`select updated_at from public.generation_item_runs where id = $1`, [target.id]);
+        assert(Date.now() - new Date(u.updated_at).getTime() < 120_000, 'la pausa tocó updated_at');
+        await ds.query(`update public.generation_item_runs set updated_at = now() - interval '9 days' where id = $1`, [target.id]);
+        list = (await admin.commonFailuresListing(false)).commonFailures;
+        sig = list.find((x) => x.kind === 'bug_hold' && x.runs.includes(runId));
+        assert(sig && sig.heldItems === 1, 'sigue en el reporte');
       });
 
-      await check('PG4 barrido (SQL real): mismo build → sigue en pausa; build nuevo → retryItem la reabre (pending, pausa inactiva, 1 reanudación por build); sin gasto', async () => {
+      const base = Date.now();
+      const tick = (h) => new Date(base + h * 3600_000);
+      await check('PG4 barrido (SQL real): mismo build → sigue en pausa; build nuevo → retryItem la reabre (pending, pausa inactiva, 1 reanudación); enfriamiento; sin gasto', async () => {
         const r0 = await rowOf(target.id);
         const b0 = r0.output_summary.bugHold.buildId;
-        const s1 = await runs.sweepCursiaIssues({ buildId: b0 });
+        const s1 = await runs.sweepCursiaIssues({ buildId: b0, now: tick(0) });
         assert(!s1.resumed.some((x) => x.itemKey === target.item_key) && s1.skipped.some((x) => x.itemKey === target.item_key && x.reason === 'still_unmapped'), JSON.stringify(s1));
-        const s2 = await runs.sweepCursiaIssues({ buildId: 'build-r99-next' });
+        const s2 = await runs.sweepCursiaIssues({ buildId: 'build-r99-next', now: tick(0) });
         assert(s2.resumed.some((x) => x.itemKey === target.item_key && x.trigger === 'new_build'), JSON.stringify(s2));
         const r = await rowOf(target.id);
-        eq([r.status, r.output_summary.bugHold.active, r.output_summary.bugHold.buildResumes, r.output_summary.bugHold.resumeTrigger], ['pending', false, 1, 'new_build'], 'reabierta');
+        eq([r.status, r.output_summary.bugHold.active, r.output_summary.bugHold.autoResumes, r.output_summary.bugHold.resumeTrigger], ['pending', false, 1, 'new_build'], 'reabierta');
+        assert(r.output_summary.recoveryBudgetResetAt, 'review P1-2: presupuesto de la parte renovado');
         eq(await ledgerCount(), spend0, 'sin gasto');
-        const [att] = await ds.query(`select strategy_applied from public.generation_item_attempts where item_run_id = $1 and strategy_applied like 'cursia_issue_resume%' order by started_at desc nulls last limit 1`, [target.id]).catch(() => [null]);
-        assert(!att || /^cursia_issue_resume:new_build/.test(att.strategy_applied), JSON.stringify(att));
       });
 
-      await check('PG5 vuelve a fallar igual → pausa otra vez (sin rehacer la escalera); tope de reanudaciones por build', async () => {
-        await ds.query(`update public.generation_item_runs set status = 'pending' where id = $1`, [target.id]);
+      await check('PG5 vuelve a fallar igual (intentos agotados) → pausa otra vez; enfriamiento entre reaperturas; tope de 3 por parte', async () => {
+        await ds.query(`update public.generation_item_runs set status = 'pending', attempt_count = max_attempts - 1 where id = $1`, [target.id]);
         await failTx(target.id, UNK, true);
         let r = await rowOf(target.id);
-        eq([r.status, r.output_summary.bugHold.active, r.output_summary.bugHold.count], ['failed', true, 2], 'pausa de nuevo');
+        eq([r.status, r.output_summary.bugHold.active, r.output_summary.bugHold.count], ['failed', true, 3], 'pausa de nuevo (reporte + pausa + pausa)');
+        const sc = await runs.sweepCursiaIssues({ buildId: 'build-r99-cool', now: tick(0.1) });
+        assert(sc.skipped.some((x) => x.itemKey === target.item_key && x.reason === 'cooldown'), 'enfriamiento: ' + JSON.stringify(sc));
         for (let i = 0; i < 3; i++) {
-          await runs.sweepCursiaIssues({ buildId: `build-r99-${i}` });
+          await runs.sweepCursiaIssues({ buildId: `build-r99-${i}`, now: tick(i + 1) });
           r = await rowOf(target.id);
-          if (r.status !== 'failed') await failTx(target.id, UNK, true);
+          if (r.status !== 'failed') { await ds.query(`update public.generation_item_runs set status = 'pending', attempt_count = max_attempts - 1 where id = $1`, [target.id]); await failTx(target.id, UNK, true); }
         }
         r = await rowOf(target.id);
-        eq([r.status, r.output_summary.bugHold.active, r.output_summary.bugHold.buildResumes], ['failed', true, BH.BUG_HOLD_MAX_BUILD_RESUMES], 'tope');
-        const s = await runs.sweepCursiaIssues({ buildId: 'build-r99-last' });
+        eq([r.status, r.output_summary.bugHold.active, r.output_summary.bugHold.autoResumes], ['failed', true, 3], 'tope');
+        const s = await runs.sweepCursiaIssues({ buildId: 'build-r99-last', now: tick(6) });
         assert(s.skipped.some((x) => x.itemKey === target.item_key && x.reason === 'build_resumes_exhausted'), JSON.stringify(s));
       });
 
-      await check('PG6 huella marcada resuelta en «Falla común» (admin_audit_log) → el barrido la reanuda (resolved) aunque el build no cambie', async () => {
+      await check('PG6 huella marcada resuelta en «Falla común» (admin_audit_log) → el barrido la reanuda (resolved) aunque el build no cambie y el tope automático esté usado', async () => {
         const r0 = await rowOf(target.id);
         const fpNow = r0.output_summary.bugHold.fingerprint;
         await admin.resolveCommonFailure(fpNow, { id: '00000000-0000-4000-8000-0000000000aa', email: 'sa@test.local' }, 'arreglo desplegado');
-        const s = await runs.sweepCursiaIssues({ buildId: r0.output_summary.bugHold.buildId });
+        const s = await runs.sweepCursiaIssues({ buildId: r0.output_summary.bugHold.buildId, now: tick(7) });
         assert(s.resumed.some((x) => x.itemKey === target.item_key && x.trigger === 'resolved'), JSON.stringify(s));
-        void fp;
       });
 
-      const other = items.find((r) => r.type !== 'content' && r.id !== target.id && !['video', 'presentation', 'audio_welcome', 'audiobook_chapter'].includes(r.type)) || items.find((r) => r.id !== target.id);
-      await check('PG7 barrido: estrategia agotada (tope de la parte con su ronda extra usada) → pausa item_budget_exhausted; pausa del usuario → nunca (decisión del dueño)', async () => {
+      const other = items.find((r) => r.type === 'experience') || items.find((r) => r.type !== 'content' && r.id !== target.id && !['video', 'presentation', 'audio_welcome', 'audiobook_chapter'].includes(r.type));
+      await check('PG7 barrido: tope de la parte agotado con su ronda extra usada → pausa item_budget_exhausted; (review P1-2) la reanudación por build RENUEVA el presupuesto de la parte → el guard de la siguiente llamada la deja pasar; pausa del usuario → nunca', async () => {
         await ds.query(`update public.generation_item_runs set status = 'failed', error = 'item_recovery_budget_exhausted: tope de la parte', finished_at = now() - interval '20 minutes',
                           output_summary = coalesce(output_summary, '{}'::jsonb) || '{"autoBudgetExtension":{"at":"2026-11-01T00:00:00Z","round":1}}'::jsonb where id = $1`, [other.id]);
-        const s = await runs.sweepCursiaIssues({ buildId: 'b-pg7' });
+        const s = await runs.sweepCursiaIssues({ buildId: 'b-pg7', now: tick(8) });
         assert(s.held.some((x) => x.itemKey === other.item_key && x.reason === 'item_budget_exhausted'), JSON.stringify(s));
-        const third = items.find((r) => r.id !== target.id && r.id !== other.id);
+        // Lo gastado por la parte antes de la pausa agota su tope: el guard (proxy / worker de IA) la frena.
+        await H.ledger.recordCharge({
+          itemRunId: other.id, ownerIdFromAuth: OWNER, provider: 'anthropic', service: 'messages', modelOrProduct: 'claude-sonnet-4-6',
+          costSource: 'ACTUAL_PROVIDER', actualAmount: '3.00', idempotencyKey: `r99:pg7:${other.id}`, callRole: 'main', attempt: 1,
+          billingAccount: 'cursia', mode: 'real', measurementStatus: 'final', recordedBy: 'check-r99', executorAuthorization: 'server_worker', metadata: {},
+        });
+        await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'recoveryBudgetResetAt' where id = $1`, [other.id]);
+        await ds.query(`update public.production_jobs set status = 'running', worker_status = 'running' where id = $1`, [runId]);
+        const guard = () => H.budget.guardServerLlmCall({ runId, itemRunId: other.id, model: 'claude-sonnet-4-6', promptChars: 2000, maxTokens: 1000 });
+        const before = await guard();
+        eq(before && before.code, 'item_recovery_budget_exhausted', 'antes de la reanudación: frenada por su tope');
+        const s2 = await runs.sweepCursiaIssues({ buildId: 'b-pg7-fix', now: tick(9) });
+        assert(s2.resumed.some((x) => x.itemKey === other.item_key && x.trigger === 'new_build'), JSON.stringify(s2));
+        await ds.query(`update public.production_jobs set status = 'running', worker_status = 'running' where id = $1`, [runId]);
+        eq(await guard(), null, 'tras la reanudación: el guard deja pasar la llamada (presupuesto de la parte renovado)');
+        const third = items.find((r) => r.id !== target.id && r.id !== other.id && r.type === 'content') || items.find((r) => r.id !== target.id && r.id !== other.id);
         await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Generación detenida por el usuario', finished_at = now() - interval '20 minutes' where id = $1`, [third.id]);
-        const s2 = await runs.sweepCursiaIssues({ buildId: 'b-pg7' });
-        assert(!s2.held.some((x) => x.itemKey === third.item_key), 'pausa del usuario: no es un bug');
+        const s3 = await runs.sweepCursiaIssues({ buildId: 'b-pg7', now: tick(10) });
+        assert(!s3.held.some((x) => x.itemKey === third.item_key), 'pausa del usuario: no es un bug');
         const [t3] = await ds.query(`select output_summary from public.generation_item_runs where id = $1`, [third.id]);
         assert(!(t3.output_summary || {}).bugHold, 'sin pausa');
       });
@@ -468,6 +566,65 @@ function strategyOfCode(code, extra = {}) {
         assert(requested.includes(run2), 'se volvió a pedir el paquete');
         const list = (await admin.commonFailuresListing(true)).commonFailures;
         assert(list.some((x) => x.fingerprint.startsWith('package|PACKAGING_PLAN_V3_INVALID')), 'el empaque en pausa aparece en «Falla común»');
+      });
+      await check('PG9 (decisión del dueño 1) presupuesto aprobado → la generación frenada sigue SOLA: usuario sin presupuesto → user_budgets nuevo; parte por presupuesto del run → autorización nueva; run pausado por su tope → reanudado; idempotente con barridos concurrentes', async () => {
+        const C3 = await H.makeCourse(OWNER, 'Curso r99 presupuesto', 'o99@cliente.test');
+        const run3 = (await runs.startRun(C3.cid, OWNER, 1, MOCK_CTX)).run.id;
+        const its = await ds.query(`select id, item_key, type from public.generation_item_runs where job_id = $1 order by item_key`, [run3]);
+        const [a, b] = its.filter((x) => x.type === 'content' || x.type === 'experience');
+        const ub = 'Tu presupuesto disponible no alcanza para esta generación; solicita autorización. No se hizo la llamada (sin gasto).';
+        await ds.query(`update public.generation_item_runs set status = 'failed', error = $2, finished_at = clock_timestamp() where id = $1`, [a.id, ub]);
+        await ds.query(`update public.generation_item_runs set status = 'failed', error = 'budget_approval_required: hace falta aprobar el presupuesto', finished_at = clock_timestamp() where id = $1`, [b.id]);
+        let o = await runs.autoResumeOwnerDecisionHolds();
+        assert(!o.reopened.some((x) => x.runId === run3), 'sin decisión nueva: nada se reabre ' + JSON.stringify(o));
+        await H.setBudget(OWNER, 900);
+        const [o1, o2] = await Promise.all([runs.autoResumeOwnerDecisionHolds(), runs.autoResumeOwnerDecisionHolds()]);
+        const reA = [...o1.reopened, ...o2.reopened].filter((x) => x.itemKey === a.item_key);
+        eq([reA.length, reA[0] && reA[0].cause], [1, 'user_budget'], 'una sola reapertura (concurrencia)');
+        const [ra] = await ds.query(`select status, output_summary from public.generation_item_runs where id = $1`, [a.id]);
+        eq([ra.status, !!ra.output_summary.ownerDecisionResume], ['pending', true], 'parte del usuario reabierta');
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(!o.reopened.some((x) => x.itemKey === b.item_key), 'presupuesto del run sin aprobar: sigue');
+        await H.budget.adminAuthorizeRun({ courseId: C3.cid, runId: run3, authorizedBudget: '60', approvedBy: 'sa@cursia.test', reason: 'QA r99' });
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(o.reopened.some((x) => x.itemKey === b.item_key && x.cause === 'run_budget'), JSON.stringify(o));
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(!o.reopened.some((x) => x.runId === run3), 'la misma aprobación no reabre dos veces');
+        // Run pausado por el sistema por su tope → una autorización nueva lo reanuda solo.
+        await ds.query(`update public.production_jobs set status = 'paused', worker_status = 'paused',
+                          output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('pause', jsonb_build_object('pausedAt', (now() - interval '1 minute')::text, 'pausedBy', 'system', 'reason', 'run_budget_cap', 'detail', 'tope'))
+                        where id = $1`, [run3]);
+        await H.budget.adminAuthorizeRun({ courseId: C3.cid, runId: run3, authorizedBudget: '80', approvedBy: 'sa@cursia.test', reason: 'QA r99 ampliación' });
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(o.resumedRuns.includes(run3), JSON.stringify(o));
+        const [j] = await ds.query(`select worker_status, output_summary->'pause' as pause from public.production_jobs where id = $1`, [run3]);
+        assert(j.worker_status !== 'paused' && /owner_decision_resume/.test(String(j.pause.autoResumedBy)), JSON.stringify(j));
+        // Una pausa del USUARIO nunca se levanta sola.
+        await ds.query(`update public.production_jobs set status = 'paused', worker_status = 'paused',
+                          output_summary = output_summary || jsonb_build_object('pause', jsonb_build_object('pausedAt', (now() - interval '1 minute')::text, 'pausedBy', $2::text, 'reason', 'user'))
+                        where id = $1`, [run3, OWNER]);
+        await H.budget.adminAuthorizeRun({ courseId: C3.cid, runId: run3, authorizedBudget: '90', approvedBy: 'sa@cursia.test', reason: 'QA r99 otra' });
+        o = await runs.autoResumeOwnerDecisionHolds();
+        assert(!o.resumedRuns.includes(run3), 'pausa del usuario: nunca sola');
+      });
+
+      await check('PG10 (decisión del dueño 4) corte móvil de 30 días: un run fallido de hace 10 días entra a la pausa; uno de hace 40 días no se toca', async () => {
+        delete process.env.R99_BUG_HOLD_SINCE;
+        try {
+          const mk = async (daysAgo) => {
+            const K = await H.makeCourse(OWNER, `Curso r99 corte ${daysAgo}`, 'o99@cliente.test');
+            const rid = (await runs.startRun(K.cid, OWNER, 1, MOCK_CTX)).run.id;
+            await ds.query(`update public.production_jobs set created_at = now() - make_interval(days => $2::int) where id = $1`, [rid, daysAgo]);
+            const [it] = await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type = 'content' order by item_key limit 1`, [rid]);
+            await ds.query(`update public.generation_item_runs set status = 'failed', error = 'missing_dependency_artifact: x', finished_at = now() - interval '1 hour' where id = $1`, [it.id]);
+            return it;
+          };
+          const recent = await mk(10);
+          const old = await mk(40);
+          const s = await runs.sweepCursiaIssues({ buildId: 'b-pg10' });
+          assert(s.held.some((x) => x.itemKey === recent.item_key), 'reciente: pausa ' + JSON.stringify(s.held));
+          assert(!s.held.some((x) => x.itemKey === old.item_key), 'viejo: sin tocar');
+        } finally { process.env.R99_BUG_HOLD_SINCE = '2000-01-01T00:00:00Z'; }
       });
     } finally {
       if (prevSince === undefined) delete process.env.R99_BUG_HOLD_SINCE; else process.env.R99_BUG_HOLD_SINCE = prevSince;

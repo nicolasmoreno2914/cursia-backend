@@ -262,7 +262,8 @@ export class AdminRecoveryService {
               pj.course_id, pj.frontend_course_id
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
-        where g.updated_at >= $1::timestamptz
+        -- review P2-3: una pausa VIGENTE nunca sale del reporte aunque la fila no se haya tocado en 7 días.
+        where (g.updated_at >= $1::timestamptz or (g.output_summary->'bugHold'->>'active') = 'true')
           and (
             (jsonb_typeof(g.output_summary->'remediation') = 'object' and (g.output_summary->'remediation'->>'lastAt') >= $1::text)
             or (jsonb_typeof(g.output_summary->'bugHold') = 'object'

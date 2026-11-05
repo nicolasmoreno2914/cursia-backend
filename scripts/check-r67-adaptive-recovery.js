@@ -731,6 +731,11 @@ async function dbChecks() {
       for (const m of [5, 60, 600]) eq((await runs.autoHealFailedItems({ now: later(m) })).reopened.filter((x) => x.runId === R.rid).length, 0, `sin reapertura (+${m} min)`);
       eq(fakes.st.tts.length - t1, 0, 'sin llamadas');
       await assertNoOrphans(R.rid, 'agotada');
+      // r99 (review P1-2): la salida HUMANA sigue disponible sobre la pausa (opcional): acción de admin + reintento del dueño.
+      const dtoH = await runs.getRun(R.cid, OWNER, 1, R.rid);
+      assert((dtoH.completion.adminActions || []).some((x) => x.itemKey === R.key), 'acción de admin sobre la parte en pausa');
+      const OR99 = loadDist('modules/dynamic-generation/owner-retry.js');
+      eq(OR99.ownerRetryCodeEligibility(OR99.itemFailureVerdict(row)), 'ok', 'el dueño puede reintentarla (opcional)');
       // r67 fix round 1 (F2): un reintento HUMANO reinicia la escalera SOLO del segmento agotado (con auditoría) y
       // conserva los aceptados y la cuarentena → corrección local del segmento (aquí el TTS vuelve a 181 ppm) a costo 0
       // para seg-0/seg-1.
@@ -758,6 +763,28 @@ async function dbChecks() {
       eq([perChunk2['0'], perChunk2['1']], [1, 1], 'seg-0/seg-1: 0 cargos nuevos');
       eq(chB.length - ch0, 1 + by2.other.size, 'un cargo nuevo por llamada nueva (el segmento corregido localmente + los que faltaban)');
       assert(row.output_summary.audioCorrections[segKey], 'corrección local registrada');
+    });
+
+    // ═══ 15b / r99 (review P1-2) — escalera agotada → pausa → build nuevo → la reanudación REINICIA la escalera y llama otra vez ═══
+    await check('15b r99: AUDIO_STRATEGIES_EXHAUSTED en pausa → el barrido (build nuevo) la reabre con la escalera del segmento reiniciada (actor system) → el worker vuelve a sintetizar (no un fallo instantáneo sin llamar)', async () => {
+      ffCtl('ok');
+      const R = await freshRun('r99 audio agotado');
+      const st = paceFor({ k: 2, base: 230, instructions: 230, split: 230 });
+      let row = await runAudio(R);
+      row = await runAudio(R);
+      row = await runAudio(R);
+      assert(/^AUDIO_STRATEGIES_EXHAUSTED/.test(row.error) && row.output_summary.bugHold && row.output_summary.bugHold.active === true, `pausa: ${row.error}`);
+      const s1 = await runs.sweepCursiaIssues({ buildId: 'r99-audio-fix' });
+      assert(s1.resumed.some((x) => x.itemKey === R.key && x.trigger === 'new_build'), JSON.stringify(s1));
+      row = await itemRow(R.rid, R.key);
+      const resets = row.output_summary.audioLadderResets || [];
+      assert(resets.length && resets[resets.length - 1].actor === 'system' && resets[resets.length - 1].trigger === 'new_build', JSON.stringify(resets));
+      assert(!Object.values(row.output_summary.audioRetryStrategy || {}).some((x) => x && x.exhausted === true), 'sin segmentos agotados');
+      st.cfg.base = 181;
+      const t1 = fakes.st.tts.length;
+      row = await runAudio(R);
+      assert(fakes.st.tts.length > t1, 'el worker volvió a llamar al TTS');
+      eq([row.status, row.error], ['completed', null], 'completa tras la reanudación automática');
     });
 
     // ═══ 10/11/2 — run failed → auto-heal reabre (B) → queued; dependiente desbloqueado; reanuda desde segmentos ═══

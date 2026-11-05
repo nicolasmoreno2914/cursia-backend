@@ -13,7 +13,7 @@ import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 import { applyStopAfterInTx, holdsPackaging, packageHoldReason } from './stop-after';
 import { LadderStep, REMEDIATION_KEY, ladderStep, remediationOf } from '../reliability/remediation-ladder';
 // r99: pausa como bug de Cursia (sin intentos ni gasto) + reporte + reanudación automática con el arreglo.
-import { BUG_HOLD_KEY, BugHoldReason, BugHoldState, bugHoldStateOf, currentBuildId, holdsImmediately, nextBugHold } from '../reliability/bug-hold';
+import { BUG_HOLD_KEY, BugHoldReason, BugHoldState, bugHoldSince, bugHoldStateOf, currentBuildId, holdsImmediately, nextBugHold, reportedBugHold } from '../reliability/bug-hold';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -252,7 +252,24 @@ export async function applyCursiaIssueHold(
   step: LadderStep | null,
   now: Date = new Date(),
 ): Promise<BugHoldState | null> {
+  // Corte de activación ÚNICO (review): la pausa (inmediata y del barrido) solo para runs desde R99_BUG_HOLD_SINCE.
+  const runAt = row.run_created_at ? new Date(row.run_created_at as any).getTime() : NaN;
+  if (Number.isFinite(runAt) && runAt < bugHoldSince(process.env).getTime()) return null;
   const imm = holdsImmediately(verdict);
+  // Review P1-1: un código SIN regla que el emisor marcó reintentable y todavía tiene intentos propios los usa (con su
+  // backoff): sin pausa, pero con REPORTE para desarrollo desde la primera vez. Contrato / config de Cursia y lo no
+  // reintentable siguen pausando al primer fallo.
+  if (imm.hold && imm.reason === 'unmapped_code' && row.status === 'retrying') {
+    const rep = reportedBugHold(bugHoldStateOf(row.output_summary), verdict, row.type, error, now, currentBuildId());
+    await qr.query(
+      `update public.generation_item_runs
+          set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb), updated_at = now()
+        where id = $1`,
+      [row.id, JSON.stringify(rep)],
+    );
+    row.output_summary = { ...(row.output_summary ?? {}), [BUG_HOLD_KEY]: rep };
+    return null;
+  }
   // La pausa inmediata NUNCA le gana a un mecanismo automático existente (conciliación de proveedor, reenvío único de
   // audio, control de gasto, claim incompleto, auto-heal…): solo cuando el sistema de hoy no haría nada solo. Lo que esos
   // mecanismos terminen declinando lo pausa después el barrido (sweepCursiaIssues).
@@ -264,7 +281,7 @@ export async function applyCursiaIssueHold(
   const state = nextBugHold(bugHoldStateOf(row.output_summary), verdict, row.type, error, reason, now, currentBuildId());
   await qr.query(
     `update public.generation_item_runs
-        set status = 'failed', next_retry_at = null, finished_at = coalesce(finished_at, now()),
+        set status = 'failed', next_retry_at = null, finished_at = coalesce(finished_at, now()), updated_at = now(),
             output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb)
       where id = $1 and status in ('failed', 'retrying')`,
     [row.id, JSON.stringify(state)],

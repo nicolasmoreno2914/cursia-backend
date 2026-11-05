@@ -32,21 +32,37 @@ export const BUG_HOLD_KEY = 'bugHold';
 /** Marca «resuelto» de una huella en «Falla común» (admin_audit_log; la escribe admin-recovery.service.ts). */
 export const BUG_HOLD_RESOLVE_ACTION = 'common_failure.resolve';
 export const BUG_HOLD_RESOLVE_TARGET_TYPE = 'failure_fingerprint';
-/** Espera antes de pausar una parte desde el barrido (los demás barridos del tick tienen su oportunidad primero). */
-export const BUG_HOLD_SWEEP_GRACE_SECONDS = 300;
+/**
+ * Espera antes de pausar una parte desde el barrido (los demás barridos del tick tienen su oportunidad primero). Review
+ * P2-1: ≥ la espera de la reapertura de IA en revisión (LLM_REVIEW_REOPEN_DELAY_SECONDS = 720) con margen.
+ */
+export const BUG_HOLD_SWEEP_GRACE_SECONDS = 900;
+/** Review P2-2: espera mínima entre dos reanudaciones AUTOMÁTICAS de la misma parte (reclasificada / build nuevo). */
+export const BUG_HOLD_RESUME_MIN_INTERVAL_SECONDS = 1800;
+/** Decisión del dueño pendiente (tope de reanudaciones): env R99_BUG_HOLD_MAX_RESUMES (default 3, rango 0…20). */
+export const BUG_HOLD_MAX_RESUMES_ENV = 'R99_BUG_HOLD_MAX_RESUMES';
 /** Enfriamiento tras una reanudación rechazada por retryItem (presupuesto, run pausado, otro run activo…). */
 export const BUG_HOLD_RESUME_COOLDOWN_SECONDS = 1800;
 /** Estado de recuperación expuesto (recovery-state.ts) mientras la parte está en pausa por un bug de Cursia. */
 export const CURSIA_ISSUE_STATE = 'paused_cursia_issue';
 /** Mensaje para el creador del curso (sin «reintentar»: no es su problema). */
 export const CURSIA_ISSUE_MESSAGE = 'Encontramos un problema de nuestro lado y lo estamos resolviendo. No tienes que hacer nada; tu curso continuará automáticamente.';
-/** Reaperturas por build nuevo por parte (cada una pasa por los guards de FinOps). */
+/** Reaperturas AUTOMÁTICAS (build nuevo + reclasificada) por parte, por defecto (cada una pasa por los guards de FinOps). */
 export const BUG_HOLD_MAX_BUILD_RESUMES = 3;
+
+export function bugHoldMaxResumes(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(String(env[BUG_HOLD_MAX_RESUMES_ENV] ?? '').trim());
+  return String(env[BUG_HOLD_MAX_RESUMES_ENV] ?? '').trim() !== '' && Number.isInteger(n) && n >= 0 && n <= 20 ? n : BUG_HOLD_MAX_BUILD_RESUMES;
+}
 /** Ventana del barrido: una pausa más vieja que esto ya no se reabre sola por build (sí por reclasificación / resuelto). */
 export const BUG_HOLD_MAX_AGE_DAYS = 14;
-/** Corte de activación: runs creados antes NO entran a la pausa por el barrido (los datos históricos no se tocan). */
+/**
+ * Corte de activación: runs creados antes NO entran a la pausa (ni la inmediata ni la del barrido; los datos históricos no
+ * se tocan). r99 (decisión del dueño 4): por defecto MÓVIL = ahora − 30 días (los fallidos del último mes entran al flujo
+ * de pausa / reanudación); R99_BUG_HOLD_SINCE (ISO) lo fija.
+ */
 export const BUG_HOLD_SINCE_ENV = 'R99_BUG_HOLD_SINCE';
-export const BUG_HOLD_DEFAULT_SINCE = '2026-11-05T00:00:00Z';
+export const BUG_HOLD_DEFAULT_SINCE_DAYS = 30;
 export const BUG_HOLD_HISTORY_MAX = 10;
 export const BUG_HOLD_ERROR_MAX = 500;
 
@@ -81,6 +97,15 @@ export interface BugHoldState {
   buildId: string;
   /** Reaperturas automáticas ya hechas por build nuevo. */
   buildResumes: number;
+  /** Review P2-2: reaperturas AUTOMÁTICAS totales (build nuevo + reclasificada); tope bugHoldMaxResumes(). */
+  autoResumes?: number;
+  /** Review P2-2: última reapertura automática (enfriamiento entre reaperturas). */
+  lastResumeAt?: string | null;
+  /**
+   * Review P1-1: solo REPORTE (no pausa): un código sin regla que el emisor marcó reintentable y todavía tiene intentos
+   * propios — los usa con su backoff; «Falla común» lo ve desde la primera vez. Si se agotan, recién ahí la pausa.
+   */
+  reportOnly?: boolean;
   /** Pago incierto: solo reclassified / resolved (nunca por build). */
   paidUncertain: boolean;
   /** Estrategia que tenía el veredicto al pausar (auditoría). */
@@ -162,8 +187,11 @@ export function nextBugHold(
     lastAt: at,
     count: Math.max(0, Math.floor(Number(prev?.count ?? 0)) || 0) + 1,
     buildId,
-    // Las reaperturas por build se cuentan por PARTE (nunca se reinician: tope duro de gasto).
+    // Las reaperturas se cuentan por PARTE (nunca se reinician: tope duro de gasto).
     buildResumes: Math.max(0, Math.floor(Number(prev?.buildResumes ?? 0)) || 0),
+    autoResumes: Math.max(0, Math.floor(Number(prev?.autoResumes ?? prev?.buildResumes ?? 0)) || 0),
+    lastResumeAt: prev?.lastResumeAt ?? null,
+    reportOnly: false,
     paidUncertain: v.paidRisk === 'uncertain' || v.humanReason === 'duplicate_charge' || reason === 'reconcile_pending',
     strategy,
     resumedAt: null,
@@ -173,9 +201,18 @@ export function nextBugHold(
   };
 }
 
+/**
+ * Review P1-1: solo REPORTE de un código sin regla que todavía usa sus intentos propios (no pausa la parte). La huella y
+ * la muestra quedan para «Falla común» desde la primera vez.
+ */
+export function reportedBugHold(prev: BugHoldState | null, v: FailureVerdict, itemType: string | null | undefined, error: string, now: Date, buildId: string): BugHoldState {
+  return { ...nextBugHold(prev, v, itemType, error, 'unmapped_code', now, buildId), active: false, reportOnly: true };
+}
+
 /** Estado tras una reapertura (automática o humana): la pausa deja de estar vigente (el historial se conserva). */
 export function resumedBugHold(prev: BugHoldState, now: Date, by: string, trigger: BugHoldResumeTrigger | null): BugHoldState {
   const at = now.toISOString();
+  const automatic = trigger === 'new_build' || trigger === 'reclassified';
   return {
     ...prev,
     active: false,
@@ -183,13 +220,15 @@ export function resumedBugHold(prev: BugHoldState, now: Date, by: string, trigge
     resumedBy: by,
     resumeTrigger: trigger,
     buildResumes: prev.buildResumes + (trigger === 'new_build' ? 1 : 0),
+    autoResumes: Math.max(0, Math.floor(Number(prev.autoResumes ?? prev.buildResumes ?? 0)) || 0) + (automatic ? 1 : 0),
+    lastResumeAt: automatic ? at : prev.lastResumeAt ?? null,
     history: [...(prev.history ?? []), { at, event: 'resumed' as const, ...(trigger ? { trigger } : {}), by }].slice(-BUG_HOLD_HISTORY_MAX),
   };
 }
 
 export type BugHoldResumeDecision =
   | { resume: true; trigger: BugHoldResumeTrigger; strategy: RemediationStrategyId }
-  | { resume: false; reason: 'not_held' | 'still_unmapped' | 'waiting_fix' | 'build_resumes_exhausted' | 'paid_uncertain' | 'too_old' };
+  | { resume: false; reason: 'not_held' | 'still_unmapped' | 'waiting_fix' | 'build_resumes_exhausted' | 'paid_uncertain' | 'too_old' | 'cooldown' };
 
 export interface BugHoldResumeCtx {
   now: Date;
@@ -199,6 +238,8 @@ export interface BugHoldResumeCtx {
   /** Veredicto del error con el clasificador VIGENTE (lo calcula el caller con la fila). */
   verdict: FailureVerdict;
   itemType: string | null;
+  /** Tope de reaperturas automáticas (default bugHoldMaxResumes()). */
+  maxResumes?: number;
 }
 
 /**
@@ -211,34 +252,43 @@ export function bugHoldResumeDecision(row: { status: string; error: string | nul
   if (!hold) return { resume: false, reason: 'not_held' };
   const now = ctx.now.getTime();
   const s = remediationStrategyFor(ctx.verdict);
-  // 1) Reclasificado: el error YA tiene una estrategia automática con el código vigente (p. ej. se agregó la regla) o la
-  //    huella cambió (otra regla / otro código: el arreglo cambió la causa).
-  const fpNow = bugHoldFingerprint(ctx.verdict, ctx.itemType, String(row.error ?? ''));
-  if (hold.reason === 'unmapped_code' || hold.reason === 'product_bug' || hold.reason === 'config') {
-    if (!isCursiaIssueStrategy(s.strategy) && s.strategy !== 'owner_decision') return { resume: true, trigger: 'reclassified', strategy: s.strategy };
-  }
-  // Huella distinta con una estrategia automática (la causa cambió con el arreglo). Si sigue siendo un bug, no se gasta
-  // un intento: espera el arreglo (o el build nuevo).
-  if (fpNow !== hold.fingerprint && !ctx.verdict.unclassified && !isCursiaIssueStrategy(s.strategy) && s.strategy !== 'owner_decision') {
+  const max = ctx.maxResumes ?? bugHoldMaxResumes();
+  const autoUsed = Math.max(0, Math.floor(Number(hold.autoResumes ?? hold.buildResumes ?? 0)) || 0);
+  const lastAuto = hold.lastResumeAt ? Date.parse(hold.lastResumeAt) : NaN;
+  const cooling = Number.isFinite(lastAuto) && now - lastAuto < BUG_HOLD_RESUME_MIN_INTERVAL_SECONDS * 1000;
+  // Las reaperturas AUTOMÁTICAS (reclasificada / build nuevo) comparten tope y enfriamiento (review P2-2).
+  const automaticGate = (): BugHoldResumeDecision | null => {
+    if (hold.paidUncertain) return { resume: false, reason: 'paid_uncertain' };
+    if (autoUsed >= max) return { resume: false, reason: 'build_resumes_exhausted' };
+    if (now - Date.parse(hold.heldAt) > BUG_HOLD_MAX_AGE_DAYS * 86_400_000) return { resume: false, reason: 'too_old' };
+    if (cooling) return { resume: false, reason: 'cooldown' };
+    return null;
+  };
+  // 1) Reclasificada (review P2-2): SOLO si al pausar la estrategia era de bug de Cursia (hold.strategy) y con el código
+  //    vigente ya no lo es. Una parte pausada con una estrategia automática que se agotó no «se reclasifica» sola.
+  const heldAsBug = isCursiaIssueStrategy(String(hold.strategy) as RemediationStrategyId);
+  if (heldAsBug && !isCursiaIssueStrategy(s.strategy) && s.strategy !== 'owner_decision') {
+    const g = automaticGate();
+    if (g) return g;
     return { resume: true, trigger: 'reclassified', strategy: s.strategy };
   }
-  // 2) Desarrollo marcó la huella como resuelta después de la pausa.
+  // 2) Desarrollo marcó la huella como resuelta después de la pausa (una reapertura por marca: fuera del tope automático).
   const resolved = ctx.resolvedAt ? Date.parse(ctx.resolvedAt) : NaN;
   if (Number.isFinite(resolved) && resolved >= Date.parse(hold.heldAt)) return { resume: true, trigger: 'resolved', strategy: s.strategy };
   // 3) Build nuevo desde la pausa: UNA reapertura por build, acotada; nunca con pago incierto ni pasada la ventana.
   if (ctx.buildId && hold.buildId && ctx.buildId !== hold.buildId) {
-    if (hold.paidUncertain) return { resume: false, reason: 'paid_uncertain' };
-    if (hold.buildResumes >= BUG_HOLD_MAX_BUILD_RESUMES) return { resume: false, reason: 'build_resumes_exhausted' };
-    if (now - Date.parse(hold.heldAt) > BUG_HOLD_MAX_AGE_DAYS * 86_400_000) return { resume: false, reason: 'too_old' };
+    const g = automaticGate();
+    if (g) return g;
     return { resume: true, trigger: 'new_build', strategy: s.strategy };
   }
   return { resume: false, reason: hold.reason === 'unmapped_code' ? 'still_unmapped' : 'waiting_fix' };
 }
 
-export function bugHoldSince(env: Record<string, string | undefined> = process.env): Date {
+export function bugHoldSince(env: Record<string, string | undefined> = process.env, now: Date = new Date()): Date {
+  const rolling = new Date(now.getTime() - BUG_HOLD_DEFAULT_SINCE_DAYS * 86_400_000);
   const raw = String(env[BUG_HOLD_SINCE_ENV] ?? '').trim();
-  const d = raw ? new Date(raw) : new Date(BUG_HOLD_DEFAULT_SINCE);
-  return Number.isFinite(d.getTime()) ? d : new Date(BUG_HOLD_DEFAULT_SINCE);
+  const d = raw ? new Date(raw) : rolling;
+  return Number.isFinite(d.getTime()) ? d : rolling;
 }
 
 let cachedBuildId: string | null = null;
@@ -248,9 +298,19 @@ let cachedBuildId: string | null = null;
  * main.js y de los módulos de confiabilidad / generación). Cambia en cada deploy (el CI compila de nuevo). Cacheada.
  */
 export function currentBuildId(env: Record<string, string | undefined> = process.env): string {
-  const explicit = String(env.CURSIA_BUILD_ID ?? '').trim();
-  if (explicit) return explicit.slice(0, 64);
+  // Review: el SHA DESPLEGADO primero (CURSIA_BUILD_ID / DEPLOY_SHA / CFG_DEPLOY_SHA o el .release-sha que escribe
+  // scripts/ops/prod-release.sh); sin él, el hash de mtimes del build compilado.
+  for (const k of ['CURSIA_BUILD_ID', 'DEPLOY_SHA', 'CFG_DEPLOY_SHA']) {
+    const explicit = String(env[k] ?? '').trim();
+    if (explicit) return explicit.slice(0, 64);
+  }
   if (cachedBuildId) return cachedBuildId;
+  try {
+    const sha = fs.readFileSync(path.resolve(__dirname, '..', '..', '..', '.release-sha'), 'utf8').trim();
+    if (/^[0-9a-f]{7,40}$/.test(sha)) { cachedBuildId = sha.slice(0, 40); return cachedBuildId; }
+  } catch {
+    // sin .release-sha (staging / local): hash del build compilado.
+  }
   const h = crypto.createHash('sha256');
   try {
     const root = path.resolve(__dirname, '..', '..');

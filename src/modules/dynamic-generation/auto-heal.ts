@@ -59,6 +59,12 @@ export const DEFAULT_AUTO_HEAL_INTERVAL_MS = 60_000;
 export const AUTO_HEAL_MAX_AGE_ENV = 'DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS';
 /** Ventana de recencia: un fallo más viejo que esto nunca se reabre solo (run abandonado). */
 export const DEFAULT_AUTO_HEAL_MAX_AGE_HOURS = 24;
+/** r99 (decisión del dueño 3): ventana TOTAL de recuperación automática de la clase A antes de la pausa por bug. */
+export const DEFAULT_CLASS_A_TOTAL_HOURS = 6;
+/** Alerta previa: a los 2/3 de la ventana (6 h → 4 h; 72 h → 48 h como en r62). */
+export function classAAlertHoursFor(total: number): number {
+  return Math.round(total * 2 / 3 * 100) / 100;
+}
 /** Fix m3: rango admitido de la ventana (1 h … 7 días). */
 export const AUTO_HEAL_MAX_AGE_HOURS_RANGE = Object.freeze({ min: 1, max: 168 });
 /**
@@ -139,10 +145,12 @@ export const DEFAULT_AUTO_HEAL_POLICY: AutoHealPolicy = Object.freeze({
   regenMaxRounds: 2,
   regenBackoffSeconds: Object.freeze([30, 120]),
   jitterRatio: 0.2,
-  // r62 (d2): fase extendida de la clase A (15 min, 30 min, 1 h, 2 h y después cada 4 h) hasta 72 h, alerta a las 48 h.
+  // r62 (d2): fase extendida de la clase A (15 min, 30 min, 1 h, 2 h y después cada 4 h). r99 (decisión del dueño 3): la
+  // ventana TOTAL baja de 72 h a 6 h (alerta a las 4 h); después, pausa como bug de Cursia (reporte + reanudación con el
+  // arreglo). Env DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS la cambia sin tocar el código.
   extendedBackoffSeconds: Object.freeze([900, 1800, 3600, 7200, 14400]),
-  classATotalHours: 72,
-  classAAlertHours: 48,
+  classATotalHours: DEFAULT_CLASS_A_TOTAL_HOURS,
+  classAAlertHours: classAAlertHoursFor(DEFAULT_CLASS_A_TOTAL_HOURS),
 });
 
 /** r62 (d2): tope de rondas del SQL del barrido cuando la política tiene fase extendida (lo acota el tiempo total). */
@@ -172,6 +180,8 @@ export function autoHealFirstAt(os: Record<string, any>, failedAt: Date | null):
 }
 
 export const AUTO_HEAL_POLICY_ENV = 'DYNAMIC_AUTO_HEAL_POLICY';
+/** r99: ventana total de la clase A (horas), decisión del dueño pendiente. Default DEFAULT_AUTO_HEAL_POLICY.classATotalHours (72). */
+export const AUTO_HEAL_CLASS_A_TOTAL_HOURS_ENV = 'DYNAMIC_AUTO_HEAL_CLASS_A_TOTAL_HOURS';
 
 /** Fila mínima que evalúa la política (generation_item_runs). */
 export interface AutoHealRow {
@@ -710,6 +720,13 @@ export function autoHealPolicyFromEnv(env: Record<string, string | undefined> = 
   const maxAgeHours = Number.isFinite(raw) && raw > 0 ? Math.min(max, Math.max(min, raw)) : DEFAULT_AUTO_HEAL_MAX_AGE_HOURS;
   // REL MVP: kill-switch de la política por clase → R16 tal cual.
   const base = String(env[AUTO_HEAL_POLICY_ENV] ?? '').trim().toLowerCase() === 'legacy' ? LEGACY_AUTO_HEAL_POLICY : DEFAULT_AUTO_HEAL_POLICY;
+  // r99: decisión del dueño pendiente (ventana TOTAL de la clase A antes de la pausa por bug, default 72 h): un env, sin
+  // tocar el código. Rango 1…168 h; la alerta queda 24 h antes (o a la mitad si la ventana es corta).
+  const totalRaw = String(env[AUTO_HEAL_CLASS_A_TOTAL_HOURS_ENV] ?? '').trim();
+  const total = Number(totalRaw);
+  if (base.classAware && totalRaw !== '' && Number.isFinite(total) && total >= 1 && total <= 168) {
+    return { ...base, maxAgeHours, classATotalHours: total, classAAlertHours: classAAlertHoursFor(total) };
+  }
   return { ...base, maxAgeHours };
 }
 

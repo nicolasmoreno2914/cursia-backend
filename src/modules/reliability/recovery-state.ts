@@ -33,6 +33,8 @@ import { providerProbeViewOf } from './provider-probe';
 import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
 import { REMEDIATION_EXHAUSTED_CODE, remediationBlocksAuto, remediationOf } from './remediation-ladder';
 import { CURSIA_ISSUE_STATE, bugHoldOf } from './bug-hold';
+// r99 (review P2-1): la reapertura única de una parte de IA en revisión (12 min) también es una recuperación automática.
+import { llmReviewReopenDecision, llmReviewReopenDelaySeconds } from '../dynamic-generation/llm-pending-review-reopen';
 
 export type RecoveryState =
   | 'completed'
@@ -125,6 +127,7 @@ export function scheduledRetryAtOf(row: RecoveryRow, now: Date = new Date()): Da
   add(providerReconcileDecision(r as any, now, policy) as any);
   const probe = providerProbeViewOf(r as any, now, autoRecoveryEnabled(process.env));
   if (probe) times.push(probe.nextProbeAt);
+  if (autoRecoveryEnabled(process.env)) add(llmReviewReopenDecision(r as any, now, { maxAgeHours: policy.maxAgeHours, delaySeconds: llmReviewReopenDelaySeconds() }) as any);
   if (!times.length) return null;
   return new Date(Math.min(...times.map((t) => t.getTime())));
 }
@@ -177,6 +180,11 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
   if (youtubeQuotaWait(os, now) && attention !== 'unrecoverable') return { state: 'waiting_external_quota', reason: 'youtube_quota', nextRetryAt: iso(at), automatic: !!at };
   // Pago incierto: la conciliación (el reenvío único acotado de audio o la del proveedor, con el peor caso dentro de lo
   // autorizado) decide ANTES de cualquier llamada nueva; ninguna ronda del auto-heal la toca.
+  // r99 (review P2-1): parte de IA en revisión con su reapertura única pendiente (la toma autoReopenLlmPendingReview).
+  if (autoRecoveryEnabled(process.env) && error.startsWith('llm_pending_review')) {
+    const d = llmReviewReopenDecision(row as any, now, { maxAgeHours: autoHealPolicyFromEnv(process.env).maxAgeHours, delaySeconds: llmReviewReopenDelaySeconds() });
+    if (d.heal === true || (d.heal === false && d.reason === 'backoff')) return { state: 'pending_retry', reason: 'llm_pending_review_reopen', nextRetryAt: iso(at), automatic: true };
+  }
   if (cur === 'provider_reconcile' || cur === 'ambiguous_audio_resubmit') {
     return { state: 'waiting_financial_reconciliation', reason: cur, nextRetryAt: iso(at), automatic: true };
   }

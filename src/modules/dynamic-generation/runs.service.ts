@@ -242,6 +242,27 @@ import { remediationStrategyFor } from '../reliability/remediation-strategies';
 
 /** r99: estrategia registrada en el log de intentos al reanudar una pausa por bug de Cursia. */
 export const CURSIA_ISSUE_RESUME_STRATEGY = 'cursia_issue_resume';
+/** r99 (decisión del dueño 1): reapertura sola cuando la decisión del dueño que frenaba la parte cambió. */
+export const OWNER_DECISION_RESUME_STRATEGY = 'owner_decision_resume';
+export type OwnerDecisionCause = 'run_budget' | 'user_budget' | 'account_access' | 'platform_freeze';
+/** Motivos de pausa del RUN por su presupuesto (los pone el sistema; los reanuda una autorización nueva). */
+export const RUN_BUDGET_PAUSE_REASONS: readonly string[] = Object.freeze(['run_budget_cap', 'run_budget_not_authorized']);
+/** Filtro GRUESO (POSIX, case-insensitive) de los errores de una decisión del dueño; la decisión fina es ownerDecisionCauseOf. */
+export const OWNER_DECISION_ERROR_SQL_REGEX =
+  '^(unexpected_error: )?(budget_exceeded|budget_approval_required|budget_blocked|run_budget_not_authorized|user_budget_insufficient|user_budget_not_assigned|generation_suspended|account_suspended|platform_generation_frozen|tu presupuesto disponible no alcanza|todav[ií]a no tienes presupuesto asignado|tus generaciones est[aá]n suspendidas|tu cuenta est[aá] suspendida|las generaciones nuevas est[aá]n pausadas)';
+
+function extractFailureCodeOf(error: string): string {
+  return classifyFailure({ error, outputSummary: {} }).code;
+}
+
+/** r99: ¿qué decisión del dueño frena esta parte? (null = otra causa). */
+export function ownerDecisionCauseOf(error: string, type: string | null | undefined): OwnerDecisionCause | null {
+  const v = classifyFailure({ error, itemType: type ?? null, outputSummary: {}, source: sourceOfItemType(type) });
+  if (v.rule === 'budget') return 'run_budget';
+  if (v.rule === 'user_budget_denied') return 'user_budget';
+  if (v.rule === 'generation_access_denied') return v.code === 'platform_generation_frozen' ? 'platform_freeze' : 'account_access';
+  return null;
+}
 
 function sourceOfItemType(type: string | null | undefined): FailureSource {
   return type === 'video' ? 'video_worker' : type === 'presentation' || type === 'audio_welcome' || type === 'audiobook_chapter' ? 'provider_worker' : 'browser_executor';
@@ -2750,6 +2771,12 @@ export class RunsService {
        * (reclasificada / huella resuelta / build nuevo). Re-evaluada bajo lock con bugHoldResumeDecision; nunca reenvía.
        */
       bugResume?: { trigger: BugHoldResumeTrigger; resolvedAt?: string | null; buildId: string };
+      /**
+       * r99 (decisión del dueño 1): la DECISIÓN que frenaba la parte cambió (un SuperAdmin aprobó / amplió el presupuesto del
+       * run, se asignó o amplió el presupuesto del usuario, se levantó la suspensión o la congelación) DESPUÉS del fallo →
+       * reapertura sola. `eventAt` = la decisión; idempotente (una reapertura por decisión). Nunca reenvía.
+       */
+      ownerDecisionResume?: { eventAt: string; cause: OwnerDecisionCause };
     },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
@@ -2782,6 +2809,10 @@ export class RunsService {
     // r83: la reapertura de una parte de IA en revisión nunca reenvía a un proveedor pagado ni se combina con otro modo.
     if (auto?.llmPendingReview && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.spendControlResume || auto.providerReconcile || auto.dependencyResolved || auto.budgetExtension)) {
       throw new BadRequestException('auto-heal: la reapertura de una parte de IA en revisión nunca reenvía ni se combina con otro modo automático');
+    }
+    if (auto?.ownerDecisionResume && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.providerReconcile || auto.spendControlResume
+      || auto.dependencyResolved || auto.budgetExtension || auto.llmPendingReview || auto.bugResume)) {
+      throw new BadRequestException('auto-heal: la reanudación tras una decisión del dueño nunca reenvía ni se combina con otro modo automático');
     }
     if (auto?.bugResume && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.providerReconcile || auto.spendControlResume
       || auto.dependencyResolved || auto.budgetExtension || auto.llmPendingReview)) {
@@ -2838,7 +2869,7 @@ export class RunsService {
         [job.id],
       );
     const preTarget = preRows.find((i) => i.item_key === itemKey);
-    if (auto && preTarget?.status !== 'failed') {
+    if (auto && preTarget?.status !== 'failed' && !(auto.ownerDecisionResume && preTarget && isBudgetBlocked(preTarget))) {
       throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" no está failed`, code: 'auto_heal_not_eligible' });
     }
     let uploadPhaseRetry = false;
@@ -2992,7 +3023,7 @@ export class RunsService {
           code: v.reason, ownerRetry: v,
           message: `${v.reason}: el reintento de "${itemKey}" no se hizo (no se cambió nada).` +
             // r99 (review P2-7): el motivo dice lo que pasa de verdad (cuándo vuelve el reintento; Cursia sigue sola).
-            (v.reason === 'owner_retry_limit' ? ` Ya usaste los reintentos de esta parte en las últimas 24 h${v.nextAvailableAt ? ` (vuelven a estar disponibles el ${v.nextAvailableAt})` : ''}. No tienes que hacer nada: Cursia sigue recuperándola sola.`
+            (v.reason === 'owner_retry_limit' ? ` Ya usaste los reintentos de esta parte en las últimas 24 h${v.nextAvailableAt ? ` (vuelven a estar disponibles el ${v.nextAvailableAt})` : ''}.${autoResolving ? ' Cursia la sigue recuperando sola; no tienes que hacer nada.' : ''}`
               : v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached' ? ' El saldo autorizado no cubre el costo máximo de esta parte: hace falta ampliar la autorización.'
                 : v.reason === 'open_reservations' ? ' Hay un cobro de esta parte pendiente de confirmar; Cursia lo concilia antes de reintentar.'
                   // r98: si un barrido automático (conciliación con el proveedor / reenvío único acotado) la va a tomar, se dice.
@@ -3079,6 +3110,17 @@ export class RunsService {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (claim_payload: ${d.action})`, code: 'auto_heal_not_eligible', reason: d.action });
         }
         autoMeta = { round: 0, code: d.code, strategy: CLAIM_PAYLOAD_RESUME_STRATEGY };
+      } else if (auto && auto.ownerDecisionResume) {
+        // r99 (decisión 1): bajo lock — sigue frenada por una decisión del dueño, y ESTA decisión es posterior al fallo y no
+        // se usó antes (dos aprobaciones / barridos concurrentes reabren una sola vez).
+        const cause = ownerDecisionCauseOf(String(target.error ?? ''), target.type);
+        const failedAt = new Date((target.finished_at ?? target.updated_at ?? 0) as any).getTime();
+        const used = target.output_summary?.ownerDecisionResume?.eventAt ? Date.parse(String(target.output_summary.ownerDecisionResume.eventAt)) : NaN;
+        const ev = Date.parse(auto.ownerDecisionResume.eventAt);
+        if (!cause || cause !== auto.ownerDecisionResume.cause || !(ev > failedAt) || (Number.isFinite(used) && !(ev > used))) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (owner_decision: ${!cause ? 'not_held' : 'stale_event'})`, code: 'auto_heal_not_eligible' });
+        }
+        autoMeta = { round: 1, code: extractFailureCodeOf(String(target.error ?? '')), strategy: `${OWNER_DECISION_RESUME_STRATEGY}:${cause}` };
       } else if (auto && auto.bugResume) {
         // r99: misma decisión que el barrido con la fila bloqueada (sigue en pausa con el MISMO error y el disparador vale).
         const d = bugHoldResumeDecision(target, {
@@ -3287,6 +3329,8 @@ export class RunsService {
       const entryExtra = autoMeta && auto?.providerReconcile
         ? { auto: true, providerReconcile: true, providerReconcileKind: auto.providerReconcile.kind, providerReconcileAction: auto.providerReconcile.action,
             providerReconcileRound: autoMeta.round, possibleDuplicate: auto.providerReconcile.ambiguous, autoHealCode: autoMeta.code }
+        : autoMeta && auto?.ownerDecisionResume
+        ? { auto: true, ownerDecisionResume: auto.ownerDecisionResume.cause, autoHealCode: autoMeta.code, actor: 'system' }
         : autoMeta && auto?.bugResume
         ? { auto: true, cursiaIssueResume: auto.bugResume.trigger, autoHealCode: autoMeta.code, autoHealStrategy: autoMeta.strategy, actor: 'system' }
         : autoMeta && auto?.dependencyResolved
@@ -3312,6 +3356,9 @@ export class RunsService {
         // Un reenvío es un job NUEVO: el re-poll gratis del auto-healer vuelve a empezar (repoll conserva sus rondas).
         ? { [PROVIDER_RECONCILE_KEY]: auto.providerReconcile.state,
             ...(auto.providerReconcile.action === 'resubmit' ? { autoHeal: { rounds: 0, regenRounds: autoRegenRoundsOf(target.output_summary), lastAt: nowIso, resetBy: PROVIDER_RECONCILE_CODE } } : {}) }
+        : autoMeta && auto?.ownerDecisionResume
+        ? { ownerDecisionResume: { eventAt: auto.ownerDecisionResume.eventAt, cause: auto.ownerDecisionResume.cause, at: nowIso,
+            count: Math.max(0, Math.floor(Number(target.output_summary?.ownerDecisionResume?.count ?? 0)) || 0) + 1 } }
         : autoMeta && auto?.dependencyResolved
         ? { claimPayloadRecovery: { ...(target.output_summary?.claimPayloadRecovery ?? {}),
             reopens: Math.max(0, Math.floor(Number(target.output_summary?.claimPayloadRecovery?.reopens ?? 0)) || 0) + 1, lastAt: nowIso, lastCode: autoMeta.code } }
@@ -3363,18 +3410,24 @@ export class RunsService {
       // puede recuperar. Las reaperturas automáticas (auto-heal) NO lo reinician: siguen dentro del mismo presupuesto.
       // r65 (R4): la ÚNICA excepción automática es la ronda extra por tope de la parte (marcada, una vez, con el saldo del
       // run cubriendo su peor caso). El tope y la autorización del RUN nunca se reinician.
+      // r99 (review P1-2): la reanudación de una pausa por bug (≤ R99_BUG_HOLD_MAX_RESUMES por parte, con enfriamiento)
+      // también renueva el presupuesto de la PARTE —si no, una parte pausada por su tope vuelve a chocar con él sin llamar—;
+      // el tope y la autorización del run siguen mandando en cada llamada.
       // r67 fix round 1 (F2): un reintento HUMANO (dueño / admin) de una parte con la escalera agotada reinicia la
       // escalera SOLO de los segmentos agotados (registro: quién, cuándo y la escalera anterior). Los segmentos aceptados
       // (audioSegments) y los originales en cuarentena se conservan: el reintento no repaga nada de lo aceptado.
       let r67LadderReset: Record<string, any> | null = null;
-      if (!auto && /^AUDIO_STRATEGIES_EXHAUSTED\b/.test(String(target.error ?? '')) && target.output_summary?.audioRetryStrategy
+      // r99 (review P1-2): la reanudación de una pausa por bug también reinicia la escalera de los segmentos agotados (si no,
+      // el worker vuelve a fallar AUDIO_STRATEGIES_EXHAUSTED sin llamar: una reapertura que no cambia nada).
+      if ((!auto || auto.bugResume) && /^AUDIO_STRATEGIES_EXHAUSTED\b/.test(String(target.error ?? '')) && target.output_summary?.audioRetryStrategy
         && typeof target.output_summary.audioRetryStrategy === 'object') {
         const ladder: Record<string, any> = { ...target.output_summary.audioRetryStrategy };
         const resets: any[] = Array.isArray(target.output_summary.audioLadderResets) ? [...target.output_summary.audioLadderResets] : [];
         const at = new Date().toISOString();
         for (const [segKey, st] of Object.entries(ladder)) {
           if (!st || (st as any).exhausted !== true) continue;
-          resets.push({ at, by: String(actor?.email ?? actorId), actor: isSuperAdminEmail(actor?.email) ? 'admin' : 'owner', segKey, previous: st });
+          resets.push({ at, by: auto ? 'system' : String(actor?.email ?? actorId), actor: auto ? 'system' : isSuperAdminEmail(actor?.email) ? 'admin' : 'owner', segKey, previous: st,
+            ...(auto?.bugResume ? { trigger: auto.bugResume.trigger } : {}) });
           delete ladder[segKey];
         }
         r67LadderReset = { audioRetryStrategy: ladder, audioLadderResets: resets.slice(-20) };
@@ -3397,7 +3450,7 @@ export class RunsService {
               set status = 'pending',
                   max_attempts = attempt_count + $2::int,
                   -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
-                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto && !auto.budgetExtension ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
+                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto && !auto.budgetExtension && !auto.bugResume ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
                     || case when $5::boolean then jsonb_build_object('${LOST_RESULT_RESEND_KEY}', jsonb_build_object('at', now(), 'afterAttempt', attempt_count, 'cause', 'lost_result') || $6::jsonb)
                             else '{}'::jsonb end,
                   error = null,
@@ -3419,11 +3472,12 @@ export class RunsService {
       await recordItemReopened(qr, target.id, {
         // r62 (regla 5): todo REENVÍO automático a un proveedor queda con actor `system` y su motivo (strategy); la
         // conciliación de proveedor (N2) también la decide el sistema.
-        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved || auto?.budgetExtension || auto?.llmPendingReview || auto?.bugResume ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
+        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved || auto?.budgetExtension || auto?.llmPendingReview || auto?.bugResume || auto?.ownerDecisionResume ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
         // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
         strategy: auto?.providerReconcile ? `${PROVIDER_RECONCILE_CODE}_${auto.providerReconcile.action}:${auto.providerReconcile.kind}`
           : auto?.dependencyResolved ? CLAIM_PAYLOAD_RESUME_STRATEGY
           : auto?.bugResume ? `${CURSIA_ISSUE_RESUME_STRATEGY}:${auto.bugResume.trigger}`
+          : auto?.ownerDecisionResume ? `${OWNER_DECISION_RESUME_STRATEGY}:${auto.ownerDecisionResume.cause}`
           : auto?.budgetExtension ? AUTO_BUDGET_EXTENSION_STRATEGY
           : auto?.llmPendingReview ? LLM_REVIEW_REOPEN_STRATEGY
           : auto?.spendControlResume ? `${SPEND_CONTROL_RESUME_STRATEGY}:${autoMeta?.code ?? ''}`.slice(0, 64)
@@ -3612,6 +3666,134 @@ export class RunsService {
   }
 
   /**
+   * r99 (decisión del dueño 1, reemplaza D-21 «aprobar no relanza nada») — reanudación SOLA cuando cambia la decisión que
+   * frenaba la generación. Sobre la ejecución VIGENTE de cada curso (runs desde R99_BUG_HOLD_SINCE):
+   *  A) run pausado por el SISTEMA por su presupuesto (run_budget_cap / run_budget_not_authorized) con una autorización
+   *     nueva (no BLOCKED) posterior a la pausa → resumeRun (sus propios guards: si no alcanza, 409 y se anota).
+   *  B) parte failed / bloqueada por presupuesto del run, presupuesto del usuario, suspensión o congelación con una
+   *     decisión POSTERIOR al fallo (autorización del run, user_budgets del que paga, suspensión levantada, congelación
+   *     apagada) → retryItem(auto.ownerDecisionResume): mismos locks y guards de FinOps; una reapertura por decisión.
+   * Nunca reenvía a un proveedor pagado; nada se gasta acá (lo deciden los guards de cada llamada).
+   */
+  async autoResumeOwnerDecisionHolds(
+    opts: { now?: Date; limit?: number; policy?: AutoHealPolicy } = {},
+  ): Promise<{ resumedRuns: string[]; reopened: Array<{ runId: string; itemKey: string; cause: string }>; skipped: Array<{ runId: string; itemKey?: string; reason: string }> }> {
+    const now = opts.now ?? new Date();
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const out = { resumedRuns: [] as string[], reopened: [] as Array<{ runId: string; itemKey: string; cause: string }>, skipped: [] as Array<{ runId: string; itemKey?: string; reason: string }> };
+    const since = bugHoldSince(process.env).toISOString();
+    const hasTable = async (t: string) => {
+      const [x] = await this.dataSource.query(`select to_regclass($1) is not null as ok`, [`public.${t}`]).catch(() => [{ ok: false }]);
+      return !!x?.ok;
+    };
+    const auths = await hasTable('cost_budget_authorizations');
+    // ── A) runs pausados por su presupuesto ──
+    if (auths) {
+      const paused: any[] = await this.dataSource.query(
+        `select pj.id, pj.course_id, pj.owner_id, b.blueprint_number, pj.output_summary->'pause' as pause, a.created_at as auth_at
+           from public.production_jobs pj
+           join public.course_generation_manifests m on m.id = (pj.input_payload->>'manifestId')::bigint
+           join public.course_blueprints b on b.id = m.blueprint_id
+           join lateral (select created_at from public.cost_budget_authorizations ca where ca.run_id = pj.id and ca.decision <> 'BLOCKED'
+                           order by created_at desc, id desc limit 1) a on true
+          where pj.execution_mode = 'dynamic_generation' and pj.worker_status = 'paused' and pj.created_at >= $1::timestamptz
+            and (pj.output_summary->'pause'->>'reason') = any($2::text[])
+            and a.created_at > coalesce((pj.output_summary->'pause'->>'autoResumeCheckedAt')::timestamptz, (pj.output_summary->'pause'->>'pausedAt')::timestamptz, pj.updated_at)
+          order by a.created_at desc
+          limit $3`,
+        [since, [...RUN_BUDGET_PAUSE_REASONS], limit],
+      );
+      for (const r of paused) {
+        try {
+          await this.resumeRun(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.id));
+          await this.dataSource.query(
+            `update public.production_jobs set output_summary = jsonb_set(output_summary, '{pause,autoResumedBy}', to_jsonb($2::text), true) where id = $1`,
+            [r.id, `${OWNER_DECISION_RESUME_STRATEGY}:run_budget`],
+          );
+          out.resumedRuns.push(String(r.id));
+          this.logger.warn(`owner-decision: run ${r.id} reanudado solo tras una autorización nueva del presupuesto`);
+        } catch (err) {
+          const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+          out.skipped.push({ runId: String(r.id), reason: String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80) });
+        }
+        // La autorización ya se evaluó (alcance o no): no se vuelve a mirar hasta que haya una más nueva.
+        await this.dataSource.query(
+          `update public.production_jobs set output_summary = jsonb_set(output_summary, '{pause,autoResumeCheckedAt}', to_jsonb($2::text), true)
+            where id = $1 and jsonb_typeof(output_summary->'pause') = 'object'`,
+          [r.id, new Date(r.auth_at).toISOString()],
+        ).catch(() => undefined);
+      }
+    }
+    // ── B) partes frenadas por una decisión del dueño ──
+    const rows: any[] = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
+              pj.course_id, pj.owner_id, coalesce(nullif(pj.input_payload->>'startedBy', ''), pj.owner_id::text) as payer_id, b.blueprint_number
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation' and pj.created_at >= $1::timestamptz
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview', 'paused')
+          and g.status in ('failed', 'blocked')
+          and ${latestGenerationPredicate('g')}
+          and g.error ~* $2
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id::text = pj.course_id::text and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+        order by g.finished_at desc nulls last, g.id
+        limit $3`,
+      [since, OWNER_DECISION_ERROR_SQL_REGEX, limit],
+    );
+    const tables = { user_budgets: await hasTable('user_budgets'), user_suspensions: await hasTable('user_suspensions'), platform_controls: await hasTable('platform_controls') };
+    for (const r of rows) {
+      const cause = ownerDecisionCauseOf(String(r.error ?? ''), r.type);
+      if (!cause) continue;
+      if (r.status === 'blocked' && !isBudgetBlocked(r)) continue;
+      let eventAt: Date | null = null;
+      const max = async (sql: string, params: any[]) => { const [x] = await this.dataSource.query(sql, params); return x?.at ? new Date(x.at) : null; };
+      if (cause === 'run_budget' && auths) {
+        eventAt = await max(`select max(created_at) as at from public.cost_budget_authorizations where run_id = $1 and decision <> 'BLOCKED'`, [r.job_id]);
+      } else if (cause === 'user_budget' && tables.user_budgets) {
+        eventAt = await max(`select max(created_at) as at from public.user_budgets where user_id::text = $1::text`, [r.payer_id]);
+      } else if (cause === 'account_access' && tables.user_suspensions) {
+        // Solo si YA no queda ninguna suspensión vigente del que paga.
+        const [act] = await this.dataSource.query(`select count(*)::int as n from public.user_suspensions where user_id::text = $1::text and lifted_at is null`, [r.payer_id]);
+        if (!act || Number(act.n) === 0) eventAt = await max(`select max(lifted_at) as at from public.user_suspensions where user_id::text = $1::text`, [r.payer_id]);
+      } else if (cause === 'platform_freeze' && tables.platform_controls) {
+        eventAt = await max(`select max(updated_at) as at from public.platform_controls where key = 'generation_freeze' and enabled = false`, []);
+      }
+      const failedAt = new Date(r.finished_at ?? r.updated_at ?? 0);
+      const used = r.output_summary?.ownerDecisionResume?.eventAt ? new Date(String(r.output_summary.ownerDecisionResume.eventAt)) : null;
+      if (!eventAt || !(eventAt.getTime() > failedAt.getTime()) || (used && !(eventAt.getTime() > used.getTime()))) {
+        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'no_new_decision' });
+        continue;
+      }
+      try {
+        await this.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.job_id), String(r.item_key), false, false,
+          { policy, now, ownerDecisionResume: { eventAt: eventAt.toISOString(), cause } });
+        out.reopened.push({ runId: r.job_id, itemKey: r.item_key, cause });
+        this.logger.warn(`owner-decision: ${r.item_key} (run ${r.job_id}) reabierta sola (${cause}: decisión ${eventAt.toISOString()})`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80) });
+        // La decisión ya se evaluó: no se reintenta en cada tick (una más nueva sí).
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('ownerDecisionResume',
+                    coalesce(output_summary->'ownerDecisionResume', '{}'::jsonb) || jsonb_build_object('eventAt', $2::text, 'declined', $3::text)),
+                  updated_at = now()
+            where id = $1 and status in ('failed', 'blocked')`,
+          [r.id, eventAt.toISOString(), String((resp && typeof resp === 'object' && (resp as any).code) || 'error').slice(0, 80)],
+        ).catch(() => undefined);
+      }
+    }
+    return out;
+  }
+
+  /**
    * r99 — barrido de PAUSAS COMO BUG DE CURSIA (bug-hold.ts). Lo corre el tick del auto-healer (solo la API; el primero
    * después de arrancar = después de cada deploy). Dos pasadas, acotadas, sobre la ejecución VIGENTE de cada curso
    * (no cancelados ni completos; la pasada A solo en runs desde R99_BUG_HOLD_SINCE):
@@ -3685,7 +3867,7 @@ export class RunsService {
       const ok = returningRows(await this.dataSource.query(
         `update public.generation_item_runs
             set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb),
-                next_retry_at = null
+                next_retry_at = null, updated_at = now()
           where id = $1 and status = 'failed' and error is not distinct from $3::text
           returning id`,
         [r.id, JSON.stringify(state), r.error],
@@ -3738,7 +3920,8 @@ export class RunsService {
         await this.dataSource.query(
           `update public.generation_item_runs
               set output_summary = jsonb_set(output_summary, '{${BUG_HOLD_KEY}}',
-                    (output_summary->'${BUG_HOLD_KEY}') || jsonb_build_object('skipUntilMs', $2::bigint, 'lastSkipReason', $3::text), true)
+                    (output_summary->'${BUG_HOLD_KEY}') || jsonb_build_object('skipUntilMs', $2::bigint, 'lastSkipReason', $3::text), true),
+                  updated_at = now()
             where id = $1 and status = 'failed' and jsonb_typeof(output_summary->'${BUG_HOLD_KEY}') = 'object'`,
           [r.id, now.getTime() + BUG_HOLD_RESUME_COOLDOWN_SECONDS * 1000, code],
         ).catch((e) => this.logger.warn(`cursia-issue: no se pudo registrar el enfriamiento de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));

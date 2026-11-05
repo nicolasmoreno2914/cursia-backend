@@ -376,7 +376,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
   },
   // r75 (02 §E.5): presupuesto por usuario del iniciador. Nada se reservó ni se llamó (0 gasto). No se reintenta sola:
-  // hace falta que el SuperAdmin apruebe presupuesto («Solicitar autorización»); aprobar NO relanza nada (D-21).
+  // hace falta que el SuperAdmin apruebe presupuesto («Solicitar autorización»). r99 (decisión del dueño 1, reemplaza D-21):
+  // al aprobarlo / ampliarlo la parte se reabre SOLA (RunsService.autoResumeOwnerDecisionHolds), con los guards de FinOps.
   {
     id: 'user_budget_denied', codes: ['user_budget_insufficient', 'user_budget_not_assigned'],
     class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget',
@@ -398,7 +399,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       // r98: Language QA del guion del audiolibro (audio-scripts.ts). Antes sin regla → D «unclassified» con riesgo de pago
       // incierto, y el worker lo marcaba reintentable: 6 reintentos idénticos en prod (run 4c6a9f71). Es una validación de
       // CONTENIDO (determinista dado el mismo prompt): B + escalera de remediación (reliability/remediation-ladder.ts).
-      'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'],
+      'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL',
+      // r99 (review P1-1): excepción JS del ejecutor al leer una salida de la IA con forma inesperada → regenerar con el
+      // hallazgo en el prompt (antes: sin regla → «unclassified» → pausa al primer fallo).
+      'browser_output_exception'],
     family: /^(GIFT|BS|TEXT|DIAGRAM)_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', rounds: 2,
   },
@@ -818,6 +822,11 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^Respuesta ilegible de la API\b/i, 'llm_empty_response'],
   [/^Generaci[oó]n detenida por el usuario\b/i, 'user_stopped'],
   [/^(fetch failed|network error|socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN)\b/i, 'llm_network'],
+  // r99 (review P1-1): excepciones CRUDAS del navegador que el ejecutor trata como transitorias (_dynMapApiError: sin
+  // `.fatal` → retryable). Red / timeout / abort → A (llm_network, backoff). Salida de la IA con forma inesperada
+  // (JSON.parse, TypeError sobre la respuesta) → B (browser_output_exception: el próximo intento lleva el hallazgo).
+  [/^(?:TypeError:\s*)?(?:Failed to fetch|Load failed|NetworkError when attempting to fetch resource|Network request failed|Request timeout|Request timed out|The operation was aborted|The user aborted a request|signal is aborted|AbortError|TimeoutError|The operation timed out|net::ERR_[A-Z_]+)/i, 'llm_network'],
+  [/^(?:SyntaxError:\s*|TypeError:\s*)?(?:Unexpected token\b|Unexpected end of JSON|Unexpected non-whitespace character after JSON|JSON\.parse:|Bad control character in string literal|Expected (?:property name|',' or '[}\]]')|Unterminated string in JSON|Cannot read propert(?:y|ies) of (?:undefined|null)|Cannot convert undefined or null to object|undefined is not an object|null is not an object|[\w$.\[\]'"]+ is not (?:a function|iterable|an object)|[\w$.]+ is undefined\b|[\w$.]+ is null\b)/, 'browser_output_exception'],
 ];
 
 /** Código de un mensaje en texto libre sin código reconocible (siempre sin regla → D retenido). */

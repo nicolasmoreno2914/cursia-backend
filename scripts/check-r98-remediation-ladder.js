@@ -346,7 +346,8 @@ function fakeQr(row) {
     eq(SCH.completionQualityPatch(acc, 'valid', 'experience', { quality: q }).quality.warnings.length, 1, 'aceptación nueva reemplaza');
   });
   await check('P1-1 D hold_for_human y sin clasificar NO entran a la escalera (sin feedback, sin intento extra, sin «Falla común» por colapso de huellas)', async () => {
-    for (const [err, t, src] of [['algo raro pasó en el navegador', 'content', 'browser_executor'], ['TypeError: x is undefined', 'content', 'browser_executor'],
+    // r99 (review P1-1): «TypeError: x is undefined» ya NO es «sin clasificar»: es B browser_output_exception (ver check-r99).
+    for (const [err, t, src] of [['algo raro pasó en el navegador', 'content', 'browser_executor'], ['kaboom: algo inesperado del worker', 'content', 'browser_executor'],
       ['EXAM_BANK_LEAF_CAPACITY: no hay texto suficiente', 'exam', 'provider_worker'], ['llm_output_cut_repeated: la salida se cortó dos veces', 'content', 'provider_worker'],
       ['claim_payload_unavailable: PEDAGOGY_DIRECTIVE_UNKNOWN', 'content', 'browser_executor']]) {
       const v = FC.classifyFailure({ error: err, itemType: t, source: src, outputSummary: {} });
@@ -474,7 +475,7 @@ function fakeQr(row) {
     const svc = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/admin-recovery.service.ts'), 'utf8');
     assert(/to_regclass\('public\.admin_audit_log'\)/.test(svc) && /resolved: false, resolvedAt: null, message:/.test(svc), 'sin la tabla: 200 con motivo');
     // P2-2: consulta acotada por updated_at y needs-attention con la señal cacheada.
-    assert(/where g\.updated_at >= \$1::timestamptz/.test(svc) && /listCommonFailuresCached\(\)/.test(svc), 'consulta acotada + caché');
+    assert(/where \(g\.updated_at >= \$1::timestamptz or \(g\.output_summary->'bugHold'->>'active'\) = 'true'\)/.test(svc) && /listCommonFailuresCached\(\)/.test(svc), 'consulta acotada (las pausas vigentes siempre) + caché');
   });
 
   // ── K: tope del gasto ───────────────────────────────────────────────────────

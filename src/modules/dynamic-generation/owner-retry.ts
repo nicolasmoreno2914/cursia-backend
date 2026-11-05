@@ -13,6 +13,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { FailureVerdict, classifyFailure, extractFailureCode } from '../reliability/failure-classifier';
 import { remediationBlocksAuto } from '../reliability/remediation-ladder';
+import { bugHoldOf } from '../reliability/bug-hold';
 
 /** r65: reintentos del dueño por parte en la ventana. */
 export const OWNER_RETRY_MAX = 2;
@@ -105,11 +106,13 @@ function sourceOfType(type: string | null | undefined): 'video_worker' | 'provid
 }
 
 /** r65: veredicto del clasificador para la fila (la clase REGISTRADA gana: solo puede ser más severa). */
-export function itemFailureVerdict(r: { error?: string | null; type?: string | null; output_summary?: Record<string, any> | null; failure_class?: string | null; failure_code?: string | null }): FailureVerdict & { recordedClass: string | null; remediationExhausted?: boolean } {
+export function itemFailureVerdict(r: { error?: string | null; type?: string | null; output_summary?: Record<string, any> | null; failure_class?: string | null; failure_code?: string | null }): FailureVerdict & { recordedClass: string | null; remediationExhausted?: boolean; cursiaIssue?: boolean } {
   const v = classifyFailure({ error: String(r.error ?? ''), itemType: r.type ?? null, outputSummary: r.output_summary ?? {}, source: sourceOfType(r.type) });
   // r98: escalera agotada con este error (fallo determinista, sin dinero en el aire) → el dueño puede reintentar.
   const remediationExhausted = remediationBlocksAuto(r.output_summary ?? {}, r.error ?? '');
-  return { ...v, recordedClass: r.failure_class ? String(r.failure_class) : null, ...(remediationExhausted ? { remediationExhausted: true } : {}) };
+  // r99 (review P1-2): parte en pausa como bug de Cursia → el dueño PUEDE reintentarla (opcional), con los guards de dinero.
+  const cursiaIssue = !!bugHoldOf(r.output_summary ?? {}, r.error ?? '');
+  return { ...v, recordedClass: r.failure_class ? String(r.failure_class) : null, ...(remediationExhausted ? { remediationExhausted: true } : {}), ...(cursiaIssue ? { cursiaIssue: true } : {}) };
 }
 
 /** r65 (R1): alcance del motivo de presupuesto del ítem. `runPauseReason` = output_summary.pause.reason del run pausado. */
@@ -125,10 +128,11 @@ export function budgetScopeOf(r: { status?: string | null; error?: string | null
 }
 
 /** r65 (R2.1): ¿el código de fallo permite el reintento del dueño? */
-export function ownerRetryCodeEligibility(v: FailureVerdict & { recordedClass?: string | null; remediationExhausted?: boolean }): 'ok' | 'ambiguous_paid_result' | 'failure_not_owner_retryable' {
+export function ownerRetryCodeEligibility(v: FailureVerdict & { recordedClass?: string | null; remediationExhausted?: boolean; cursiaIssue?: boolean }): 'ok' | 'ambiguous_paid_result' | 'failure_not_owner_retryable' {
   const cls = v.recordedClass && ['A', 'B', 'C', 'D'].includes(v.recordedClass) && v.recordedClass > v.class ? v.recordedClass : v.class;
   if (OWNER_RETRY_NEVER_CODES.has(v.code) || v.paidRisk === 'uncertain' || v.humanReason === 'duplicate_charge') return 'ambiguous_paid_result';
   if (OWNER_RETRY_EXTRA_CODES.has(v.code)) return 'ok';
+  if (v.cursiaIssue) return 'ok';
   if (cls === 'A' || cls === 'B') return 'ok';
   return 'failure_not_owner_retryable';
 }

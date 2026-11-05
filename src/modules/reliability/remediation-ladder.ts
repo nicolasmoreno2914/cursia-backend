@@ -152,7 +152,10 @@ export function feedbackFor(code: string, innerCodes: readonly string[], finding
   const lines: string[] = [rung === 2
     ? 'CORRECCIÓN OBLIGATORIA (el pedido ya fue rechazado varias veces por la misma causa; cambia de enfoque):'
     : 'CORRECCIÓN OBLIGATORIA (el intento anterior fue rechazado por esta causa):'];
-  if ([...codes].some((c) => /LANGUAGE_NOT_NEUTRAL$/.test(c))) {
+  if (codes.has('browser_output_exception')) {
+    // r99 (review P1-1): el ejecutor no pudo leer la salida (JSON inválido / campos faltantes).
+    lines.push(`- La respuesta anterior no se pudo leer (${list}). Responde SOLO con el formato pedido (JSON válido y completo, con todos los campos requeridos), sin texto antes ni después.`);
+  } else if ([...codes].some((c) => /LANGUAGE_NOT_NEUTRAL$/.test(c))) {
     lines.push(`- Escribe en español latinoamericano neutro (tuteo «tú», «ustedes» para el plural; sin voseo ni regionalismos). Evita estos términos: ${list}; si son parte del contenido del curso, cítalos entre comillas.`);
   } else if ([...codes].some((c) => /^(CONTENT_TRUTH|FABRICATED_DATA|OUTDATED_CLAIM|QUANTITY_CLAIM)/.test(c))) {
     lines.push(`- No uses cifras, fechas, estudios ni datos que no estén en la fuente. Hallazgos: ${list}.`);
@@ -379,7 +382,7 @@ function occurrenceOf(r: CommonFailureRow): Occ | null {
       row: r, fp: b.fingerprint, code: b.code, rule: b.rule, itemType: b.itemType ?? r.itemType ?? null, innerCodes: rem?.innerCodes ?? [],
       firstAt: ms(b.heldAt), lastAt: ms(b.lastAt), sampleError: b.sampleError ?? null, findings: rem?.findings ?? [],
       rung: rem?.rung ?? 3,
-      outcome: b.active ? `en pausa (${b.reason})` : `reanudada (${b.resumeTrigger ?? 'manual'})`,
+      outcome: b.reportOnly ? 'reportado (sigue con sus intentos propios)' : b.active ? `en pausa (${b.reason})` : `reanudada (${b.resumeTrigger ?? 'manual'})`,
       held: b.active === true,
     };
   }
@@ -437,7 +440,9 @@ export function commonFailureSignals(rows: readonly CommonFailureRow[], resoluti
     const resolvedAdmin = resolutions.get(fp) ?? null;
     const adminOk = !!resolvedAdmin && ms(resolvedAdmin) >= last;
     const quiet = !isHold && now.getTime() - last > COMMON_FAILURE_QUIET_HOURS * 3_600_000;
-    const allResumed = isHold && held === 0;
+    // Review P1-1: un reporte sin pausa (código sin regla que todavía usa sus intentos) mantiene la señal activa 72 h.
+    const reportedRecent = list.some((o) => o.row.bugHold?.reportOnly && now.getTime() - o.lastAt <= COMMON_FAILURE_QUIET_HOURS * 3_600_000);
+    const allResumed = isHold && held === 0 && !reportedRecent;
     const status: CommonFailureSignal['status'] = adminOk || quiet || allResumed ? 'resolved' : 'active';
     const lastResume = Math.max(...list.map((o) => ms(o.row.bugHold?.resumedAt ?? null)).filter(Number.isFinite), NaN);
     const sig: CommonFailureSignal = {

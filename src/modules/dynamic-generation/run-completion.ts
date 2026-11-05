@@ -563,10 +563,8 @@ export function adminActionFor(
     return null; // bloqueado por una dependencia: la acción es la de la dependencia
   }
   if (r.status === 'cancelled') return null;
-  // r99: pausa como bug de Cursia → sin acción humana por curso: la reanuda el arreglo (sweepCursiaIssues). Con pago
-  // INCIERTO la herramienta de conciliación de admin sigue visible (nunca se oculta un cobro por confirmar).
-  { const held = r.status === 'failed' ? bugHoldOf(s, err) : null;
-    if (held && !held.paidUncertain) return null; }
+  // r99 (review P1-2): una parte en pausa como bug de Cursia la reanuda sola el arreglo (sweepCursiaIssues), pero la
+  // salida HUMANA sigue disponible (opcional, nunca necesaria): la acción de admin de siempre se conserva.
   // r62 (M1): frenado por un control de gasto (kill switch / allow-list): el barrido lo reabre solo al revertirse.
   const tickOn0 = autoHealEnabled(process.env);
   if (tickOn0 && autoRecoveryEnabled(process.env) && spendControlHoldOf(err, r.type)) return null;
