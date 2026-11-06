@@ -92,7 +92,7 @@ export function presentationCardHtml(input: PresentationCardInput): string {
   const inner =
     eyebrow(h, `Presentación · Capítulo ${chapterNumber}`, s) +
     img +
-    link(h, pdfUrl, linkText, s, { button: true });
+    link(h, pdfUrl, linkText, s, { button: true, target: '_blank' });
   void cs;
   void pHtml;
   const html = root(h, `ch${chapterNumber}-presentation`, inner);
