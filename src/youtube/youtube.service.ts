@@ -205,9 +205,15 @@ export class YoutubeService {
       );
     }
 
-    // Marcar como revocado en nuestra base de datos
-    connection.status    = 'revoked';
-    connection.revokedAt = new Date();
+    // Marcar como revocado en nuestra base de datos.
+    // r102 (Política de datos de usuario de Google / YouTube API Services): al desconectar se BORRA la credencial
+    // guardada (refresh token cifrado + IV) y la miniatura del canal; solo queda el registro de que hubo una conexión.
+    // Ningún camino usa la credencial de una conexión `revoked` (subida y preflight exigen `active`).
+    connection.status                = 'revoked';
+    connection.revokedAt             = new Date();
+    connection.encryptedRefreshToken = '';
+    connection.tokenIv               = '';
+    connection.channelThumbnailUrl   = null;
     await this.repo.save(connection);
 
     this.logger.log(`YouTube desconectado: user=${userId}`);

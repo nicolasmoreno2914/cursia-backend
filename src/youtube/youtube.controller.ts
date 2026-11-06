@@ -295,8 +295,10 @@ export class YoutubeController {
     const privacyStatus = (body['privacy_status'] as string  | undefined) ?? 'unlisted';
     const chapterNumber = (body['chapter_number'] as number  | undefined) ?? null;
 
-    if (!['public', 'unlisted', 'private'].includes(privacyStatus)) {
-      throw new BadRequestException('privacy_status debe ser public, unlisted o private.');
+    // r102 (verificación de Google / política de privacidad): Cursia sube los videos SOLO como no listados (o privados);
+    // nunca públicos.
+    if (!['unlisted', 'private'].includes(privacyStatus)) {
+      throw new BadRequestException('privacy_status debe ser unlisted o private.');
     }
 
     // Verificar conexión YouTube del usuario (también en dry-run — valida auth)

@@ -47,6 +47,39 @@ export const BUG_HOLD_RESUME_COOLDOWN_SECONDS = 1800;
 export const CURSIA_ISSUE_STATE = 'paused_cursia_issue';
 /** Mensaje para el creador del curso (sin «reintentar»: no es su problema). */
 export const CURSIA_ISSUE_MESSAGE = 'Encontramos un problema de nuestro lado y lo estamos resolviendo. No tienes que hacer nada; tu curso continuará automáticamente.';
+/**
+ * r102: reglas cuya salida depende de que el CREADOR vuelva a conectar SU canal de YouTube (la conexión es la del owner,
+ * dynamic-youtube.resolveYoutubeConnectionFor): token vencido / revocado, canal sin resolver, permiso de subida ausente.
+ * Mientras dure, el mensaje se lo pide (nunca «no tienes que hacer nada»); al reconectar, el barrido la reanuda sola
+ * (`youtube_reconnected`), sin admin.
+ */
+export const YOUTUBE_RECONNECT_RULES: ReadonlySet<string> = new Set(['youtube_auth']);
+/** Review r102 (1): códigos de esas reglas que son configuración de CURSIA (no del canal): mensaje de siempre, sin reconexión. */
+export const YOUTUBE_RECONNECT_EXCLUDED_CODES: ReadonlySet<string> = new Set(['youtube_publisher_not_configured']);
+export const YOUTUBE_RECONNECT_MESSAGE = 'Tu canal de YouTube se desconectó de Cursia. Vuelve a conectarlo en Cuenta → YouTube y tu curso continuará automáticamente, sin costo adicional.';
+
+export function needsYoutubeReconnect(hold: Pick<BugHoldState, 'rule' | 'code'> | null | undefined): boolean {
+  return !!hold && YOUTUBE_RECONNECT_RULES.has(String(hold.rule ?? '')) && !YOUTUBE_RECONNECT_EXCLUDED_CODES.has(String(hold.code ?? ''));
+}
+
+/**
+ * Review r102 (2): desde cuándo cuenta una reconexión. La pausa se escribe a veces ≥ 15 min después del fallo (barrido) o
+ * mucho después (backfill): una reconexión entre el fallo y la pausa también vale → se mide desde el fallo ORIGINAL; tras
+ * una reanudación, desde la última reanudación (la misma reconexión no reabre dos veces).
+ */
+export function youtubeReconnectReferenceMs(hold: Pick<BugHoldState, 'heldAt' | 'originalFailedAt' | 'history'>): number {
+  let ref = Date.parse(hold.originalFailedAt ?? '') ;
+  if (!Number.isFinite(ref)) ref = Date.parse(hold.heldAt);
+  for (const h of hold.history ?? []) {
+    if (h && h.event === 'resumed') { const t = Date.parse(h.at); if (Number.isFinite(t) && t > ref) ref = t; }
+  }
+  return ref;
+}
+
+/** Mensaje para el creador según la pausa (r102: YouTube del creador → se le pide reconectar). */
+export function bugHoldMessageOf(hold: Pick<BugHoldState, 'rule' | 'code'> | null | undefined): string {
+  return needsYoutubeReconnect(hold) ? YOUTUBE_RECONNECT_MESSAGE : CURSIA_ISSUE_MESSAGE;
+}
 /** Reaperturas AUTOMÁTICAS (build nuevo + reclasificada) por parte, por defecto (cada una pasa por los guards de FinOps). */
 export const BUG_HOLD_MAX_BUILD_RESUMES = 3;
 
@@ -74,7 +107,7 @@ export type BugHoldReason =
   | 'reconcile_pending' // pago incierto sin conciliación automática que lo tome
   | 'item_budget_exhausted'; // la ronda extra del tope de la parte ya se usó
 
-export type BugHoldResumeTrigger = 'reclassified' | 'resolved' | 'new_build' | 'reprobe';
+export type BugHoldResumeTrigger = 'reclassified' | 'resolved' | 'new_build' | 'reprobe' | 'youtube_reconnected';
 
 /**
  * Re-review: una pausa cuya estrategia esperaba una condición EXTERNA (proveedor caído > 6 h, cuota…) no espera al
@@ -269,7 +302,7 @@ export function resumedBugHold(prev: BugHoldState, now: Date, by: string, trigge
 
 export type BugHoldResumeDecision =
   | { resume: true; trigger: BugHoldResumeTrigger; strategy: RemediationStrategyId }
-  | { resume: false; reason: 'not_held' | 'still_unmapped' | 'waiting_fix' | 'build_resumes_exhausted' | 'paid_uncertain' | 'too_old' | 'cooldown' | 'reprobe_exhausted' };
+  | { resume: false; reason: 'not_held' | 'still_unmapped' | 'waiting_fix' | 'build_resumes_exhausted' | 'paid_uncertain' | 'too_old' | 'cooldown' | 'reprobe_exhausted' | 'waiting_youtube_reconnect' };
 
 export interface BugHoldResumeCtx {
   now: Date;
@@ -281,6 +314,11 @@ export interface BugHoldResumeCtx {
   itemType: string | null;
   /** Tope de reaperturas automáticas (default bugHoldMaxResumes()). */
   maxResumes?: number;
+  /**
+   * r102: `connected_at` de la conexión de YouTube ACTIVA del owner del run (null si no hay / no está activa). Una
+   * reconexión posterior a la pausa reanuda las partes pausadas por YOUTUBE_RECONNECT_RULES.
+   */
+  youtubeConnectedAt?: string | null;
 }
 
 /**
@@ -317,6 +355,14 @@ export function bugHoldResumeDecision(row: { status: string; error: string | nul
   // 2) Desarrollo marcó la huella como resuelta después de la pausa (una reapertura por marca: fuera del tope automático).
   const resolved = ctx.resolvedAt ? Date.parse(ctx.resolvedAt) : NaN;
   if (Number.isFinite(resolved) && resolved >= Date.parse(hold.heldAt)) return { resume: true, trigger: 'resolved', strategy: s.strategy };
+  // 2b) r102: el creador volvió a conectar su canal de YouTube DESPUÉS de la pausa → una reapertura por reconexión (fuera
+  //     del tope automático, como «resuelto»: la condición que faltaba ya está). Si vuelve a fallar, la pausa se renueva
+  //     (heldAt nuevo) y espera otra reconexión. Nunca con pago incierto.
+  const reconnected = ctx.youtubeConnectedAt ? Date.parse(ctx.youtubeConnectedAt) : NaN;
+  if (needsYoutubeReconnect(hold) && Number.isFinite(reconnected) && reconnected > youtubeReconnectReferenceMs(hold)) {
+    if (hold.paidUncertain) return { resume: false, reason: 'paid_uncertain' };
+    return { resume: true, trigger: 'youtube_reconnected', strategy: s.strategy };
+  }
   // 3) Build nuevo desde la pausa: UNA reapertura por build, acotada; nunca con pago incierto ni pasada la ventana.
   if (ctx.buildId && hold.buildId && ctx.buildId !== hold.buildId) {
     const g = automaticGate();
@@ -338,6 +384,7 @@ export function bugHoldResumeDecision(row: { status: string; error: string | nul
       return { resume: true, trigger: 'reprobe', strategy: String(hold.strategy) as RemediationStrategyId };
     }
   }
+  if (needsYoutubeReconnect(hold)) return { resume: false, reason: 'waiting_youtube_reconnect' };
   return { resume: false, reason: hold.reason === 'unmapped_code' ? 'still_unmapped' : 'waiting_fix' };
 }
 

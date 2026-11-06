@@ -8,7 +8,7 @@
 // `cost`: estimado (línea del estimado congelado del run, scope 'run') y real/pendiente (ledger, suma por
 // item_key en todas las generaciones del run). El ledger sigue siendo la única fuente de dinero.
 // ─────────────────────────────────────────────────────────────────────────────
-import { CURSIA_ISSUE_MESSAGE, bugHoldOf } from '../reliability/bug-hold';
+import { bugHoldMessageOf, bugHoldOf, needsYoutubeReconnect } from '../reliability/bug-hold';
 import { CurrentRecovery, FailureClass, classifyFailure, currentRecoveryOf } from '../reliability/failure-classifier';
 import { maxAutomaticRoundsToday } from './item-transitions';
 import { autoRecoveryEnabled } from './auto-heal';
@@ -53,7 +53,7 @@ export interface ItemRecoveryView {
    * r99: PAUSA COMO BUG DE CURSIA (bug-hold.ts): el usuario ve `message` (sin «reintentar»); `reason` es el motivo de
    * fondo (unmapped_code, product_bug, config, strategy_exhausted…). Ausente si la parte no está en pausa.
    */
-  cursiaIssue?: { since: string; reason: string; message: string };
+  cursiaIssue?: { since: string; reason: string; message: string; action?: 'reconnect_youtube' };
   /** r98: la parte se aceptó con una marca de calidad (rung 2): códigos aceptados. */
   qualityAccepted?: string[];
 }
@@ -115,7 +115,7 @@ function withRemediation(r: Record<string, any>, v: ItemRecoveryView): ItemRecov
     out = { ...out, remediation: { rung: rem.rung, code: rem.code, count: rem.count, next, reasonText: exhausted ? REMEDIATION_EXHAUSTED_REASON : null, outcome: rem.outcome ?? null } };
   }
   const hold = r.status === 'failed' ? bugHoldOf(r.output_summary, r.error) : null;
-  if (hold) out = { ...out, cursiaIssue: { since: hold.heldAt, reason: hold.reason, message: CURSIA_ISSUE_MESSAGE } };
+  if (hold) out = { ...out, cursiaIssue: { since: hold.heldAt, reason: hold.reason, message: bugHoldMessageOf(hold), ...(needsYoutubeReconnect(hold) ? { action: 'reconnect_youtube' as const } : {}) } };
   return accepted.length ? { ...out, qualityAccepted: accepted } : out;
 }
 
