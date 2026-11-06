@@ -28,7 +28,7 @@
  *  - sin validación de servidor (content, activity SCORM, course_plan, exam GIFT): cuentan como
  *    hechos al completarse (sin validación nueva acá — ver el reporte de BE-A).
  */
-import { CURSIA_ISSUE_MESSAGE, bugHoldOf } from '../reliability/bug-hold';
+import { CURSIA_ISSUE_MESSAGE, YOUTUBE_RECONNECT_MESSAGE, bugHoldOf, needsYoutubeReconnect } from '../reliability/bug-hold';
 import { isNonRealLlmMode } from '../artifacts/artifact-type-policy';
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
@@ -167,7 +167,7 @@ export interface RunCompletion {
    * r99: partes en PAUSA COMO BUG DE CURSIA (bug-hold.ts) — el curso no está listo y continúa solo cuando el arreglo
    * esté desplegado; el usuario ve `message` (nunca «reintentar»). Ausente si no hay ninguna.
    */
-  cursiaIssue?: { items: string[]; since: string | null; message: string };
+  cursiaIssue?: { items: string[]; since: string | null; message: string; action?: 'reconnect_youtube' };
   /**
    * BE-B: estado del último job de paquete FINAL del run (solo cuando la generación está completa):
    * `none` (todavía no hay job), `queued`/`running`/`retrying` (armándose), `completed`, `failed`
@@ -677,6 +677,9 @@ export function evaluateRunCompletion(
   let autoPending = false;
   const cursiaIssueItems: string[] = [];
   let cursiaIssueSince: number | null = null;
+  // r102: TODAS las partes en pausa esperan que el creador reconecte su canal de YouTube → el mensaje se lo pide (review
+  // r102 (3): con otra pausa de Cursia en el mismo run, el mensaje de siempre: reconectar solo no termina el curso).
+  let youtubeReconnectHolds = 0;
   for (const it of manifest.items) {
     const c = classes.get(it.key) as ItemCompletionClass;
     if (c === 'not_done' || c === 'unvalidated') {
@@ -684,6 +687,7 @@ export function evaluateRunCompletion(
       const held = row && row.status === 'failed' ? bugHoldOf(os(row), row.error ?? null) : null;
       if (held && c === 'not_done') {
         cursiaIssueItems.push(it.key);
+        if (needsYoutubeReconnect(held)) youtubeReconnectHolds++;
         const t = Date.parse(held.heldAt);
         if (Number.isFinite(t)) cursiaIssueSince = cursiaIssueSince === null ? t : Math.min(cursiaIssueSince, t);
       }
@@ -733,6 +737,7 @@ export function evaluateRunCompletion(
   // §2.6: upgrade fallido de un run de vista previa → siempre recuperación (nunca «listo»).
   if (opts.upgradeOnlyFailure && state !== 'in_progress') state = 'needs_attention';
   const autoRecovering = state === 'needs_attention' && actions.length === 0 && autoPending && autoHealEnabled(process.env);
+  const youtubeReconnect = cursiaIssueItems.length > 0 && youtubeReconnectHolds === cursiaIssueItems.length;
 
   return {
     state,
@@ -744,7 +749,8 @@ export function evaluateRunCompletion(
     adminActions: actions,
     ...(autoRecovering ? { autoRecovering: true } : {}),
     ...(cursiaIssueItems.length && state !== 'cancelled'
-      ? { cursiaIssue: { items: cursiaIssueItems, since: cursiaIssueSince === null ? null : new Date(cursiaIssueSince).toISOString(), message: CURSIA_ISSUE_MESSAGE } } : {}),
+      ? { cursiaIssue: { items: cursiaIssueItems, since: cursiaIssueSince === null ? null : new Date(cursiaIssueSince).toISOString(),
+          message: youtubeReconnect ? YOUTUBE_RECONNECT_MESSAGE : CURSIA_ISSUE_MESSAGE, ...(youtubeReconnect ? { action: 'reconnect_youtube' } : {}) } } : {}),
     ...(generationComplete && pkg && pkg.status !== undefined
       ? { packageJob: {
           status: packageReady ? 'completed' : String(pkg.status ?? 'none'),
