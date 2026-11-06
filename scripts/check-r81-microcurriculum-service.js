@@ -651,6 +651,38 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       eq((await svc.get(W, d.id)).lastError.code, 'GENERATION_FAILED');
       eq((await svc.update(W, d.id, { answers: p3.answers })).lastError, null, 'lastError limpio');
     });
+    await check('MS25 (r101) tipo «Otro»: sin «¿Cuál?» → 400 ANSWERS_INCOMPLETE con identification.institutionTypeOther (sin llamada); con texto → generated con el texto en documento, prompt (citado) y PDF; DTO lo admite; cambiar de tipo lo quita', async () => {
+      reset();
+      const W = { id: 'dddddddd-1111-4222-8333-444444444444', email: 'w9@ejemplo.edu' };
+      const a = clone(ANS('corporativa'));
+      a.identification = { ...a.identification, institutionType: 'otro' };
+      const d = await svc.create(W, a);
+      const body = await rejects(svc.generate(W, d.id), 400, 'ANSWERS_INCOMPLETE');
+      eq(body.missing, ['identification.institutionTypeOther'], 'falta «¿Cuál?»');
+      eq(gen.calls.length, 0, 'sin llamada');
+      const { ValidationPipe } = require('@nestjs/common');
+      const dto = D('modules/microcurriculum/dto/microcurriculum.dto.js');
+      const pipe = new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true, transformOptions: { enableImplicitConversion: true } });
+      const piped = await pipe.transform({ answers: { ...a, identification: { ...a.identification, institutionTypeOther: '  Escuela  de conducción ' } } }, { type: 'body', metatype: dto.UpdateMicrocurriculumDto });
+      await rejects(pipe.transform({ answers: { identification: { institutionType: 'otro', institutionTypeOther: 'x'.repeat(81) } } }, { type: 'body', metatype: dto.UpdateMicrocurriculumDto }), 400);
+      const p = await svc.update(W, d.id, { answers: piped.answers });
+      eq(p.answers.identification.institutionTypeOther, 'Escuela de conducción', 'normalizado');
+      gen.queue.push(TOOL('corporativa'));
+      const rec = await G(W, d.id);
+      eq([rec.status, rec.issues.filter((i) => i.severity === 'error'), rec.document.identification.institutionType, rec.document.identification.institutionTypeOther], ['generated', [], 'otro', 'Escuela de conducción']);
+      const last = gen.calls[gen.calls.length - 1];
+      assert(JSON.stringify(last).includes(JSON.stringify(JSON.stringify('Escuela de conducción')).slice(1, -1)), 'el texto va citado en el prompt');
+      const pdf = await svc.pdf(W, d.id);
+      assert(pdf.pdf.length > 1000, 'PDF');
+      // Cambiar a universidad en el asistente: el documento deja la clave (y las respuestas también).
+      const u = clone(rec.answers); u.identification.institutionType = 'universidad';
+      const p2 = await svc.update(W, d.id, { answers: u });
+      assert(!('institutionTypeOther' in p2.answers.identification) && !('institutionTypeOther' in p2.document.identification), 'sin la clave');
+      // Cambiar a «otro» desde el documento: vuelve a las respuestas.
+      const doc = clone(p2.document); doc.identification = { ...doc.identification, institutionType: 'otro', institutionTypeOther: 'ONG ambiental' };
+      const p3 = await svc.update(W, d.id, { document: doc });
+      eq([p3.answers.identification.institutionType, p3.answers.identification.institutionTypeOther, p3.document.identification.institutionTypeOther], ['otro', 'ONG ambiental', 'ONG ambiental']);
+    });
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});

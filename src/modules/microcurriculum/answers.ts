@@ -1,5 +1,5 @@
 import {
-  HOUR_KINDS, HourKind, INSTITUTION_TYPES, InstitutionType, MC_LIMITS, McIdentification, MicrocurriculumAnswers, MODALITIES, Modality, TIME_MODES, TimeMode,
+  cleanInstitutionOther, HOUR_KINDS, HourKind, INSTITUTION_TYPES, InstitutionType, MC_LIMITS, McIdentification, MicrocurriculumAnswers, MODALITIES, Modality, TIME_MODES, TimeMode,
 } from './microcurriculum.types';
 
 /**
@@ -58,10 +58,13 @@ export function normalizeAnswers(raw: unknown): MicrocurriculumAnswers {
   const me = g('methodology');
   const re = g('references');
   const sp = isObj(ti.split) ? ti.split : {};
+  const instType = oneOf<InstitutionType>(id.institutionType, INSTITUTION_TYPES);
   const out: MicrocurriculumAnswers = {
     identification: compact({
       courseName: str(id.courseName),
-      institutionType: oneOf<InstitutionType>(id.institutionType, INSTITUTION_TYPES),
+      institutionType: instType,
+      // r101 · «¿Cuál?» solo con tipo `otro`; con otro tipo se descarta (así los demás tipos quedan idénticos).
+      institutionTypeOther: instType === 'otro' ? cleanInstitutionOther(id.institutionTypeOther) : undefined,
       program: str(id.program),
       term: str(id.term),
       modality: oneOf<Modality>(id.modality, MODALITIES),
@@ -132,11 +135,12 @@ export function splitConsistent(time: MicrocurriculumAnswers['time'] | null | un
   return true;
 }
 
-/** Las 8 obligatorias (★) del cuestionario que faltan, como rutas estables (el frontend lleva al paso). */
+/** Las 8 obligatorias (★) (+ «¿Cuál?» si el tipo es `otro`, r101) del cuestionario que faltan, como rutas estables (el frontend lleva al paso). */
 export function missingRequired(answers: MicrocurriculumAnswers): string[] {
   const miss: string[] = [];
   if (!answers.identification?.courseName) miss.push('identification.courseName');
   if (!answers.identification?.institutionType) miss.push('identification.institutionType');
+  else if (answers.identification.institutionType === 'otro' && !cleanInstitutionOther(answers.identification.institutionTypeOther)) miss.push('identification.institutionTypeOther');
   if (!answers.learners?.profile) miss.push('learners.profile');
   if (!answers.purpose?.need) miss.push('purpose.need');
   if (!answers.purpose?.expectedAbilities) miss.push('purpose.expectedAbilities');
@@ -165,9 +169,12 @@ export function parseInstitutionalCuts(text: string | null | undefined): number[
 /** Identificación del documento: SIEMPRE la del paso 1, literal (V7). */
 export function identificationFromAnswers(answers: MicrocurriculumAnswers): McIdentification {
   const id = answers.identification || {};
+  const institutionType = (id.institutionType || 'universidad') as InstitutionType;
+  const other = institutionType === 'otro' ? cleanInstitutionOther(id.institutionTypeOther) : undefined;
   return {
     courseName: id.courseName || '',
-    institutionType: (id.institutionType || 'universidad') as InstitutionType,
+    institutionType,
+    ...(other ? { institutionTypeOther: other } : {}),
     program: id.program ?? null,
     term: id.term ?? null,
     modality: id.modality ?? null,
