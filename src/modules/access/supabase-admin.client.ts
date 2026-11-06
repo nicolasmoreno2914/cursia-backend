@@ -66,6 +66,21 @@ export function classifyAdminError(status: number, body: any): SupabaseAdminErro
   return 'error';
 }
 
+/**
+ * r103 · Adónde vuelve el enlace de invitación: `AUTH_INVITE_REDIRECT_URL` o, si no está, `FRONTEND_URL` (el mismo que
+ * usa el regreso de YouTube). Solo https (http://localhost solo con un Supabase local); otro valor → null (Supabase usa
+ * su Site URL).
+ */
+export function inviteRedirectUrl(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = String(env.AUTH_INVITE_REDIRECT_URL || env.FRONTEND_URL || '').trim().replace(/\/+$/, '');
+  if (!raw) return null;
+  if (/^https:\/\/[^\s/?#]+(\/[^\s?#]*)?$/i.test(raw)) return raw;
+  // http://localhost solo contra un Supabase local (pruebas): nunca un enlace real a la máquina de quien lo abre.
+  const localSupabase = /^http:\/\/127\.0\.0\.1(:\d+)?\/?$/i.test(String(env.SUPABASE_URL || '').trim());
+  if (localSupabase && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(raw)) return raw;
+  return null;
+}
+
 @Injectable()
 export class SupabaseAdminClient {
   private readonly logger = new Logger('SupabaseAdmin');
@@ -118,9 +133,15 @@ export class SupabaseAdminClient {
     return parsed;
   }
 
-  /** mode 'invite': correo de invitación; el usuario fija su contraseña. */
+  /**
+   * mode 'invite': correo de invitación; el usuario fija su contraseña.
+   * r103: el enlace vuelve SIEMPRE a la app real (`inviteRedirectUrl`). Sin `redirect_to`, Supabase usaba el «Site URL»
+   * del proyecto (era orbia.pages.dev, donde la app no habla con el backend: la persona entraba y nada funcionaba).
+   */
   async inviteUser(email: string, data: Record<string, unknown>): Promise<SupabaseAuthUser> {
-    return mapUser(await this.call('POST', '/auth/v1/invite', { email, data }));
+    const to = inviteRedirectUrl();
+    const qs = to ? `?redirect_to=${encodeURIComponent(to)}` : '';
+    return mapUser(await this.call('POST', `/auth/v1/invite${qs}`, { email, data }));
   }
 
   /** mode 'temp_password': usuario confirmado con contraseña temporal (que el llamador devuelve UNA vez y no guarda). */
