@@ -2,7 +2,7 @@ import PDFDocument = require('pdfkit');
 import { cursiaDefaultLogo } from '../../package/v3/libro-logo';
 import { pdfText } from '../../package/v3/libro-v3';
 import { formatDateEs } from '../prebrief/prebrief-document';
-import { BLOOM_LABEL, MODALITY_LABEL, MicrocurriculumAnswers, MicrocurriculumIssue, MicrocurriculumV1, terminologyFor } from './microcurriculum.types';
+import { BLOOM_LABEL, MODALITY_LABEL, MicrocurriculumAnswers, MicrocurriculumIssue, MicrocurriculumV1, terminologyForIdentification } from './microcurriculum.types';
 import { MC_PDF_ATTACHMENT, buildMicrocurriculumPdfPayload } from './pdf-payload';
 
 /**
@@ -41,7 +41,7 @@ export interface MicrocurriculumPdfResult { pdf: Buffer; pages: number }
 
 /** Títulos de sección en orden (Competencias solo si hay); los numera el PDF y los usa la prueba. */
 export function microcurriculumSectionTitles(mc: MicrocurriculumV1): string[] {
-  const t = terminologyFor(mc.identification.institutionType);
+  const t = terminologyForIdentification(mc.identification);
   return [
     'Identificación', 'Descripción y justificación', `Perfil del ${t.learner} y prerrequisitos`, 'Objetivos', t.outcomesLabel,
     ...(mc.competencies.length ? ['Competencias'] : []),
@@ -51,7 +51,7 @@ export function microcurriculumSectionTitles(mc: MicrocurriculumV1): string[] {
 
 export async function renderMicrocurriculumPdf(mc: MicrocurriculumV1, meta: MicrocurriculumPdfMeta): Promise<MicrocurriculumPdfResult> {
   const id = mc.identification;
-  const term = terminologyFor(id.institutionType);
+  const term = terminologyForIdentification(id);
   const date = meta.date;
   const pdf = new PDFDocument({
     size: [PAGE.w, PAGE.h],

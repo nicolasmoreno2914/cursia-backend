@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import { normalizeAnswers } from './answers';
 import {
-  BLOOM, INSTITUTION_TYPES, MODALITIES, MicrocurriculumAnswers, MicrocurriculumV1, PROVENANCE_FIELDS,
+  BLOOM, INSTITUTION_OTHER_MAX, INSTITUTION_TYPES, MODALITIES, MicrocurriculumAnswers, MicrocurriculumV1, PROVENANCE_FIELDS,
 } from './microcurriculum.types';
 
 /**
@@ -59,7 +59,11 @@ export function microcurriculumShapeProblems(raw: unknown): string[] {
   const id = raw.identification;
   if (!isObj(id) || !isStr(id.courseName) || !id.courseName.trim() || !(INSTITUTION_TYPES as readonly unknown[]).includes(id.institutionType)
     || !strOrNull(id.program) || !strOrNull(id.term) || !strOrNull(id.code) || !strOrNull(id.area)
-    || !(id.modality === null || (MODALITIES as readonly unknown[]).includes(id.modality))) p.push('identification');
+    || !(id.modality === null || (MODALITIES as readonly unknown[]).includes(id.modality))
+    // r101 · `otro` exige su «¿Cuál?» (texto no vacío ≤ 80); los demás tipos no lo llevan.
+    || !(id.institutionType === 'otro'
+      ? isStr(id.institutionTypeOther) && !!id.institutionTypeOther.trim() && id.institutionTypeOther.length <= INSTITUTION_OTHER_MAX
+      : id.institutionTypeOther === undefined)) p.push('identification');
   for (const k of ['description', 'justification', 'learnerProfile', 'priorKnowledge', 'generalObjective']) if (!isStr(raw[k])) p.push(k);
   for (const k of ['specificObjectives', 'resources', 'repairs']) if (!strArr(raw[k])) p.push(k);
   if (!isNum(raw.totalHours)) p.push('totalHours');
