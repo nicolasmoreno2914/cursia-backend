@@ -53,6 +53,17 @@ function stagingProcesses() {
   return { procs, env };
 }
 
+/** Procesos PM2 de PRODUCCIÓN (scripts/ops/prod-release.sh): nombre + entry compilado (rol del pool). */
+function productionProcesses() {
+  const sh = fs.readFileSync(path.join(REPO, 'scripts/ops/prod-release.sh'), 'utf8');
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'));
+  const arr = (n) => { const m = new RegExp(`^${n}=\\(([\\s\\S]*?)\\)`, 'm').exec(sh); if (!m) throw new Error(`falta ${n}`); return m[1]; };
+  const entries = (n) => [...arr(n).matchAll(/"(\S+) (\S+)"/g)].map((m) => ({ name: m[1], entry: m[2].startsWith('start:') ? (pkg.scripts[m[2]] || '').split(/\s+/)[1] : m[2] }));
+  const byName = Object.fromEntries([...entries('PROD_PROCESSES_LEGACY'), ...entries('PROD_PROCESSES_DRAIN'), ...entries('PROD_PROCESSES_NODE')].map((p) => [p.name, p]));
+  // cursia-backend: `pm2 reload cursia-backend` (API, dist/main.js).
+  return arr('PROD_ALL_NAMES').trim().split(/\s+/).map((n) => byName[n] || { name: n, entry: n === 'cursia-backend' ? 'dist/main.js' : null });
+}
+
 function budgetOf(procs, env) {
   const rows = procs.map((p) => ({ ...p, ...dbPoolConfig(env, path.join('/srv', p.entry || 'x')) }));
   return { rows, total: rows.reduce((a, r) => a + r.max, 0) };
@@ -82,6 +93,16 @@ function budgetOf(procs, env) {
     assert(prod.rows.every((r) => r.max === 5 && r.idleTimeoutMillis === 20000), 'defaults intactos');
     eq(prod.total, 55, 'teórico anterior');
     assert(prod.total > SESSION_LIMIT, 'la config anterior excede el cupo del pooler');
+  });
+
+  await check('puro: producción (prod-release.sh) presencia de 12 procesos = 1 api + 11 workers, todos con entry compilado; cursia-brand-worker cuenta como worker (DB_POOL_MAX_WORKER / DB_POOL_IDLE_MS_WORKER)', () => {
+    const prodProcs = productionProcesses();
+    eq(prodProcs.length, 12, 'procesos de producción');
+    assert(prodProcs.every((p) => p.entry && fs.existsSync(path.join(REPO, p.entry))), `entry compilado de cada proceso: ${JSON.stringify(prodProcs)}`);
+    const b = budgetOf(prodProcs, { DB_POOL_MAX: '3', DB_POOL_MAX_WORKER: '1', DB_POOL_IDLE_MS_WORKER: '1000' });
+    eq(b.rows.filter((r) => r.role === 'api').map((r) => r.name), ['cursia-backend'], 'un solo proceso api');
+    assert(b.rows.find((r) => r.name === 'cursia-brand-worker').role === 'worker', 'cursia-brand-worker = worker');
+    console.log(`     producción: máximo teórico = DB_POOL_MAX + ${b.rows.length - 1} × DB_POOL_MAX_WORKER (con 3/1 → ${b.total} / ${SESSION_LIMIT})`);
   });
 
   await check('puro: valores inválidos fallan fuerte (nunca un pool silenciosamente enorme)', () => {
