@@ -1,6 +1,6 @@
 import { identificationFromAnswers, resolveTotalHours } from './answers';
 import {
-  BloomEs, INSTITUTION_TYPES, InstitutionType, MC_LIMITS, McBibliography, McEvaluation, McIdentification, McOrigin, McOutcome, McUnit, MicrocurriculumAnswers,
+  BloomEs, cleanInstitutionOther, INSTITUTION_TYPES, InstitutionType, MC_LIMITS, McBibliography, McEvaluation, McIdentification, McOrigin, McOutcome, McUnit, MicrocurriculumAnswers,
   MicrocurriculumV1, MICROCURRICULUM_VERSION, MODALITIES, Modality, PROVENANCE_FIELDS, ProvenanceField,
 } from './microcurriculum.types';
 
@@ -146,9 +146,13 @@ export function withRegeneratedSection(doc: MicrocurriculumV1, section: 'outcome
 function identification(v: unknown, prev: McIdentification): McIdentification {
   if (!isObj(v)) return prev;
   const opt = (x: unknown) => { const s = text(x, MC_LIMITS.text); return s ? s : null; };
+  const institutionType = (INSTITUTION_TYPES as readonly string[]).includes(v.institutionType as string) ? (v.institutionType as InstitutionType) : prev.institutionType;
+  // r101 · «¿Cuál?» solo con `otro` (el editado, o el anterior si no viene); otro tipo no lleva la clave.
+  const other = institutionType === 'otro' ? cleanInstitutionOther(v.institutionTypeOther) || cleanInstitutionOther(prev.institutionTypeOther) : undefined;
   return {
     courseName: text(v.courseName, MC_LIMITS.text) || prev.courseName,
-    institutionType: (INSTITUTION_TYPES as readonly string[]).includes(v.institutionType as string) ? (v.institutionType as InstitutionType) : prev.institutionType,
+    institutionType,
+    ...(other ? { institutionTypeOther: other } : {}),
     program: opt(v.program),
     term: opt(v.term),
     modality: (MODALITIES as readonly string[]).includes(v.modality as string) ? (v.modality as Modality) : null,

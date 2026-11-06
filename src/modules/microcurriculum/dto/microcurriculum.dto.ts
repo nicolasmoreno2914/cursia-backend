@@ -2,7 +2,7 @@ import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { INSTITUTION_TYPES, MC_LIMITS, MODALITIES, REGEN_SECTIONS, STRATEGIES, TIME_MODES } from '../microcurriculum.types';
+import { INSTITUTION_OTHER_MAX, INSTITUTION_TYPES, MC_LIMITS, MODALITIES, REGEN_SECTIONS, STRATEGIES, TIME_MODES } from '../microcurriculum.types';
 
 /**
  * r81 · DTOs del microcurrículo (límites de spec §1: textos ≤ 2 000, listas ≤ 40, horas 1–1 000). Todo es opcional:
@@ -28,6 +28,8 @@ const LIST = MC_LIMITS.listItems;
 export class IdentificationDto {
   @IsOptional() @IsString() @MaxLength(TEXT) courseName?: string;
   @IsOptional() @IsIn([...INSTITUTION_TYPES, '']) institutionType?: string;
+  /** r101 · «¿Cuál?» del tipo `otro` (obligatorio al generar si el tipo es `otro`; lo exige missingRequired). */
+  @IsOptional() @IsString() @MaxLength(INSTITUTION_OTHER_MAX) institutionTypeOther?: string;
   @IsOptional() @IsString() @MaxLength(TEXT) program?: string;
   @IsOptional() @IsString() @MaxLength(TEXT) term?: string;
   @IsOptional() @IsIn([...MODALITIES, '']) modality?: string;

@@ -5,7 +5,7 @@ import {
 import { outcomeDomainOf } from '../academic-context/bloom';
 import type { EducationLevel } from '../pedagogy/vocabulary';
 import { requestedSplit, resolveTotalHours } from './answers';
-import { BloomEs, HourKind, InstitutionType, McOrigin, MicrocurriculumAnswers, MicrocurriculumV1, ProvenanceField, terminologyFor } from './microcurriculum.types';
+import { BloomEs, HourKind, InstitutionType, McOrigin, MicrocurriculumAnswers, MicrocurriculumV1, ProvenanceField, terminologyForIdentification } from './microcurriculum.types';
 
 /**
  * r81 · Puente microcurrículo → contexto académico del curso (AcademicContextV1), mapeo PURO para «Crear curso con
@@ -19,7 +19,8 @@ export const MICROCURRICULUM_BASIS = 'cursia-microcurriculum';
 export const MICROCURRICULUM_EXTRACTOR = { id: 'cursia-microcurriculum', version: 1 } as const;
 
 const BLOOM_MAP: Record<BloomEs, BloomLevel> = { recordar: 'remember', comprender: 'understand', aplicar: 'apply', analizar: 'analyze', evaluar: 'evaluate', crear: 'create' };
-const LEVEL_MAP: Record<InstitutionType, EducationLevel> = { universidad: 'university', tecnica: 'technical', etdh: 'technical', colegio: 'secondary', corporativa: 'professional' };
+// r101 · `otro` no tiene un nivel educativo deducible: null (el contexto lo deja sin nivel, como antes con un tipo desconocido).
+const LEVEL_MAP: Record<InstitutionType, EducationLevel | null> = { universidad: 'university', tecnica: 'technical', etdh: 'technical', colegio: 'secondary', corporativa: 'professional', otro: null };
 
 const clip = (s: string, max: number) => {
   const t = String(s ?? '').replace(/\s+/g, ' ').trim();
@@ -56,7 +57,7 @@ export function toAcademicContext(mc: MicrocurriculumV1, answers: Microcurriculu
   }];
 
   const id = mc.identification;
-  const t = terminologyFor(id.institutionType);
+  const t = terminologyForIdentification(id);
   ctx.identity = {
     subjectName: field(clip(id.courseName, ACADEMIC_LIMITS.title), 'docente'),
     program: field(id.program ? clip(id.program, ACADEMIC_LIMITS.title) : null, 'docente'),

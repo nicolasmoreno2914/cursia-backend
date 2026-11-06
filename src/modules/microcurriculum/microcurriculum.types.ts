@@ -9,8 +9,21 @@
 
 export const MICROCURRICULUM_VERSION = 1 as const;
 
-export const INSTITUTION_TYPES = ['universidad', 'tecnica', 'etdh', 'colegio', 'corporativa'] as const;
+export const INSTITUTION_TYPES = ['universidad', 'tecnica', 'etdh', 'colegio', 'corporativa', 'otro'] as const;
 export type InstitutionType = (typeof INSTITUTION_TYPES)[number];
+/** r101 · Largo máximo del «¿Cuál?» cuando el tipo de institución es `otro`. */
+export const INSTITUTION_OTHER_MAX = 80;
+
+/**
+ * r101 · Texto libre del tipo «Otro» («¿Cuál?»): sin caracteres de control, espacios colapsados, recortado a 80.
+ * undefined si queda vacío o no es texto. Es DATO del docente: el prompt lo inserta citado (JSON), nunca como instrucción.
+ */
+export function cleanInstitutionOther(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  // eslint-disable-next-line no-control-regex
+  const s = v.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, INSTITUTION_OTHER_MAX).trim();
+  return s ? s : undefined;
+}
 export const MODALITIES = ['presencial', 'virtual', 'mixta'] as const;
 export type Modality = (typeof MODALITIES)[number];
 export const TIME_MODES = ['total', 'credits', 'weekly'] as const;
@@ -56,6 +69,8 @@ export interface MicrocurriculumAnswers {
   identification?: {
     courseName?: string;
     institutionType?: InstitutionType;
+    /** r101 · Solo con `institutionType: 'otro'` (obligatorio entonces): «¿Cuál?», ≤ 80 caracteres. */
+    institutionTypeOther?: string;
     program?: string;
     term?: string;
     modality?: Modality;
@@ -81,6 +96,8 @@ export interface MicrocurriculumAnswers {
 export interface McIdentification {
   courseName: string;
   institutionType: InstitutionType;
+  /** r101 · Presente solo con `institutionType: 'otro'` (los demás tipos no llevan la clave: documentos idénticos). */
+  institutionTypeOther?: string;
   program: string | null;
   term: string | null;
   modality: Modality | null;
@@ -177,13 +194,25 @@ export const TERMINOLOGY: Readonly<Record<InstitutionType, McTerminology>> = Obj
   etdh: { institutionLabel: 'SENA / Educación para el trabajo (ETDH)', outcomesLabel: 'Resultados de aprendizaje', outcomeSingular: 'resultado de aprendizaje', learner: 'aprendiz', learnersPlural: 'aprendices', course: 'programa de formación' },
   colegio: { institutionLabel: 'Colegio', outcomesLabel: 'Desempeños', outcomeSingular: 'desempeño', learner: 'estudiante', learnersPlural: 'estudiantes', course: 'asignatura' },
   corporativa: { institutionLabel: 'Formación corporativa', outcomesLabel: 'Resultados de aprendizaje', outcomeSingular: 'resultado de aprendizaje', learner: 'participante', learnersPlural: 'participantes', course: 'programa de formación' },
+  /** r101 · El rótulo real es el «¿Cuál?» del docente (terminologyForIdentification); este es el respaldo. */
+  otro: { institutionLabel: 'Otra institución', outcomesLabel: 'Resultados de aprendizaje', outcomeSingular: 'resultado de aprendizaje', learner: 'participante', learnersPlural: 'participantes', course: 'curso' },
 });
 
 export function terminologyFor(type: InstitutionType | null | undefined): McTerminology {
   return TERMINOLOGY[(type && (INSTITUTION_TYPES as readonly string[]).includes(type) ? type : 'universidad') as InstitutionType];
 }
 
-/** Las competencias son obligatorias si el docente las dio o el tipo de institución trabaja por competencias. */
+/**
+ * r101 · Terminología a partir de la identificación (respuestas o documento): igual a terminologyFor(tipo), salvo `otro`,
+ * cuyo institutionLabel es el «¿Cuál?» del docente (limpio) o «Otra institución» si falta.
+ */
+export function terminologyForIdentification(id: { institutionType?: InstitutionType | null; institutionTypeOther?: string | null } | null | undefined): McTerminology {
+  const t = terminologyFor(id?.institutionType);
+  if (id?.institutionType !== 'otro') return t;
+  return { ...t, institutionLabel: cleanInstitutionOther(id.institutionTypeOther) || t.institutionLabel };
+}
+
+/** Las competencias son obligatorias si el docente las dio o el tipo de institución trabaja por competencias (colegio, corporativa y otro: solo si el docente las dio). */
 export function competenciesRequired(answers: MicrocurriculumAnswers): boolean {
   const t = answers.identification?.institutionType;
   return !!(answers.purpose?.competencies && answers.purpose.competencies.trim()) || t === 'etdh' || t === 'tecnica' || t === 'universidad';

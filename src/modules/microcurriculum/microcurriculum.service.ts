@@ -321,7 +321,9 @@ export class MicrocurriculumService {
         const fromAnswers = identificationFromAnswers(answers);
         const idn = { ...doc.identification } as Record<string, unknown>;
         const ans = { ...(answers.identification || {}) } as Record<string, unknown>;
-        for (const k of Object.keys(fromAnswers) as (keyof typeof fromAnswers)[]) {
+        // r101 · `institutionTypeOther` es opcional (solo con `otro`): se recorre siempre, aunque falte en un lado.
+        const keys = [...new Set([...Object.keys(fromAnswers), 'institutionTypeOther'])] as (keyof typeof fromAnswers)[];
+        for (const k of keys) {
           if ((idn[k] ?? null) !== ((prev as unknown as Record<string, unknown>)[k] ?? null)) ans[k] = idn[k] ?? '';
           else idn[k] = fromAnswers[k];
         }
