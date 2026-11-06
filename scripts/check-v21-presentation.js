@@ -239,6 +239,7 @@ check('4: presentationCardHtml — contiene el N medido y el link de respaldo, n
   const html = buildCard(lightTheme, 7);
   assertTrue(html.includes('PDF, 7 diapositivas'), 'debe mostrar el conteo real de diapositivas');
   assertTrue(html.includes('@@PLUGINFILE@@/cap3_presentacion.pdf'), 'debe linkear al PDF completo');
+  assertTrue(/<a [^>]*href="@@PLUGINFILE@@\/cap3_presentacion\.pdf"[^>]*target="_blank" rel="noopener noreferrer"/.test(html), 'la presentación abre en una pestaña nueva');
   assertTrue(!/Diapositiva 1 de 10/.test(html), 'no debe haber un badge hardcodeado tipo V1');
   // singular correcto
   const singular = buildCard(lightTheme, 1);
