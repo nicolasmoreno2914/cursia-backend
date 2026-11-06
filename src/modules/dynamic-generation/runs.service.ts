@@ -2786,7 +2786,7 @@ export class RunsService {
        * r99: reanudación AUTOMÁTICA de una parte en pausa como bug de Cursia (bug-hold.ts) — el arreglo está desplegado
        * (reclasificada / huella resuelta / build nuevo). Re-evaluada bajo lock con bugHoldResumeDecision; nunca reenvía.
        */
-      bugResume?: { trigger: BugHoldResumeTrigger; resolvedAt?: string | null; buildId: string; backfill?: boolean };
+      bugResume?: { trigger: BugHoldResumeTrigger; resolvedAt?: string | null; buildId: string; backfill?: boolean; youtubeConnectedAt?: string | null };
       /**
        * r99 (decisión del dueño 1): la DECISIÓN que frenaba la parte cambió (un SuperAdmin aprobó / amplió el presupuesto del
        * run, se asignó o amplió el presupuesto del usuario, se levantó la suspensión o la congelación) DESPUÉS del fallo →
@@ -3141,6 +3141,7 @@ export class RunsService {
         // r99: misma decisión que el barrido con la fila bloqueada (sigue en pausa con el MISMO error y el disparador vale).
         const d = bugHoldResumeDecision(target, {
           now: auto.now ?? new Date(), buildId: auto.bugResume.buildId, resolvedAt: auto.bugResume.resolvedAt ?? null, itemType: target.type ?? null,
+          youtubeConnectedAt: auto.bugResume.youtubeConnectedAt ?? null,
           verdict: classifyFailure({ error: String(target.error ?? ''), itemType: target.type, outputSummary: target.output_summary ?? {}, source: sourceOfItemType(target.type) }),
         });
         if (d.resume === false || d.trigger !== auto.bugResume.trigger) {
@@ -3970,6 +3971,21 @@ export class RunsService {
         [now.toISOString()],
       ).catch(() => [] as any[])).map((x: any) => String(x.job_id)),
     );
+    // r102: reconexión de YouTube del owner (la conexión es la del owner: dynamic-youtube.resolveYoutubeConnectionFor) →
+    // reanuda las partes pausadas porque el canal se desconectó. Se lee una vez por barrido; sin la tabla (entorno sin la
+    // integración) no hay reconexiones y lo demás sigue igual.
+    const youtubeConnectedAt = new Map<string, string>();
+    try {
+      const rows: any[] = await this.dataSource.query(
+        `select user_id::text as user_id, connected_at from public.youtube_connections where status = 'active' and connected_at is not null`,
+      );
+      for (const x of rows) {
+        const t = new Date(x.connected_at as any);
+        if (x?.user_id && Number.isFinite(t.getTime())) youtubeConnectedAt.set(String(x.user_id), t.toISOString());
+      }
+    } catch {
+      // youtube_connections ausente: sin reconexiones.
+    }
     let probeHealth: LlmHealthProbeResult | null = null;
     // Las pausas solo existen desde r99: la reanudación no se corta por la fecha del run.
     await page(`${currentRunSql('$1')} and ${heldSql}
@@ -3981,7 +3997,8 @@ export class RunsService {
         if (!hold) return;
         const verdict = classifyFailure({ error: String(r.error ?? ''), itemType: r.type, outputSummary: r.output_summary ?? {}, source: sourceOfItemType(r.type) });
         const resolvedAt = resolutions.get(hold.fingerprint) ?? null;
-        const d = bugHoldResumeDecision(r, { now, buildId, resolvedAt, verdict, itemType: r.type ?? null });
+        const ytAt = youtubeConnectedAt.get(String(r.owner_id)) ?? null;
+        const d = bugHoldResumeDecision(r, { now, buildId, resolvedAt, verdict, itemType: r.type ?? null, youtubeConnectedAt: ytAt });
         if (d.resume === false) { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason }); return; }
         const backfill = Date.parse(hold.originalFailedAt ?? hold.heldAt) < activation.getTime();
         if (backfill && !backfillRuns.has(String(r.job_id)) && backfillRuns.size >= backfillCap) {
@@ -4004,7 +4021,7 @@ export class RunsService {
         }
         try {
           await this.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.job_id), String(r.item_key), false, false,
-            { policy, now, bugResume: { trigger: d.trigger, resolvedAt, buildId, backfill } });
+            { policy, now, bugResume: { trigger: d.trigger, resolvedAt, buildId, backfill, youtubeConnectedAt: ytAt } });
           if (backfill) backfillRuns.add(String(r.job_id));
           out.resumed.push({ runId: r.job_id, itemKey: r.item_key, trigger: d.trigger, ...(backfill ? { backfill: true } : {}) });
           this.logger.warn(`cursia-issue: ${r.item_key} (run ${r.job_id}) reanudada (${d.trigger} → ${d.strategy}${backfill ? ', backfill' : ''}); huella ${hold.fingerprint}`);
