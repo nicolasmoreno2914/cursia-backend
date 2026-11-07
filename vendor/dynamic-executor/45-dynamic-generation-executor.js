@@ -8657,7 +8657,7 @@ async function _dynRunExamBank(item) {
       return async function () {
         var base = chunks.filter(function (ch) { return ch.unit === g.unit; })[0];
         var accepted = recordList().filter(function (r) { return r.unit === g.unit && r.status === 'valid'; }).map(function (r) { return r.q; });
-        var mk = function (acc) { var rp = dynExamBankRepairParts(base.parts, g.list, acc, ''); return dynExamBankWithTail(rp, rp.tail + avoidFor(g.unit)); };
+        var mk = function (acc) { var rp = dynExamBankRepairParts(base.parts, g.list, acc, ''); return dynExamBankWithTail(rp, rp.tail + avoidFor(g.unit) + '\n\nPREGUNTAS NUEVAS (regla de conjunto), intento ' + (item.attempt || 1) + '.'); };
         var parts = mk(accepted);
         if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) parts = mk([]);
         if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) return;
