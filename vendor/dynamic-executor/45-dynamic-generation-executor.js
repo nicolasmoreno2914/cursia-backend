@@ -7518,6 +7518,12 @@ var DYN_EXAM_BANK_REPAIR_TOKENS_EST = { multichoice: 930, truefalse: 320, match:
 // Exam-bank D2: 5 rondas (las últimas solo corren en la cola: hojas que siguen bajo el piso) — con el pool, cerrar dentro del
 // intento cuesta una llamada; repetir el intento entero, decenas (#1353: 19 intentos extra, 104 llamadas).
 var DYN_EXAM_BANK_REPAIR_ROUNDS = 5;
+// r105 (examen final #104): banco completo pero sobre el 30 % «correcta la más larga» y SIN candidatas de longitud
+// revisables → antes de la falla definitiva, a lo sumo 2 rondas de preguntas NUEVAS (ids del pool) en las hojas con
+// rellenos «solo más larga»: el ensamblado prefiere las normales, así que cada nueva válida desplaza un relleno.
+var DYN_EXAM_BANK_SET_RULE_REPLACE_ROUNDS = 2;
+var DYN_EXAM_BANK_SET_RULE_REPLACE_MAX = 8; // ids nuevos por ronda (tope de gasto: ≈ 1–2 llamadas cortas)
+var DYN_EXAM_BANK_SET_RULE_REPLACE_REASON = { code: 'EXAM_BANK_LENGTH_BIAS', message: 'pregunta NUEVA de selección múltiple (reemplaza otra cuya respuesta correcta era la opción más larga): otra situación del capítulo; la opción correcta CORTA y directa (50 a 110 caracteres) y al menos 2 distractores MÁS LARGOS que la correcta, con el mismo error conceptual más detallado, sin pistas ni palabras absolutas' };
 var DYN_EXAM_BANK_POOL_ROUND_TOKENS = 14000;          // rev. M6: tope del pool por hoja y ronda (tokens de salida estimados)               // 2.ª–4.ª ronda solo para hojas bajo el piso (I2)
 var DYN_EXAM_BANK_CACHE_PREFIX = 'cursia.examBank.v1|';
 
@@ -8610,6 +8616,60 @@ async function _dynRunExamBank(item) {
   if (!a.perLeaf.some(function (l) { return l.kept < l.floor; })) {
     for (var lp = 0; lp < 2; lp++) { if (!(await reviseLengthExcess())) break; a = assemble(); }
   }
+  // r105: la revisión de longitud ya no tiene candidatas (todas revisadas en este u otro intento, o sin rango para
+  // alargar) o se estancó, y el banco sigue sesgado → reemplazo acotado del excedente con preguntas nuevas. Corre en
+  // cada intento que llegaría a EXAM_BANK_SET_RULE_CAPACITY, así que un reintento MANUAL de esa falla vuelve a tener una
+  // oportunidad real (los puntos de guardado del intento fallido se descartaron: el modelo responde de nuevo).
+  var setRuleReplace = { rounds: 0, asked: 0, returned: 0, excessBefore: null, excessAfter: null };
+  if (!a.perLeaf.some(function (l) { return l.kept < l.floor; }) && dynExamBankLengthBiasExcess(a) > 0 &&
+    (setRuleStats.stalled || !lengthCandidates(a, true).length)) {
+    setRuleReplace.excessBefore = dynExamBankLengthBiasExcess(a);
+    for (var rr = 0; rr < DYN_EXAM_BANK_SET_RULE_REPLACE_ROUNDS; rr++) { if (!(await replaceLengthExcess())) break; a = assemble(); }
+    setRuleReplace.excessAfter = dynExamBankLengthBiasExcess(a);
+  }
+  async function replaceLengthExcess() {
+    var excess = dynExamBankLengthBiasExcess(a);
+    if (!excess) return false;
+    var inBank = idSet(a.questions.map(function (q) { return q.id; }));
+    var fillers = recordList().filter(function (r) { return inBank[r.id] && r.status === 'valid' && r.type === 'multichoice' && _dynEbReachOnlyLongest(r.combos); })
+      .sort(function (x, y) { return x.order - y.order; });
+    if (!fillers.length) return false;
+    var want = Math.min(DYN_EXAM_BANK_SET_RULE_REPLACE_MAX, excess + 2);
+    var asked = [];
+    for (var k = 0; k < want; k++) {
+      var f = fillers[k % fillers.length];
+      var nr = mint(f.leafIndex, f.unit);
+      if (!nr) break;
+      stats.mintedIds++;
+      nr.reasons = [DYN_EXAM_BANK_SET_RULE_REPLACE_REASON];
+      asked.push(nr);
+    }
+    if (!asked.length) return false;
+    setRuleReplace.rounds++;
+    setRuleReplace.asked += asked.length;
+    var byUnit = [];
+    asked.forEach(function (rec) {
+      var g = byUnit.filter(function (x) { return x.unit === rec.unit; })[0];
+      if (!g) { g = { unit: rec.unit, list: [] }; byUnit.push(g); }
+      g.list.push({ id: rec.id, type: rec.type, chapterId: rec.unit.chapterId, moduleId: rec.unit.moduleId, reasons: rec.reasons.slice() });
+    });
+    await _dynExamBankPool(byUnit.map(function (g) {
+      return async function () {
+        var base = chunks.filter(function (ch) { return ch.unit === g.unit; })[0];
+        var accepted = recordList().filter(function (r) { return r.unit === g.unit && r.status === 'valid'; }).map(function (r) { return r.q; });
+        var mk = function (acc) { var rp = dynExamBankRepairParts(base.parts, g.list, acc, ''); return dynExamBankWithTail(rp, rp.tail + avoidFor(g.unit)); };
+        var parts = mk(accepted);
+        if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) parts = mk([]);
+        if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) return;
+        var res = await callJson('continuation', parts, 'questions', 'lengthReplace');
+        if (!res.ok) return;
+        setRuleReplace.returned += res.questions.length;
+        ingest(res.questions, idSet(g.list.map(function (x) { return x.id; })), true);
+        chunks.filter(function (ch) { return ch.unit === g.unit; }).forEach(saveChunk);
+      };
+    }), DYN_EXAM_BANK_CONCURRENCY);
+    return true;
+  }
   var repairedCount = recordList().filter(function (r) { return r.repaired && r.status === 'valid'; }).length;
 
   // Borrador para un reintento (opción 1e): las preguntas VÁLIDAS de este intento. processItem lo sube
@@ -8655,7 +8715,7 @@ async function _dynRunExamBank(item) {
   }
   function diagnosticsOut() {
     return { rejectedByCode: rejectedByCode, rejectedDetail: topDetail(), firstPass: stats.firstPass, repairPass: repairPass, calls: stats.calls,
-      poolCandidates: stats.poolCandidates, mintedIds: stats.mintedIds, strategyCandidates: stats.strategyCandidates, evidenceByRef: stats.evidenceByRef, draftUnused: stats.draftUnused, systemicStop: stats.systemicStop || null, revision: stats.revision, setRule: setRuleStats, correctLongest: a ? (a.histogram || [])[3] : null, mcTotal: a ? a.mcTotal : null, mainPartsFailed: stats.mainPartsFailed || 0, tagsReduced: stats.tagsReduced || 0,
+      poolCandidates: stats.poolCandidates, mintedIds: stats.mintedIds, strategyCandidates: stats.strategyCandidates, evidenceByRef: stats.evidenceByRef, draftUnused: stats.draftUnused, systemicStop: stats.systemicStop || null, revision: stats.revision, setRule: setRuleStats, setRuleReplace: setRuleReplace, correctLongest: a ? (a.histogram || [])[3] : null, mcTotal: a ? a.mcTotal : null, mainPartsFailed: stats.mainPartsFailed || 0, tagsReduced: stats.tagsReduced || 0,
       perLeaf: (a ? a.perLeaf : []).map(function (l) { return { owner: l.owner, type: l.type, slots: l.slots, kept: l.kept, requested: l.requested, accepted: l.accepted, acceptedAfterRepair: l.acceptedAfterRepair }; }) };
   }
   function detailTail() {
@@ -8711,6 +8771,9 @@ async function _dynRunExamBank(item) {
       // ninguna) → la revisión no avanza: falla definitiva.
       // rev. I1: «sin avance» exige respuestas REALES del modelo en ambos intentos (fallas de formato no cuentan).
       var noProgress = draft.draftReason === 'bank_rule' && (!left || ((draft.setRuleFixedLast || 0) === 0 && (draft.setRuleReturnedLast || 0) > 0 && setRuleStats.fixed === 0 && setRuleStats.returned > 0));
+      // r105: el reemplazo de este intento bajó el excedente → hubo avance: borrador bank_rule (reintentable, con las
+      // nuevas válidas), nunca la falla definitiva. Acotado: el excedente es finito y cada intento debe bajarlo.
+      if (setRuleReplace.excessBefore !== null && setRuleReplace.excessAfter < setRuleReplace.excessBefore) noProgress = false;
       if (noProgress) {
         var srOut = fail('EXAM_BANK_SET_RULE_CAPACITY: ' + lbMsg + ' tras la revisión de longitud (' + setRuleStats.fixed + ' corregidas en este intento, ' + Object.keys(lenTried).length + ' revisadas en total) y sin candidatas revisables: revisar el capítulo o el plan del examen' + detailTail(), false);
         srOut.diagnostics = diagnosticsOut();
