@@ -131,6 +131,22 @@ async function main() {
     assert(/^VIDEO_PLAN_INVARIANT: checkpoint 2 en \d+ no está anclado al final de una escena/.test(msg), msg);
   });
 
+  await check('P apertura: la primera pausa va como pronto al final de la escena 3 (gancho y contexto aún no enseñan); si así no caben, el plan de siempre', () => {
+    // Capítulo 5 real (intersecciones, 412 s): antes la primera pausa caía al final del contexto (escenas 1–2)
+    const durs = [31.4, 33.7, 26.0, 32.3, 36.3, 32.3, 30.6, 28.6, 24.8, 27.8, 32.3, 32.5, 32.6];
+    const r = P.videoScenesFromVideogen(durs.map((d, i) => ({ scene_order: i + 1, duration_seconds: d, narration: 'x' })));
+    assert(r.ok, 'escenas');
+    const total = r.scenes[r.scenes.length - 1].endSec;
+    const plan = P.planVideoCheckpoints(total, r.scenes);
+    assert(plan.timelineSource === 'videogen_scenes', plan.timelineSource);
+    const firstScenes = P.scenesForCheckpoint(plan.checkpoints[0], plan.scenes).map((x) => x.order);
+    assert(firstScenes.includes(3) && plan.checkpoints[0].atSec >= Math.ceil(r.scenes[2].endSec), `primera pausa ${plan.checkpoints[0].atSec} s, escenas ${firstScenes}`);
+    // Video corto con pocas escenas: la regla no cabe → plan anclado igual (nunca sin preguntas)
+    const short = P.videoScenesFromVideogen([40, 40, 40, 30].map((d, i) => ({ scene_order: i + 1, duration_seconds: d, narration: 'x' })));
+    const sp = P.planVideoCheckpoints(150, short.scenes);
+    assert(sp.checkpoints.length === P.planInteractionCheckpoints(150).length, 'misma cantidad');
+  });
+
   await check('P fallback equidistante con motivo (nunca en silencio): sin escenas, Σ escenas ≠ duración, tiempos rotos, sin candidatos; video corto sigue fallando fuerte', () => {
     const even = plain(P.planInteractionCheckpoints(D));
     const cases = [
@@ -322,6 +338,22 @@ async function main() {
     eq(serverOk(rc, true).timelineSource, 'videogen_scenes', 'validado anclado');
     const rl = await run(curSrc, legacyClaim);
     assert(rl.ok === true && rl.summary.timelineSource === 'even_spacing', 'ejecutor actual con claim de siempre');
+  });
+
+  await check('P apertura (navegador): mismo plan que el servidor, y acepta el claim con el plan anterior (servidor sin la regla)', () => {
+    const files = ['05-libro.js', '07-examenes.js', '08-downloads.js', '44-dynamic-prompt-builders.js', '45-dynamic-generation-executor.js', '46-dynamic-context-package.js'];
+    const ctx = { console: { log() {}, warn() {}, error() {}, info() {} }, Math, JSON, Date, Promise, setTimeout, clearTimeout };
+    ctx.window = ctx;
+    vm.createContext(ctx);
+    files.forEach((f) => vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'vendor', 'dynamic-executor', f), 'utf8'), ctx, { filename: f }));
+    const durs = [31.4, 33.7, 26.0, 32.3, 36.3, 32.3, 30.6, 28.6, 24.8, 27.8, 32.3, 32.5, 32.6];
+    const r = P.videoScenesFromVideogen(durs.map((d, i) => ({ scene_order: i + 1, duration_seconds: d, narration: 'x' })));
+    const total = r.scenes[r.scenes.length - 1].endSec;
+    const key = (pl) => pl.checkpoints.map((c) => `${c.atSec}[${c.segment}]`).join(',');
+    const srv = P.planVideoCheckpoints(total, r.scenes);
+    assert(key(ctx.dynPlanVideoCheckpoints(total, r.scenes)) === key(srv), 'servidor ≠ navegador');
+    const legacy = ctx.dynPlanVideoCheckpoints(total, r.scenes, { legacyOpening: true });
+    assert(key(legacy) !== key(srv) && legacy.checkpoints[0].atSec < srv.checkpoints[0].atSec, 'el plan anterior debe ser distinto en este video');
   });
 
   await check('M-7 duración cruda: con d no entera, claim, validación del servidor y .h5p dan el MISMO plan anclado (escala con la d medida)', async () => {

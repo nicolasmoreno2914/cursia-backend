@@ -3569,7 +3569,7 @@ function dynPlanInteractionCheckpoints(durationSec) {
 // candidatos = ⌈fin de escena⌉ en [30, d − 15]; n crecientes, ≥ 20 s entre sí, que minimizan
 // Σ|candidato − atSec equidistante| (empates → el más temprano); segmento = [atSec anterior (0), atSec].
 // Sin escenas, escenas inconsistentes con la duración o sin candidatos → plan equidistante + motivo.
-var DYN_VIDEO_SCENE_RULES = { maxScenes: 100, narrationMax: 360, anchorEpsilonSec: 1, durationToleranceSec: 3, durationToleranceRatio: 0.03 };
+var DYN_VIDEO_SCENE_RULES = { maxScenes: 100, narrationMax: 360, anchorEpsilonSec: 1, durationToleranceSec: 3, durationToleranceRatio: 0.03, firstQuestionAfterScene: 3 };
 function _dynVideoScenesProblem(durationSec, scenes) {
   var R = DYN_VIDEO_SCENE_RULES;
   if (!Array.isArray(scenes) || !scenes.length) return 'no_scene_data';
@@ -3616,21 +3616,19 @@ function dynScaleVideoScenes(durationSec, scenes) {
   var at = function (x) { return Math.round(x * f * 1000) / 1000; };
   return scenes.map(function (s) { return { order: s.order, startSec: at(s.startSec), endSec: at(s.endSec), narration: s.narration }; });
 }
-function dynPlanVideoCheckpoints(durationSec, scenes) {
-  var even = dynPlanInteractionCheckpoints(durationSec);
-  if (scenes === undefined || scenes === null) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'no_scene_data' };
-  var C = DYN_VIDEO_CHECKPOINT_RULES;
-  var d = dynVideoPlanDurationSec(durationSec);
-  var problem = _dynVideoScenesProblem(d, scenes);
-  if (problem) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: problem };
-  var lo = C.noInteractionFirstSec;
-  var hi = d - C.noInteractionLastSec;
+// Finales de escena (⌈fin⌉) en [lo, hi], crecientes y sin repetir; espejo de sceneBoundaries.
+function _dynSceneBoundaries(sc, lo, hi) {
   var cand = [];
-  var sc = dynScaleVideoScenes(durationSec, scenes); // review M-7: la duración MEDIDA cruda, como el servidor
   sc.forEach(function (s) {
     var b = Math.ceil(s.endSec - 1e-6);
     if (b >= lo && b <= hi && (!cand.length || b > cand[cand.length - 1])) cand.push(b);
   });
+  return cand;
+}
+// n candidatos crecientes, ≥ minGapSec entre sí, lo más cerca posible del plan equidistante; null si no caben.
+// Espejo de pickSceneAnchors.
+function _dynPickSceneAnchors(even, cand) {
+  var C = DYN_VIDEO_CHECKPOINT_RULES;
   var n = even.length;
   var m = cand.length;
   var cost = [];
@@ -3655,9 +3653,28 @@ function dynPlanVideoCheckpoints(durationSec, scenes) {
   var end = -1;
   var endCost = Infinity;
   for (var k = 0; k < m; k++) if (cost[n - 1][k] < endCost) { endCost = cost[n - 1][k]; end = k; }
-  if (end < 0) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'insufficient_scene_boundaries(' + m + '<' + n + ')' };
+  if (end < 0) return null;
   var picks = new Array(n);
   for (var q = n - 1, jj = end; q >= 0; q--) { picks[q] = cand[jj]; jj = par[q][jj]; }
+  return picks;
+}
+// opts.legacyOpening: el plan anterior, que podía poner la primera pausa en las escenas de apertura (solo para
+// aceptar el claim de un servidor que aún no tiene la regla firstQuestionAfterScene).
+function dynPlanVideoCheckpoints(durationSec, scenes, opts) {
+  var even = dynPlanInteractionCheckpoints(durationSec);
+  if (scenes === undefined || scenes === null) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'no_scene_data' };
+  var C = DYN_VIDEO_CHECKPOINT_RULES;
+  var d = dynVideoPlanDurationSec(durationSec);
+  var problem = _dynVideoScenesProblem(d, scenes);
+  if (problem) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: problem };
+  var lo = C.noInteractionFirstSec;
+  var hi = d - C.noInteractionLastSec;
+  var sc = dynScaleVideoScenes(durationSec, scenes); // review M-7: la duración MEDIDA cruda, como el servidor
+  var k = DYN_VIDEO_SCENE_RULES.firstQuestionAfterScene;
+  var opening = !(opts && opts.legacyOpening) && sc.length > k ? Math.ceil(sc[k - 1].endSec - 1e-6) : lo;
+  // Primero sin las escenas de apertura; si así no caben las n pausas, con todas
+  var picks = _dynPickSceneAnchors(even, _dynSceneBoundaries(sc, Math.max(lo, opening), hi)) || _dynPickSceneAnchors(even, _dynSceneBoundaries(sc, lo, hi));
+  if (!picks) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'insufficient_scene_boundaries(' + _dynSceneBoundaries(sc, lo, hi).length + '<' + even.length + ')' };
   var out = picks.map(function (atSec, x) { return { index: x + 1, atSec: atSec, segment: [x === 0 ? 0 : picks[x - 1], atSec] }; });
   _dynAssertSceneAnchored(d, out, sc);
   return { checkpoints: out, timelineSource: 'videogen_scenes', scenes: sc };
@@ -5055,12 +5072,20 @@ async function _dynRunVideoInteractions(item) {
   if (claimTimeline === 'videogen_scenes' && vplan.timelineSource !== 'videogen_scenes') {
     return { ok: false, error: 'video_interactions: VIDEO_PLAN_MISMATCH — el claim ancla las preguntas a las escenas pero su línea de tiempo no es utilizable (' + vplan.timelineReason + ')', retryable: false };
   }
-  var plan = vplan.checkpoints;
   var anchored = vplan.timelineSource === 'videogen_scenes';
-  var planMatches = plan.length === claimCheckpoints.length && plan.every(function (p, i) {
-    var c = claimCheckpoints[i];
-    return c.index === p.index && c.atSec === p.atSec && c.segmentStart === p.segment[0] && c.segmentEnd === p.segment[1];
-  });
+  var sameAsClaim = function (pl) {
+    return pl.length === claimCheckpoints.length && pl.every(function (p, i) {
+      var c = claimCheckpoints[i];
+      return c.index === p.index && c.atSec === p.atSec && c.segmentStart === p.segment[0] && c.segmentEnd === p.segment[1];
+    });
+  };
+  var planMatches = sameAsClaim(vplan.checkpoints);
+  // Un servidor que aún no tiene firstQuestionAfterScene manda el plan anterior: se acepta y se usa ese
+  if (!planMatches && anchored) {
+    var legacy = dynPlanVideoCheckpoints(durationSec, claimScenes, { legacyOpening: true });
+    if (legacy.timelineSource === 'videogen_scenes' && sameAsClaim(legacy.checkpoints)) { vplan = legacy; planMatches = true; }
+  }
+  var plan = vplan.checkpoints;
   if (!planMatches) return { ok: false, error: 'video_interactions: VIDEO_PLAN_MISMATCH — los checkpoints del claim no coinciden con ' + (anchored ? 'planVideoCheckpoints(' + durationSec + ', escenas)' : 'planInteractionCheckpoints(' + durationSec + ')'), retryable: false };
 
   // EV6 IV avanzado: el claim pide schemaVersion 2 (Manifest ivAdvanced) y trae el plan de pausas
