@@ -106,6 +106,11 @@ import {
 // r62 (N2): conciliación automática de Videogen/Gamma con evidencia del proveedor + reenvío acotado.
 import { PROVIDER_RECONCILE_CODE, PROVIDER_RECONCILE_KEY, ProviderReconcileKind, providerReconcileDecision } from './provider-reconcile';
 import { PROVIDER_STUCK_NO_CANCEL, STUCK_RENDER_RESEND, STUCK_RENDER_RESEND_KEY, VIDEOGEN_RENDER_OVERDUE } from './videogen-render-cap';
+// r106: compuertas de estado de retry / regenerate / youtube-resolution (las mismas que usa el clasificador de fallos).
+import {
+  RESUBMIT_PROVIDER_ITEM_TYPES, isAmbiguousYoutubeUpload, isBudgetBlocked, manualResubmitVideoEligible, regenerateAcceptsStatus,
+  resubmitProviderErrorEligible, retryAcceptsItem,
+} from './admin-action-eligibility';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
 import { reservationHasConsultableId, settleAmbiguousAsPossibleDuplicate } from '../finops/ambiguous-resend';
@@ -562,21 +567,8 @@ function deliveryStateOrPending(v: unknown): string {
   }
 }
 
-/** DN-1: la subida a YouTube de este item video quedó ambigua (empezó y no registró id). */
-function isAmbiguousYoutubeUpload(row: { error?: string | null; output_summary?: Record<string, any> | null }): boolean {
-  const os = row.output_summary ?? {};
-  if (os.external?.youtubeVideoId) return false;
-  return (
-    os.delivery === 'ambiguous' ||
-    String(row.error ?? '').startsWith('ambiguous_youtube_upload') ||
-    (!!os.youtubeUploadStartedAt && os.delivery !== 'blocked_auth' && os.delivery !== 'blocked_quota')
-  );
-}
-
-/** V2.1 RF-b: item bloqueado por el runtime guard de presupuesto (reanudable con retry). */
-function isBudgetBlocked(row: { status?: string | null; error?: string | null }): boolean {
-  return row.status === 'blocked' && String(row.error ?? '').startsWith(BUDGET_EXCEEDED);
-}
+// DN-1 (subida a YouTube ambigua) y V2.1 RF-b (bloqueado por presupuesto): r106 los movió a admin-action-eligibility.ts
+// (fuente única de las compuertas de estado de las acciones de admin, también para el clasificador).
 
 export interface StartRunResult {
   created: boolean;
@@ -3019,7 +3011,7 @@ export class RunsService {
       }
       // V2.1 RF-b: un item `blocked` por presupuesto (budget_exceeded) se reanuda
       // igual que un failed, tras ampliar la autorización del run.
-      if (target.status !== 'failed' && !isBudgetBlocked(target)) {
+      if (!retryAcceptsItem(target)) {
         throw new ConflictException(
           `Solo se puede reintentar un item en estado "failed" (o "blocked" por ${BUDGET_EXCEEDED}); "${itemKey}" está en "${target.status}"`,
         );
@@ -3242,13 +3234,11 @@ export class RunsService {
       if (resubmitProvider) {
         if (resubmitVideo) throw new BadRequestException('resubmitVideo y resubmitProvider son excluyentes');
         // Calibración #2: también los items de audio (OpenAI TTS / guion LLM) en reconciliación.
-        if (!['presentation', 'audio_welcome', 'audiobook_chapter'].includes(target.type)) {
+        if (!RESUBMIT_PROVIDER_ITEM_TYPES.includes(target.type)) {
           throw new BadRequestException(`resubmitProvider solo aplica a items type="presentation" | "audio_welcome" | "audiobook_chapter"; "${itemKey}" es "${target.type}"`);
         }
         const err = target.error ?? '';
-        const eligible = target.type === 'presentation'
-          ? err.startsWith('gamma_submit_ambiguous') || err.startsWith('gamma_generation_failed') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED)
-          : err.startsWith(PROVIDER_RECONCILIATION_REQUIRED);
+        const eligible = resubmitProviderErrorEligible(target.type, err);
         if (!eligible) {
           throw new BadRequestException(
             `resubmitProvider solo aplica cuando el último error es "gamma_submit_ambiguous", "gamma_generation_failed" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,
@@ -3276,15 +3266,13 @@ export class RunsService {
           throw new BadRequestException(`resubmitVideo solo aplica a items type="video"; "${itemKey}" es "${target.type}"`);
         }
         const err = target.error ?? '';
-        const eligible = err.startsWith('videogen_failed') || err.startsWith('ambiguous_video_submission')
-          || err.startsWith('videogen_submit_rejected') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED)
+        // r106: lo que admite un pedido de una persona (incluye `videogen_render_overdue` SOLO con la excepción ya registrada
+        // para ESTE error — review overdue m1 / re-review m-n1) vive en admin-action-eligibility.ts.
+        const eligible = manualResubmitVideoEligible(err, target.output_summary)
           // r62 (N2): job que nunca termina (re-poll del auto-healer agotado), ya liquidado de forma conservadora.
           || (!!auto?.providerReconcile && auto.providerReconcile.kind === 'videogen_stuck' && err.startsWith('video_timeout'))
-          // r62 (N2): job vencido (tope único de render): el automático tras una cancelación confirmada, o el de admin
-          // SOLO con la excepción ya registrada (review overdue m1: nunca mientras la conciliación todavía decide/cancela).
-          || (err.startsWith('videogen_render_overdue') && (!!auto?.providerReconcile
-            // re-review m-n1: la excepción tiene que ser la de ESTE error (no la de un render anterior).
-            || (!!target.output_summary?.providerReconcile?.declined && String(target.output_summary?.providerReconcile?.declinedError ?? '') === err)));
+          // r62 (N2): job vencido (tope único de render): el automático tras una cancelación confirmada.
+          || (err.startsWith('videogen_render_overdue') && !!auto?.providerReconcile);
         if (!eligible) {
           throw new BadRequestException(
             `resubmitVideo solo aplica cuando el último error es "videogen_failed", "ambiguous_video_submission", "videogen_submit_rejected" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,
@@ -5645,7 +5633,7 @@ export class RunsService {
       const err = this.otherActiveRunConflict(other, manifest);
       block('active_run_on_other_manifest', err.message, () => err);
     }
-    if (latest.status !== 'completed') {
+    if (!regenerateAcceptsStatus(latest.status)) {
       const message =
         `Solo se puede regenerar un item completado; "${itemKey}" (generation ${latest.generation}) está en "${latest.status}"` +
         (latest.status === 'failed' ? ' — usa retry para reintentarlo' : '');

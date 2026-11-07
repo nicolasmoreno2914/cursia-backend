@@ -362,7 +362,8 @@ const ON = { DYNAMIC_COURSE_STRUCTURE: 'true' }; // tick del auto-healer encendi
     eq([v.state, v.actions, v.alert.code, v.costKind], ['blocked_quota', [], 'youtube_quota_long_wait', null], 'espera con alerta');
     const err = 'youtube_quota_exhausted: YouTube siguió sin permitir subidas durante 7 días (cuota agotada).';
     const fv = FC.classifyFailure({ error: err, itemType: 'video', source: 'video_worker' });
-    eq([fv.class, fv.humanReason, fv.adminAction, fv.unclassified], ['D', 'config', 'resolve_youtube', false], 'excepción clasificada');
+    // r106: subida no ambigua → la acción ejecutable es el retry simple (re-sube sin re-renderizar), no youtube-resolution.
+    eq([fv.class, fv.humanReason, fv.adminAction, fv.unclassified], ['D', 'config', 'retry_item', false], 'excepción clasificada');
     const osx = { delivery: 'upload_failed', external: { videogenJobId: 'vg' }, youtubeQuotaExhaustedAt: NOW.toISOString() };
     const d = AH.autoHealDecision({ id: 'v1', status: 'failed', type: 'video', error: err, output_summary: osx, finished_at: hAgo(1), failure_class: 'D' }, NOW, AH.autoHealPolicyFromEnv({}));
     eq(d.heal, false, 'el auto-healer no la reabre en silencio');
