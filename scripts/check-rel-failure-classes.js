@@ -218,9 +218,11 @@ check('tabla: YouTube, Gamma y TTS', () => {
   expectVerdict('youtube_upload_failed: YouTube respondió con un error temporal (HTTP 503)', { class: 'A', provider: 'youtube' });
   expectVerdict('youtube_blocked_quota: cuota diaria agotada', { class: 'A', strategy: 'wait_provider', scope: 'provider' });
   for (const m of ['youtube_blocked_auth: token revocado', 'youtube_preflight_failed: x', 'youtube_publisher_not_configured']) {
-    expectVerdict(m, { class: 'D', humanReason: 'config', adminAction: 'resolve_youtube', scope: 'provider' });
+    // r106: subida NO ambigua → el retry simple re-sube (youtube-resolution respondería 409 not_ambiguous).
+    expectVerdict(m, { class: 'D', humanReason: 'config', adminAction: 'retry_item', scope: 'provider' });
+    expectVerdict(m, { class: 'D', humanReason: 'config', adminAction: 'resolve_youtube' }, { outputSummary: { delivery: 'ambiguous' } });
   }
-  expectVerdict('ambiguous_youtube_upload: x', { class: 'C', strategy: 'provider_check', paidRisk: 'none' });
+  expectVerdict('ambiguous_youtube_upload: x', { class: 'C', strategy: 'provider_check', paidRisk: 'none', adminAction: 'resolve_youtube' });
   expectVerdict('youtube_invalid_url: x', { class: 'A', strategy: 'repoll_external' });
   for (const m of ['youtube_delivery_without_videogen_job', 'youtube_missing_videogen_download_url', 'invalid_video_delivery: x']) {
     expectVerdict(m, { class: 'B', strategy: 'regenerate_dependency' });

@@ -624,7 +624,8 @@ async function runWorkerChecks() {
       assert(f.retryable === false && f.error.startsWith('youtube_quota_exhausted: ') && /7 días/.test(f.error), 'failItem: ' + JSON.stringify(f));
       const FC = loadDist('modules/reliability/failure-classifier.js');
       const v = FC.classifyFailure({ error: f.error, itemType: 'video', source: 'video_worker' });
-      eq([v.class, v.code, v.humanReason, v.adminAction, v.unclassified], ['D', 'youtube_quota_exhausted', 'config', 'resolve_youtube', false], 'excepción clasificada');
+      // r106: subida no ambigua → retry simple (youtube-resolution respondería 409 not_ambiguous).
+      eq([v.class, v.code, v.humanReason, v.adminAction, v.unclassified], ['D', 'youtube_quota_exhausted', 'config', 'retry_item', false], 'excepción clasificada');
       assert(typeof os.youtubeQuotaExhaustedAt === 'string', 'instante de la excepción registrado');
       assert(os.delivery === 'upload_failed' && os.youtubeQuotaSince === null && !os.youtubeUploadStartedAt, 'estado: ' + JSON.stringify(os));
       eq(D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: f.error, outputSummary: os }).actions, ['retry_upload'], 'acción manual');

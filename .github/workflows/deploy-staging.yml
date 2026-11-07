@@ -212,6 +212,9 @@ jobs:
             node scripts/check-rel-failure-classes.js
           fi
 
+      - name: Check r106 acciones de admin ejecutables (cada adminAction del clasificador contra las compuertas de RunsService; puro)
+        run: node scripts/check-rel-admin-actions.js
+
       - name: Check REL R2 log de intentos + columnas de recuperación (puro; la parte PG16 corre local)
         run: node scripts/check-rel-recovery.js --pure-only
 
