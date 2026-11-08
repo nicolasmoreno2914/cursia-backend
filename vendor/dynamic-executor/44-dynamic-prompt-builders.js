@@ -1183,7 +1183,8 @@ function _dynVideoScenesHead(contentMd, cps, scenes) {
   return 'El video tiene su PROPIO guion, narrado por escenas (no recorre el capítulo de forma pareja). Guion real del video (escena, tramo en segundos, narración):\n<<<GUION\n' + script + '\nGUION>>>'
     + '\n\nTexto del capítulo (solo como referencia de términos, datos y contexto):\n<<<CAPITULO\n' + String(contentMd || '') + '\nCAPITULO>>>'
     + '\n\nPuntos de pausa (fijos, cada uno al final de una escena; genera EXACTAMENTE una pregunta por cada uno, en este orden y con este index):\n' + cpLines
-    + '\n\nCada pregunta evalúa SOLO algo que la narración del video ya dijo en ESE tramo (las escenas indicadas): nunca algo de escenas posteriores ni algo que el video no narra, aunque esté en el capítulo.';
+    + '\n\nCada pregunta evalúa SOLO algo que la narración del video ya dijo en ESE tramo (las escenas indicadas): nunca algo de escenas posteriores ni algo que el video no narra, aunque esté en el capítulo.'
+    + ' Si el tramo plantea una pregunta o un caso sin resolverlo («¿quién tiene el paso?»), no preguntes por esa respuesta: evalúa algo que la narración SÍ explicó o afirmó.';
 }
 
 function dynVideoInteractionsPrompt(contentMd, checkpoints, reflections, opts) {

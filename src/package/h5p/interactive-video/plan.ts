@@ -215,6 +215,13 @@ export const VIDEO_SCENE_RULES = Object.freeze({
   /** |Σ escenas − duración medida| ≤ max(3 s, 3 %) — si no, la línea de tiempo no es la del MP4. */
   durationToleranceSec: 3,
   durationToleranceRatio: 0.03,
+  /**
+   * La primera pregunta va, como pronto, al final de esta escena (1-based): las primeras escenas de un
+   * video de Videogen son gancho y contexto (máximo 2) y aún no explican nada; una pregunta ahí evalúa algo
+   * que el video todavía no enseñó. Si con esa restricción no caben las n preguntas, se usa el plan anclado
+   * sin ella.
+   */
+  firstQuestionAfterScene: 3,
 });
 
 export interface VideoScene {
@@ -349,27 +356,22 @@ export function scenesForCheckpoint(checkpoint: VideoCheckpoint, scenes: VideoSc
   });
 }
 
-/**
- * Plan de checkpoints con la línea de tiempo del video si existe (Q-04). Misma cantidad que el plan
- * equidistante; lanza los mismos errores que planInteractionCheckpoints (duración inválida / corta).
- */
-export function planVideoCheckpoints(durationSec: number, scenes?: unknown): VideoCheckpointPlan {
-  const even = planInteractionCheckpoints(durationSec);
-  if (scenes === undefined || scenes === null) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'no_scene_data' };
-  const R = VIDEO_CHECKPOINT_RULES;
-  const d = videoPlanDurationSec(durationSec);
-  const problem = videoScenesProblem(d, scenes);
-  if (problem) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: problem };
-  // Review M-7: se escala con la duración MEDIDA (sin floor): claim, validación y .h5p reciben la misma d cruda
-  // (activity.ts la pasa sin redondear), así el fin escalado de cada escena es el del MP4.
-  const sc = scaleVideoScenes(durationSec, scenes as VideoScene[]);
-  const lo = R.noInteractionFirstSec;
-  const hi = d - R.noInteractionLastSec;
+/** Finales de escena (⌈fin⌉) dentro de [lo, hi], crecientes y sin repetir: candidatos para las pausas. */
+function sceneBoundaries(scenes: VideoScene[], lo: number, hi: number): number[] {
   const cand: number[] = [];
-  for (const s of sc) {
+  for (const s of scenes) {
     const b = Math.ceil(s.endSec - 1e-6);
     if (b >= lo && b <= hi && (cand.length === 0 || b > cand[cand.length - 1])) cand.push(b);
   }
+  return cand;
+}
+
+/**
+ * n candidatos (uno por checkpoint del plan equidistante), crecientes y ≥ minGapSec entre sí, que minimizan la
+ * distancia total al plan equidistante (programación dinámica). null si no caben.
+ */
+function pickSceneAnchors(even: VideoCheckpoint[], cand: number[]): number[] | null {
+  const R = VIDEO_CHECKPOINT_RULES;
   const n = even.length;
   const m = cand.length;
   const INF = Number.POSITIVE_INFINITY;
@@ -403,12 +405,37 @@ export function planVideoCheckpoints(durationSec: number, scenes?: unknown): Vid
   let end = -1;
   let endCost = INF;
   for (let j = 0; j < m; j++) if (cost[n - 1][j] < endCost) { endCost = cost[n - 1][j]; end = j; }
-  if (end < 0) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: `insufficient_scene_boundaries(${m}<${n})` };
+  if (end < 0) return null;
   const picks: number[] = new Array(n);
   for (let i = n - 1, j = end; i >= 0; i--) {
     picks[i] = cand[j];
     j = par[i][j];
   }
+  return picks;
+}
+
+/**
+ * Plan de checkpoints con la línea de tiempo del video si existe (Q-04). Misma cantidad que el plan
+ * equidistante; lanza los mismos errores que planInteractionCheckpoints (duración inválida / corta).
+ */
+export function planVideoCheckpoints(durationSec: number, scenes?: unknown): VideoCheckpointPlan {
+  const even = planInteractionCheckpoints(durationSec);
+  if (scenes === undefined || scenes === null) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'no_scene_data' };
+  const R = VIDEO_CHECKPOINT_RULES;
+  const d = videoPlanDurationSec(durationSec);
+  const problem = videoScenesProblem(d, scenes);
+  if (problem) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: problem };
+  // Review M-7: se escala con la duración MEDIDA (sin floor): claim, validación y .h5p reciben la misma d cruda
+  // (activity.ts la pasa sin redondear), así el fin escalado de cada escena es el del MP4.
+  const sc = scaleVideoScenes(durationSec, scenes as VideoScene[]);
+  const lo = R.noInteractionFirstSec;
+  const hi = d - R.noInteractionLastSec;
+  const n = even.length;
+  const k = VIDEO_SCENE_RULES.firstQuestionAfterScene;
+  const opening = sc.length > k ? Math.ceil(sc[k - 1].endSec - 1e-6) : lo;
+  // Primero sin las escenas de apertura; si así no caben las n pausas, con todas
+  const picks = pickSceneAnchors(even, sceneBoundaries(sc, Math.max(lo, opening), hi)) ?? pickSceneAnchors(even, sceneBoundaries(sc, lo, hi));
+  if (!picks) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: `insufficient_scene_boundaries(${sceneBoundaries(sc, lo, hi).length}<${n})` };
   const out: VideoCheckpoint[] = picks.map((atSec, i) => ({ index: i + 1, atSec, segment: [i === 0 ? 0 : picks[i - 1], atSec] as [number, number] }));
   assertSceneAnchoredCheckpoints(d, out, sc);
   return { checkpoints: out, timelineSource: 'videogen_scenes', scenes: sc };
