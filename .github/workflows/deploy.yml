@@ -233,6 +233,11 @@ jobs:
       - name: Check r58 endurecimiento del pipeline (puro)
         run: node scripts/check-r58-pipeline-hardening.js --pure-only
 
+      # r107 B1: lector seguro del .mbz (anti zip-bomb / rutas) + identificación del Taller de cursos. --ci = solo sintéticos y
+      # dañados generados en el momento (el corpus real de clientes vive solo en la máquina local: modo --corpus).
+      - name: Check r107 Taller de cursos — lector seguro + identificación (puro, sintéticos)
+        run: node scripts/r107/check-r107-identify.js --ci
+
       # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
       - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
         env:

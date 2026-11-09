@@ -43,8 +43,10 @@ const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
   'migrate-r83-infra-health.js': { sql: 'supabase-migration-r83-infra-health.sql' },
   // r99: activación persistida (cursia_feature_activations), staging-only hasta aprobación del owner.
   'migrate-r99-activation.js': { sql: 'supabase-migration-r99-activation.sql' },
+  // r107: «Taller de cursos» (workshop_sessions), staging-only hasta aprobación del owner.
+  'migrate-r107-workshop-sessions.js': { sql: 'supabase-migration-r107-workshop-sessions.sql' },
 };
-const STAGING_ONLY_REASON = /^r(75|79\.1|81|83|99): staging-only hasta aprobación del owner/;
+const STAGING_ONLY_REASON = /^r(75|79\.1|81|83|99|107): staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).
 const ORDER_EXCEPTIONS = {
   'supabase-migration-ev6-h5p2.sql': 'courses.review_cards_enabled: columna aditiva independiente (nullable, default false); producción la aplica después de FinOps desde EV6',

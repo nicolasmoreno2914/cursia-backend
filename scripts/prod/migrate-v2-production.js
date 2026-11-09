@@ -311,6 +311,10 @@ const EXCLUDED = [
   // arranque del proceso (nunca retroactivo).
   { file: 'supabase-migration-r99-activation.sql', reason: 'r99: staging-only hasta aprobación del owner' },
   { file: 'scripts/migrate-r99-activation.js', reason: 'r99: staging-only hasta aprobación del owner' },
+  // r107 («Taller de cursos»): tabla nueva workshop_sessions (RLS, sin anon/authenticated). Staging-only hasta aprobación
+  // del owner; sin ella la API del Taller responde 503 COURSE_WORKSHOP_NOT_MIGRATED y el flag COURSE_WORKSHOP está apagado.
+  { file: 'supabase-migration-r107-workshop-sessions.sql', reason: 'r107: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r107-workshop-sessions.js', reason: 'r107: staging-only hasta aprobación del owner' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

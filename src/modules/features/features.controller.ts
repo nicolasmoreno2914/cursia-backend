@@ -5,6 +5,7 @@ import { AuthUser } from '../../auth/auth.types';
 import { DynamicFeatures, resolveDynamicFeatures, toHttpConfigError } from './dynamic-features';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import { isBudgetFitEnabled } from '../course-design/budget-fit';
+import { isCourseWorkshopAllowedForOwner } from './course-workshop-flag';
 import { AllowInactiveAccount } from '../authz/public.decorator';
 import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
@@ -15,7 +16,16 @@ import { AuthenticatedOnly } from '../authz/require-permission.decorator';
  * - `superAdmin` — si ESTE usuario es SUPER_ADMIN, con el MISMO chequeo que aplica el servidor
  *   (`isSuperAdminEmail`, SUPER_ADMIN_EMAILS). Nunca se expone la lista de admins.
  */
-export type FeaturesResponse = DynamicFeatures & { dodContract: true; superAdmin: boolean; budgetFit?: true };
+export type FeaturesResponse = DynamicFeatures & { dodContract: true; superAdmin: boolean; budgetFit?: true; courseWorkshop?: true };
+
+/** r107: una lista de dueños mal escrita apaga el Taller (y lo dice el guard del Taller con un 500), nunca /features. */
+function courseWorkshopFor(userId: string): boolean {
+  try {
+    return isCourseWorkshopAllowedForOwner(userId);
+  } catch {
+    return false;
+  }
+}
 
 @AuthenticatedOnly('flags del propio usuario')
 @Controller('features')
@@ -30,7 +40,12 @@ export class FeaturesController {
     try {
       const f = resolveDynamicFeatures(user.id);
       // r79: «Ajustar al presupuesto» (DYNAMIC_BUDGET_FIT === 'true', solo con V2 habilitada para el usuario).
-      return { ...f, dodContract: true, superAdmin: isSuperAdminEmail(user.email), ...(f.dynamicCourseStructure && isBudgetFitEnabled() ? { budgetFit: true as const } : {}) };
+      // r107: «Taller de cursos» (COURSE_WORKSHOP === 'true' + lista de dueños; la clave solo aparece si está habilitado).
+      return {
+        ...f, dodContract: true, superAdmin: isSuperAdminEmail(user.email),
+        ...(f.dynamicCourseStructure && isBudgetFitEnabled() ? { budgetFit: true as const } : {}),
+        ...(courseWorkshopFor(user.id) ? { courseWorkshop: true as const } : {}),
+      };
     } catch (err) {
       toHttpConfigError(err);
     }

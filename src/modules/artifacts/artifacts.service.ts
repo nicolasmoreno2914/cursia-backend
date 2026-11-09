@@ -690,6 +690,58 @@ export class ArtifactsService {
     }
   }
 
+  // ── SIGNED UPLOAD URL ───────────────────────────────────────────────────────
+
+  /**
+   * r107 B1 (Taller de cursos): URL firmada de SUBIDA para que el navegador mande un archivo grande (hasta 300 MB)
+   * directo a Storage, sin pasar por la API ni por nginx. Mismo criterio que `getDownloadUrl`:
+   *  - solo una ruta de la carpeta del dueño (`assertWritableStoragePath`: la service role ignora RLS, este es el control);
+   *  - `x-upsert: false` (nunca pisa un objeto existente);
+   *  - sin service role o si Supabase no firma → `method: 'frontend'`: el navegador sube con su propio SDK a SU carpeta
+   *    (políticas own-folder de cursia-artifacts), igual que el resto de los artifacts del cliente.
+   * Supabase no limita el tamaño de una subida firmada: quien la pide verifica después el tamaño real (HEAD / bytes).
+   * Las URLs firmadas de subida de Supabase valen 2 h (no configurable).
+   */
+  async createSignedUploadUrl(
+    ownerId: string,
+    bucket: string,
+    storagePath: string,
+  ): Promise<{ method: 'backend'; url: string; token: string | null; storagePath: string; bucket: string } | { method: 'frontend'; storagePath: string; bucket: string }> {
+    assertWritableStoragePath(ownerId, bucket, storagePath);
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    const frontend = { method: 'frontend' as const, storagePath, bucket };
+    if (!supabaseUrl || !serviceKey) {
+      this.logger.warn('createSignedUploadUrl: sin SUPABASE_SERVICE_ROLE_KEY — el navegador sube con su SDK a su carpeta');
+      return frontend;
+    }
+    const encodedPath = assertSafeStoragePath(storagePath).map((s) => encodeURIComponent(s)).join('/');
+    const signUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/upload/sign/${bucket}/${encodedPath}`;
+    try {
+      const response = await fetch(signUrl, {
+        method: 'POST',
+        headers: { ...supabaseServiceHeaders(serviceKey), 'Content-Type': 'application/json', 'x-upsert': 'false' },
+        body: '{}',
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) {
+        this.logger.error(`createSignedUploadUrl: Supabase respondió ${response.status} ${sanitizeStorageErrorText(await response.text())}`);
+        return frontend;
+      }
+      const data = (await response.json()) as { url?: string; token?: string };
+      if (!data?.url) return frontend;
+      const full = data.url.startsWith('http') ? data.url : `${supabaseUrl.replace(/\/$/, '')}/storage/v1${data.url}`;
+      let token: string | null = typeof data.token === 'string' ? data.token : null;
+      if (!token) {
+        try { token = new URL(full).searchParams.get('token'); } catch { token = null; }
+      }
+      return { method: 'backend', url: full, token, storagePath, bucket };
+    } catch (err) {
+      this.logger.error(`createSignedUploadUrl: ${err instanceof Error ? err.message : String(err)}`);
+      return frontend;
+    }
+  }
+
   // ── DELETE ──────────────────────────────────────────────────────────────────
 
   /**

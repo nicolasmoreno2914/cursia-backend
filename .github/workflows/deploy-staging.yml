@@ -230,6 +230,11 @@ jobs:
       - name: Check r58 endurecimiento del pipeline (tipos del servidor, reuse verificado, procedencia LLM, URLs base en prod; puro, la parte PG16 corre local)
         run: node scripts/check-r58-pipeline-hardening.js --pure-only
 
+      # r107 B1: lector seguro del .mbz (anti zip-bomb / rutas) + identificación del Taller de cursos. --ci = solo sintéticos y
+      # dañados generados en el momento (el corpus real de clientes vive solo en la máquina local: modo --corpus).
+      - name: Check r107 Taller de cursos — lector seguro + identificación (puro, sintéticos)
+        run: node scripts/r107/check-r107-identify.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -859,6 +864,11 @@ jobs:
                # del plan de producción). Aditiva e idempotente.
                echo "━━━ [5h] r99: activación (cursia_feature_activations) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r99-activation.js
+
+               # r107: «Taller de cursos» (workshop_sessions, RLS + sin anon/authenticated). Staging-only (EXCLUDED del plan de
+               # producción). Aditiva e idempotente. Sin la tabla la API del Taller responde 503; flag COURSE_WORKSHOP apagado → 404.
+               echo "━━━ [5i] r107: Taller de cursos (workshop_sessions) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r107-workshop-sessions.js
 
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod

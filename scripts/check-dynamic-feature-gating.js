@@ -168,6 +168,7 @@ const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
   'AdminSpendController',
   // r81: «Crear microcurrículo» — para TODOS los usuarios, con su propio flag (MICROCURRICULUM_ENABLED); no es ruta V2.
   'MicrocurriculumController',
+  'CourseWorkshopController', // r107: «Taller de cursos», con su propio flag (COURSE_WORKSHOP), no es ruta V2
   'AppController',
   'AuthController',
   'YoutubeController',
