@@ -266,6 +266,9 @@ jobs:
       - name: Check REL R1 clasificador central de fallos (backend + frontend, obligatorio)
         run: node scripts/check-rel-failure-classes.js --require-fe --fe frontend-for-gate
 
+      - name: Check r106 acciones de admin ejecutables (cada adminAction del clasificador contra las compuertas de RunsService; puro)
+        run: node scripts/check-rel-admin-actions.js
+
       - name: Pricing keys del seed v1 y de la propuesta r60 (para verificar la base)
         id: pricing
         run: |
