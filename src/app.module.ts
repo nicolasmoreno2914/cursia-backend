@@ -33,6 +33,7 @@ import { VisualDesignModule } from './modules/visual-design/visual-design.module
 import { PedagogyModule } from './modules/pedagogy/pedagogy.module';
 import { AcademicContextModule } from './modules/academic-context/academic-context.module';
 import { MicrocurriculumModule } from './modules/microcurriculum/microcurriculum.module';
+import { CourseWorkshopModule } from './modules/course-workshop/course-workshop.module';
 import { CourseFactsModule } from './modules/course-facts/course-facts.module';
 import { CourseDesignModule } from './modules/course-design/course-design.module';
 import { PrebriefModule } from './modules/prebrief/prebrief.module';
@@ -83,6 +84,7 @@ import { BudgetsModule } from './modules/budgets/budgets.module';
     PrebriefModule, // Prebrief pedagógico: propuesta versionada, aprobación y PDF
     AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
     MicrocurriculumModule, // r81: «Crear microcurrículo» (todos los usuarios con MICROCURRICULUM_ENABLED=true; 404 si no)
+    CourseWorkshopModule, // r107: «Taller de cursos» (COURSE_WORKSHOP=true + lista de dueños; 404 si no)
     FinopsModule,
     AccessModule, // r75 (A): instituciones multi-miembro, membresías, usuarios SA, suspensiones, auditoría, /me/context
     BudgetsModule, // r75 (C): presupuesto mensual por usuario, solicitudes y gasto por institución (CURSIA_USER_BUDGETS)

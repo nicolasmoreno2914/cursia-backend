@@ -185,6 +185,47 @@ export function isDynamicArtifactRow(row: { type?: string | null; item_run_id?: 
   return String(row?.type ?? '').startsWith('dynamic_') || row?.item_run_id != null || row?.manifest_id != null;
 }
 
+/** r107 (fix P1-1): el objeto de Storage pesa más que el tope de la lectura (nunca se materializa entero). */
+export const STORAGE_OBJECT_TOO_LARGE = 'storage_object_too_large';
+export class StorageObjectTooLargeError extends Error {
+  readonly code = STORAGE_OBJECT_TOO_LARGE;
+  constructor(readonly maxBytes: number, readonly seenBytes: number) {
+    super(`${STORAGE_OBJECT_TOO_LARGE}: el objeto supera ${maxBytes} bytes (visto: ${seenBytes})`);
+    this.name = 'StorageObjectTooLargeError';
+  }
+}
+
+/**
+ * r107 (fix P1-1): lee el cuerpo de una respuesta en flujo con tope duro sobre los bytes RECIBIDOS. `content-length`
+ * mayor que el tope → rechazo sin leer; el flujo que lo pasa → `abort()` + rechazo. Pura sobre `Response` (testeable).
+ */
+export async function readBodyCapped(res: Response, maxBytes: number, abort: () => void, onChunk?: (chunk: Buffer) => void): Promise<Buffer> {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    abort();
+    try { await res.body?.cancel(); } catch { /* ya abortado */ }
+    throw new StorageObjectTooLargeError(maxBytes, declared);
+  }
+  const chunks: Buffer[] = [];
+  let seen = 0;
+  if (!res.body) return Buffer.alloc(0);
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    seen += chunk.length;
+    if (seen > maxBytes) {
+      abort();
+      try { await reader.cancel(); } catch { /* ya abortado */ }
+      throw new StorageObjectTooLargeError(maxBytes, seen);
+    }
+    if (onChunk) onChunk(chunk);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, seen);
+}
+
 /** Re-review N3: tope del DELETE HTTP a Storage en remove() (ms). */
 function storageDeleteTimeoutMs(): number {
   const n = Number(process.env.ARTIFACT_STORAGE_DELETE_TIMEOUT_MS);
@@ -540,6 +581,31 @@ export class ArtifactsService {
     return Buffer.from(await res.arrayBuffer());
   }
 
+  /**
+   * r107 B1 (fix P1-1): descarga EN FLUJO con tope duro de bytes REALMENTE recibidos (nunca `arrayBuffer()` sin
+   * límite): un `content-length` mayor que `maxBytes` se rechaza sin leer el cuerpo, y si el flujo pasa el tope se aborta
+   * la conexión. Cada trozo se pasa a `onChunk` (p. ej. hashes incrementales: nada recorre 300 MB de una vez). Lo usa el
+   * Taller para el .mbz del usuario, cuyo objeto el dueño puede reemplazar entre el HEAD y la descarga (TOCTOU).
+   */
+  async downloadStorageObjectCapped(
+    bucket: string,
+    storagePath: string,
+    opts: { maxBytes: number; timeoutMs?: number; onChunk?: (chunk: Buffer) => void },
+  ): Promise<Buffer> {
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    if (!supabaseUrl || !serviceKey) {
+      throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side storage download');
+    }
+    if (!/^[a-z0-9][a-z0-9._-]{0,62}$/.test(bucket)) throw new Error(`STORAGE_PATH_INVALID: bucket ${JSON.stringify(bucket)}`);
+    const encodedPath = assertSafeStoragePath(storagePath).map((s) => encodeURIComponent(s)).join('/');
+    const url = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
+    const cap = new AbortController();
+    const { response: res } = await this.storageRequest('download', 0, (signal) => fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.any([signal, cap.signal]) }), { attemptTimeoutMs: opts.timeoutMs ?? 60_000 });
+    if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
+    return readBodyCapped(res, opts.maxBytes, () => cap.abort(), opts.onChunk);
+  }
+
   /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
   /** r74: tamaño del objeto en Storage (HEAD con la service role) o null si no existe / no se pudo verificar. */
   async headStorageObjectBytes(bucket: string, storagePath: string): Promise<number | null> {
@@ -687,6 +753,58 @@ export class ArtifactsService {
         bucket:      artifact.storageBucket,
         method:      'frontend',
       };
+    }
+  }
+
+  // ── SIGNED UPLOAD URL ───────────────────────────────────────────────────────
+
+  /**
+   * r107 B1 (Taller de cursos): URL firmada de SUBIDA para que el navegador mande un archivo grande (hasta 300 MB)
+   * directo a Storage, sin pasar por la API ni por nginx. Mismo criterio que `getDownloadUrl`:
+   *  - solo una ruta de la carpeta del dueño (`assertWritableStoragePath`: la service role ignora RLS, este es el control);
+   *  - `x-upsert: false` (nunca pisa un objeto existente);
+   *  - sin service role o si Supabase no firma → `method: 'frontend'`: el navegador sube con su propio SDK a SU carpeta
+   *    (políticas own-folder de cursia-artifacts), igual que el resto de los artifacts del cliente.
+   * Supabase no limita el tamaño de una subida firmada: quien la pide verifica después el tamaño real (HEAD / bytes).
+   * Las URLs firmadas de subida de Supabase valen 2 h (no configurable).
+   */
+  async createSignedUploadUrl(
+    ownerId: string,
+    bucket: string,
+    storagePath: string,
+  ): Promise<{ method: 'backend'; url: string; token: string | null; storagePath: string; bucket: string } | { method: 'frontend'; storagePath: string; bucket: string }> {
+    assertWritableStoragePath(ownerId, bucket, storagePath);
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    const frontend = { method: 'frontend' as const, storagePath, bucket };
+    if (!supabaseUrl || !serviceKey) {
+      this.logger.warn('createSignedUploadUrl: sin SUPABASE_SERVICE_ROLE_KEY — el navegador sube con su SDK a su carpeta');
+      return frontend;
+    }
+    const encodedPath = assertSafeStoragePath(storagePath).map((s) => encodeURIComponent(s)).join('/');
+    const signUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/upload/sign/${bucket}/${encodedPath}`;
+    try {
+      const response = await fetch(signUrl, {
+        method: 'POST',
+        headers: { ...supabaseServiceHeaders(serviceKey), 'Content-Type': 'application/json', 'x-upsert': 'false' },
+        body: '{}',
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) {
+        this.logger.error(`createSignedUploadUrl: Supabase respondió ${response.status} ${sanitizeStorageErrorText(await response.text())}`);
+        return frontend;
+      }
+      const data = (await response.json()) as { url?: string; token?: string };
+      if (!data?.url) return frontend;
+      const full = data.url.startsWith('http') ? data.url : `${supabaseUrl.replace(/\/$/, '')}/storage/v1${data.url}`;
+      let token: string | null = typeof data.token === 'string' ? data.token : null;
+      if (!token) {
+        try { token = new URL(full).searchParams.get('token'); } catch { token = null; }
+      }
+      return { method: 'backend', url: full, token, storagePath, bucket };
+    } catch (err) {
+      this.logger.error(`createSignedUploadUrl: ${err instanceof Error ? err.message : String(err)}`);
+      return frontend;
     }
   }
 
