@@ -20,7 +20,7 @@ import { foldValidator, validatorItems } from './check-v3';
 import { CHECK_IDS, CheckId, CheckStatus, Finding, SEVERITY_RANK, Severity } from './finding';
 
 /** Versión del ARMADO del diagnóstico: subirla en cada cambio de un check (un diagnóstico guardado con otra se rehace). */
-export const DIAGNOSIS_CODE_VERSION = 'b3-r1';
+export const DIAGNOSIS_CODE_VERSION = 'b3-r2';
 export const DIAGNOSIS_SCHEMA = 1;
 
 export type Light = 'red' | 'yellow' | 'green';

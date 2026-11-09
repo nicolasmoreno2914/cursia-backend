@@ -11,8 +11,8 @@
 import { WorkshopActivity } from '../course-model';
 import { MbzV3Issue } from '../../../package/v3/mbz-validator-v3';
 import { DiagnosisContext } from './context';
-import { Finding, Severity, makeFinding } from './finding';
-import { scopeOf } from './checks';
+import { Finding, SEVERITY_RANK, Severity, makeFinding } from './finding';
+import { humanName, scopeOf } from './checks';
 
 export interface ValidatorItem {
   finding: Finding;
@@ -79,10 +79,10 @@ export function validatorItems(ctx: DiagnosisContext): ValidatorItem[] {
     } else {
       activity = ctx.actByDir.get(i.where) ?? ctx.actByIdnumber.get(i.where.split('#')[0]) ?? null;
     }
-    const related = [...new Set([...`${i.where} ${i.message}`.matchAll(/\b(\d{2,9})\b/g)].map((m) => Number(m[1])).filter((x) => ctx.actByMid.has(x)))];
+    const related = relatedModuleIds(i).filter((x) => ctx.actByMid.has(x));
     const finding = makeFinding({
       check: 'T11', code: i.code.toLowerCase(), severity: validatorSeverity(i, withFacts), scope: scopeOf(ctx, activity),
-      title: `${TITLES[i.code] ?? 'El paquete no cumple una regla del builder.'}${activity ? ` (${activity.title ? `«${activity.title.slice(0, 60)}»` : activity.dir})` : ''}`,
+      title: `${TITLES[i.code] ?? 'El paquete no cumple una regla del builder.'}${activity ? ` («${humanName(activity)}»)` : ''}`,
       detail: `mbz-validator-v3${withFacts ? '' : ' (sin expectativas)'} ${i.code} @ ${i.where}: ${i.message}`,
       evidence: { entry: activity ? `${activity.dir}/${activity.modname}.xml` : i.where, excerpt: i.message },
       key: `${n}|${i.where}|${i.message}`,
@@ -93,20 +93,58 @@ export function validatorItems(ctx: DiagnosisContext): ValidatorItem[] {
 }
 
 /**
- * Une el validador con T01–T10: cada ítem se adjunta al hallazgo existente del MISMO archivo (`file N`) o de la MISMA
- * actividad (la que nombra `where`, o alguna que nombra el mensaje); si no hay ninguno, queda como hallazgo T11.
- * Devuelve los hallazgos T11 que quedan solos. Muta `findings` (agrega corroboraciones).
+ * Fix round 1 (P1-2): moduleids que el mensaje nombra SOLO por patrones explícitos («moduleid repetido N», «el módulo N»,
+ * «backup N», y la diferencia entre las dos listas de un «sequence A ≠ actividades de la sección B»); nunca cualquier
+ * número que casualmente coincida con un moduleid.
+ */
+export function relatedModuleIds(i: MbzV3Issue): number[] {
+  const out = new Set<number>();
+  for (const m of i.message.matchAll(/\b(?:moduleid repetido|el módulo|backup)\s+(\d{1,9})\b/g)) out.add(Number(m[1]));
+  const seq = /sequence ([\d,]*) ≠ actividades de la sección ([\d,]*)/.exec(i.message);
+  if (seq) {
+    const a = new Set(seq[1].split(',').filter(Boolean).map(Number));
+    const b = new Set(seq[2].split(',').filter(Boolean).map(Number));
+    for (const x of a) if (!b.has(x)) out.add(x);
+    for (const x of b) if (!a.has(x)) out.add(x);
+  }
+  return [...out];
+}
+
+/**
+ * Qué hallazgos de T01–T10 describen LO MISMO que cada código del validador (familia de defecto). Un ítem del
+ * validador solo se adjunta a un hallazgo de su familia; CLEAN_SAFE, H5P_LIBRARIES y lo que dependa de facts no tienen
+ * equivalente y siempre quedan como hallazgo T11 propio.
+ */
+export const VALIDATOR_FAMILY: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  FILES_INTEGRITY: ['T02.blob_missing', 'T02.blob_altered', 'T02.filesize_mismatch', 'T02.bad_contenthash', 'T02.undeclared_blobs', 'T02.malformed_blob_path', 'T01.listed_missing_folder'],
+  TOKEN_INVALID: ['T04.token_orphan', 'T04.token_wrong_type', 'T04.token_malformed', 'T04.token_external', 'T04.anchor_orphan', 'T04.dead_link'],
+  STRUCTURE: ['T01.listed_missing_folder', 'T01.xml_unreadable', 'T01.section_missing', 'T01.not_in_sequence', 'T01.sequence_unknown_module', 'T03.moduleid_mismatch', 'T03.duplicate_moduleid', 'T03.duplicate_contextid'],
+  LIBRO: ['T07.libro_pdf_truncated', 'T07.libro_truncated', 'T07.libro_missing_chapters', 'T02.blob_missing', 'T02.blob_altered'],
+  LIBRO_HTML: ['T07.libro_book_empty_chapter'],
+  AUDIO_DURATION: ['T02.blob_missing', 'T02.blob_altered', 'T08.audio_missing', 'T08.audio_unreadable', 'T08.audio_truncated', 'T08.audio_not_linked', 'T08.audiobook_short'],
+  H5P_FILES: ['T09.h5p_package_missing', 'T09.h5p_unreadable', 'T02.blob_missing', 'T02.blob_altered'],
+});
+
+/**
+ * Une el validador con T01–T10 sin ESCONDER nada (fix round 1, P1-2): cada ítem se adjunta solo a un hallazgo de SU
+ * familia (VALIDATOR_FAMILY) sobre el mismo archivo (`file N`) o la misma actividad (la de `where`, o una que el mensaje
+ * nombra explícitamente); el receptor queda con la severidad MÁXIMA de los dos. Si no hay receptor de su familia, el
+ * ítem queda como hallazgo T11 propio. Devuelve esos hallazgos sueltos; muta `findings` (corroboración + severidad).
  */
 export function foldValidator(items: ValidatorItem[], findings: Finding[]): Finding[] {
   const alone: Finding[] = [];
   for (const it of items) {
-    const corr = { source: 'mbz-validator-v3' as const, code: it.issue.code, where: it.issue.where, message: it.issue.message };
+    const fam = VALIDATOR_FAMILY[it.issue.code] ?? [];
+    const same = (x: Finding) => fam.includes(`${x.check}.${x.code}`);
     let host: Finding | undefined;
-    if (it.fileId !== null) host = findings.find((x) => x.evidence.file?.fileId === it.fileId);
-    if (!host && it.activity) host = findings.find((x) => x.scope.activity?.moduleId === it.activity!.moduleId);
-    if (!host && it.related.length) host = findings.find((x) => x.scope.activity && it.related.includes(x.scope.activity.moduleId));
-    if (host) host.corroboratedBy.push(corr);
-    else alone.push(it.finding);
+    if (fam.length) {
+      if (it.fileId !== null) host = findings.find((x) => same(x) && x.evidence.file?.fileId === it.fileId);
+      if (!host && it.activity) host = findings.find((x) => same(x) && x.scope.activity?.moduleId === it.activity!.moduleId);
+      if (!host && it.related.length) host = findings.find((x) => same(x) && !!x.scope.activity && it.related.includes(x.scope.activity.moduleId));
+    }
+    if (!host) { alone.push(it.finding); continue; }
+    host.corroboratedBy.push({ source: 'mbz-validator-v3', code: it.issue.code, where: it.issue.where, message: it.issue.message });
+    if (SEVERITY_RANK[it.finding.severity] > SEVERITY_RANK[host.severity]) host.severity = it.finding.severity;
   }
   return alone;
 }

@@ -130,10 +130,47 @@ const fmt = (x) => `${x.check}/${x.code}@${x.scope.activity ? x.scope.activity.d
 function exactlySeeded(dmg, base, exp) {
   const baseIds = new Set(visible(base).map((x) => x.id));
   const added = visible(dmg).filter((x) => !baseIds.has(x.id));
+  // Fix round 1: `none` = el cambio NO debe producir ningún error / aviso nuevo (antes era un falso positivo).
+  if (exp.none) { if (added.length) throw new Error(`no esperaba hallazgos nuevos, hay ${added.map(fmt).join(', ')}`); return null; }
   if (added.length !== 1) throw new Error(`esperaba 1 hallazgo nuevo (${exp.check} ${exp.target}), hay ${added.length}: ${added.map(fmt).join(', ') || '(ninguno)'}`);
   const x = added[0];
   if (x.check !== exp.check || !matchesTarget(x, exp.target)) throw new Error(`esperaba ${exp.check} en ${exp.target}, vino ${fmt(x)}`);
+  if (exp.severity && x.severity !== exp.severity) throw new Error(`esperaba severidad ${exp.severity}, vino ${x.severity} (${fmt(x)})`);
+  if (exp.code && x.code !== exp.code) throw new Error(`esperaba código ${exp.code}, vino ${fmt(x)}`);
   return x;
+}
+
+/**
+ * Fix round 1 (P2-4/P2-5/P2-6): todo arreglo sugerido se puede aplicar de verdad — edit_libro_section sobre un Libro
+ * que existe; remove_activity solo si nada nombra la actividad; los desplazamientos en bytes de edit_html apuntan a lo
+ * que dicen (verificados contra los bytes del paquete).
+ */
+async function assertFixesPossible(r, buf, filename, id) {
+  const fixes = r.findings.filter((x) => x.suggestedFix);
+  if (!fixes.length) return;
+  const pkg = await R.openMbz(buf);
+  const facts = await I.readPackageFacts(pkg, filename);
+  const ctx = await DG.buildDiagnosisContext({ pkg, packageBytes: buf, family: I.familyOf(facts), builderLine: I.builderLineOf(facts), builderVersion: null });
+  for (const x of fixes) {
+    const { operation, params } = x.suggestedFix;
+    if (operation === 'edit_libro_section') {
+      const a = ctx.actByMid.get(params.moduleId);
+      assert(a && a.kind === 'libro', `${id}: ${fmt(x)} edit_libro_section sin un Libro existente (${params.moduleId})`);
+    }
+    if (operation === 'remove_activity') {
+      const a = ctx.actByMid.get(params.moduleId);
+      assert(a && !a.referencedBy.length && !a.referencedBySections.length && !a.referencedByCourse, `${id}: ${fmt(x)} sugiere quitar una actividad que otras nombran`);
+    }
+    if (x.code === 'dead_link') assert(Number.isInteger(params.fieldRawOffset) && Number.isInteger(params.linkRawByteOffset) && Number.isInteger(params.linkRawBytes), `${id}: ${fmt(x)} sin desplazamientos en bytes del campo crudo`);
+    if (operation === 'edit_html' && params.linkRawByteOffset !== undefined && params.linkRawByteOffset !== null) {
+      const entry = await pkg.readEntry(params.entry);
+      const at = params.fieldRawOffset + params.linkRawByteOffset;
+      const frag = entry.subarray(at, at + params.linkRawBytes).toString('utf8');
+      assert(/^&lt;a\b/.test(frag) && /&lt;\/a&gt;$/.test(frag) && /href=(?:&quot;|")\s*(?:#?|javascript:[^"&]*)\s*(?:&quot;|")/.test(frag), `${id}: bytes del enlace ≠ lo esperado: ${JSON.stringify(frag.slice(0, 80))}`);
+      const fieldBytes = entry.subarray(params.fieldRawOffset);
+      assert(fieldBytes.length > 0 && typeof params.fieldRawSha1 === 'string', `${id}: sin huella del campo`);
+    }
+  }
 }
 
 // ── V1 mínimo (CI): bienvenida + audiolibro + Libro Guía HTML + 2 capítulos (página, hvp, SCORM) + examen ──────────────
@@ -162,12 +199,13 @@ async function miniV1(audioMp3) {
   const cAudio = act(902, 'label', '📻 Audiolibro del Curso', '<p>Escucha el audiolibro.</p><audio controls><source src="@@PLUGINFILE@@/audiolibro.mp3" type="audio/mpeg"></audio>', 1);
   addFile(902, cAudio, 'mod_label', 'intro', 'audiolibro.mp3', audioMp3, 'audio/mpeg');
   const cLibro = act(903, 'resource', '📚 Libro Guía Completo', '<p>El libro del curso.</p>', 1);
+  act(904, 'label', '📚 Libro Guía del Curso', '<p>Tu guía completa del curso. <a href="$@RESOURCEVIEWBYID*903@$">Descargar Libro Guía</a></p>', 1);
   addFile(903, cLibro, 'mod_resource', 'content', 'libro_guia_completo.html', Buffer.from(LIBRO_HTML), 'text/html');
   for (const n of [1, 2]) {
     const base = 900 + n * 10;
     act(base, 'label', `▶️ Cap. ${n} — Video: Tema ${n}`, `<p>MÓDULO 1 · CAPÍTULO ${n}</p><p>📺 Instrucciones: mira el video.</p>`, 1 + n);
     act(base + 1, 'hvp', `🎥 Video Interactivo Cap ${n} — Tema ${n}`, `<p>Video del capítulo ${n}. <a href="$@SCORMVIEWBYID*${base + 2}@$">Practicar</a></p>`, 1 + n, `<json_content>${esc(HVP_JSON(n))}</json_content>`);
-    const cS = act(base + 2, 'scorm', `🎮 Actividad Interactiva Cap ${n} — Tema ${n}`, '<p>Juego.</p>', 1 + n, '<reference>scorm.zip</reference>');
+    const cS = act(base + 2, 'scorm', `🎮 Actividad Interactiva Cap ${n} — Tema ${n}`, '<p>Juego.</p>', 1 + n, `<reference>scorm.zip</reference><scoes><sco id="${60000 + n * 2}"><manifest>cap${n}_juego</manifest><organization></organization><parent>/</parent><identifier>o</identifier><launch></launch><scormtype></scormtype><title>Juego</title></sco><sco id="${60001 + n * 2}"><manifest>cap${n}_juego</manifest><organization>o</organization><parent>o</parent><identifier>i</identifier><launch>index.html</launch><scormtype>sco</scormtype><title>Juego</title></sco></scoes>`);
     addFile(base + 2, cS, 'mod_scorm', 'content', 'imsmanifest.xml', Buffer.from(MANIFEST(n)), 'application/xml');
     addFile(base + 2, cS, 'mod_scorm', 'content', 'index.html', Buffer.from(GAME(n)), 'text/html');
   }
@@ -288,6 +326,84 @@ const V1_MUTATIONS = {
   },
 };
 
+/** Fix round 1: mutaciones de regresión (cada una falla con el dist/ de la ronda anterior). */
+async function replaceBlobBy(zip, filename, fn) {
+  const files = await zip.file('files.xml').async('string');
+  const h = new RegExp(`<contenthash>([0-9a-f]{40})</contenthash>(?:(?!</file>)[\\s\\S])*<filename>${filename.replace(/\./g, '\\.')}</filename>`).exec(files)[1];
+  const nb = Buffer.from(fn((await zip.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer')).toString('utf8')));
+  const nh = sha1(nb);
+  zip.remove(`files/${h.slice(0, 2)}/${h}`);
+  zip.file(`files/${nh.slice(0, 2)}/${nh}`, nb);
+  zip.file('files.xml', files.split(`<contenthash>${h}</contenthash>`).join(`<contenthash>${nh}</contenthash>`).replace(new RegExp(`(<contenthash>${nh}</contenthash>[\\s\\S]*?<filesize>)\\d+`, 'g'), (_m, a) => `${a}${nb.length}`));
+}
+const R1_V1_MUTATIONS = {
+  // P2-1: el manifiesto nombra una página que no está, pero scorm.xml (lo que Moodle restaura) lanza index.html → aviso.
+  async 'scorm-manifest-launch-mismatch'(zip) {
+    const files = await zip.file('files.xml').async('string');
+    const blk = /<file id="\d+">(?:(?!<\/file>)[\s\S])*<filename>imsmanifest\.xml<\/filename>[\s\S]*?<\/file>/.exec(files)[0];
+    const h = /<contenthash>([0-9a-f]{40})/.exec(blk)[1];
+    const nb = Buffer.from((await zip.file(`files/${h.slice(0, 2)}/${h}`).async('string')).split('href="index.html"').join('href="scorm_cap1_index.html"'));
+    const nh = sha1(nb);
+    zip.remove(`files/${h.slice(0, 2)}/${h}`); zip.file(`files/${nh.slice(0, 2)}/${nh}`, nb);
+    zip.file('files.xml', files.replace(blk, blk.replace(h, nh).replace(/<filesize>\d+/, `<filesize>${nb.length}`)));
+    return { check: 'T06', target: 'scorm_912', severity: 'warning', code: 'scorm_manifest_launch_mismatch' };
+  },
+  // …y si TAMPOCO scorm.xml lanza algo que exista → error.
+  async 'scorm-no-launch'(zip) {
+    await R1_V1_MUTATIONS['scorm-manifest-launch-mismatch'](zip);
+    const p = 'activities/scorm_912/scorm.xml';
+    zip.file(p, (await zip.file(p).async('string')).split('<launch>index.html</launch>').join('<launch>juego.html</launch>'));
+    return { check: 'T06', target: 'scorm_912', severity: 'error', code: 'scorm_launch_missing' };
+  },
+  // P2-2: títulos escritos a mano con el número repetido («Capítulo 1» dos veces): no se deduce que falte el 2.
+  async 'libro-titles-ambiguous'(zip) {
+    await replaceBlobBy(zip, 'libro_guia_completo.html', (h) => h.replace('<h1>Capítulo 2: Segundo</h1>', '<h1>Capítulo 1: Segundo</h1>'));
+    return { none: true };
+  },
+  // P2-4: el paquete no trae el Libro Guía y la tarjeta tiene el botón muerto → T07 error (y no un T04 aparte).
+  async 'libro-removed'(zip) {
+    let mb = await zip.file('moodle_backup.xml').async('string');
+    mb = mb.replace(/<activity><moduleid>903<\/moduleid>[\s\S]*?<\/activity>/, '');
+    zip.file('moodle_backup.xml', mb);
+    zip.forEach((p) => { if (p.startsWith('activities/resource_903/')) zip.remove(p); });
+    const sp = 'sections/section_11/section.xml';
+    zip.file(sp, (await zip.file(sp).async('string')).replace(/<sequence>[^<]*<\/sequence>/, (m) => m.replace(/(^|,)903(?=,|<)/, '').replace('<sequence>,', '<sequence>')));
+    let files = await zip.file('files.xml').async('string');
+    const blk = /<file id="\d+">(?:(?!<\/file>)[\s\S])*<filename>libro_guia_completo\.html<\/filename>[\s\S]*?<\/file>/.exec(files)[0];
+    const h = /<contenthash>([0-9a-f]{40})/.exec(blk)[1];
+    zip.file('files.xml', files.replace(blk, '')); zip.remove(`files/${h.slice(0, 2)}/${h}`);
+    for (const [d, from, to] of [['label_904', '$@RESOURCEVIEWBYID*903@$', '#'], ['label_901', '&lt;a href=&quot;$@RESOURCEVIEWBYID*903@$&quot;&gt;Abrir el Libro Guía&lt;/a&gt;', 'el Libro Guía']]) {
+      const p = `activities/${d}/label.xml`;
+      zip.file(p, (await zip.file(p).async('string')).split(from).join(to));
+    }
+    return { check: 'T07', target: 'label_904', severity: 'error', code: 'libro_missing' };
+  },
+  // P2-5: etiqueta vacía que OTRO botón nombra → nunca «quitar la actividad».
+  async 'empty-referenced-label'(zip) {
+    const p = 'activities/label_910/label.xml';
+    zip.file(p, (await zip.file(p).async('string')).replace(/<intro>[\s\S]*?<\/intro>/, '<intro></intro>'));
+    const w = 'activities/label_901/label.xml';
+    zip.file(w, (await zip.file(w).async('string')).replace('&lt;/p&gt;', () => '&lt;a href=&quot;$@LABELVIEWBYID*910@$&quot;&gt;Ver el capítulo&lt;/a&gt;&lt;/p&gt;')); // función: un string con `$&` se expande (changelog #1)
+    return { check: 'T05', target: 'label_910', code: 'empty_activity' };
+  },
+  // P2-6: enlace muerto — su arreglo lleva desplazamientos en BYTES del campo crudo (D10 los verifica en el paquete).
+  async 'dead-link'(zip) {
+    const w = 'activities/label_901/label.xml';
+    zip.file(w, (await zip.file(w).async('string')).replace('&lt;/p&gt;', 'á &lt;a href=&quot;#&quot;&gt;Ir al módulo&lt;/a&gt;&lt;/p&gt;'));
+    return { check: 'T04', target: 'label_901', code: 'dead_link' };
+  },
+};
+const R1_V3_MUTATIONS = {
+  // P2-3: Moodle renombró la etiqueta («label1000»): el título nunca lo muestra (D7).
+  async 'reexport-name-orphan'(zip) {
+    const p = 'activities/label_1000/label.xml';
+    zip.file(p, (await zip.file(p).async('string')).replace(/<name>[^<]*<\/name>/, '<name>label1000</name>'));
+    zip.file('moodle_backup.xml', (await zip.file('moodle_backup.xml').async('string')).replace(/(<moduleid>1000<\/moduleid>[\s\S]*?<title>)[^<]*(<\/title>)/, (_m, a, b) => `${a}label1000${b}`));
+    await BC.MUTATIONS['orphan-token'](zip);
+    return { check: 'T04', target: 'label_1000', code: 'token_orphan' };
+  },
+};
+
 /** MP3 «largo» sintético: el audiolibro del v3 A-S (motor de la simulación, sin red). */
 async function audiobookOf(v3buf) {
   const z = await JSZip.loadAsync(v3buf);
@@ -315,7 +431,7 @@ async function ciFixtures() {
       const zip = await JSZip.loadAsync(from);
       const exp = await table[name](zip);
       if (!exp) { damaged.push({ id: `${baseId}~${name}`, skipped: true }); continue; }
-      damaged.push({ id: `${baseId}~${name}`, base: baseId, filename: `${baseId}~${name}.mbz`, buf: await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), expected: { check: exp.check, target: exp.target } });
+      damaged.push({ id: `${baseId}~${name}`, base: baseId, filename: `${baseId}~${name}.mbz`, buf: await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), expected: { check: exp.check, target: exp.target, severity: exp.severity, code: exp.code, none: exp.none } });
     }
   };
   await gen(base, 'v3-A-S', ['blob-missing', 'blob-altered', 'orphan-token', 'wrong-type-token', 'duplicate-moduleid', 'listed-missing-folder', 'pending-placeholder', 'empty-label', 'exam-no-correct', 'libro-pdf-truncated'], BC.MUTATIONS);
@@ -323,6 +439,8 @@ async function ciFixtures() {
   const v1 = await miniV1(await audiobookOf(base));
   await gen(v1, 'v1-min', ['blob-missing', 'blob-altered', 'orphan-token', 'wrong-type-token', 'pending-placeholder', 'exam-no-correct', 'libro-html-truncated', 'scorm-pending'], BC.MUTATIONS);
   await gen(v1, 'v1-min', Object.keys(V1_MUTATIONS), V1_MUTATIONS);
+  await gen(v1, 'v1-min', Object.keys(R1_V1_MUTATIONS), R1_V1_MUTATIONS);
+  await gen(base, 'v3-A-S', Object.keys(R1_V3_MUTATIONS), R1_V3_MUTATIONS);
   return { synth, damaged, bases: { 'v3-A-S': { buf: base, filename: 'v3-A-S.mbz' }, 'v1-min': { buf: v1, filename: 'curso-v1-minimo.mbz' } }, real: [] };
 }
 function corpusFixtures(manifestPath) {
@@ -449,20 +567,31 @@ async function censusMode(surveyPath) {
     }
     for (const d of damaged) {
       if (d.skipped) { console.log(`⏭️  ${d.id}: la base no tiene el elemento a dañar`); continue; }
-      await check(`D1 ${d.id} → exactamente ${d.expected.check} en ${d.expected.target}`, async () => {
+      await check(d.expected.none ? `D1 ${d.id} → ningún error / aviso nuevo (antes, falso positivo)` : `D1 ${d.id} → exactamente ${d.expected.check} en ${d.expected.target}${d.expected.severity ? ` (${d.expected.severity})` : ''}`, async () => {
         const r = await diagnose(d.buf, d.filename);
         reports.set(d.id, r);
         const base = baseReports[d.base];
         assert(base, `sin base ${d.base}`);
         const x = exactlySeeded(r, base, d.expected);
-        assert(r.light.course !== 'green', 'el curso dañado no puede quedar verde');
-        if (x.severity === 'error') assert(r.light.course === 'red', 'error → curso rojo');
+        if (x) {
+          assert(r.light.course !== 'green', 'el curso dañado no puede quedar verde');
+          if (x.severity === 'error') assert(r.light.course === 'red', 'error → curso rojo');
+        }
+        await assertFixesPossible(r, d.buf, d.filename, d.id);
       });
     }
     for (const f of real) {
       await check(`D3 real ${f.id} (${f.family}): diagnóstico sin excepción`, async () => {
-        const r = await diagnose(fs.readFileSync(f.path), f.filename);
+        const buf = fs.readFileSync(f.path);
+        const r = await diagnose(buf, f.filename);
         reports.set(f.id, r);
+        await assertFixesPossible(r, buf, f.filename, f.id);
+        // Fix round 1 (P2-1 / P2-2): el curso QA real abre sus juegos (scorm.xml lanza index.html) y su Libro trae los 9
+        // capítulos con títulos escritos a mano («Cap 3» dos veces): ningún error de lanzamiento ni de capítulo faltante.
+        if (/Curso_QA_Content_Worker_Real/.test(f.filename)) {
+          const bad = r.findings.filter((x) => x.code === 'scorm_launch_missing' || x.code === 'libro_missing_chapters');
+          assert(!bad.length, `curso QA: ${bad.map(fmt).join(', ')}`);
+        }
         const by = Object.entries(r.counts.byCheck).filter(([, c]) => c.error + c.warning + c.info).map(([k, c]) => `${k} ${c.error}/${c.warning}/${c.info}`).join(' · ');
         console.log(`   ${r.light.course.padEnd(6)} ${by || '(sin hallazgos)'}`);
       });
@@ -524,6 +653,7 @@ async function censusMode(surveyPath) {
     await check('D7 forma: id estable único, título sin jerga, evidencia, arreglo del catálogo cerrado (o null)', async () => {
       const ops = new Set(DG.WORKSHOP_OPERATIONS);
       const JARGON = /\$@|\.xml\b|moduleid|contenthash|sha1|\btoken\b|files\.xml|activities\/|inforef|idnumber|cv3:/i;
+      const AUTO = /«(?:label|page|resource|url|hvp|scorm|quiz)\d+»/i; // fix round 1 (P2-3): nombres que pone Moodle
       let n = 0;
       for (const [id, r] of reports) {
         const ids = new Set();
@@ -534,6 +664,7 @@ async function censusMode(surveyPath) {
           ids.add(x.id);
           const titleSansNames = x.title.replace(/«[^»]*»/g, '«»');
           assert(!JARGON.test(titleSansNames), `${id} jerga en el título: ${x.title}`);
+          assert(!AUTO.test(x.title), `${id} nombre automático de Moodle en el título: ${x.title}`);
           assert(x.detail && x.detail.length > 5, `${id} sin detalle`);
           assert(x.evidence && 'entry' in x.evidence, `${id} sin evidencia`);
           if (x.evidence.excerpt) assert(x.evidence.excerpt.length <= 160, `${id} fragmento largo`);
@@ -543,6 +674,28 @@ async function censusMode(surveyPath) {
         }
       }
       assert(n > 0, 'ningún hallazgo verificado');
+    });
+
+    await check('D10 validador: un error del validador NUNCA queda escondido en un hallazgo de otra familia (info / warning) — semáforo rojo', async () => {
+      const act = { moduleId: 900, dir: 'activities/quiz_900', modname: 'quiz', title: 'Examen' };
+      const scope = { level: 'activity', chapterNumber: null, moduleNumber: 1, activity: act };
+      const mk = (check, code, severity) => DG.makeFinding({ check, code, severity, scope, title: 't', detail: 'd' });
+      const item = (code, sev) => ({ finding: mk('T11', code.toLowerCase(), sev), issue: { code, where: 'activities/quiz_900', message: 'm' }, activity: { moduleId: 900 }, related: [], fileId: null });
+      // (a) info de sesgo de longitud + STRUCTURE (error) del validador en la MISMA actividad → el error queda solo, curso rojo.
+      let fs2 = [mk('T10', 'exam_length_bias', 'info')];
+      let alone = DG.foldValidator([item('STRUCTURE', 'error')], fs2);
+      eq([alone.length, DG.lightOf([...fs2, ...alone])], [1, 'red'], 'info + STRUCTURE');
+      // (b) dead_link (warning) + H5P_PARTIAL_LIBRARY_CLOSURE (error) → no se adjunta (otra familia).
+      fs2 = [mk('T04', 'dead_link', 'warning')];
+      alone = DG.foldValidator([item('H5P_PARTIAL_LIBRARY_CLOSURE', 'error')], fs2);
+      eq([alone.length, DG.lightOf([...fs2, ...alone])], [1, 'red'], 'warning + H5P');
+      // (c) misma familia → corroboración, y el receptor sube a la severidad máxima.
+      fs2 = [mk('T04', 'dead_link', 'warning')];
+      alone = DG.foldValidator([item('TOKEN_INVALID', 'error')], fs2);
+      eq([alone.length, fs2[0].severity, fs2[0].corroboratedBy.length], [0, 'error', 1], 'misma familia: máximo');
+      // (d) un número cualquiera del mensaje no «relaciona» actividades; sí «el módulo N».
+      eq(DG.relatedModuleIds({ code: 'STRUCTURE', where: 'x', message: 'pesa 900 bytes' }), [], 'número suelto');
+      eq(DG.relatedModuleIds({ code: 'STRUCTURE', where: 'x', message: 'sequence referencia el módulo 1068 inexistente' }), [1068], 'el módulo N');
     });
 
     await check('D9 validador v3 sin expectativas: cada hallazgo suyo queda como corroboración o como T11 propio', async () => {

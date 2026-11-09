@@ -50,10 +50,29 @@ export function scopeOf(ctx: DiagnosisContext, a: WorkshopActivity | null): Find
 }
 const courseScope = (): FindingScope => ({ level: 'course', chapterNumber: null, moduleNumber: null, activity: null });
 
+/**
+ * Fix round 1 (P2-3): nombre de la actividad para el docente. Moodle, al re-exportar, renombra las etiquetas
+ * («label441»): ese nombre nunca se muestra; en su lugar, el comienzo del texto visible o la clase en español.
+ */
+export const AUTO_NAME = /^(?:label|page|resource|url|hvp|scorm|quiz|forum|book|h5pactivity|assign)\s*\d*$/i;
+export function humanName(a: WorkshopActivity): string {
+  const t = (a.title || '').trim();
+  if (t && !AUTO_NAME.test(t)) return short(t, 60);
+  const words = a.html.map((h) => plainText(h.html, 80)).find((x) => x.length >= 3);
+  const what = ROLE_ES[String(a.role ?? '')] ?? ROLE_ES[String(a.kind ?? '')] ?? kindEs(a.modname);
+  return words ? `${what}: ${short(words, 45)}` : what;
+}
+const ROLE_ES: Record<string, string> = {
+  presentation: 'presentación', text: 'página del capítulo', video: 'video', cta: 'botón de práctica', game: 'juego', activity: 'actividad práctica', audio: 'audio',
+  welcome: 'bienvenida', welcome_audio: 'audio de bienvenida', competencies: 'competencias', methodology: 'metodología', route: 'ruta de aprendizaje',
+  libro: 'Libro Guía', libro_info: 'tarjeta del Libro Guía', audiobook: 'audiolibro', exam: 'examen', final_exam: 'examen final', exam_info: 'información del examen',
+  final_exam_info: 'información del examen final', course_info: 'información del curso', forum: 'foro', closing: 'cierre',
+};
+
 /** «“Bienvenida” del capítulo 3» / «“Bienvenida”». */
 function where(a: WorkshopActivity | null): string {
   if (!a) return 'del curso';
-  const t = short(a.title || kindEs(a.modname), 60);
+  const t = humanName(a);
   const ch = a.placement.scope === 'chapter' && a.placement.chapterNumber !== null ? ` del capítulo ${a.placement.chapterNumber}` : '';
   return `«${t}»${ch}`;
 }
@@ -65,6 +84,11 @@ const KIND_ES: Record<string, string> = {
 const kindEs = (m: string | null | undefined): string => KIND_ES[String(m ?? '')] ?? String(m ?? 'actividad');
 
 const isAudioFile = (name: string, mime: string | null): boolean => /\.(mp3|m4a|ogg|oga|wav|aac)$/i.test(name) || /^audio\//.test(mime ?? '');
+
+/** Fix round 1 (P2-5): nada la nombra (botones, secciones, resumen del curso): solo así se puede sugerir quitarla. */
+export function unreferenced(a: WorkshopActivity): boolean {
+  return !a.referencedBy.length && !a.referencedBySections.length && !a.referencedByCourse;
+}
 
 /** Operación sugerida para REGENERAR lo que una actividad es (por su rol / clase), o null si no hay arreglo automático. */
 function regenerateFixFor(a: WorkshopActivity | null): SuggestedFix | null {
@@ -106,13 +130,15 @@ function t01(ctx: DiagnosisContext): Finding[] {
         out.push(f({ check: 'T01', code: 'listed_missing_folder', severity: 'error', scope: scopeOf(ctx, a),
           title: `La actividad ${where(a)} está en el índice del curso pero no viene en el paquete: Moodle no la puede restaurar.`,
           detail: `${i.target}: ${i.detail}`, evidence: { entry: 'moodle_backup.xml', excerpt: i.target },
-          suggestedFix: a ? { operation: 'remove_activity', params: { moduleId: a.moduleId } } : null }));
+          // Sin carpeta no hay contenido que recuperar: quitarla del índice, SOLO si nada la nombra (P2-5).
+          suggestedFix: a && unreferenced(a) ? { operation: 'remove_activity', params: { moduleId: a.moduleId } } : null }));
         break;
       case 'xml_unreadable':
         out.push(f({ check: 'T01', code: 'xml_unreadable', severity: 'error', scope: scopeOf(ctx, a),
           title: `A la actividad ${a ? where(a) : i.target} le falta una parte del paquete: no se restaura completa.`,
           detail: `${i.target}: ${i.detail}`, evidence: { entry: i.target },
-          suggestedFix: a ? regenerateFixFor(a) ?? { operation: 'remove_activity', params: { moduleId: a.moduleId } } : null }));
+          // El XML que queda puede tener contenido: nunca se sugiere borrarla (P2-5).
+          suggestedFix: a ? regenerateFixFor(a) : null }));
         break;
       case 'section_missing':
         out.push(f({ check: 'T01', code: 'section_missing', severity: 'error', scope: courseScope(),
@@ -292,6 +318,31 @@ function tokenFinding(ctx: DiagnosisContext, owner: WorkshopActivity | null, t: 
 /** true si el paquete TIENE Libro Guía (con Libro, el botón muerto de la tarjeta sí es un hallazgo de T04). */
 const hasLibroActivity = (ctx: DiagnosisContext): boolean => ctx.course.activities.some((a) => a.kind === 'libro' && !a.missingFolder);
 
+/**
+ * Fix round 1 (P2-6): referencia EXACTA en bytes (lo que parchea B4) de un fragmento del HTML desescapado: el campo
+ * (`fieldRawOffset` en la entrada, `fieldRawSha1` para verificar antes de aplicar) y el fragmento dentro del contenido
+ * CRUDO del campo (`linkRawByteOffset`, `linkRawBytes`). La conversión recorre el crudo entidad por entidad (la inversa
+ * exacta de xmlUnescape: &lt; &gt; &quot; &#39; &amp; = un carácter).
+ */
+export function rawLinkRef(ctx: DiagnosisContext, h: { entry: string; field: string; rawOffset: number; rawSha1: string }, charIndex: number, charLength: number): Record<string, unknown> {
+  const raw = ctx.rawFields.get(`${h.entry}|${h.field}`);
+  const base = { fieldRawOffset: h.rawOffset, fieldRawSha1: h.rawSha1 };
+  if (raw === undefined) return { ...base, linkRawByteOffset: null, linkRawBytes: null };
+  const rawIndexOf = (target: number): number => {
+    let i = 0;
+    let n = 0;
+    while (i < raw.length && n < target) {
+      const ent = /^&(?:lt|gt|quot|amp|#39);/.exec(raw.slice(i, i + 6));
+      i += ent ? ent[0].length : 1;
+      n++;
+    }
+    return i;
+  };
+  const a = rawIndexOf(charIndex);
+  const b = rawIndexOf(charIndex + charLength);
+  return { ...base, linkRawByteOffset: Buffer.byteLength(raw.slice(0, a), 'utf8'), linkRawBytes: Buffer.byteLength(raw.slice(a, b), 'utf8') };
+}
+
 const DEAD_LINK = /<a\b[^>]*\bhref\s*=\s*(["'])\s*(#?|javascript:[^"']*)\s*\1[^>]*>([\s\S]*?)<\/a>/gi;
 
 function t04(ctx: DiagnosisContext): Finding[] {
@@ -318,7 +369,7 @@ function t04(ctx: DiagnosisContext): Finding[] {
           title: `${text ? `El botón «${short(text, 50)}»` : 'Un enlace'} de ${where(a)} no lleva a ningún lado.`,
           detail: `${h.entry} (${h.field}): href=${m[1]}${m[2]}${m[1]} — destino que el builder no pudo resolver (saneado a #) o enlace inventado`,
           evidence: { entry: h.entry, excerpt: m[0].slice(0, 160) }, key: `${h.field}|${m.index ?? 0}`,
-          suggestedFix: { operation: 'edit_html', params: { moduleId: a.moduleId, field: h.field, entry: h.entry, deadLinkIndex: m.index ?? 0, replaceWith: null } } }));
+          suggestedFix: { operation: 'edit_html', params: { moduleId: a.moduleId, field: h.field, entry: h.entry, ...rawLinkRef(ctx, h, m.index ?? 0, m[0].length), replaceWith: null } } }));
       }
     }
   }
@@ -369,14 +420,15 @@ function t05(ctx: DiagnosisContext): Finding[] {
         out.push(f({ check: 'T05', code: 'empty_activity', severity: 'warning', scope: scopeOf(ctx, a),
           title: `La ${kindEs(a.modname)} ${where(a)} está vacía: en el curso se ve un espacio en blanco.`,
           detail: `${a.dir}: ${a.html.map((h) => `${h.field} ${h.length} car.`).join(', ') || 'sin campos HTML'} sin texto ni medios`,
-          evidence: { entry: `${a.dir}/${a.modname}.xml` }, suggestedFix: { operation: 'remove_activity', params: { moduleId: a.moduleId } } }));
+          evidence: { entry: `${a.dir}/${a.modname}.xml` },
+          suggestedFix: unreferenced(a) ? { operation: 'remove_activity', params: { moduleId: a.moduleId } } : { operation: 'edit_html', params: { moduleId: a.moduleId, field: a.html[0]?.field ?? 'intro', entry: a.html[0]?.entry ?? `${a.dir}/${a.modname}.xml`, reason: 'la nombran otras actividades: completar el contenido en vez de quitarla' } } }));
       }
     }
     if (a.modname === 'resource' && !a.files.some((x) => x.filearea === 'content' && x.filename !== '.')) {
       out.push(f({ check: 'T05', code: 'empty_resource', severity: 'error', scope: scopeOf(ctx, a),
         title: `El archivo ${where(a)} no trae ningún documento: al abrirlo no hay nada.`,
         detail: `${a.dir}: mod_resource sin archivos en el área content`, evidence: { entry: `${a.dir}/resource.xml` },
-        suggestedFix: regenerateFixFor(a) ?? { operation: 'remove_activity', params: { moduleId: a.moduleId } } }));
+        suggestedFix: regenerateFixFor(a) ?? (unreferenced(a) ? { operation: 'remove_activity', params: { moduleId: a.moduleId } } : null) }));
     }
   }
   return out;
@@ -421,12 +473,22 @@ function t06(ctx: DiagnosisContext): Finding[] {
         detail: `${a.dir}: imsmanifest.xml sin <manifest> o sin <resource href>`, evidence: { ...ev('imsmanifest.xml'), excerpt: sc.manifest.slice(0, 160) }, suggestedFix: fix }));
       continue;
     }
-    const launch = decodeURIComponent(href.split(/[?#]/)[0]).replace(/^\.?\//, '');
-    if (!sc.files.includes(launch)) {
-      out.push(f({ check: 'T06', code: 'scorm_launch_missing', severity: 'error', scope: scopeOf(ctx, a),
-        title: `El juego ${where(a)} no trae la página con la que empieza: al abrirlo da error.`,
-        detail: `${a.dir}: imsmanifest.xml lanza «${launch}», que no está en el SCORM (${sc.files.slice(0, 6).join(', ')})`, evidence: ev('imsmanifest.xml'), suggestedFix: fix }));
-      continue;
+    const norm = (x: string) => { try { return decodeURIComponent(x.split(/[?#]/)[0]).replace(/^\.?\//, ''); } catch { return x; } };
+    const manifestLaunch = norm(href);
+    // Fix round 1 (P2-1): Moodle abre el `launch` del sco que restaura de scorm.xml (scorm_scoes), no el del manifiesto.
+    const scoLaunch = (sc.scoLaunches ?? []).map(norm).find((x) => sc.files.includes(x)) ?? null;
+    let launch = manifestLaunch;
+    if (!sc.files.includes(manifestLaunch)) {
+      if (!scoLaunch) {
+        out.push(f({ check: 'T06', code: 'scorm_launch_missing', severity: 'error', scope: scopeOf(ctx, a),
+          title: `El juego ${where(a)} no trae la página con la que empieza: al abrirlo da error.`,
+          detail: `${a.dir}: ni el imsmanifest.xml («${manifestLaunch}») ni scorm.xml (${(sc.scoLaunches ?? []).join(', ') || 'sin launch'}) lanzan un archivo que esté en el SCORM (${sc.files.slice(0, 6).join(', ')})`, evidence: ev('imsmanifest.xml'), suggestedFix: fix }));
+        continue;
+      }
+      out.push(f({ check: 'T06', code: 'scorm_manifest_launch_mismatch', severity: 'warning', scope: scopeOf(ctx, a),
+        title: `La configuración interna del juego ${where(a)} nombra una página que no existe: hoy abre, pero si se actualiza el paquete en Moodle dejará de abrir.`,
+        detail: `${a.dir}: imsmanifest.xml lanza «${manifestLaunch}» (no está); scorm.xml lanza «${scoLaunch}» (sí está), que es lo que Moodle restaura`, evidence: ev('imsmanifest.xml'), suggestedFix: fix }));
+      launch = scoLaunch;
     }
     const pendingIn = [...sc.html.entries()].find(([, h]) => PENDING_MARK.test(h));
     if (pendingIn) {
@@ -462,15 +524,22 @@ function t06(ctx: DiagnosisContext): Finding[] {
 
 // ─── T07 · Libro Guía completo ───────────────────────────────────────────────
 
-/** Números de capítulo que el Libro nombra en sus títulos (h1–h3): «Capítulo 3», «Cap 3», «Capitulo 3». */
+/**
+ * Números de capítulo que el Libro nombra en sus títulos (h1–h3), EN ORDEN. Fix round 1 (P2-2): primero el formato del
+ * builder (`buildLibroHTML`: «Capítulo N: …» / «Capítulo N — …»); si no aparece, cualquier «Cap / Capítulo N».
+ * `reliable` = la secuencia es estrictamente creciente y sin repetidos; si no (títulos escritos a mano: «Cap 3» dos veces),
+ * no se deduce qué capítulo falta.
+ */
+export function libroChapterSequence(html: string): { numbers: number[]; reliable: boolean; format: 'builder' | 'loose' | 'none' } {
+  const heads = [...html.matchAll(/<h([1-3])\b[^>]*>([\s\S]*?)<\/h\1>/gi)].map((m) => plainText(m[2], 200));
+  const strict = heads.map((t) => /^\s*Cap[ií]tulo\s+(\d{1,3})\s*[:—–-]/i.exec(t)).filter((m): m is RegExpExecArray => !!m).map((m) => Number(m[1]));
+  const loose = heads.map((t) => /^\s*(?:\d+(?:\.\d+)*\s*[.)-]?\s*)?Cap(?:[ií]tulo|\.)?\s*(\d{1,3})\b/i.exec(t)).filter((m): m is RegExpExecArray => !!m).map((m) => Number(m[1]));
+  const numbers = strict.length ? strict : loose;
+  const reliable = numbers.length > 0 && numbers.every((n, i) => i === 0 || n > numbers[i - 1]);
+  return { numbers, reliable, format: strict.length ? 'builder' : loose.length ? 'loose' : 'none' };
+}
 export function libroChapterNumbers(html: string): Set<number> {
-  const out = new Set<number>();
-  for (const m of html.matchAll(/<h([1-3])\b[^>]*>([\s\S]*?)<\/h\1>/gi)) {
-    const t = plainText(m[2], 200);
-    const c = /^\s*(?:\d+(?:\.\d+)*\s*[.)-]?\s*)?Cap(?:[ií]tulo|\.)?\s*(\d{1,3})\b/i.exec(t);
-    if (c) out.add(Number(c[1]));
-  }
-  return out;
+  return new Set(libroChapterSequence(html).numbers);
 }
 
 function t07(ctx: DiagnosisContext): Finding[] {
@@ -482,10 +551,12 @@ function t07(ctx: DiagnosisContext): Finding[] {
     const card = ctx.course.activities.find((a) => a.kind === 'libro_info' || a.kind === 'libro_mobile');
     if (card && card.kind === 'libro_info') {
       const dead = card.html.some((h) => [...h.html.matchAll(DEAD_LINK)].some((m) => LIBRO_BUTTON.test(plainText(m[3], 60))));
-      out.push(f({ check: 'T07', code: 'libro_missing', severity: 'warning', scope: scopeOf(ctx, card),
+      // Fix round 1 (P2-4): error (el mismo bug #6 que el token del Libro mal tipado). Ninguna operación del catálogo
+      // CREA un Libro Guía (edit_libro_section edita uno existente): sin arreglo automático, lo decide B4/B11.
+      out.push(f({ check: 'T07', code: 'libro_missing', severity: 'error', scope: scopeOf(ctx, card),
         title: `El curso anuncia el Libro Guía en ${where(card)}, pero el paquete no trae el Libro Guía${dead ? ': su botón de descarga no lleva a ningún lado' : ''}.`,
-        detail: `${card.dir}: kind libro_info sin ninguna actividad libro (resource / page) en el paquete${dead ? '; el botón del Libro tiene href="#" (changelog #6 de CLAUDE.md)' : ''}`, evidence: { entry: `${card.dir}/${card.modname}.xml`, excerpt: plainText(card.html[0]?.html ?? '', 160) },
-        suggestedFix: { operation: 'edit_libro_section', params: { section: 'all', create: true } } }));
+        detail: `${card.dir}: kind libro_info sin ninguna actividad libro (resource / page) en el paquete${dead ? '; el botón del Libro tiene href="#" (changelog #6 de CLAUDE.md)' : ''}. Sin arreglo automático: el catálogo no tiene una operación que cree el Libro Guía (B4/B11 deciden).`, evidence: { entry: `${card.dir}/${card.modname}.xml`, excerpt: plainText(card.html[0]?.html ?? '', 160) },
+        suggestedFix: null }));
     }
     return out;
   }
@@ -535,11 +606,12 @@ function t07(ctx: DiagnosisContext): Finding[] {
 
 function libroChapterFindings(ctx: DiagnosisContext, a: WorkshopActivity, html: string, chapters: number[], ev: { entry: string; file?: Finding['evidence']['file'] }, fix: SuggestedFix): Finding[] {
   if (!chapters.length) return [];
-  const named = libroChapterNumbers(html);
-  if (!named.size) {
+  const seq = libroChapterSequence(html);
+  const named = new Set(seq.numbers);
+  if (!seq.reliable) {
     return [f({ check: 'T07', code: 'libro_chapters_unverified', severity: 'info', scope: scopeOf(ctx, a),
-      title: 'No se pudo comprobar que el Libro Guía tenga todos los capítulos (no los titula como «Capítulo N»).',
-      detail: `${ev.entry}: ningún título h1–h3 «Capítulo N»`, evidence: ev })];
+      title: 'No se pudo comprobar que el Libro Guía tenga todos los capítulos (sus títulos no siguen el formato «Capítulo N: …»).',
+      detail: `${ev.entry}: ${seq.numbers.length ? `títulos de capítulo en orden ${seq.numbers.join(', ')} (repetidos o fuera de orden: no se deduce cuál falta)` : 'ningún título h1–h3 «Capítulo N»'}`, evidence: ev })];
   }
   const missing = chapters.filter((n) => !named.has(n));
   if (!missing.length) return [];

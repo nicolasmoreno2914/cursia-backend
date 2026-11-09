@@ -78,6 +78,8 @@ export interface ScormContent {
   /** Archivo de files.xml de cada nombre (área content). */
   fileOf: Map<string, WorkshopFile>;
   problem: string | null;
+  /** Páginas que lanzan los sco de scorm.xml (lo que Moodle restaura en scorm_scoes y abre). */
+  scoLaunches?: string[];
 }
 
 export interface ValidatorRun {
@@ -108,6 +110,8 @@ export interface DiagnosisContext {
   hvp: Map<number, { json: unknown; problem: string | null }>;
   /** `<single>` de cada pregunta multichoice de questions.xml. */
   mcSingle: Map<number, boolean>;
+  /** Contenido crudo (escapado) de cada campo HTML, por `${entry}|${field}` (fix round 1, P2-6). */
+  rawFields: Map<string, string>;
   validator: ValidatorRun;
   actByMid: Map<number, WorkshopActivity>;
   actByDir: Map<string, WorkshopActivity>;
@@ -176,6 +180,24 @@ async function readScormZip(buf: Buffer): Promise<ScormContent> {
 /** Arma el contexto (toda la lectura). Nunca lanza por el contenido del paquete: lo deja como datos para los checks. */
 export async function buildDiagnosisContext(input: DiagnosisInput): Promise<DiagnosisContext> {
   const { pkg } = input;
+  // Fix round 1 (P1-1): el validador (JSZip sobre TODO el paquete) corre PRIMERO y suelta su estructura antes de armar
+  // el inventario con HTML y la pasada por los blobs: los dos picos de memoria ya no se suman.
+  // ── T11: validador v3 del builder ──
+  let validator: ValidatorRun;
+  if (input.builderLine !== 'v3') {
+    validator = { mode: 'not_applicable', reason: 'el validador v3 solo entiende paquetes del builder v3', issues: [], error: null };
+  } else if (pkg.container !== 'zip') {
+    validator = { mode: 'not_applicable', reason: 'el paquete no es un zip (el builder v3 siempre arma zip)', issues: [], error: null };
+  } else {
+    const withExp = !!input.expectations;
+    try {
+      const r = withExp ? await validateMbzV3(input.packageBytes, input.expectations as MbzV3ValidationExpectations) : await validateMbzV3Structure(input.packageBytes);
+      validator = { mode: withExp ? 'with_expectations' : 'without_expectations', reason: withExp ? null : (input.expectationsReason ?? 'no hay expectativas del builder para este paquete'), issues: r.issues, error: null };
+    } catch (err) {
+      validator = { mode: withExp ? 'with_expectations' : 'without_expectations', reason: null, issues: [], error: err instanceof Error ? err.message.slice(0, 300) : String(err) };
+    }
+  }
+
   const raw = await readRawCourse(pkg, { family: input.family, builderLine: input.builderLine, builderVersion: input.builderVersion });
   const course = buildWorkshopCourse(raw, adapterFor(input.family));
   const actByMid = new Map(course.activities.map((a) => [a.moduleId, a]));
@@ -241,6 +263,19 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
     if ((libroHashes.has(hash) || scormContentHashes.has(hash)) && b.length <= TEXT_MAX) texts.set(hash, b.toString('utf8'));
     if (h5pHashes.has(hash) || scormZipHashes.has(hash)) nested.set(hash, b);
   };
+  // Fix round 1 (P1-1): cada .h5p / zip de SCORM se abre APENAS se leyó y se suelta (antes quedaban todos en memoria
+  // hasta el final de la pasada). Solo se guarda lo extraído (h5p.json + content.json / manifiesto + HTML).
+  const nestedH5p = new Map<string, H5pPackage>();
+  const nestedScorm = new Map<string, ScormContent>();
+  const drainNested = async () => {
+    for (const [hash, b] of nested) {
+      if (sha1(b) === hash) {
+        if (h5pHashes.has(hash)) nestedH5p.set(hash, await readH5p(b));
+        if (scormZipHashes.has(hash)) nestedScorm.set(hash, await readScormZip(b));
+      }
+      nested.delete(hash);
+    }
+  };
   let budgetProblem: string | null = null;
   const markUnread = (rest: Array<{ hash: string; entry: string }>, why: string) => {
     for (const w of rest) if (!blobs.has(w.hash)) blobs.set(w.hash, { hash: w.hash, entry: w.entry, present: true, sha1: null, size: null, head: null, tail: null, mp3: null, unread: why });
@@ -250,6 +285,7 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
       const w = want[i];
       try {
         take(w.hash, w.entry, await pkg.readEntry(w.entry));
+        if (nested.size) await drainNested();
       } catch (err) {
         const why = isMbzReaderError(err) ? err.message : 'no se pudo leer';
         if (isMbzReaderError(err) && err.code === 'read_budget_exceeded') { budgetProblem = why; markUnread(want.slice(i), why); break; }
@@ -264,6 +300,8 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
       try {
         const got = await pkg.readEntries(batch.map((w) => w.entry));
         for (const w of batch) { const b = got.get(w.entry); if (b) take(w.hash, w.entry, b); else markUnread([w], 'no se pudo leer'); }
+        got.clear();
+        await drainNested();
       } catch (err) {
         const why = isMbzReaderError(err) ? err.message : 'no se pudo leer';
         if (isMbzReaderError(err) && err.code === 'read_budget_exceeded') budgetProblem = why;
@@ -289,26 +327,35 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
     const content = a.files.filter((f) => f.filearea === 'content' && f.filename !== '.');
     if (content.length) {
       const rel = (f: WorkshopFile) => `${(f.filepath || '/').replace(/^\//, '')}${f.filename}`;
-      const sc: ScormContent = { source: 'content', manifest: null, files: content.map(rel), html: new Map(), fileOf: new Map(content.map((f) => [rel(f), f])), problem: null };
+      const sc: ScormContent = { source: 'content', manifest: null, files: content.map(rel), html: new Map(), fileOf: new Map(content.map((f) => [rel(f), f])), problem: null, scoLaunches: [] };
       const man = content.find((f) => rel(f) === 'imsmanifest.xml');
       if (man && verified(man.contenthash)) sc.manifest = texts.get(man.contenthash) ?? null;
       for (const f of content) if (/\.html?$/i.test(f.filename) && verified(f.contenthash) && texts.has(f.contenthash)) sc.html.set(rel(f), texts.get(f.contenthash) as string);
       scorm.set(a.moduleId, sc);
     } else {
       const p = scormPackageByMid.get(a.moduleId);
-      if (p && nested.has(p.contenthash) && verified(p.contenthash)) scorm.set(a.moduleId, await readScormZip(nested.get(p.contenthash) as Buffer));
-      else scorm.set(a.moduleId, { source: p ? 'package' : 'none', manifest: null, files: [], html: new Map(), fileOf: new Map(), problem: p ? null : 'sin archivos' });
+      if (p && nestedScorm.has(p.contenthash) && verified(p.contenthash)) scorm.set(a.moduleId, { ...(nestedScorm.get(p.contenthash) as ScormContent) });
+      else scorm.set(a.moduleId, { source: p ? 'package' : 'none', manifest: null, files: [], html: new Map(), fileOf: new Map(), problem: p ? null : 'sin archivos', scoLaunches: [] });
     }
+    // Fix round 1 (P2-1): lo que Moodle RESTAURA y lanza es scorm.xml <scoes><sco><launch> (scorm_scoes), no el manifiesto.
+    const sx = await pkg.readText(`${a.dir}/scorm.xml`, { maxBytes: TEXT_MAX }).catch(() => null);
+    const sc = scorm.get(a.moduleId) as ScormContent;
+    sc.scoLaunches = sx ? [...sx.matchAll(/<sco id="\d+">([\s\S]*?)<\/sco>/g)]
+      .map((m) => ({ launch: xmlUnescape(tagOf(m[1], 'launch') ?? '').trim(), type: (tagOf(m[1], 'scormtype') ?? '').trim() }))
+      .filter((x) => x.launch && (x.type === 'sco' || x.type === 'asset' || x.type === ''))
+      .map((x) => x.launch) : [];
   }
   // ── H5P (h5pactivity): h5p.json + content.json de cada paquete verificado ──
   const h5p = new Map<number, H5pPackage>();
   const h5pByHash = new Map<string, H5pPackage>();
   for (const [mid, f] of h5pPackageByMid) {
-    if (!verified(f.contenthash) || !nested.has(f.contenthash)) continue;
-    if (!h5pByHash.has(f.contenthash)) h5pByHash.set(f.contenthash, await readH5p(nested.get(f.contenthash) as Buffer));
+    if (!verified(f.contenthash) || !nestedH5p.has(f.contenthash)) continue;
+    if (!h5pByHash.has(f.contenthash)) h5pByHash.set(f.contenthash, nestedH5p.get(f.contenthash) as H5pPackage);
     h5p.set(mid, h5pByHash.get(f.contenthash) as H5pPackage);
   }
   nested.clear();
+  nestedH5p.clear();
+  nestedScorm.clear();
   // Solo quedan los textos del Libro Guía (los del SCORM ya se copiaron a su mapa).
   for (const h of [...texts.keys()]) if (!libroHashes.has(h)) texts.delete(h);
 
@@ -325,6 +372,20 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
     }
   }
 
+  // ── Fix round 1 (P2-6): contenido CRUDO (escapado, como está en el paquete) de cada campo HTML de las actividades,
+  // por (entrada, campo): los arreglos sugeridos llevan desplazamientos en BYTES de esos campos (los que parchea B4).
+  const rawFields = new Map<string, string>();
+  const byEntry = new Map<string, Array<{ field: string; off: number; len: number }>>();
+  for (const a of course.activities) for (const h of a.html) {
+    if (!byEntry.has(h.entry)) byEntry.set(h.entry, []);
+    byEntry.get(h.entry)!.push({ field: h.field, off: h.rawOffset, len: h.rawBytes });
+  }
+  for (const [entry, fs] of byEntry) {
+    const b = await pkg.readEntry(entry, { maxBytes: TEXT_MAX }).catch(() => null);
+    if (!b) continue;
+    for (const x of fs) rawFields.set(`${entry}|${x.field}`, b.subarray(x.off, x.off + x.len).toString('utf8'));
+  }
+
   // ── `<single>` de las opciones múltiples ──
   const mcSingle = new Map<number, boolean>();
   if (course.exams.length && pkg.has('questions.xml')) {
@@ -335,25 +396,9 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
     }
   }
 
-  // ── T11: validador v3 del builder ──
-  let validator: ValidatorRun;
-  if (input.builderLine !== 'v3') {
-    validator = { mode: 'not_applicable', reason: 'el validador v3 solo entiende paquetes del builder v3', issues: [], error: null };
-  } else if (pkg.container !== 'zip') {
-    validator = { mode: 'not_applicable', reason: 'el paquete no es un zip (el builder v3 siempre arma zip)', issues: [], error: null };
-  } else {
-    const withExp = !!input.expectations;
-    try {
-      const r = withExp ? await validateMbzV3(input.packageBytes, input.expectations as MbzV3ValidationExpectations) : await validateMbzV3Structure(input.packageBytes);
-      validator = { mode: withExp ? 'with_expectations' : 'without_expectations', reason: withExp ? null : (input.expectationsReason ?? 'no hay expectativas del builder para este paquete'), issues: r.issues, error: null };
-    } catch (err) {
-      validator = { mode: withExp ? 'with_expectations' : 'without_expectations', reason: null, issues: [], error: err instanceof Error ? err.message.slice(0, 300) : String(err) };
-    }
-  }
-
   return {
     family: input.family, builderLine: input.builderLine, builderVersion: input.builderVersion, container: pkg.container,
-    course, raw, files, blobs, undeclaredBlobs: undeclaredBlobs.sort(), malformedBlobPaths: malformedBlobPaths.sort(), texts, scorm, h5p, hvp, mcSingle, validator,
+    course, raw, files, blobs, undeclaredBlobs: undeclaredBlobs.sort(), malformedBlobPaths: malformedBlobPaths.sort(), texts, scorm, h5p, hvp, mcSingle, rawFields, validator,
     actByMid, actByDir, actByIdnumber,
   };
 }
