@@ -6,7 +6,7 @@
 //
 //   W1  migración aditiva e idempotente (dos veces, con roles de Supabase): RLS, sin acceso para anon/authenticated;
 //       el script se niega sin MIGRATION_ENV=staging
-//   W2  crear sesión: ruta en la carpeta del dueño, URL firmada; nombre inválido / > 300 MB → 400
+//   W2  crear sesión: ruta en la carpeta del dueño, URL firmada; nombre inválido / > 200 MB → 400 (tope del Taller, B3 N2)
 //   W3  cerrar la subida: sin objeto → 409; con objeto → 202 `identifying` → `identified` (sha1, tamaño, contenedor,
 //       familia, builder, huella → curso del dueño) + artifact `workshop_original` con sha256; re-POST idempotente (no
 //       duplica el artifact)
@@ -47,6 +47,12 @@
 //       `queued` y NO vencen aunque pasen 15 min; re-POST de uno en cola no duplica nada; 1 descarga por diagnóstico
 //   W34 P1-1 presupuesto de memoria: un original cuyo estimado lo supera → failed WORKSHOP_DIAGNOSIS_TOO_LARGE, visible,
 //       no reintentable, sin descargarlo
+//   Fix round 2:
+//   W35 N1 pm2 reload: el proceso A muere con un diagnóstico `running` y otro `queued`; el proceso B (otro arranque) no
+//       toca filas que A sigue latiendo y reclama las abandonadas en el re-POST y en el próximo GET → cada una corre
+//       EXACTAMENTE una vez en B; lo que A termine después no escribe nada
+//   W36 N2 presupuesto del proceso: con una reserva viva que no deja lugar, el diagnóstico espera en cola sin tomar el
+//       carril y arranca al soltarse; TOO_LARGE se reintenta si el presupuesto actual es mayor que el del error
 //   W32 un run interrumpido (proceso reiniciado) → GET lo marca fallido reintentable; el POST lo reclama y termina; una
 //       falla determinista del diagnóstico es terminal (no se reintenta sola)
 //
@@ -256,14 +262,14 @@ function rawZip(entries) {
     await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, checksum_sha256, size_bytes) values ($1, $2, 'dynamic_mbz', $3, $4, $5)`, [OTHER.id, String(foreign.id), `${OTHER.id}/dynamic/x.mbz`, MBZ_SHA256, MBZ.length]);
 
     let s1;
-    await check('W2 crear sesión: ruta en la carpeta del dueño + URL firmada; nombre inválido / > 300 MB → 400', async () => {
+    await check('W2 crear sesión: ruta en la carpeta del dueño + URL firmada; nombre inválido / > 200 MB → 400', async () => {
       const res = await svc.createSession(OWNER, { filename: 'C:\\x\\Mi curso.mbz', sizeBytes: MBZ.length });
       s1 = res.session;
       eq([s1.status, s1.phase, s1.filename, s1.institutionId], ['uploaded', 'awaiting_upload', 'Mi curso.mbz', null], 'sesión (RBAC off: sin institución)');
       eq(res.upload.storagePath, SVC.workshopStoragePath(OWNER.id, s1.id), 'ruta');
-      eq([res.upload.method, res.upload.maxBytes], ['backend', 300 * 1024 * 1024], 'upload');
+      eq([res.upload.method, res.upload.maxBytes], ['backend', 200 * 1024 * 1024], 'upload (tope 200 MB)');
       await rejects(svc.createSession(OWNER, { filename: 'curso.zip', sizeBytes: 10 }), 400, 'WORKSHOP_FILENAME_INVALID', 'extensión');
-      await rejects(svc.createSession(OWNER, { filename: 'c.mbz', sizeBytes: 300 * 1024 * 1024 + 1 }), 400, 'WORKSHOP_FILE_TOO_LARGE', 'tope');
+      await rejects(svc.createSession(OWNER, { filename: 'c.mbz', sizeBytes: 200 * 1024 * 1024 + 1 }), 400, 'WORKSHOP_FILE_TOO_LARGE', 'tope');
     });
 
     await check('W3 cerrar la subida: sin objeto → 409; con objeto → identifying → identified (huella → curso propio) + workshop_original; idempotente', async () => {
@@ -369,7 +375,7 @@ function rawZip(entries) {
       await rejects(svc2.createSession(OWNER, { filename: 'x.mbz', sizeBytes: 10 }), 503, 'COURSE_WORKSHOP_NOT_MIGRATED', 'sin migrar');
     });
 
-    await check('W10 fix P1-1: el objeto se reemplaza entre el HEAD y la descarga — más grande que 300 MB → abort + failed (no reintentable); distinto tamaño → reintentable', async () => {
+    await check('W10 fix P1-1: el objeto se reemplaza entre el HEAD y la descarga — más grande que el tope (200 MB) → abort + failed (no reintentable); distinto tamaño → reintentable', async () => {
       const res = await svc.createSession(OWNER, { filename: 't.mbz', sizeBytes: MBZ.length });
       objects.set(res.upload.storagePath, MBZ);
       await svc.markUploaded(OWNER, res.session.id); // HEAD ve el chico
@@ -787,6 +793,10 @@ function rawZip(entries) {
         const colsOf = async () => (await c.query(`select table_name, column_name, data_type from information_schema.columns where table_name in ('courses','artifacts','workshop_sessions') order by 1, 2`)).rows;
         const before = await colsOf();
         for (let i = 0; i < 2; i++) { await c.query('begin'); await c.query(SQL_B3); await c.query('commit'); }
+        // Fix round 2 (N4): una tabla creada antes con default 'running' queda con default 'queued' al volver a aplicarla.
+        await c.query(`alter table public.workshop_diagnoses alter column status set default 'running'`);
+        await c.query('begin'); await c.query(SQL_B3); await c.query('commit');
+        eq((await c.query(`select column_default from information_schema.columns where table_name = 'workshop_diagnoses' and column_name = 'status'`)).rows[0].column_default, "'queued'::text", 'default queued');
         eq((await c.query('show lock_timeout')).rows[0].lock_timeout, '0', 'lock_timeout local a la transacción');
         eq(await colsOf(), before, 'tablas existentes intactas');
         const t = await c.query(`select relname, relrowsecurity from pg_class where relname in ('workshop_diagnoses','workshop_findings') order by 1`);
@@ -917,14 +927,14 @@ function rawZip(entries) {
       eq((await svc.getDiagnosis(OWNER, res2.session.id)).error.code, 'WORKSHOP_ORIGINAL_MISSING', 'original borrado');
     });
 
-    await check('W32 run interrumpido → GET lo marca reintentable y el POST lo termina; falla determinista → terminal', async () => {
+    await check('W32 run abandonado → el GET lo reclama y termina; falla determinista → terminal', async () => {
       const res = await newIdentified('b3-interrumpido.mbz');
       const sid = res.session.id;
       const [row] = await ds.query(`select original_sha1 from public.workshop_sessions where id = $1`, [sid]);
       await ds.query(`insert into public.workshop_diagnoses (session_id, original_sha1, code_version, status, claim_id, updated_at) values ($1, $2, $3, 'running', 'muerto', now() - interval '20 minutes')`, [sid, row.original_sha1, DGN.DIAGNOSIS_CODE_VERSION]);
+      // Fix round 2 (N1): el sondeo reclama la fila abandonada (otro arranque, sin latido) y la vuelve a encolar.
       const g = await svc.getDiagnosis(OWNER, sid);
-      eq([g.status, g.error.code, g.error.retryable], ['failed', 'WORKSHOP_DIAGNOSIS_INTERRUPTED', true], 'interrumpido');
-      await svc.startDiagnosis(OWNER, sid);
+      eq(g.status, 'queued', 'el GET la reclama');
       await settleD(sid);
       eq((await svc.getDiagnosis(OWNER, sid)).status, 'ready', 'reclamado y listo');
       // Un run viejo con el reclamo vencido no escribe nada.
@@ -986,9 +996,9 @@ function rawZip(entries) {
 
     await check('W34 P1-1 presupuesto de memoria: original demasiado grande → failed WORKSHOP_DIAGNOSIS_TOO_LARGE visible, sin descargarlo', async () => {
       const res = await newIdentified('b3-grande.mbz');
-      const saved = svc.diagnosisMemoryBudgetBytes;
+      const saved = svc.memoryBudgetBytes;
       const d0 = storage.downloads; const runs0 = svc.diagnosisRuns;
-      svc.diagnosisMemoryBudgetBytes = MBZ.length * 4; // estimado = 5 × tamaño > presupuesto
+      svc.memoryBudgetBytes = MBZ.length * 4; // estimado = 5 × tamaño > presupuesto
       try {
         const a = await svc.startDiagnosis(OWNER, res.session.id);
         eq([a.status, a.error && a.error.code, a.error && a.error.retryable], ['failed', 'WORKSHOP_DIAGNOSIS_TOO_LARGE', false], 'falla visible');
@@ -997,7 +1007,69 @@ function rawZip(entries) {
         eq((await svc.getDiagnosis(OWNER, res.session.id)).error.code, 'WORKSHOP_DIAGNOSIS_TOO_LARGE', 'GET igual');
         eq((await svc.startDiagnosis(OWNER, res.session.id)).status, 'failed', 're-POST: la misma falla');
         eq([storage.downloads - d0, svc.diagnosisRuns - runs0], [0, 0], 'no se descargó ni corrió');
-      } finally { svc.diagnosisMemoryBudgetBytes = saved; }
+      } finally { svc.memoryBudgetBytes = saved; }
+    });
+
+    await check('W35 N1 pm2 reload: running + queued de un proceso muerto → B los reclama (re-POST y GET) y cada uno corre UNA vez', async () => {
+      const A = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const B = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const x = (await newIdentified('b3-reload-x.mbz')).session.id;
+      const y = (await newIdentified('b3-reload-y.mbz')).session.id;
+      const realA = A.diagnosisRunner;
+      let openA = false;
+      A.diagnosisRunner = async (input) => { while (!openA) await sleep(5); return realA(input); };
+      eq((await A.startDiagnosis(OWNER, x)).status, 'queued', 'A: x en cola');
+      eq((await A.startDiagnosis(OWNER, y)).status, 'queued', 'A: y en cola');
+      await sleep(60);
+      const st = async () => (await ds.query(`select session_id::text sid, status, claim_id from public.workshop_diagnoses where session_id = any($1::uuid[]) order by session_id = $2::uuid desc`, [[x, y], x]));
+      eq((await st()).map((r) => [r.status, r.claim_id.split('.')[0] === A.bootId]), [['running', true], ['queued', true]], 'A: x corriendo, y en cola');
+      // A vivo (acaba de latir): B NO reclama sus filas.
+      await A.diagnosisHeartbeat();
+      eq([(await B.getDiagnosis(OWNER, x)).status, (await B.startDiagnosis(OWNER, y)).status], ['running', 'queued'], 'B respeta a A vivo');
+      eq(B.diagnosisRuns, 0, 'B no corrió nada');
+      // pm2 reload: A muere (deja de latir); pasan 3 latidos.
+      A.simulateDeathForTests();
+      await ds.query(`update public.workshop_diagnoses set updated_at = now() - ($2::int * interval '1 millisecond') where session_id = any($1::uuid[])`, [[x, y], SVC.DIAGNOSIS_HEARTBEAT_STALE_MS + 1000]);
+      const d0 = storage.downloads;
+      eq((await B.startDiagnosis(OWNER, x)).status, 'queued', 'B: el re-POST reclama el running abandonado');
+      eq((await B.getDiagnosis(OWNER, y)).status, 'queued', 'B: el GET reclama el queued abandonado');
+      await B.inFlight.get(`diagnosis:${x}`); await B.inFlight.get(`diagnosis:${y}`);
+      eq([B.diagnosisRuns, storage.downloads - d0], [2, 2], 'cada uno corre una vez en B (una descarga cada uno)');
+      eq((await st()).map((r) => [r.status, r.claim_id.split('.')[0] === B.bootId]), [['ready', true], ['ready', true]], 'listos, con el reclamo de B');
+      const cnt = async () => (await ds.query(`select count(*)::int n from public.workshop_findings f join public.workshop_diagnoses d on d.id = f.diagnosis_id where d.session_id = any($1::uuid[])`, [[x, y]]))[0].n;
+      const f0 = await cnt();
+      // A «revive» la corrida colgada: termina, pero ya no es dueño — no escribe nada.
+      openA = true;
+      await sleep(500);
+      eq((await st()).map((r) => [r.status, r.claim_id.split('.')[0] === B.bootId]), [['ready', true], ['ready', true]], 'A no pisa');
+      eq(await cnt(), f0, 'hallazgos intactos');
+    });
+
+    await check('W36 N2 presupuesto del proceso: reserva viva sin lugar → el diagnóstico espera sin tomar el carril; TOO_LARGE se reintenta con más presupuesto', async () => {
+      const saved = svc.memoryBudgetBytes;
+      try {
+        svc.memoryBudgetBytes = MBZ.length * 7;
+        const res = await newIdentified('b3-reserva.mbz');
+        let release;
+        const held = svc.withMemory('identify:simulada', MBZ.length * 3, () => new Promise((r) => { release = r; }));
+        eq(svc.reservedMemoryBytes, MBZ.length * 3, 'reserva viva');
+        eq((await svc.startDiagnosis(OWNER, res.session.id)).status, 'queued', 'en cola');
+        await sleep(60);
+        eq([svc.diagnosisRunningCount, (await svc.getDiagnosis(OWNER, res.session.id)).status], [0, 'queued'], 'no entra: espera sin tomar el carril');
+        release(); await held;
+        await settleD(res.session.id);
+        eq((await svc.getDiagnosis(OWNER, res.session.id)).status, 'ready', 'al soltarse la reserva, corre');
+        eq(svc.reservedMemoryBytes, 0, 'sin reservas colgadas');
+        const big = await newIdentified('b3-reintento.mbz');
+        svc.memoryBudgetBytes = MBZ.length * 4;
+        eq((await svc.startDiagnosis(OWNER, big.session.id)).error.code, 'WORKSHOP_DIAGNOSIS_TOO_LARGE', 'rechazado');
+        svc.memoryBudgetBytes = saved;
+        eq((await svc.startDiagnosis(OWNER, big.session.id)).status, 'queued', 'con más presupuesto se reintenta');
+        await settleD(big.session.id);
+        eq((await svc.getDiagnosis(OWNER, big.session.id)).status, 'ready', 'listo');
+        eq(SVC.workshopMemoryBudgetBytes({ COURSE_WORKSHOP_MEMORY_BUDGET_MB: '3072' }), 3072 * 1024 * 1024, 'presupuesto por env');
+        eq(SVC.workshopMemoryBudgetBytes({ COURSE_WORKSHOP_MEMORY_BUDGET_MB: 'x' }), 2048 * 1024 * 1024, 'env inválido → por defecto');
+      } finally { svc.memoryBudgetBytes = saved; }
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

@@ -1,8 +1,8 @@
 import { Type } from 'class-transformer';
 import { IsInt, IsString, Max, MaxLength, Min } from 'class-validator';
-import { MBZ_READER_LIMITS } from '../mbz-reader';
+import { WORKSHOP_MAX_UPLOAD_BYTES } from '../workshop-limits';
 
-/** r107 B1 · `POST /course-workshop/sessions`: nombre y tamaño del .mbz que el navegador va a subir (tope 300 MB). */
+/** r107 B1 · `POST /course-workshop/sessions`: nombre y tamaño del .mbz que el navegador va a subir (tope 200 MB: WORKSHOP_MAX_UPLOAD_BYTES). */
 export class CreateWorkshopSessionDto {
   @IsString()
   @MaxLength(255)
@@ -11,6 +11,6 @@ export class CreateWorkshopSessionDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(MBZ_READER_LIMITS.maxPackageBytes)
+  @Max(WORKSHOP_MAX_UPLOAD_BYTES)
   sizeBytes: number;
 }

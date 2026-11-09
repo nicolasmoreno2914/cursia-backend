@@ -40,6 +40,8 @@ create table if not exists public.workshop_diagnoses (
 -- con el CHECK sin `queued` (solo pruebas locales: la tabla todavía no existe en staging).
 alter table public.workshop_diagnoses drop constraint if exists workshop_diagnoses_status_check;
 alter table public.workshop_diagnoses add constraint workshop_diagnoses_status_check check (status in ('queued', 'running', 'ready', 'failed'));
+-- Fix round 2 (N4): el default también, sobre una tabla creada antes con default 'running'.
+alter table public.workshop_diagnoses alter column status set default 'queued';
 create unique index if not exists workshop_diagnoses_version_uidx on public.workshop_diagnoses (session_id, original_sha1, code_version);
 
 create table if not exists public.workshop_findings (

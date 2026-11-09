@@ -233,7 +233,8 @@ async function miniV1(audioMp3) {
 const B3_MUTATIONS = {
   async 'token-external'(zip) {
     const dir = await injectLabel(zip, '<p><a href="$@COURSEVIEWBYID*424242@$">Ir al otro curso</a></p>');
-    return { check: 'T04', target: dir };
+    // Fix round 2 (N3): en un paquete v3 el validador lo marca TOKEN_INVALID (error) — sigue siendo AVISO.
+    return { check: 'T04', target: dir, severity: 'warning', code: 'token_external' };
   },
   async 'token-malformed'(zip) {
     // El bug de `$&` (changelog #1): el `$` final del token se pierde → `$@KIND*id@` que Moodle deja literal.
@@ -693,6 +694,10 @@ async function censusMode(surveyPath) {
       fs2 = [mk('T04', 'dead_link', 'warning')];
       alone = DG.foldValidator([item('TOKEN_INVALID', 'error')], fs2);
       eq([alone.length, fs2[0].severity, fs2[0].corroboratedBy.length], [0, 'error', 1], 'misma familia: máximo');
+      // (c bis, fix round 2 N3) external es aviso por decisión: el TOKEN_INVALID lo corrobora sin subirlo.
+      fs2 = [mk('T04', 'token_external', 'warning')];
+      alone = DG.foldValidator([item('TOKEN_INVALID', 'error')], fs2);
+      eq([alone.length, fs2[0].severity, fs2[0].corroboratedBy.length], [0, 'warning', 1], 'external sigue aviso');
       // (d) un número cualquiera del mensaje no «relaciona» actividades; sí «el módulo N».
       eq(DG.relatedModuleIds({ code: 'STRUCTURE', where: 'x', message: 'pesa 900 bytes' }), [], 'número suelto');
       eq(DG.relatedModuleIds({ code: 'STRUCTURE', where: 'x', message: 'sequence referencia el módulo 1068 inexistente' }), [1068], 'el módulo N');

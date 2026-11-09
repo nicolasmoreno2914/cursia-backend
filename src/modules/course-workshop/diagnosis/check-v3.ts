@@ -131,6 +131,9 @@ export const VALIDATOR_FAMILY: Readonly<Record<string, readonly string[]>> = Obj
  * nombra explícitamente); el receptor queda con la severidad MÁXIMA de los dos. Si no hay receptor de su familia, el
  * ítem queda como hallazgo T11 propio. Devuelve esos hallazgos sueltos; muta `findings` (corroboración + severidad).
  */
+/** Hallazgos cuya severidad es una decisión del producto: el validador los corrobora sin subirlos. */
+export const NO_ESCALATE: ReadonlySet<string> = new Set(['T04.token_external']);
+
 export function foldValidator(items: ValidatorItem[], findings: Finding[]): Finding[] {
   const alone: Finding[] = [];
   for (const it of items) {
@@ -144,6 +147,9 @@ export function foldValidator(items: ValidatorItem[], findings: Finding[]): Find
     }
     if (!host) { alone.push(it.finding); continue; }
     host.corroboratedBy.push({ source: 'mbz-validator-v3', code: it.issue.code, where: it.issue.where, message: it.issue.message });
+    // Fix round 2 (N3): un enlace a OTRO curso del sitio es aviso por decisión (brief): el TOKEN_INVALID del validador
+    // («no apunta al curso del backup») lo corrobora pero no lo sube a error.
+    if (NO_ESCALATE.has(`${host.check}.${host.code}`)) continue;
     if (SEVERITY_RANK[it.finding.severity] > SEVERITY_RANK[host.severity]) host.severity = it.finding.severity;
   }
   return alone;
