@@ -47,4 +47,20 @@ export class CourseWorkshopController {
   inventory(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.workshop.getInventory(actorOf(user), id);
   }
+
+  // r107 B3 · POST /api/v1/course-workshop/sessions/:id/diagnosis → 202 { status: running | ready | failed, report… }:
+  // corre el diagnóstico técnico (T01–T12, USD 0). Idempotente: uno por versión del original; re-POST = el mismo.
+  // 409 WORKSHOP_NOT_IDENTIFIED / WORKSHOP_ORIGINAL_CHANGED / WORKSHOP_ORIGINAL_MISSING. Mismas compuertas que B1.
+  @Post('sessions/:id/diagnosis')
+  @HttpCode(HttpStatus.ACCEPTED)
+  diagnose(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.workshop.startDiagnosis(actorOf(user), id);
+  }
+
+  // r107 B3 · GET /api/v1/course-workshop/sessions/:id/diagnosis → { status: not_started | running | ready | failed, report }
+  // (informe con semáforo por curso / capítulo / actividad + hallazgos con su arreglo sugerido). Sondeo del navegador.
+  @Get('sessions/:id/diagnosis')
+  diagnosis(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.workshop.getDiagnosis(actorOf(user), id);
+  }
 }

@@ -19,6 +19,9 @@ import { WorkshopCourse, stableStringify } from './course-model';
 import {
   INVENTORY_CODE_VERSION, INVENTORY_PERSIST_MAX_BYTES, InventoryMeta, SourceArtifactRow, SourceStructure, WORKSHOP_SOURCE_TYPES, attachSources, buildInventory, persistableInventory,
 } from './inventory';
+import { DIAGNOSIS_CODE_VERSION, DiagnosisReport, runTechnicalDiagnosis } from './diagnosis/diagnose';
+import type { DiagnosisInput } from './diagnosis/context';
+import type { Finding } from './diagnosis/finding';
 
 /**
  * r107 B1 · Taller de cursos — ingesta + identificación (diseño §4 «ingest» / «identify»).
@@ -61,7 +64,17 @@ export const WORKSHOP_ERRORS = Object.freeze({
   INVENTORY_FAILED: 'WORKSHOP_INVENTORY_FAILED',
   INVENTORY_TOO_LARGE: 'WORKSHOP_INVENTORY_TOO_LARGE',
   ORIGINAL_MISSING: 'WORKSHOP_ORIGINAL_MISSING',
+  DIAGNOSIS_FAILED: 'WORKSHOP_DIAGNOSIS_FAILED',
+  DIAGNOSIS_INTERRUPTED: 'WORKSHOP_DIAGNOSIS_INTERRUPTED',
 });
+
+/**
+ * r107 B3: un diagnóstico `running` más viejo que esto se da por interrumpido (proceso reiniciado) y se puede reclamar
+ * de nuevo. Medido: el paquete más grande del corpus (1353, 106 MB) se diagnostica en ~3–4 s (descarga aparte).
+ */
+export const DIAGNOSIS_STALE_MS = 15 * 60_000;
+/** Por qué el validador v3 corre sin expectativas en el servicio (la base no las guarda; ver B3-report §decisiones). */
+export const DIAGNOSIS_NO_EXPECTATIONS_REASON = 'la base no guarda las expectativas del builder (facts + perfil) de los paquetes entregados';
 
 /**
  * Fix round 2 (P1-3): la reconstrucción del inventario desde el original (sesiones sin inventario) se intenta a lo sumo
@@ -168,6 +181,34 @@ export interface WorkshopInventoryResponse {
   error: { code: string; message: string; retryable: boolean } | null;
 }
 
+/** `GET/POST …/sessions/:id/diagnosis`: estado del diagnóstico técnico de la versión ACTUAL del original. */
+export interface WorkshopDiagnosisResponse {
+  sessionId: string;
+  status: 'not_started' | 'running' | 'ready' | 'failed';
+  diagnosisId: string | null;
+  codeVersion: string;
+  originalSha1: string | null;
+  startedAt: string | null;
+  diagnosedAt: string | null;
+  /** Informe con semáforo + hallazgos (solo `ready`). */
+  report: DiagnosisReport | null;
+  error: { code: string; message: string; retryable: boolean } | null;
+}
+
+interface DiagRow {
+  id: string;
+  session_id: string;
+  original_sha1: string;
+  code_version: string;
+  status: 'running' | 'ready' | 'failed';
+  claim_id: string | null;
+  report: any;
+  error: any;
+  started_at: Date | string;
+  finished_at: Date | string | null;
+  updated_at: Date | string;
+}
+
 type Q = { query: (sql: string, params?: unknown[]) => Promise<any> };
 
 /** Columnas de la sesión SIN el inventario (jsonb de hasta MB): las lecturas de sondeo no lo arrastran. */
@@ -200,6 +241,10 @@ export class CourseWorkshopService {
   now: () => Date = () => new Date();
   /** Armado del inventario (puro). Reemplazable SOLO en pruebas (simular un armado que falla). */
   inventoryBuilder: (pkg: MbzPackage, meta: InventoryMeta) => Promise<WorkshopCourse> = buildInventory;
+  /** B3: diagnóstico técnico (puro). Reemplazable SOLO en pruebas. */
+  diagnosisRunner: (input: DiagnosisInput) => Promise<DiagnosisReport> = runTechnicalDiagnosis;
+  /** Diagnósticos efectivamente corridos por este proceso (las pruebas lo leen para la idempotencia). */
+  diagnosisRuns = 0;
   /** Carril propio de la reconstrucción del inventario (1 por proceso; no usa el semáforo de las identificaciones). */
   private rebuildLane: symbol | null = null;
 
@@ -781,6 +826,176 @@ export class CourseWorkshopService {
     const scope: IdentifyScope = { ownerId: row.owner_id, institutionId: row.institution_id ?? null };
     const inv = await this.composeInventory(pkg, { family: (row.family ?? 'prototype') as WorkshopFamily, builderLine, builderVersion }, row.identified_course_id ?? null, scope);
     await saveInfo(inv.info, inv.json);
+  }
+
+  // ── diagnóstico técnico (B3) ──
+
+  /**
+   * POST …/sessions/:id/diagnosis — corre el diagnóstico técnico (T01–T12, USD 0) sobre el original VERIFICADO.
+   * Idempotente: UN diagnóstico por (sesión, sha1 del original, DIAGNOSIS_CODE_VERSION) — re-correr devuelve el mismo
+   * (listo o en curso), nunca duplica. Corre EN ESTE PROCESO (sin await, 202) con el MISMO semáforo de B1
+   * (IDENTIFY_CONCURRENCY): medido ~3–4 s sobre 106 MB, no justifica un worker. Un `running` de más de
+   * DIAGNOSIS_STALE_MS (proceso reiniciado) o una falla reintentable se reclaman de nuevo con este mismo POST.
+   * Compuertas: las de B1 (`courses.edit`); original cambiado / borrado → 409 con su código y no se diagnostica.
+   */
+  async startDiagnosis(actor: WorkshopActor, id: string): Promise<WorkshopDiagnosisResponse> {
+    let row = await this.loadForActor(actor, id, 'courses.edit');
+    row = await this.expireIfStale(row);
+    this.assertDiagnosable(row);
+    let cur = await this.diagnosisRowOf(row);
+    if (cur && (cur.status === 'ready' || (cur.status === 'failed' && cur.error?.retryable !== true) || (cur.status === 'running' && !this.diagnosisStale(cur)))) {
+      return this.diagnosisView(row, cur);
+    }
+    const claimId = randomUUID();
+    const [claimed] = returningRows(await this.q(this.dataSource,
+      `insert into public.workshop_diagnoses (session_id, original_sha1, code_version, status, claim_id, started_at, updated_at)
+            values ($1, $2, $3, 'running', $4, now(), now())
+       on conflict (session_id, original_sha1, code_version) do update
+            set status = 'running', claim_id = excluded.claim_id, error = null, report = null, started_at = now(), finished_at = null, updated_at = now()
+          where (workshop_diagnoses.status = 'failed' and coalesce((workshop_diagnoses.error->>'retryable')::boolean, false))
+             or (workshop_diagnoses.status = 'running' and workshop_diagnoses.updated_at < now() - ($5::int * interval '1 millisecond'))
+       returning *`,
+      [row.id, row.original_sha1, DIAGNOSIS_CODE_VERSION, claimId, DIAGNOSIS_STALE_MS])) as DiagRow[];
+    if (!claimed) {
+      cur = await this.diagnosisRowOf(row);
+      return this.diagnosisView(row, cur);
+    }
+    const key = `diagnosis:${row.id}`;
+    const p = this.withSlot(() => this.runDiagnosis(claimed.id, claimId))
+      .catch((err) => this.logger.error(`workshop ${row.id}: el diagnóstico terminó con error: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => this.inFlight.delete(key));
+    this.inFlight.set(key, p);
+    return this.diagnosisView(row, claimed);
+  }
+
+  /** GET …/sessions/:id/diagnosis — mismas compuertas que GET …/:id (`courses.view`). */
+  async getDiagnosis(actor: WorkshopActor, id: string): Promise<WorkshopDiagnosisResponse> {
+    let row = await this.loadForActor(actor, id, 'courses.view');
+    row = await this.expireIfStale(row);
+    const gone = this.originalGone(row);
+    if (gone) return { ...this.emptyDiagnosis(row), status: 'failed', error: gone };
+    if (row.status !== 'identified') {
+      throw new ConflictException({ code: WORKSHOP_ERRORS.NOT_IDENTIFIED, message: 'El diagnóstico está disponible cuando termina la identificación del paquete.', status: row.status });
+    }
+    let cur = await this.diagnosisRowOf(row);
+    if (cur && cur.status === 'running' && this.diagnosisStale(cur) && !this.inFlight.has(`diagnosis:${row.id}`)) {
+      const [r] = returningRows(await this.q(this.dataSource,
+        `update public.workshop_diagnoses set status = 'failed', error = $2::jsonb, updated_at = now()
+          where id = $1 and status = 'running' and updated_at < now() - ($3::int * interval '1 millisecond') returning *`,
+        [cur.id, JSON.stringify({ code: WORKSHOP_ERRORS.DIAGNOSIS_INTERRUPTED, message: 'El diagnóstico se interrumpió; vuelve a pedirlo.', retryable: true }), DIAGNOSIS_STALE_MS])) as DiagRow[];
+      cur = r ?? cur;
+    }
+    return this.diagnosisView(row, cur);
+  }
+
+  /**
+   * Corre el diagnóstico reclamado (`claimId`). Nunca lanza: termina `ready` (informe + hallazgos, en UNA transacción) o
+   * `failed` con el motivo visible; si el reclamo ya no es suyo, no escribe nada.
+   */
+  async runDiagnosis(diagnosisId: string, claimId: string): Promise<void> {
+    const [d] = (await this.q<DiagRow[]>(this.dataSource, `select * from public.workshop_diagnoses where id = $1`, [diagnosisId])) as DiagRow[];
+    if (!d || d.status !== 'running' || d.claim_id !== claimId) return;
+    const [row] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS} from public.workshop_sessions where id = $1`, [d.session_id]);
+    const CLAIMED = `id = $1 and status = 'running' and claim_id = $2`;
+    const fail = (code: string, message: string, retryable: boolean) => this.q(this.dataSource,
+      `update public.workshop_diagnoses set status = 'failed', error = $3::jsonb, finished_at = now(), updated_at = now() where ${CLAIMED}`,
+      [diagnosisId, claimId, JSON.stringify({ code, message, retryable })]);
+    if (!row || row.status !== 'identified' || row.original_sha1 !== d.original_sha1) {
+      await fail(WORKSHOP_ERRORS.ORIGINAL_CHANGED, 'El original de la sesión ya no es el que se pidió diagnosticar.', false);
+      return;
+    }
+    let original: { buffer: Buffer; sha1: string; sha256: string };
+    try {
+      original = await this.verifiedOriginalOf(row);
+    } catch (err) {
+      const body = (err as { getResponse?: () => any })?.getResponse?.();
+      const code = String(body?.code ?? WORKSHOP_ERRORS.STORAGE_UNAVAILABLE);
+      const terminal = code === WORKSHOP_ERRORS.ORIGINAL_CHANGED || code === WORKSHOP_ERRORS.ORIGINAL_MISSING;
+      await fail(code, String(body?.message ?? 'No se pudo leer el original; vuelve a pedir el diagnóstico en unos minutos.'), !terminal);
+      return;
+    }
+    let report: DiagnosisReport;
+    try {
+      const pkg = await openMbz(original.buffer);
+      this.diagnosisRuns++;
+      report = await this.diagnosisRunner({
+        pkg, packageBytes: original.buffer, family: (row.family ?? 'prototype') as WorkshopFamily,
+        builderLine: String(row.identification?.result?.builder?.line ?? 'unknown'),
+        builderVersion: typeof row.identification?.result?.builder?.version === 'string' ? row.identification.result.builder.version : null,
+        expectations: null, expectationsReason: DIAGNOSIS_NO_EXPECTATIONS_REASON,
+      });
+    } catch (err) {
+      this.logger.error(`workshop ${row.id}: el diagnóstico falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+      await fail(WORKSHOP_ERRORS.DIAGNOSIS_FAILED, 'No se pudo diagnosticar este paquete (falla con estos mismos bytes: no se reintenta sola). Avísanos para revisarlo.', false);
+      return;
+    }
+    const { findings, ...summary } = report;
+    const rows = findings.map((x: Finding, i: number) => ({
+      finding_id: x.id, check_id: x.check, code: x.code, severity: x.severity, scope_level: x.scope.level,
+      chapter_number: x.scope.chapterNumber, activity_module_id: x.scope.activity?.moduleId ?? null, activity_dir: x.scope.activity?.dir ?? null, ordinal: i, finding: x,
+    }));
+    try {
+      await this.dataSource.transaction(async (m) => {
+        const [still] = await this.q<any[]>(m, `select 1 as ok from public.workshop_diagnoses where ${CLAIMED} for update`, [diagnosisId, claimId]);
+        if (!still) return; // el reclamo ya no es nuestro
+        await this.q(m, `delete from public.workshop_findings where diagnosis_id = $1`, [diagnosisId]);
+        if (rows.length) {
+          await this.q(m,
+            `insert into public.workshop_findings (diagnosis_id, finding_id, check_id, code, severity, scope_level, chapter_number, activity_module_id, activity_dir, ordinal, finding)
+             select $1, x.finding_id, x.check_id, x.code, x.severity, x.scope_level, x.chapter_number, x.activity_module_id, x.activity_dir, x.ordinal, x.finding
+               from jsonb_to_recordset($2::jsonb) as x(finding_id text, check_id text, code text, severity text, scope_level text, chapter_number int, activity_module_id int, activity_dir text, ordinal int, finding jsonb)`,
+            [diagnosisId, JSON.stringify(rows)]);
+        }
+        await this.q(m,
+          `update public.workshop_diagnoses set status = 'ready', report = $3::jsonb, error = null, finished_at = now(), updated_at = now() where ${CLAIMED}`,
+          [diagnosisId, claimId, JSON.stringify(summary)]);
+      });
+    } catch (err) {
+      this.logger.error(`workshop ${row.id}: no se pudo guardar el diagnóstico: ${err instanceof Error ? err.message : String(err)}`);
+      await fail(WORKSHOP_ERRORS.DIAGNOSIS_FAILED, 'No se pudo guardar el diagnóstico; vuelve a pedirlo.', true);
+    }
+  }
+
+  private assertDiagnosable(row: Row): void {
+    const gone = this.originalGone(row);
+    if (gone) throw new ConflictException({ code: gone.code, message: gone.message });
+    if (row.status !== 'identified' || !row.original_sha1) {
+      throw new ConflictException({ code: WORKSHOP_ERRORS.NOT_IDENTIFIED, message: 'El diagnóstico se puede pedir cuando termina la identificación del paquete.', status: row.status });
+    }
+  }
+
+  private originalGone(row: Row): { code: string; message: string; retryable: false } | null {
+    if (row.status === 'failed' && (row.error?.code === WORKSHOP_ERRORS.ORIGINAL_CHANGED || row.error?.code === WORKSHOP_ERRORS.ORIGINAL_MISSING)) {
+      return { code: String(row.error.code), message: String(row.error.message), retryable: false };
+    }
+    return null;
+  }
+
+  private diagnosisStale(d: DiagRow): boolean {
+    return this.now().getTime() - new Date(d.updated_at).getTime() >= DIAGNOSIS_STALE_MS;
+  }
+
+  private async diagnosisRowOf(row: Row): Promise<DiagRow | null> {
+    const [d] = (await this.q<DiagRow[]>(this.dataSource,
+      `select * from public.workshop_diagnoses where session_id = $1 and original_sha1 = $2 and code_version = $3`,
+      [row.id, row.original_sha1, DIAGNOSIS_CODE_VERSION])) as DiagRow[];
+    return d ?? null;
+  }
+
+  private emptyDiagnosis(row: Row): WorkshopDiagnosisResponse {
+    return { sessionId: row.id, status: 'not_started', diagnosisId: null, codeVersion: DIAGNOSIS_CODE_VERSION, originalSha1: row.original_sha1 ?? null, startedAt: null, diagnosedAt: null, report: null, error: null };
+  }
+
+  private async diagnosisView(row: Row, d: DiagRow | null): Promise<WorkshopDiagnosisResponse> {
+    if (!d) return this.emptyDiagnosis(row);
+    const base: WorkshopDiagnosisResponse = {
+      ...this.emptyDiagnosis(row), status: d.status, diagnosisId: d.id, startedAt: d.started_at ? iso(d.started_at) : null,
+      diagnosedAt: d.status === 'ready' && d.finished_at ? iso(d.finished_at) : null,
+      error: d.error && typeof d.error === 'object' ? { code: String(d.error.code), message: String(d.error.message), retryable: d.error.retryable === true } : null,
+    };
+    if (d.status !== 'ready') return base;
+    const fs = await this.q<any[]>(this.dataSource, `select finding from public.workshop_findings where diagnosis_id = $1 order by ordinal`, [d.id]);
+    return { ...base, report: { ...(d.report as Omit<DiagnosisReport, 'findings'>), findings: fs.map((r) => r.finding as Finding) } };
   }
 
   /**
