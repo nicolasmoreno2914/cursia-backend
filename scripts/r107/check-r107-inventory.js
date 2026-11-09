@@ -620,6 +620,16 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
       assert(e && e.code === ART.STORAGE_DOWNLOAD_TIMEOUT, `esperaba StorageDownloadTimeoutError: ${e && (e.code || e.message)}`);
       assert(e.receivedBytes > 0 && e.receivedBytes < 20 * 1024 && e.expectedBytes === 20 * 1024, `lo recibido: ${e.receivedBytes}/${e.expectedBytes}`);
       assert(/no terminó de llegar/.test(e.message), 'mensaje claro');
+      // Fix round 3 (N2): una respuesta no 2xx lleva el STATUS estructurado; «no existe» = 404, o 400 not_found de Supabase.
+      const status = async (code, body) => {
+        global.fetch = async () => new Response(body ?? '', { status: code, headers: { 'content-type': 'application/json' } });
+        try { await svc.downloadStorageObjectCapped('cursia-artifacts', 'u404/workshop/a404-e400/original.mbz', { maxBytes: 1 << 20, timeoutMs: 1000 }); } catch (x) { return [x.status, x.notFound]; }
+        return null;
+      };
+      eq(await status(404, '{"error":"not_found","message":"Object not found"}'), [404, true], '404');
+      eq(await status(400, '{"statusCode":"404","error":"not_found","message":"Object not found"}'), [400, true], '400 not_found (Supabase)');
+      eq(await status(400, '{"error":"InvalidJWT"}'), [400, false], '400 de otra cosa');
+      eq(await status(403, ''), [403, false], '403 (ruta con «404» y «400»): no es «no existe»');
     } finally {
       global.fetch = realFetch;
     }
@@ -707,7 +717,34 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
       }
       assert(fields > 10 && toks > 0, `${f.id}: ${fields} campos / ${toks} tokens`);
     }
-    const inv = (await inventoryOf(await r2Fixture(), 'r2.mbz')).inv;
+    // Fix round 3 (N5): TODO token de TODO campo que el motor de parches podría tocar — actividades, resúmenes de sección y
+    // curso, y preguntas (questions.xml, con su rawOffset) — cae en los bytes exactos del paquete.
+    const r2buf = await r2Fixture();
+    const r2pkg = await R.openMbz(r2buf);
+    const inv = (await inventoryOf(r2buf, 'r2.mbz')).inv;
+    let mapped = 0;
+    const checkField = async (h, tokens) => {
+      const b = await r2pkg.readEntry(h.entry);
+      assert(Number.isInteger(h.rawOffset) && h.rawOffset > 0 && Number.isInteger(h.rawBytes), `${h.entry} ${h.field}: sin ancla en bytes`);
+      assert(require('crypto').createHash('sha1').update(b.subarray(h.rawOffset, h.rawOffset + h.rawBytes)).digest('hex') === h.rawSha1, `${h.entry} ${h.field}: rawSha1`);
+      for (const t of tokens) for (const off of t.rawByteOffsets) {
+        const at = b.subarray(h.rawOffset + off, h.rawOffset + off + Buffer.byteLength(t.token)).toString('utf8');
+        assert(at === t.token, `${h.entry} ${h.field}: en el byte ${h.rawOffset + off} hay «${at}», no «${t.token}»`);
+        mapped++;
+      }
+    };
+    for (const a of inv.activities) for (const h of a.html) await checkField(h, a.tokens.filter((t) => t.entry === h.entry && t.field === h.field));
+    for (const sct of inv.sections) for (const h of sct.html) await checkField(h, sct.tokens.filter((t) => t.field === h.field));
+    for (const h of inv.courseSummary.html) await checkField(h, inv.courseSummary.tokens);
+    const quiz = inv.activities.find((a) => a.moduleId === 31);
+    let qFields = 0;
+    for (const q of quiz.exam.questions) for (const rf of q.rawFields) {
+      qFields++;
+      await checkField({ ...rf, entry: 'questions.xml' }, quiz.tokens.filter((t) => t.entry === 'questions.xml' && t.field === rf.field));
+    }
+    const qTokens = quiz.tokens.filter((t) => t.entry === 'questions.xml');
+    assert(qFields >= 4 && qTokens.length === 2 && qTokens.every((t) => quiz.exam.questions.some((q) => q.rawFields.some((f) => f.field === t.field))), `preguntas: ${qFields} campos, ${qTokens.length} tokens con campo ubicado`);
+    assert(mapped >= 8, `tokens ubicados en bytes: ${mapped}`);
     const lab = inv.activities.find((a) => a.moduleId === 30);
     const bad = lab.tokens.find((t) => t.status === 'malformed');
     eq([bad.token, bad.context.startsWith('&quot;')], ['$@SCORMVIEWBYID*7@', true], 'token roto: el texto exacto y el contexto tal cual está en el XML');

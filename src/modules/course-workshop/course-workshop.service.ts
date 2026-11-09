@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'crypto';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { isSuperAdminEmail } from '../../auth/super-admin';
-import { ArtifactsService, STORAGE_DOWNLOAD_TIMEOUT, STORAGE_OBJECT_TOO_LARGE, StorageDownloadTimeoutError, assertWritableStoragePath } from '../artifacts/artifacts.service';
+import { ArtifactsService, STORAGE_DOWNLOAD_TIMEOUT, STORAGE_OBJECT_TOO_LARGE, StorageDownloadTimeoutError, StorageHttpError, assertWritableStoragePath } from '../artifacts/artifacts.service';
 import { isStorageUnavailableError } from '../artifacts/storage-resilience';
 import { rbacMode } from '../authz/authz-flags';
 import { PermissionService } from '../authz/permission.service';
@@ -17,7 +17,7 @@ import {
 } from './identify';
 import { WorkshopCourse, stableStringify } from './course-model';
 import {
-  INVENTORY_PERSIST_MAX_BYTES, InventoryMeta, SourceArtifactRow, SourceStructure, WORKSHOP_SOURCE_TYPES, attachSources, buildInventory, persistableInventory,
+  INVENTORY_CODE_VERSION, INVENTORY_PERSIST_MAX_BYTES, InventoryMeta, SourceArtifactRow, SourceStructure, WORKSHOP_SOURCE_TYPES, attachSources, buildInventory, persistableInventory,
 } from './inventory';
 
 /**
@@ -67,7 +67,8 @@ export const WORKSHOP_ERRORS = Object.freeze({
  * Fix round 2 (P1-3): la reconstrucción del inventario desde el original (sesiones sin inventario) se intenta a lo sumo
  * INVENTORY_REBUILD_MAX_ATTEMPTS veces por versión del original (sha1), y SOLO ante fallas transitorias de Storage, con
  * espera creciente entre intentos (1, 4, 16 min). Una falla del armado es determinista para los mismos bytes: no se reintenta.
- * Corre en su propio carril (1 por proceso): nunca ocupa los lugares de las identificaciones.
+ * Corre en su propio carril (1 por proceso): nunca ocupa los lugares de las identificaciones. Los intentos se cuentan por
+ * (sha1 del original, INVENTORY_CODE_VERSION) y AL RECLAMAR (fix round 3, N1/N4).
  */
 export const INVENTORY_REBUILD_MAX_ATTEMPTS = 3;
 export const INVENTORY_REBUILD_BACKOFF_MS = 60_000;
@@ -200,7 +201,7 @@ export class CourseWorkshopService {
   /** Armado del inventario (puro). Reemplazable SOLO en pruebas (simular un armado que falla). */
   inventoryBuilder: (pkg: MbzPackage, meta: InventoryMeta) => Promise<WorkshopCourse> = buildInventory;
   /** Carril propio de la reconstrucción del inventario (1 por proceso; no usa el semáforo de las identificaciones). */
-  private rebuildBusy = false;
+  private rebuildLane: symbol | null = null;
 
   constructor(
     private readonly dataSource: DataSource,
@@ -470,7 +471,8 @@ export class CourseWorkshopService {
         catalog: { size: catalog.length, truncated },
         result,
         identifiedAt: this.now().toISOString(),
-        inventory: inv.info,
+        // N1/N4: la falla (si hubo) queda atada a esta versión del original y del armado; no es un intento de reconstrucción.
+        inventory: { ...inv.info, forSha1: sha1, codeVersion: INVENTORY_CODE_VERSION, attempts: 0 },
       };
       const container = pkg.container;
       await this.dataSource.transaction(async (m) => {
@@ -527,8 +529,9 @@ export class CourseWorkshopService {
       }
       this.logger.warn(`workshop ${row.id}: no se pudo descargar el original (${err instanceof Error ? err.message.slice(0, 200) : String(err)})`);
       const unavailable = isStorageUnavailableError(err);
-      // `downloadStorageObjectCapped`: «Supabase Storage download failed: <status> …»; el Storage falso de las pruebas: «404».
-      const missing = !unavailable && /(^|\D)(400|404)(\D|$)/.test(err instanceof Error ? err.message : String(err));
+      // Fix round 3 (N2): «el objeto no existe» SOLO por el status estructurado de la respuesta (404, o 400 not_found de
+      // Supabase); 401 / 403 / 5xx / red quedan transitorios. Nunca por el texto del mensaje (la ruta lleva dígitos).
+      const missing = !unavailable && err instanceof StorageHttpError && err.notFound;
       return { fail: { code: unavailable ? WORKSHOP_ERRORS.STORAGE_UNAVAILABLE : WORKSHOP_ERRORS.UPLOAD_NOT_FOUND, message: 'No se pudo leer el archivo subido; vuelve a intentarlo en unos minutos.', retryable: true, missing } };
     }
   }
@@ -664,7 +667,9 @@ export class CourseWorkshopService {
   /**
    * GET …/sessions/:id/inventory — mismas compuertas que GET …/:id. Fix round 2 (P1-3): un sondeo NUNCA dispara una
    * descarga por sí solo: la reconstrucción se reclama en la base (una a la vez por sesión, entre procesos), se intenta a
-   * lo sumo INVENTORY_REBUILD_MAX_ATTEMPTS veces por versión del original y respeta la espera entre intentos.
+   * lo sumo INVENTORY_REBUILD_MAX_ATTEMPTS veces por (versión del original, versión del armado) y respeta la espera.
+   * Fix round 3 (N4): una falla determinista es terminal solo para la versión del armado que falló: tras un deploy con
+   * otra INVENTORY_CODE_VERSION se permite (exactamente) una reconstrucción más por versión.
    */
   async getInventory(actor: WorkshopActor, id: string): Promise<WorkshopInventoryResponse> {
     let row = await this.loadForActor(actor, id, 'courses.view');
@@ -680,8 +685,13 @@ export class CourseWorkshopService {
     const [r] = await this.q<any[]>(this.dataSource, `select inventory from public.workshop_sessions where id = $1`, [row.id]);
     if (r?.inventory) return { ...base, status: 'ready', inventory: r.inventory, error: null };
     const err = info?.error && typeof info.error === 'object' ? { code: String(info.error.code), message: String(info.error.message), retryable: info.error.retryable === true } : null;
-    if (err && !err.retryable) return { ...base, status: 'failed', inventory: null, error: err };
-    const retryAt = typeof info?.nextAttemptAt === 'string' ? info.nextAttemptAt : null;
+    const sameVersion = info?.forSha1 === row.original_sha1 && info?.codeVersion === INVENTORY_CODE_VERSION;
+    // Terminal para ESTA versión del original y del armado (fallas sin `codeVersion` son de antes de N4: se rehacen una vez).
+    if (err && !err.retryable && sameVersion) return { ...base, status: 'failed', inventory: null, error: err };
+    if (sameVersion && Number(info?.attempts) >= INVENTORY_REBUILD_MAX_ATTEMPTS) {
+      return { ...base, status: 'failed', inventory: null, error: err ?? { code: WORKSHOP_ERRORS.INVENTORY_FAILED, message: `No se pudo armar el inventario después de ${INVENTORY_REBUILD_MAX_ATTEMPTS} intentos; avísanos.`, retryable: false } };
+    }
+    const retryAt = sameVersion && typeof info?.nextAttemptAt === 'string' ? info.nextAttemptAt : null;
     if (retryAt && new Date(retryAt).getTime() > this.now().getTime()) return { ...base, status: 'building', inventory: null, error: err, retryAt };
     await this.startInventoryRebuild(row);
     return { ...base, status: 'building', inventory: null, error: err, retryAt };
@@ -690,24 +700,43 @@ export class CourseWorkshopService {
   /**
    * Reconstrucción en segundo plano. Reclamo en la base (`identification.inventory.rebuildClaimAt`, condicional: otro
    * sondeo u otro proceso no lanza una segunda) + carril propio de 1 por proceso (no usa los lugares de identificación).
+   * Fix round 3:
+   *  - N1: el INTENTO se cuenta en el mismo UPDATE del reclamo (no al terminar): un proceso que muere a mitad (OOM,
+   *    pm2 reload) igual gastó su intento, y el tope vale;
+   *  - N3: el carril se toma de forma SÍNCRONA antes de cualquier await, y solo su dueño lo suelta.
    */
   private async startInventoryRebuild(row: Row): Promise<void> {
     const key = `inventory:${row.id}`;
-    if (this.inFlight.has(key) || this.rebuildBusy) return;
-    const claimed = returningRows(await this.q(this.dataSource,
-      `update public.workshop_sessions
-          set identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{inventory}',
-                coalesce(identification->'inventory', '{}'::jsonb) || jsonb_build_object('rebuildClaimAt', $2::text))
-        where id = $1 and status = 'identified' and inventory is null
-          and (identification->'inventory'->>'rebuildClaimAt' is null
-               or (identification->'inventory'->>'rebuildClaimAt')::timestamptz < $2::timestamptz - ($3::int * interval '1 millisecond'))
-        returning id`,
-      [row.id, this.now().toISOString(), IDENTIFY_STALE_MS]));
-    if (!claimed.length) return;
-    this.rebuildBusy = true;
+    if (this.inFlight.has(key) || this.rebuildLane !== null) return;
+    const lane = Symbol(key);
+    this.rebuildLane = lane; // síncrono: ningún otro sondeo del proceso pasa de acá mientras tanto
+    const release = () => { if (this.rebuildLane === lane) this.rebuildLane = null; };
+    let claimed: any[];
+    try {
+      claimed = returningRows(await this.q(this.dataSource,
+        `update public.workshop_sessions
+            set identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{inventory}',
+                  coalesce(identification->'inventory', '{}'::jsonb) || jsonb_build_object(
+                    'rebuildClaimAt', $2::text,
+                    'forSha1', $4::text,
+                    'codeVersion', $5::text,
+                    'attempts', case when identification->'inventory'->>'forSha1' = $4::text and identification->'inventory'->>'codeVersion' = $5::text
+                                     then coalesce((identification->'inventory'->>'attempts')::int, 0) + 1 else 1 end))
+          where id = $1 and status = 'identified' and inventory is null
+            and (identification->'inventory'->>'rebuildClaimAt' is null
+                 or (identification->'inventory'->>'rebuildClaimAt')::timestamptz < $2::timestamptz - ($3::int * interval '1 millisecond'))
+            and not (identification->'inventory'->>'forSha1' = $4::text and identification->'inventory'->>'codeVersion' = $5::text
+                     and coalesce((identification->'inventory'->>'attempts')::int, 0) >= $6::int)
+          returning id`,
+        [row.id, this.now().toISOString(), IDENTIFY_STALE_MS, row.original_sha1, INVENTORY_CODE_VERSION, INVENTORY_REBUILD_MAX_ATTEMPTS]));
+    } catch (e) {
+      release();
+      throw e;
+    }
+    if (!claimed.length) { release(); return; }
     const p = this.rebuildInventory(row.id)
       .catch((e) => this.logger.error(`workshop ${row.id}: la reconstrucción del inventario terminó con error: ${e instanceof Error ? e.message : String(e)}`))
-      .finally(() => { this.rebuildBusy = false; this.inFlight.delete(key); });
+      .finally(() => { release(); this.inFlight.delete(key); });
     this.inFlight.set(key, p);
   }
 
@@ -716,12 +745,12 @@ export class CourseWorkshopService {
     const [row] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS}, inventory is not null as has_inventory from public.workshop_sessions where id = $1`, [id]);
     if (!row || row.status !== 'identified' || (row as Row & { has_inventory?: boolean }).has_inventory) return;
     const prev = row.identification?.inventory ?? {};
-    // Los intentos se cuentan por VERSIÓN del original (sha1): otro original empieza de cero.
-    const attempts = prev.forSha1 === row.original_sha1 && Number.isInteger(prev.attempts) ? Number(prev.attempts) : 0;
+    // N1: el intento YA se contó al reclamar (este es el número `attempts`); acá no se vuelve a sumar.
+    const attempts = Number.isInteger(prev.attempts) ? Number(prev.attempts) : 1;
     const saveInfo = (info: Record<string, unknown>, json: string | null) => this.q(this.dataSource,
       `update public.workshop_sessions set inventory = $2::jsonb, identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{inventory}', $3::jsonb), updated_at = now()
         where id = $1 and status = 'identified' and inventory is null`,
-      [id, json, JSON.stringify({ ...info, forSha1: row.original_sha1, attempts: attempts + 1 })]);
+      [id, json, JSON.stringify({ ...info, forSha1: row.original_sha1, codeVersion: INVENTORY_CODE_VERSION, attempts })]);
     let original;
     try {
       original = await this.verifiedOriginalOf(row);
@@ -729,8 +758,8 @@ export class CourseWorkshopService {
       const body = (err as { getResponse?: () => any })?.getResponse?.();
       if (body?.code === WORKSHOP_ERRORS.ORIGINAL_CHANGED || body?.code === WORKSHOP_ERRORS.ORIGINAL_MISSING) return; // la sesión ya quedó failed
       // Transitorio (Storage caído / lento): reintento con espera creciente; agotados los intentos, terminal.
-      const last = attempts + 1 >= INVENTORY_REBUILD_MAX_ATTEMPTS;
-      const nextAttemptAt = last ? null : new Date(this.now().getTime() + INVENTORY_REBUILD_BACKOFF_MS * Math.pow(4, attempts)).toISOString();
+      const last = attempts >= INVENTORY_REBUILD_MAX_ATTEMPTS;
+      const nextAttemptAt = last ? null : new Date(this.now().getTime() + INVENTORY_REBUILD_BACKOFF_MS * Math.pow(4, attempts - 1)).toISOString();
       await saveInfo({
         builtAt: this.now().toISOString(), nextAttemptAt,
         error: {

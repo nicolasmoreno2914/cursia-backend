@@ -173,6 +173,13 @@ export function attachSources(course: WorkshopCourse, input: { courseId: number;
 
 // ─── Persistencia ───────────────────────────────────────────────────────────
 
+/**
+ * Versión del ARMADO del inventario (adaptadores + modelo). Subirla en cada cambio que pueda cambiar el resultado: una
+ * sesión cuyo armado falló de forma determinista con la versión anterior se reconstruye una vez más con la nueva
+ * (fix round 3, N4) — sin eso, arreglar un adaptador no rescataría las sesiones que ya fallaron.
+ */
+export const INVENTORY_CODE_VERSION = 'b2-r3';
+
 /** Tope del inventario persistido en `workshop_sessions.inventory` (jsonb). */
 export const INVENTORY_PERSIST_MAX_BYTES = 8 * 1024 * 1024;
 

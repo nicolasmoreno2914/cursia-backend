@@ -185,6 +185,23 @@ export function isDynamicArtifactRow(row: { type?: string | null; item_run_id?: 
   return String(row?.type ?? '').startsWith('dynamic_') || row?.item_run_id != null || row?.manifest_id != null;
 }
 
+/**
+ * r107 B2 (fix round 3, N2): respuesta HTTP no 2xx de Storage en una descarga con tope, con el STATUS estructurado (y el
+ * código de error de Supabase si vino en el cuerpo), para decidir por el número y no por el texto del mensaje (la ruta
+ * lleva UUID con dígitos). `notFound`: 404, o 400 con `not_found` / «Object not found» (forma de Supabase Storage).
+ */
+export const STORAGE_HTTP_ERROR = 'storage_http_error';
+export class StorageHttpError extends Error {
+  readonly code = STORAGE_HTTP_ERROR;
+  constructor(readonly status: number, readonly storageError: string | null, where: string) {
+    super(`Supabase Storage download failed: ${status} ${where}`);
+    this.name = 'StorageHttpError';
+  }
+  get notFound(): boolean {
+    return this.status === 404 || (this.status === 400 && /not[_ ]?found/i.test(this.storageError ?? ''));
+  }
+}
+
 /** r107 B2: el .mbz original del Taller (lo registra course-workshop.service) no se borra por DELETE /artifacts/:id. */
 export const WORKSHOP_ORIGINAL_ARTIFACT_TYPE = 'workshop_original';
 export const ARTIFACT_WORKSHOP_ORIGINAL_IMMUTABLE = 'artifact_workshop_original_immutable';
@@ -665,7 +682,16 @@ export class ArtifactsService {
         signal.removeEventListener('abort', onAbort);
       }
     }, { attemptTimeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000) });
-    if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
+    if (!res.ok) {
+      let storageError: string | null = null;
+      try {
+        const t = (await res.text()).slice(0, 2000);
+        const j = JSON.parse(t);
+        storageError = typeof j?.error === 'string' ? j.error : typeof j?.message === 'string' ? j.message : null;
+        if (storageError) storageError = sanitizeStorageErrorText(storageError, 120);
+      } catch { /* cuerpo vacío o no JSON */ }
+      throw new StorageHttpError(res.status, storageError, `${bucket}/${storagePath}`);
+    }
     const expected = declaredLength(res) ?? (typeof opts.sizeHint === 'number' ? opts.sizeHint : null);
     const bodyMs = opts.bodyTimeoutMs ?? cappedBodyTimeoutMs(expected, opts.timeoutMs ?? 60_000);
     let received = 0;

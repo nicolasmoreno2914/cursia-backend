@@ -141,6 +141,8 @@ export interface WorkshopQuestion {
   version: number | null;
   /** Ids de las OTRAS versiones de la misma entrada (no cuentan como preguntas del examen). */
   otherVersions: number[];
+  /** Campos con HTML de la pregunta ubicados en questions.xml (bytes exactos, para el motor de parches). */
+  rawFields: Array<{ field: string; rawOffset: number; rawBytes: number; rawSha1: string }>;
 }
 
 export interface WorkshopExam {
@@ -523,18 +525,60 @@ function parseQuestion(id: number, b: string, cat: { id: number; name: string } 
     bankEntryId: null,
     version: null,
     otherVersions: [],
+    rawFields: [],
   };
-  // Texto crudo de los campos con HTML de la pregunta (P2-3: sus tokens también cuentan).
-  const raws: Array<[string, string]> = [];
-  for (const k of ['questiontext', 'generalfeedback']) { const v = tag(b, k); if (v) raws.push([k, v]); }
-  for (const a of b.matchAll(/<answer id="(\d+)">([\s\S]*?)<\/answer>/g)) {
-    const at = tag(a[2], 'answertext'); if (at) raws.push([`answer:${a[1]}`, at]);
-    const fb = tag(a[2], 'feedback'); if (fb) raws.push([`feedback:${a[1]}`, fb]);
-  }
-  QUESTION_RAW.set(q, raws);
   return q;
 }
-const QUESTION_RAW = new WeakMap<WorkshopQuestion, Array<[string, string]>>();
+/** Campos con HTML de cada pregunta (crudos, con su desplazamiento en questions.xml): sus tokens cuentan (P2-3). */
+const QUESTION_RAW = new WeakMap<WorkshopQuestion, WorkshopHtmlField[]>();
+
+/** Desplazamientos en bytes de varios índices de carácter de un mismo texto, en UNA pasada (orden ascendente). */
+function byteOffsetsAt(text: string, charIndices: number[]): Map<number, number> {
+  const out = new Map<number, number>();
+  let lastChar = 0;
+  let lastByte = 0;
+  for (const ci of [...new Set(charIndices)].sort((a, b) => a - b)) {
+    lastByte += Buffer.byteLength(text.slice(lastChar, ci), 'utf8');
+    lastChar = ci;
+    out.set(ci, lastByte);
+  }
+  return out;
+}
+
+/**
+ * Fix round 3 (N5): ubica en questions.xml los campos con HTML de cada pregunta (enunciado, feedback general, texto y
+ * feedback de cada respuesta) con su desplazamiento en BYTES, para que el motor de parches los encuentre en el paquete.
+ */
+function locateQuestionFields(xml: string, questions: WorkshopQuestion[]): void {
+  const found: Array<{ q: WorkshopQuestion; field: string; value: string; index: number }> = [];
+  for (const q of questions) {
+    const start = xml.indexOf(`<question id="${q.id}">`);
+    if (start < 0) continue;
+    const end = xml.indexOf('</question>', start);
+    if (end < 0) continue;
+    for (const k of ['questiontext', 'generalfeedback']) {
+      const t = tagAt(xml, k, start, end);
+      if (t && t.value) found.push({ q, field: k, value: t.value, index: t.index });
+    }
+    const re = /<answer id="(\d+)">/g;
+    re.lastIndex = start;
+    for (let m = re.exec(xml); m && m.index < end; m = re.exec(xml)) {
+      const aEnd = xml.indexOf('</answer>', m.index);
+      if (aEnd < 0 || aEnd > end) break;
+      for (const [k, name] of [['answertext', 'answer'], ['feedback', 'feedback']] as const) {
+        const t = tagAt(xml, k, m.index, aEnd);
+        if (t && t.value) found.push({ q, field: `${name}:${m[1]}`, value: t.value, index: t.index });
+      }
+    }
+  }
+  const bytes = byteOffsetsAt(xml, found.map((f) => f.index));
+  for (const f of found) {
+    const h = htmlField(`question:${f.q.id}:${f.field}`, 'questions.xml', f.value, bytes.get(f.index) ?? 0)!;
+    if (!QUESTION_RAW.has(f.q)) QUESTION_RAW.set(f.q, []);
+    QUESTION_RAW.get(f.q)!.push(h);
+    f.q.rawFields.push({ field: h.field, rawOffset: h.rawOffset, rawBytes: h.rawBytes, rawSha1: h.rawSha1 });
+  }
+}
 
 /** questions.xml (Moodle 3.x y 4.x): categorías con su contexto, preguntas y entradas del banco. */
 export function parseQuestionsXml(xml: string): RawQuestionCategory[] {
@@ -577,6 +621,7 @@ export function parseQuestionsXml(xml: string): RawQuestionCategory[] {
     }
     out.push(cat);
   }
+  locateQuestionFields(xml, out.flatMap((c) => c.questions));
   return out;
 }
 
@@ -1124,7 +1169,7 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
     const questions = ids.map((id) => qById.get(id)!);
     x.exam = { final, unit: final ? null : x.unit, slots: ra.quizSlots, questions, giftEntry: giftOf(final, final ? null : x.unit) };
     // P2-3: los tokens del texto de las preguntas son referencias DEL quiz.
-    for (const q of questions) for (const [field, rawText] of QUESTION_RAW.get(q) ?? []) x.tokens.push(...extractTokens(rawText, { field: `question:${q.id}:${field}`, entry: 'questions.xml' }, tokenCtx));
+    for (const q of questions) for (const h of QUESTION_RAW.get(q) ?? []) x.tokens.push(...extractTokens(rawOf(h), h, tokenCtx));
   }
 
   // Referencias inversas (tokens que apuntan a cada actividad): actividades (y sus preguntas), secciones, curso.
@@ -1220,7 +1265,12 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
   const byRole = Object.fromEntries(CHAPTER_ROLES.map((r) => [r, 0])) as Record<ChapterRole, number>;
   for (const x of activities) if (x.role) byRole[x.role]++;
   const tokensStat: Record<TokenStatus, number> = { ok: 0, orphan: 0, wrong_type: 0, external: 0, malformed: 0, unchecked: 0 };
-  for (const x of activities) for (const t of x.tokens) tokensStat[t.status] += t.count;
+  // Una pregunta de una categoría compartida aporta sus tokens a cada quiz (correcto para referencedBy), pero se cuenta una vez.
+  const countedQ = new Set<string>();
+  for (const x of activities) for (const t of x.tokens) {
+    if (t.entry === 'questions.xml') { const k = `${t.field}|${t.token}|${t.anchor ? t.anchor.id : ''}`; if (countedQ.has(k)) continue; countedQ.add(k); }
+    tokensStat[t.status] += t.count;
+  }
   for (const t of [...[...sectionTokens.values()].flat(), ...courseTokens]) tokensStat[t.status] += t.count;
 
   return {

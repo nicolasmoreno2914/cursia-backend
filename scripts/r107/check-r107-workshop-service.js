@@ -26,6 +26,10 @@
 //   W16 original verificado: inventario faltante → se reconstruye igual; original cambiado → failed WORKSHOP_ORIGINAL_CHANGED
 //   W17 DELETE /artifacts/:id de workshop_original → 403 con motivo (y los demás tipos se borran igual)
 //   W18 índices N3 presentes, válidos y usados por la consulta de la huella
+//   W19–W22 fix round 2 (reconstrucción acotada, original borrado, fuente con dueño y alcance)
+//   W23–W26 fix round 3: 403 con «404» en la ruta = transitorio (status estructurado); un proceso que muere a mitad de
+//       la reconstrucción gasta su intento; carril de 1 estricto entre sondeos concurrentes; una falla determinista se
+//       reintenta UNA vez con otra versión del armado
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -203,7 +207,10 @@ function rawZip(entries) {
       async downloadStorageObjectCapped(bucket, p, opts) {
         this.downloads++;
         if (this.down) { const { StorageUnavailableError } = D('modules/artifacts/storage-resilience.js'); throw new StorageUnavailableError('download', 'simulado'); }
-        if (!objects.has(p)) throw new Error('404');
+        // Respuestas HTTP como las de downloadStorageObjectCapped real: error con el status estructurado (fix round 3, N2).
+        const httpErr = (status, body) => (ART.StorageHttpError ? new ART.StorageHttpError(status, body, `${bucket}/${p}`) : Object.assign(new Error(`Supabase Storage download failed: ${status} ${bucket}/${p}`), { status }));
+        if (this.httpStatus) throw httpErr(this.httpStatus, null);
+        if (!objects.has(p)) throw httpErr(404, 'not_found');
         const b = objects.get(p);
         const body = new ReadableStream({ start(c) { for (let i = 0; i < b.length; i += 1 << 20) c.enqueue(new Uint8Array(b.buffer, b.byteOffset + i, Math.min(1 << 20, b.length - i))); c.close(); } });
         return ART.readBodyCapped(new Response(body), opts.maxBytes, () => { this.aborted = (this.aborted || 0) + 1; }, opts.onChunk, { sizeHint: opts.sizeHint });
@@ -664,6 +671,94 @@ function rawZip(entries) {
         await ds.query(`update public.courses set owner_id = $2 where id = $1`, [own.id, OWNER.id]);
       }
       void iv;
+    });
+
+    // ── Fix round 3 (B2-review.md «Re-review 1») ──
+    const nullInventory = (sid) => ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [sid]);
+
+    await check('W23 N2 «original borrado» SOLO por el status: 403 con «a404» en la ruta → transitorio (503, la sesión sigue identificada); 404 → terminal', async () => {
+      const U = { id: 'a4040400-e400-4b40-8404-400404400404', email: 'cuatro@ejemplo.edu' };
+      const res = await svc.createSession(U, { filename: 'r3.mbz', sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(U, res.session.id);
+      await settle(res.session.id);
+      eq((await svc.get(U, res.session.id)).status, 'identified', 'identificada');
+      assert(/404|400/.test(res.upload.storagePath), 'la ruta tiene los dígitos que confundían al regex');
+      storage.httpStatus = 403;
+      try {
+        await rejects(svc.loadVerifiedOriginal(res.session.id), 503, null, '403 = transitorio');
+        storage.httpStatus = 401;
+        await rejects(svc.loadVerifiedOriginal(res.session.id), 503, null, '401 = transitorio');
+        storage.httpStatus = 503;
+        await rejects(svc.loadVerifiedOriginal(res.session.id), 503, null, '5xx = transitorio');
+      } finally { storage.httpStatus = 0; }
+      eq((await svc.get(U, res.session.id)).status, 'identified', 'la sesión no se tocó');
+      objects.delete(res.upload.storagePath);
+      await rejects(svc.loadVerifiedOriginal(res.session.id), 409, 'WORKSHOP_ORIGINAL_MISSING', '404 = borrado');
+    });
+
+    await check('W24 N1 un proceso que muere a mitad de la reconstrucción GASTA su intento: 3 reclamos (cada 15 min) y después failed sin más descargas', async () => {
+      const res = await newIdentified('r3-oom.mbz');
+      const sid = res.session.id;
+      await nullInventory(sid);
+      let t = Date.now();
+      const hang = new Promise(() => {});
+      const dead = [];
+      const d0 = storage.downloads;
+      for (let i = 0; i < 3; i++) {
+        // «Proceso» nuevo cada vez; el armado se cuelga (OOM / pm2 reload simulado: nunca termina ni escribe nada).
+        const p = new SVC.CourseWorkshopService(ds, storage, permissions);
+        p.now = () => new Date(t);
+        p.inventoryBuilder = () => hang;
+        eq((await p.getInventory(OWNER, sid)).status, 'building', `reclamo ${i + 1}`);
+        await new Promise((r) => setTimeout(r, 300)); // que llegue a descargar y colgarse en el armado
+        dead.push(p);
+        t += SVC.IDENTIFY_STALE_MS + 60_000; // el reclamo vence
+      }
+      eq(storage.downloads - d0, 3, 'una descarga por intento');
+      const [row] = await ds.query(`select identification->'inventory' as inv from public.workshop_sessions where id = $1`, [sid]);
+      eq(Number(row.inv.attempts), 3, 'los 3 intentos quedaron contados al reclamar');
+      const p4 = new SVC.CourseWorkshopService(ds, storage, permissions);
+      p4.now = () => new Date(t);
+      const r = await p4.getInventory(OWNER, sid);
+      await new Promise((res2) => setTimeout(res2, 200));
+      eq([r.status, storage.downloads - d0], ['failed', 3], 'tope: failed, sin un 4.º intento');
+    });
+
+    await check('W25 N3 carril de 1 estricto: dos sondeos CONCURRENTES de sesiones distintas → una sola reconstrucción a la vez', async () => {
+      const a = await newIdentified('r3-a.mbz');
+      const b = await newIdentified('r3-b.mbz');
+      await nullInventory(a.session.id);
+      await nullInventory(b.session.id);
+      let running = 0;
+      let max = 0;
+      const real = svc.inventoryBuilder;
+      svc.inventoryBuilder = async (...args) => { running++; max = Math.max(max, running); await new Promise((r) => setTimeout(r, 150)); running--; return real(...args); };
+      try {
+        await Promise.all([svc.getInventory(OWNER, a.session.id), svc.getInventory(OWNER, b.session.id)]);
+        const keys = [...svc.inFlight.keys()].filter((k) => k.startsWith('inventory:'));
+        eq(keys.length, 1, 'una sola reconstrucción lanzada');
+        await Promise.all(keys.map((k) => settle(k)));
+        // El segundo sondeo de la otra sesión arranca recién ahora, cuando el carril quedó libre.
+        await Promise.all([svc.getInventory(OWNER, a.session.id), svc.getInventory(OWNER, b.session.id)]);
+        for (const k of [...svc.inFlight.keys()].filter((x) => x.startsWith('inventory:'))) await settle(k);
+      } finally { svc.inventoryBuilder = real; }
+      eq(max, 1, 'nunca dos armados a la vez');
+      eq([(await svc.getInventory(OWNER, a.session.id)).status, (await svc.getInventory(OWNER, b.session.id)).status], ['ready', 'ready'], 'las dos listas');
+    });
+
+    await check('W26 N4 falla determinista: terminal para su versión del armado; con otra versión (deploy con el arreglo) se reconstruye UNA vez', async () => {
+      const res = await newIdentified('r3-version.mbz');
+      const sid = res.session.id;
+      const [row] = await ds.query(`select original_sha1 from public.workshop_sessions where id = $1`, [sid]);
+      const failInfo = (codeVersion) => ({ builtAt: new Date().toISOString(), forSha1: row.original_sha1, codeVersion, attempts: 1, error: { code: 'WORKSHOP_INVENTORY_FAILED', message: 'x', retryable: false } });
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = jsonb_set(identification, '{inventory}', $2::jsonb) where id = $1`, [sid, JSON.stringify(failInfo(D('modules/course-workshop/inventory.js').INVENTORY_CODE_VERSION || 'actual'))]);
+      const d0 = storage.downloads;
+      eq((await poll(sid, 3))[2], 'failed', 'misma versión del armado: terminal');
+      eq(storage.downloads - d0, 0, 'sin descargas');
+      await ds.query(`update public.workshop_sessions set identification = jsonb_set(identification, '{inventory}', $2::jsonb) where id = $1`, [sid, JSON.stringify(failInfo('version-vieja'))]);
+      const st = await poll(sid, 4);
+      eq([st[0], st[st.length - 1], storage.downloads - d0], ['building', 'ready', 1], 'otra versión: una reconstrucción y listo');
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {
