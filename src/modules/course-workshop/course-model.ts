@@ -71,16 +71,19 @@ export interface WorkshopFile {
 
 /**
  * ok: el destino existe y es del tipo que el token exige · orphan: no existe nada con ese id · wrong_type: existe pero
- * es de otro tipo · malformed: empieza como token pero no cierra en `@$` (Moodle lo deja literal: enlace roto) ·
+ * es de otro tipo · external: id de CURSO que no es el de este backup (enlace a otro curso del sitio original; Moodle no
+ * lo mapea al restaurar) · malformed: empieza como token pero no cierra en `@$` (Moodle lo deja literal: enlace roto) ·
  * unchecked: tipo de token que el Taller no sabe verificar.
  */
-export type TokenStatus = 'ok' | 'orphan' | 'wrong_type' | 'malformed' | 'unchecked';
+export type TokenStatus = 'ok' | 'orphan' | 'wrong_type' | 'external' | 'malformed' | 'unchecked';
 export interface WorkshopToken {
   /** Texto exacto del token (`$@SCORMVIEWBYID*1063@$`). */
   token: string;
   kind: string;
-  /** Primer id del token (moduleid, sección o curso según el tipo); null si no trae. */
+  /** Primer id del token (moduleid, instancia, sección, contexto o curso según el tipo); null si no trae. */
   targetId: number | null;
+  /** moduleid de la actividad destino, si el token apunta a una que existe (también por id de instancia). */
+  targetModuleId: number | null;
   /** modname que el token exige (`scorm` para SCORMVIEWBYID), `section` / `course` / `context`, o null si no se sabe. */
   expected: string | null;
   /** Lo que hay de verdad con ese id en el paquete (modname / `section` / `course`), o null si nada. */
@@ -90,6 +93,8 @@ export interface WorkshopToken {
   field: string;
   entry: string;
   count: number;
+  /** `#module-N` / `#section-N` que sigue al token (enlaces «al curso» que apuntan a una actividad), resuelto aparte. */
+  anchor: { type: 'module' | 'section'; id: number; actual: string | null; status: 'ok' | 'orphan' } | null;
 }
 
 export interface WorkshopQuestionAnswer {
@@ -307,6 +312,8 @@ export interface RawActivity {
   idnumber: string | null;
   visible: boolean | null;
   contextId: number | null;
+  /** Id de instancia (`<activity id=…>` del XML del tipo). */
+  instanceId: number | null;
   html: WorkshopHtmlField[];
   /** quiz.xml: cantidad de question_instances + ids referenciados directamente (questionid / questionbankentryid). */
   quizSlots: number;
@@ -334,6 +341,9 @@ export interface RawCourse {
   shortname: string | null;
   backupName: string | null;
   originalCourseId: number | null;
+  /** `<course id>` de course/course.xml (Moodle lo escribe igual que original_course_id; se aceptan los dos). */
+  courseXmlId: number | null;
+  originalCourseContextId: number | null;
   moodleRelease: string | null;
   backupRelease: string | null;
   originalWwwroot: string | null;
@@ -506,7 +516,7 @@ export async function readRawCourse(
   }));
 
   // Una sola pasada por todos los XML que hacen falta (clave en tar.gz).
-  const want = new Set<string>(['files.xml', 'questions.xml']);
+  const want = new Set<string>(['files.xml', 'questions.xml', 'course/course.xml']);
   for (const s of listedSecs) if (s.dir) want.add(`${s.dir}/section.xml`);
   for (const a of listedActs) {
     if (!a.dir || !a.modname) continue;
@@ -593,6 +603,7 @@ export async function readRawCourse(
       idnumber: modX ? (tagText(modX, 'idnumber') ?? '').trim() || null : null,
       visible: modX ? (tag(modX, 'visible') ?? '').trim() !== '0' : null,
       contextId: typX ? int(/<activity [^>]*contextid="(\d+)"/.exec(typX)?.[1]) : null,
+      instanceId: typX ? int(/<activity id="(\d+)"/.exec(typX)?.[1]) : null,
       html: typX ? htmlFieldsOf(a.modname, typeEntry, typX) : [],
       quizSlots,
       quizRefs,
@@ -634,6 +645,8 @@ export async function readRawCourse(
     shortname: tagText(mb, 'original_course_shortname'),
     backupName: tagText(mb, 'name'),
     originalCourseId: int(tag(mb, 'original_course_id')),
+    courseXmlId: int(/<course id="(\d+)"/.exec(texts.get('course/course.xml') ?? '')?.[1]),
+    originalCourseContextId: int(tag(mb, 'original_course_contextid')),
     moodleRelease: tagText(mb, 'moodle_release'),
     backupRelease: tagText(mb, 'backup_release'),
     originalWwwroot: tagText(mb, 'original_wwwroot'),
@@ -649,56 +662,109 @@ export async function readRawCourse(
 
 // ─── Tokens ─────────────────────────────────────────────────────────────────
 
-/** `$@XVIEWBYID*mid@$` / `$@XEMBEDBYID*mid@$` → modname del destino (mapa de assertTokensV3 del builder v3, más HVP del V1). */
+/**
+ * r107 B2 fix round 1 — ESPACIO DE IDS de cada token `$@KIND*id[*id2]@$` (auditado contra los builders y contra lo que
+ * escribe Moodle al exportar: `encode_content_links` de cada módulo, y el censo completo de 259 paquetes):
+ *   <MOD>VIEWBYID*cmid             moduleid (cm) de una actividad de tipo <mod> (SCORM, QUIZ, RESOURCE, PAGE, URL, H5PACTIVITY,
+ *                                  HVP, LABEL, FORUM, BOOK, ASSIGN, FOLDER, …)
+ *   HVPEMBEDBYID*cmid              moduleid del hvp (16-mbz-patch.js `makeH5PEmbed`: `$@HVPEMBEDBYID*<hvpMid>@$` en el iframe)
+ *   BOOKVIEWBYIDCH*cmid*chapterid  moduleid del book + id de un capítulo de ESE libro
+ *   <MOD>VIEWBY<L>*instanceid      id de INSTANCIA (`<activity id=…>` del XML del tipo): FORUMVIEWBYF, QUIZVIEWBYQ,
+ *                                  RESOURCEVIEWBYR, PAGEVIEWBYP, URLVIEWBYU, BOOKVIEWBYB, SCORMVIEWBYS, HVPVIEWBYH…
+ *   <MOD>INDEX*courseid            id del CURSO (índice de actividades del tipo)
+ *   COURSEVIEWBYID / BADGESVIEWBYID / GRADEINDEXBYID / …BYCOURSE*courseid   id del CURSO (original_course_id de
+ *                                  moodle_backup.xml = `<course id>` de course/course.xml). Otro id = un curso que NO es
+ *                                  este (texto pegado desde otro curso del sitio): Moodle no lo puede mapear al restaurar →
+ *                                  `external` (no es un moduleid huérfano). El `#module-N` / `#section-N` que lo sigue se
+ *                                  resuelve aparte (`anchor`).
+ *   COURSESECTIONBYID*sectionid    sección del paquete
+ *   PLUGINFILEBYCONTEXT*contextid  contexto de una actividad del paquete o el del curso (original_course_contextid)
+ *   WWWROOT, USER…, otros          sin id que verificar → `unchecked`
+ */
 export const TOKEN_MODNAME: Readonly<Record<string, string>> = Object.freeze({
   SCORM: 'scorm', QUIZ: 'quiz', RESOURCE: 'resource', PAGE: 'page', URL: 'url', H5PACTIVITY: 'h5pactivity', HVP: 'hvp',
-  LABEL: 'label', FORUM: 'forum', BOOK: 'book', ASSIGN: 'assign', FOLDER: 'folder',
+  LABEL: 'label', FORUM: 'forum', BOOK: 'book', ASSIGN: 'assign', FOLDER: 'folder', CHOICE: 'choice', FEEDBACK: 'feedback',
+  GLOSSARY: 'glossary', LESSON: 'lesson', WIKI: 'wiki', WORKSHOP: 'workshop', DATA: 'data', CHAT: 'chat', IMSCP: 'imscp',
+  LTI: 'lti', SURVEY: 'survey', BIGBLUEBUTTONBN: 'bigbluebuttonbn',
 });
+const COURSE_TOKENS = new Set(['COURSEVIEWBYID', 'BADGESVIEWBYID', 'GRADEINDEXBYID', 'GRADEREPORTBYID', 'COURSECOMPLETIONBYID', 'COURSEPARTICIPANTSBYID']);
 
-export function extractTokens(
-  html: string,
-  where: { field: string; entry: string },
-  ctx: { modnameByMid: Map<number, string>; sectionIds: Set<number>; sectionNumbers: Set<number>; courseId: number | null; contextIds: Set<number> },
-): WorkshopToken[] {
+export interface TokenContext {
+  modnameByMid: Map<number, string>;
+  sectionIds: Set<number>;
+  sectionNumbers: Set<number>;
+  /** Ids del curso del backup: original_course_id y `<course id>` de course/course.xml. */
+  courseIds: Set<number>;
+  contextIds: Set<number>;
+  /** `<modname>:<instanceid>` → moduleid. */
+  instances: Map<string, number>;
+  /** moduleid del book → ids de sus capítulos. */
+  bookChapters: Map<number, Set<number>>;
+}
+
+export function extractTokens(html: string, where: { field: string; entry: string }, ctx: TokenContext): WorkshopToken[] {
   const byText = new Map<string, WorkshopToken>();
   for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@\$/g)) {
-    const prev = byText.get(m[0]);
-    if (prev) { prev.count++; continue; }
     const kind = m[1];
+    if (kind === 'NULL') continue; // `$@NULL@$` es el nulo de Moodle, no un enlace
+    const after = html.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 40);
+    const am = /^#(module|section)-(\d+)/.exec(after);
+    const key = am ? `${m[0]}${am[0]}` : m[0];
+    const prev = byText.get(key);
+    if (prev) { prev.count++; continue; }
     const id = m[2] !== undefined ? Number(m[2]) : null;
+    const id2 = m[3] !== undefined ? Number(m[3]) : null;
     let expected: string | null = null;
     let actual: string | null = null;
     let status: TokenStatus = 'unchecked';
-    if (kind === 'NULL') continue; // `$@NULL@$` es el nulo de Moodle, no un enlace
+    let base: string | null;
+    let letter: RegExpExecArray | null;
     if (kind === 'COURSESECTIONBYID') {
       expected = 'section';
       actual = id !== null && (ctx.sectionIds.has(id) || ctx.sectionNumbers.has(id)) ? 'section' : null;
       status = actual ? 'ok' : 'orphan';
-    } else if (kind === 'PLUGINFILEBYCONTEXT') {
-      // Archivo de otro contexto (Moodle lo escribe al re-exportar): el contexto tiene que ser de una actividad del paquete.
+    } else if (/^PLUGINFILEBYCONTEXT/.test(kind)) {
       expected = 'context';
       actual = id !== null && ctx.contextIds.has(id) ? 'context' : null;
       status = actual ? 'ok' : 'orphan';
-    } else if (kind === 'COURSEVIEWBYID' || kind === 'BADGESVIEWBYID') {
+    } else if (COURSE_TOKENS.has(kind) || /INDEX$/.test(kind) || /BYCOURSE$/.test(kind)) {
       expected = 'course';
-      actual = id !== null && ctx.courseId !== null && id === ctx.courseId ? 'course' : null;
-      status = ctx.courseId === null ? 'unchecked' : actual ? 'ok' : 'orphan';
-    } else {
-      const base = /^(.+?)(?:VIEWBYID|EMBEDBYID)(?:CH)?$/.exec(kind)?.[1] ?? null;
-      expected = base ? TOKEN_MODNAME[base] ?? null : null;
+      actual = id !== null && ctx.courseIds.has(id) ? 'course' : null;
+      status = !ctx.courseIds.size || id === null ? 'unchecked' : actual ? 'ok' : 'external';
+    } else if (kind === 'BOOKVIEWBYIDCH') {
+      expected = 'book';
+      actual = id !== null ? ctx.modnameByMid.get(id) ?? null : null;
+      status = actual === null ? 'orphan' : actual !== 'book' ? 'wrong_type' : id2 !== null && ctx.bookChapters.get(id as number)?.has(id2) ? 'ok' : 'orphan';
+    } else if ((base = /^(.+?)(?:VIEWBYID|EMBEDBYID)$/.exec(kind)?.[1] ?? null) !== null) {
+      expected = TOKEN_MODNAME[base] ?? null;
       if (expected && id !== null) {
         actual = ctx.modnameByMid.get(id) ?? null;
         status = actual === null ? 'orphan' : actual === expected ? 'ok' : 'wrong_type';
       }
+    } else if ((letter = /^(.+?)VIEWBY([A-Z])$/.exec(kind)) && TOKEN_MODNAME[letter[1]]) {
+      // Por id de INSTANCIA (FORUMVIEWBYF, QUIZVIEWBYQ…): existe una actividad de ese tipo con esa instancia.
+      expected = TOKEN_MODNAME[letter[1]];
+      actual = id !== null && ctx.instances.has(`${expected}:${id}`) ? expected : null;
+      status = id === null ? 'unchecked' : actual ? 'ok' : 'orphan';
     }
-    byText.set(m[0], { token: m[0], kind, targetId: id, expected, actual, status, field: where.field, entry: where.entry, count: 1 });
+    let targetModuleId: number | null = null;
+    if (actual !== null && expected !== 'course' && expected !== 'section' && expected !== 'context') {
+      targetModuleId = letter && TOKEN_MODNAME[letter[1]] === expected && !/(?:VIEWBYID|EMBEDBYID)$/.test(kind) ? ctx.instances.get(`${expected}:${id}`) ?? null : id;
+    }
+    let anchor: WorkshopToken['anchor'] = null;
+    if (am) {
+      const aid = Number(am[2]);
+      const ok = am[1] === 'module' ? ctx.modnameByMid.has(aid) : ctx.sectionIds.has(aid) || ctx.sectionNumbers.has(aid);
+      anchor = { type: am[1] as 'module' | 'section', id: aid, actual: am[1] === 'module' ? ctx.modnameByMid.get(aid) ?? null : ok ? 'section' : null, status: ok ? 'ok' : 'orphan' };
+    }
+    byText.set(key, { token: m[0], kind, targetId: id, targetModuleId, expected, actual, status, field: where.field, entry: where.entry, count: 1, anchor });
   }
   // Tokens rotos: `$@KIND*id@` sin el `$` final (p. ej. un String.replace que expandió `$&`): Moodle los deja literales.
   for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@(?!\$)/g)) {
     const text = html.slice(m.index ?? 0, (m.index ?? 0) + m[0].length + 12);
     const prev = byText.get(text);
     if (prev) { prev.count++; continue; }
-    byText.set(text, { token: text, kind: m[1], targetId: m[2] !== undefined ? Number(m[2]) : null, expected: null, actual: null, status: 'malformed', field: where.field, entry: where.entry, count: 1 });
+    byText.set(text, { token: text, kind: m[1], targetId: m[2] !== undefined ? Number(m[2]) : null, expected: null, actual: null, targetModuleId: null, status: 'malformed', field: where.field, entry: where.entry, count: 1, anchor: null });
   }
   return [...byText.values()];
 }
@@ -806,12 +872,19 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
 
   const modnameByMid = new Map<number, string>();
   for (const a of raw.activities) if (!modnameByMid.has(a.moduleId)) modnameByMid.set(a.moduleId, a.modname);
-  const tokenCtx = {
+  const bookChapters = new Map<number, Set<number>>();
+  for (const a of raw.activities) {
+    if (a.modname !== 'book') continue;
+    bookChapters.set(a.moduleId, new Set(a.html.map((h) => /^chapter:(\d+)$/.exec(h.field)?.[1]).filter((v): v is string => !!v).map(Number)));
+  }
+  const tokenCtx: TokenContext = {
     modnameByMid,
     sectionIds: new Set(raw.sections.map((s) => s.id)),
     sectionNumbers: new Set(raw.sections.map((s) => s.number).filter((n): n is number => n !== null)),
-    courseId: raw.originalCourseId,
-    contextIds: new Set(raw.activities.map((a) => a.contextId).filter((v): v is number => v !== null)),
+    courseIds: new Set([raw.originalCourseId, raw.courseXmlId].filter((v): v is number => v !== null)),
+    contextIds: new Set([...raw.activities.map((a) => a.contextId), raw.originalCourseContextId].filter((v): v is number => v !== null)),
+    instances: new Map(raw.activities.filter((a) => a.instanceId !== null).map((a) => [`${a.modname}:${a.instanceId}`, a.moduleId] as [string, number])),
+    bookChapters,
   };
 
   // Clasificación + ubicación en capítulos.
@@ -891,8 +964,8 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
   for (const x of activities) if (!actByMid.has(x.moduleId)) actByMid.set(x.moduleId, x);
   for (const x of activities) {
     for (const t of x.tokens) {
-      if (t.targetId === null || t.expected === 'section' || t.expected === 'course' || t.expected === 'context' || t.actual === null) continue;
-      const target = actByMid.get(t.targetId);
+      if (t.targetModuleId === null) continue;
+      const target = actByMid.get(t.targetModuleId);
       if (target && !target.referencedBy.includes(x.moduleId)) target.referencedBy.push(x.moduleId);
     }
   }
@@ -992,7 +1065,7 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
 
   const byRole = Object.fromEntries(CHAPTER_ROLES.map((r) => [r, 0])) as Record<ChapterRole, number>;
   for (const x of activities) if (x.role) byRole[x.role]++;
-  const tokensStat: Record<TokenStatus, number> = { ok: 0, orphan: 0, wrong_type: 0, malformed: 0, unchecked: 0 };
+  const tokensStat: Record<TokenStatus, number> = { ok: 0, orphan: 0, wrong_type: 0, external: 0, malformed: 0, unchecked: 0 };
   for (const x of activities) for (const t of x.tokens) tokensStat[t.status] += t.count;
 
   return {

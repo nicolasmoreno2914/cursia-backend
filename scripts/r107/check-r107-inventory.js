@@ -17,10 +17,18 @@
 //      por clave; «no hay» y «error» distinguibles; forma persistida sin HTML
 //   V8 N1: la descarga con tope reserva UN buffer por content-length / sizeHint (sin Buffer.concat) y da los mismos bytes
 //   V9 N2: el plazo del cuerpo no lo corta el timeout de los encabezados; vencido → StorageDownloadTimeoutError claro
+//   V10 (fix round 1) espacio de ids de cada token, sobre un paquete mínimo armado acá: COURSEVIEWBYID contra el
+//      curso del backup (otro curso → `external`, con su `#module-N` resuelto aparte), HVPEMBEDBYID contra el moduleid del
+//      hvp (huérfano / roto), id de instancia (FORUMVIEWBYF), BOOKVIEWBYIDCH, *INDEX, PLUGINFILEBYCONTEXT del curso
+//
+//   --census <survey.json> (local, fix round 1): TODO el censo real (survey-corpus.js): 0 excepciones salvo los rechazos
+//      tipados del lector; unknown 0 en V1 y v2; por familia se imprimen capítulos, paquetes sin capítulos, unknown y los
+//      estados de los tokens (y el detalle de los no ok)
 //
 // Usage:
 //   node scripts/r107/check-r107-inventory.js --corpus [manifest.json|dir]   (completo, local: corpus de B0)
 //   node scripts/r107/check-r107-inventory.js --ci                            (CI: sintéticos + dañados generados acá)
+//   node scripts/r107/check-r107-inventory.js --census <survey.json>          (local: todo el censo real)
 //   [--dist dist]
 'use strict';
 require('reflect-metadata');
@@ -34,9 +42,10 @@ const has = (n) => argv.includes(n);
 const arg = (n, d = null) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : d; };
 const DIST = path.resolve(arg('--dist', path.join(REPO, 'dist')));
 const CI = has('--ci');
+const CENSUS = has('--census') ? arg('--census', path.join(os.homedir(), 'cursia-test-env/work/r107/survey/survey.json')) : null;
 const DEFAULT_CORPUS = path.join(os.homedir(), 'cursia-test-env/work/r107/corpus/manifest.json');
-if (!CI && !has('--corpus')) { console.error('Usage: --corpus [manifest.json|dir] | --ci  [--dist dist]'); process.exit(2); }
-let corpusArg = CI ? null : arg('--corpus', DEFAULT_CORPUS);
+if (!CI && !CENSUS && !has('--corpus')) { console.error('Usage: --corpus [manifest.json|dir] | --ci | --census <survey.json>  [--dist dist]'); process.exit(2); }
+let corpusArg = CI || CENSUS ? null : arg('--corpus', DEFAULT_CORPUS);
 if (corpusArg && fs.existsSync(corpusArg) && fs.statSync(corpusArg).isDirectory()) corpusArg = path.join(corpusArg, 'manifest.json');
 
 const L = (rel) => { try { return require(path.join(DIST, rel)); } catch (e) { console.error(`❌ No se pudo cargar ${rel} (¿npm run build?): ${e.message}`); process.exit(1); } };
@@ -61,7 +70,11 @@ function spyWrites() {
   const calls = [];
   for (const n of names) {
     saved[n] = fs[n];
-    fs[n] = function (...a) { calls.push(`${n}(${String(a[0]).slice(0, 80)})`); return saved[n].apply(fs, a); };
+    fs[n] = function (...a) {
+      // openSync de LECTURA (readFileSync del censo) no es una escritura.
+      if (!(n === 'openSync' && (a[1] === undefined || a[1] === 'r' || a[1] === 0))) calls.push(`${n}(${String(a[0]).slice(0, 80)})`);
+      return saved[n].apply(fs, a);
+    };
   }
   const p = fs.promises;
   const savedP = { writeFile: p.writeFile, open: p.open, mkdtemp: p.mkdtemp };
@@ -112,6 +125,80 @@ async function inventoryOf(buf, filename) {
   return { inv, family };
 }
 
+// Paquete mínimo (zip) para V10: label 10 con todos los tokens, hvp 11, foro 12 (instancia 5), book 13 (capítulo 7).
+// Solo prueba el espacio de ids de los tokens (con el book la familia es v2-dynamic: los roles no son el punto).
+async function tokenFixture() {
+  const JSZip = require('jszip');
+  const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const z = new JSZip();
+  const acts = [[10, 'label', '🎯 Practicar — Cap 1'], [11, 'hvp', '🎥 Video Interactivo Cap 1 — Uno'], [12, 'forum', '📢 Avisos'], [13, 'book', 'Libro']];
+  z.file('moodle_backup.xml', `<?xml version="1.0" encoding="UTF-8"?><moodle_backup><information><name>t.mbz</name><original_course_id>1</original_course_id>`
+    + `<original_course_contextid>2</original_course_contextid><original_course_fullname>Tokens</original_course_fullname><contents><activities>`
+    + acts.map(([id, mod, t]) => `<activity><moduleid>${id}</moduleid><sectionid>2</sectionid><modulename>${mod}</modulename><title>${t}</title><directory>activities/${mod}_${id}</directory></activity>`).join('')
+    + `</activities><sections><section><sectionid>2</sectionid><title>Módulo 1 — Uno</title><directory>sections/section_2</directory></section></sections></contents></information></moodle_backup>`);
+  z.file('course/course.xml', '<course id="1" contextid="2"></course>');
+  z.file('sections/section_2/section.xml', '<section id="2"><number>2</number><name>Módulo 1 — Uno</name><sequence>10,11,12,13</sequence><visible>1</visible></section>');
+  const html = '<a href="$@COURSEVIEWBYID*1@$#module-11">a</a><a href="$@COURSEVIEWBYID*2006@$#module-77">b</a><a href="$@COURSEVIEWBYID*2006@$">c</a>'
+    + '<iframe src="$@HVPEMBEDBYID*11@$"></iframe><iframe src="$@HVPEMBEDBYID*4821@$"></iframe><a href="$@FORUMVIEWBYF*5@$">f</a><a href="$@FORUMVIEWBYF*12@$">g</a>'
+    + '<a href="$@BOOKVIEWBYIDCH*13*7@$">h</a><a href="$@BOOKVIEWBYIDCH*13*8@$">i</a><a href="$@SCORMINDEX*1@$">j</a><img src="$@PLUGINFILEBYCONTEXT*2@$/x.png">'
+    + '<a href="$@QUIZVIEWBYID*11@$">k</a><iframe src="$@HVPEMBEDBYID*11@<intro>quot;"></iframe>';
+  const inst = { 10: 1, 11: 2, 12: 5, 13: 3 };
+  for (const [id, mod, t] of acts) {
+    const extra = mod === 'book' ? '<chapters><chapter id="7"><title>C</title><content>&lt;p&gt;x&lt;/p&gt;</content></chapter></chapters>' : '';
+    z.file(`activities/${mod}_${id}/module.xml`, `<module id="${id}"><modulename>${mod}</modulename><sectionid>2</sectionid><sectionnumber>2</sectionnumber><idnumber></idnumber><visible>1</visible></module>`);
+    z.file(`activities/${mod}_${id}/${mod}.xml`, `<activity id="${inst[id]}" moduleid="${id}" modulename="${mod}" contextid="${100 + id}"><${mod} id="${inst[id]}"><name>${esc(t)}</name><intro>${id === 10 ? esc(html) : ''}</intro>${extra}</${mod}></activity>`);
+  }
+  z.file('files.xml', '<files></files>');
+  return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+// --census: todo el censo real (local).
+async function censusMode(surveyPath) {
+  const recs = JSON.parse(fs.readFileSync(surveyPath, 'utf8')).filter((r) => !r.duplicateOf);
+  console.log(`  modo censo: ${surveyPath} — ${recs.length} paquetes únicos`);
+  const fam = {};
+  const rejected = [];
+  const errors = [];
+  const notOk = [];
+  const unspy = spyWrites();
+  try {
+    for (const r of recs) {
+      let pkg;
+      try { pkg = await R.openMbz(fs.readFileSync(r.file)); } catch (e) { if (R.isMbzReaderError(e)) rejected.push(`${path.basename(r.file)}: ${e.code}`); else errors.push(`${path.basename(r.file)}: ${e && e.stack}`); continue; }
+      try {
+        const facts = await I.readPackageFacts(pkg, path.basename(r.file));
+        const family = I.familyOf(facts);
+        const inv = await INV.buildInventory(pkg, { family, builderLine: I.builderLineOf(facts) });
+        M.stableStringify(INV.persistableInventory(inv));
+        const f = (fam[family] ||= { packages: 0, chapters: 0, noChapters: 0, activities: 0, unknown: 0, tokens: {} });
+        f.packages++; f.chapters += inv.chapters.length; f.activities += inv.activities.length;
+        if (!inv.chapters.length) f.noChapters++;
+        f.unknown += unknownActs(inv).length;
+        for (const a of inv.activities) for (const t of a.tokens) {
+          f.tokens[t.status] = (f.tokens[t.status] || 0) + t.count;
+          if (!['ok', 'unchecked', 'external'].includes(t.status)) notOk.push(`${family} | ${path.basename(r.file)} | ${a.dir} | ${t.token.slice(0, 40)} → ${t.status}`);
+        }
+      } catch (e) {
+        if (e instanceof I.PackageFactsError) rejected.push(`${path.basename(r.file)}: ${e.code}`); else errors.push(`${path.basename(r.file)}: ${e && e.stack}`);
+      }
+    }
+  } finally {
+    const calls = unspy();
+    if (calls.length) errors.push(`escribió a disco: ${calls.slice(0, 3).join(', ')}`);
+  }
+  for (const [k, f] of Object.entries(fam).sort()) console.log(`   ${k.padEnd(16)} paquetes ${f.packages} · capítulos ${f.chapters} · sin capítulos ${f.noChapters} · unknown ${f.unknown}/${f.activities} · tokens ${JSON.stringify(f.tokens)}`);
+  console.log(`   rechazos tipados del lector: ${rejected.length}${rejected.length ? ' — ' + rejected.join('; ') : ''}`);
+  console.log(`   tokens no ok (huérfanos / mal tipados / rotos): ${notOk.length}`);
+  for (const x of notOk) console.log(`      · ${x}`);
+  await check('C1 censo: 0 excepciones (salvo los rechazos tipados del lector), 0 escrituras a disco', async () => { if (errors.length) throw new Error(errors.slice(0, 5).join('\n')); });
+  await check('C2 censo: 0 roles / clases unknown en V1 y v2', async () => {
+    const bad = ['v1-legacy', 'v1-legacy-hvp', 'v2-dynamic'].filter((k) => fam[k] && fam[k].unknown);
+    if (bad.length) throw new Error(bad.map((k) => `${k}: ${fam[k].unknown}`).join(', '));
+  });
+  console.log(`\n${fail ? '❌' : '✅'} check-r107-inventory --census: ${ok} ok, ${fail} fallidos`);
+  process.exit(fail ? 1 : 0);
+}
+
 const unknownActs = (inv) => inv.activities.filter((a) => a.role === 'unknown' || (a.placement.scope === 'course' && a.kind === 'unknown'));
 const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
 
@@ -119,6 +206,7 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
   const { Logger } = require('@nestjs/common');
   Logger.overrideLogger(false);
   // Los fixtures CI se generan ANTES de espiar (el motor de la simulación no es parte del inventario).
+  if (CENSUS) return censusMode(CENSUS);
   const fixtures = CI ? await ciFixtures() : corpusFixtures(corpusArg);
   console.log(`  modo ${CI ? 'CI (sintéticos + dañados generados)' : 'completo: ' + corpusArg} — ${fixtures.length} fixtures`);
   const built = new Map(); // id → { inv, family, json }
@@ -202,7 +290,7 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
       assert(libros[0].filename && /^libro_guia_/.test(libros[0].filename), `${tag} archivo del Libro Guía: ${libros[0].filename}`);
       eq(inv.audiobook.length, F.audio && F.audio.audiobookSeconds ? 1 : 0, `${tag} audiolibro`);
       eq([inv.stats.unknownChapterRoles, inv.stats.unknownCourseKinds, inv.issues.length], [0, 0, 0], `${tag} unknown / issues`);
-      eq([inv.stats.tokens.orphan, inv.stats.tokens.wrong_type, inv.stats.tokens.malformed, inv.stats.tokens.unchecked], [0, 0, 0, 0], `${tag} tokens`);
+      eq([inv.stats.tokens.orphan, inv.stats.tokens.wrong_type, inv.stats.tokens.external, inv.stats.tokens.malformed, inv.stats.tokens.unchecked], [0, 0, 0, 0, 0], `${tag} tokens`);
       if (f.summary) eq(f.summary.builderVersion, f.expectations.builderVersion, `${tag} versión del builder (summary = expectativas)`);
     }
   });
@@ -258,7 +346,7 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
     const healthy = fixtures.filter((f) => f.source === 'synthetic' || (f.source === 'damaged' && !/token$/.test(f.mutation || '')) || (f.source === 'real' && f.family !== 'moodle-reexport'));
     for (const f of healthy) {
       const s = built.get(f.id).inv.stats.tokens;
-      if (s.orphan || s.wrong_type || s.malformed) errs.push(`${f.id}: ${JSON.stringify(s)}`);
+      if (s.orphan || s.wrong_type || s.malformed || s.external) errs.push(`${f.id}: ${JSON.stringify(s)}`);
     }
     for (const f of fixtures.filter((x) => x.source === 'real' && x.family === 'moodle-reexport')) {
       const inv = built.get(f.id).inv;
@@ -270,9 +358,9 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
       const inv = built.get(f.id).inv;
       const want = new Map();
       for (const a of inv.activities) for (const t of a.tokens) {
-        if (t.actual && t.expected !== 'section' && t.expected !== 'course' && t.expected !== 'context' && t.targetId !== null) {
-          if (!want.has(t.targetId)) want.set(t.targetId, new Set());
-          want.get(t.targetId).add(a.moduleId);
+        if (t.targetModuleId !== null) {
+          if (!want.has(t.targetModuleId)) want.set(t.targetModuleId, new Set());
+          want.get(t.targetModuleId).add(a.moduleId);
         }
       }
       for (const a of inv.activities) {
@@ -282,7 +370,7 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
     }
     // Un token roto (`$@…@` sin `$`, p. ej. el `$&` de un String.replace) se ve como `malformed`.
     const tk = M.extractTokens('<a href="$@SCORMVIEWBYID*12@<intro>quot;">x</a> $@QUIZVIEWBYID*13@$ $@NULL@$', { field: 'intro', entry: 'e' },
-      { modnameByMid: new Map([[13, 'quiz']]), sectionIds: new Set(), sectionNumbers: new Set(), courseId: 1, contextIds: new Set() });
+      { modnameByMid: new Map([[13, 'quiz']]), sectionIds: new Set(), sectionNumbers: new Set(), courseIds: new Set([1]), contextIds: new Set(), instances: new Map(), bookChapters: new Map() });
     eq(tk.map((t) => t.status).sort(), ['malformed', 'ok'], 'token roto + sano (y $@NULL@$ ignorado)');
     if (errs.length) throw new Error(errs.slice(0, 8).join('\n'));
   });
@@ -409,6 +497,26 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
     } finally {
       global.fetch = realFetch;
     }
+  });
+
+  await check('V10 espacio de ids de cada token (paquete mínimo armado acá): curso / hvp embebido / instancia / capítulo de libro / índice / contexto', async () => {
+    const inv = (await inventoryOf(await tokenFixture(), 'tokens.mbz')).inv;
+    const lab = inv.activities.find((a) => a.moduleId === 10);
+    const st = (tok) => { const t = lab.tokens.filter((x) => x.token === tok); assert(t.length, `falta ${tok}`); return t.map((x) => [x.status, x.anchor ? x.anchor.status : null]); };
+    eq(st('$@COURSEVIEWBYID*1@$'), [['ok', 'ok']], 'curso del backup con #module-11 (existe)');
+    eq(st('$@COURSEVIEWBYID*2006@$'), [['external', 'orphan'], ['external', null]], 'otro curso del sitio → external (no huérfano), #module-77 no existe');
+    eq(st('$@HVPEMBEDBYID*11@$'), [['ok', null]], 'hvp embebido por su moduleid');
+    eq(st('$@HVPEMBEDBYID*4821@$'), [['orphan', null]], 'hvp que no está en el paquete');
+    eq(st('$@FORUMVIEWBYF*5@$'), [['ok', null]], 'foro por id de INSTANCIA');
+    eq(st('$@FORUMVIEWBYF*12@$'), [['orphan', null]], 'instancia inexistente (12 es un moduleid, no una instancia)');
+    eq(st('$@BOOKVIEWBYIDCH*13*7@$'), [['ok', null]], 'capítulo 7 del libro 13');
+    eq(st('$@BOOKVIEWBYIDCH*13*8@$'), [['orphan', null]], 'capítulo inexistente');
+    eq(st('$@SCORMINDEX*1@$'), [['ok', null]], 'índice por id de curso');
+    eq(st('$@PLUGINFILEBYCONTEXT*2@$'), [['ok', null]], 'contexto del curso');
+    eq(st('$@QUIZVIEWBYID*11@$'), [['wrong_type', null]], 'quiz que es un hvp');
+    eq(lab.tokens.filter((x) => x.status === 'malformed').length, 1, 'hvp roto por $&');
+    eq(inv.activities.find((a) => a.moduleId === 11).referencedBy, [10], 'el hvp lo referencia el label');
+    eq(inv.activities.find((a) => a.moduleId === 12).referencedBy, [10], 'el foro (por instancia) también');
   });
 
   console.log(`\n${fail ? '❌' : '✅'} check-r107-inventory: ${ok} ok, ${fail} fallidos`);

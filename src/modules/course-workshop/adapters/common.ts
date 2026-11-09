@@ -216,6 +216,12 @@ export function classifyV1File(fn: string): Omit<Classified, 'evidence'> | null 
  *   🎮 Cap. N — Actividad Gamificada → cta (descripción del juego)
  *   🎮 Actividad Interactiva Cap N — T → game (scorm)
  *   ⚠️ Pendiente: <archivo>          → lo que ese archivo iba a ser, marcado `pending`
+ *   Variantes vistas en el censo (fix round 1): hvp «▶️ Cap. N — Video: T» → video (16-mbz-patch.js renombra el
+ *   video al título del label); scorm «🎮 Actividad Cap N — T» / «🎮 Juego Cap. N — T» / «SCORM Cap N» → game; label
+ *   «🎮 Juego Cap. N» → cta; url «🎬 Video del capítulo N — T» → video (builder 5B.1 con video externo); label
+ *   «ℹ️ Evaluación del módulo N» → exam_info; quiz «📝 Evaluación del módulo N — T» → exam; «📘 Tarjeta Libro Guía» →
+ *   libro_info; resource «📘 Libro Guía» / page «📖 Libro Guía Completo» → libro; nombres cortos del prototipo
+ *   (`S0 Intro`, `S1 Ruta`, `Ef Desc`…) → por su archivo de origen.
  *   Nombres de respaldo de friendlyName (`Cap5 Video Interactivo`, `Seccion1 Audiolibro`…) → por el archivo de origen.
  */
 export function classifyByV1Title(i: ClassifyInput): Classified | null {
@@ -233,22 +239,42 @@ export function classifyByV1Title(i: ClassifyInput): Classified | null {
     const f = classifyV1File(fn);
     if (f) return { ...f, evidence: `nombre de respaldo de friendlyName («${t}» ← ${fn})` } as Classified;
   }
+  if (mod === 'hvp' && (m = /^(?:▶️?\s*)?Cap\. (\d{1,3}) — Video:\s*(.*)$/.exec(t))) return chapterOf('video', 'video', Number(m[1]), 'título «▶️ Cap. N — Video: …» (hvp)', titleHint(m[2], 1));
+  if (mod === 'scorm' && (m = /^(?:🎮\s*)?(?:Actividad|Juego) Cap\.? (\d{1,3})(?:\s+—\s+(.*))?$/.exec(t))) return chapterOf('game', 'game', Number(m[1]), 'título «🎮 Actividad / Juego Cap N»', titleHint(m[2], 2));
+  if (mod === 'scorm' && (m = /^SCORM Cap (\d{1,3})$/.exec(t))) return chapterOf('game', 'game', Number(m[1]), 'título «SCORM Cap N»');
+  if (mod === 'label' && (m = /^(?:🎮\s*)?Juego Cap\.? (\d{1,3})\b/.exec(t))) return chapterOf('cta', 'game_description', Number(m[1]), 'título «🎮 Juego Cap. N» (label)');
+  if (mod === 'url' && (m = /^(?:🎬\s*)?Video del cap[íi]tulo (\d{1,3})(?:\s+—\s+(.*))?$/.exec(t))) return chapterOf('video', 'video_url', Number(m[1]), 'título «🎬 Video del capítulo N» (url)', titleHint(m[2], 2));
+  if (mod === 'label' && (m = /^(?:ℹ️?\s*)?Evaluación del módulo (\d{1,2})\b/.exec(t))) return courseOf('exam_info', 'título «ℹ️ Evaluación del módulo N»', { unit: Number(m[1]) });
+  if (mod === 'quiz' && (m = /^(?:📝\s*)?Evaluación del módulo (\d{1,2})\b(?:\s*[—:-]\s*(.+))?/.exec(t))) return courseOf('exam', 'título «📝 Evaluación del módulo N — …»', { unit: Number(m[1]), moduleTitle: clean(m[2]) });
+  if (mod === 'label' && /^(?:📘\s*)?Tarjeta Libro Gu[íi]a$/.test(t)) return courseOf('libro_info', 'título «📘 Tarjeta Libro Guía»');
+  if (mod === 'resource' && /^(?:📘\s*)?Libro Gu[íi]a$/.test(t)) return courseOf('libro', 'título «📘 Libro Guía»');
+  if (mod === 'page' && /Libro Gu[íi]a Completo$/.test(t)) return courseOf('libro', 'título «📖 Libro Guía Completo» (page)');
+  const short: Record<string, string> = { 'S0 Intro': 'seccion0_introduccion.html', 'S0 Bienvenida': 'seccion0_bienvenida.html', 'S0 Bien': 'seccion0_bienvenida.html', 'S0 Audio': 'seccion0_audio_bienvenida.html', 'S0 Metodologia': 'seccion0_metodologia.html', 'S1 Ruta': 'seccion1_ruta_aprendizaje.html', 'S1 Libro': 'seccion1_libro_guia.html', 'S1 Audiolibro': 'seccion1_audiolibro.html', 'Ef Desc': 'examen_final_descripcion.html' };
+  if ((mod === 'page' || mod === 'label') && short[t]) {
+    const f = classifyV1File(short[t]);
+    if (f) return { ...f, evidence: `nombre corto del prototipo («${t}» ← ${short[t]})` } as Classified;
+  }
+  if ((mod === 'page' || mod === 'label') && (m = /^Eu(\d) Desc$/.exec(t))) return courseOf('exam_info', `nombre corto del prototipo («${t}» ← examen_unidad${m[1]}_descripcion.html)`, { unit: Number(m[1]) });
   if (mod === 'label' && (m = /^(?:📊\s*)?Presentación Cap (\d{1,3})(?:\s+—\s+(.*))?$/.exec(t))) return chapterOf('presentation', 'presentation', Number(m[1]), 'título «📊 Presentación Cap N»', titleHint(m[2], 2));
-  if (mod === 'label' && (m = /^(?:▶️?\s*)?Cap\. (\d{1,3}) — Video:\s*(.*)$/.exec(t))) return chapterOf('text', 'chapter_page', Number(m[1]), 'título «▶️ Cap. N — Video: …» (página del capítulo)', titleHint(m[2], 3));
+  if ((mod === 'label' || mod === 'page') && (m = /^(?:▶️?\s*)?Cap\. (\d{1,3}) — Video:\s*(.*)$/.exec(t))) return chapterOf('text', 'chapter_page', Number(m[1]), 'título «▶️ Cap. N — Video: …» (página del capítulo)', titleHint(m[2], 3));
   if (mod === 'label' && (m = /^(?:📖\s*)?Cap[íi]tulo (\d{1,3})(?:\s+—\s+(.*))?$/.exec(t))) return chapterOf('text', 'video_intro', Number(m[1]), 'título «📖 Capítulo N — …» (introducción del video)', titleHint(m[2], 4));
   if (mod === 'hvp' && (m = /Video Interactivo Cap (\d{1,3})(?:\s+—\s+(.*))?$/.exec(t))) return chapterOf('video', 'video', Number(m[1]), 'título «🎥 Video Interactivo Cap N»', titleHint(m[2], 1));
+  // Prototipos de prueba: «Video Cap N: T» (label) y páginas «CapN Video» / «CN Video» (archivo capN_video_interactivo).
+  if ((mod === 'label' || mod === 'page') && (m = /^Video Cap (\d{1,3}):\s*(.*)$/.exec(t))) return chapterOf('text', 'chapter_page', Number(m[1]), 'título «Video Cap N: …» (prototipo)', titleHint(m[2], 2));
+  if ((mod === 'label' || mod === 'page') && (m = /^C(?:ap)?(\d{1,3}) Video$/.exec(t))) return chapterOf('text', 'chapter_page', Number(m[1]), `nombre corto del prototipo («${t}» ← cap${m[1]}_video_interactivo.html)`);
   if (mod === 'label' && (m = /^(?:🎯\s*)?Practicar — Cap (\d{1,3})\b/.exec(t))) return chapterOf('cta', 'practice_cta', Number(m[1]), 'título «🎯 Practicar — Cap N»');
-  if (mod === 'label' && (m = /^(?:🎮\s*)?Cap\. (\d{1,3}) — Actividad Gamificada/.exec(t))) return chapterOf('cta', 'game_description', Number(m[1]), 'título «🎮 Cap. N — Actividad Gamificada»');
+  if ((mod === 'label' || mod === 'page') && (m = /^(?:🎮\s*)?Cap\. (\d{1,3}) — Actividad Gamificada/.exec(t))) return chapterOf('cta', 'game_description', Number(m[1]), 'título «🎮 Cap. N — Actividad Gamificada»');
   if (mod === 'scorm' && (m = /Actividad Interactiva Cap (\d{1,3})(?:\s+—\s+(.*))?$/.exec(t))) return chapterOf('game', 'game', Number(m[1]), 'título «🎮 Actividad Interactiva Cap N»', titleHint(m[2], 2));
   // Curso.
   if (mod === 'quiz' && (m = /Examen Unidad (\d{1,2})\b/.exec(t))) return courseOf('exam', 'título «📝 Examen Unidad N»', { unit: Number(m[1]) });
   if (mod === 'quiz' && /Examen Final/.test(t)) return courseOf('final_exam', 'título «📝 Examen Final»');
-  if (mod === 'label' && (m = /^(?:ℹ️?\s*Información:\s*|📝\s*)Examen Unidad (\d{1,2})\b/.exec(t))) return courseOf('exam_info', 'título «ℹ️ Información: Examen Unidad N»', { unit: Number(m[1]) });
-  if (mod === 'label' && /^(?:ℹ️?\s*Información:\s*|🏆\s*)Examen Final/.test(t)) return courseOf('final_exam_info', 'título «ℹ️ Información: Examen Final»');
+  if (mod === 'label' && (m = /^(?:🎮\s*)?Actividad Interactiva Cap (\d{1,3})$/.exec(t))) return chapterOf('cta', 'game_description', Number(m[1]), 'título «Actividad Interactiva Cap N» (label del prototipo)');
+  if (mod === 'label' && (m = /^(?:ℹ️?\s*Información:\s*|📝\s*)?Examen Unidad (\d{1,2})\b/.exec(t))) return courseOf('exam_info', 'título «ℹ️ Información: Examen Unidad N»', { unit: Number(m[1]) });
+  if (mod === 'label' && /^(?:ℹ️?\s*Información:\s*|🏆\s*|Cierre y )?Examen Final/.test(t)) return courseOf('final_exam_info', 'título «ℹ️ Información: Examen Final»');
   if (mod === 'resource' && /Libro Gu[íi]a Completo/.test(t)) return courseOf('libro', 'título «📚 Libro Guía Completo»');
   const simple: Array<[RegExp, CourseKind]> = [
-    [/Bienvenida al Curso$/, 'welcome'], [/Audio de Bienvenida$/, 'welcome_audio'], [/¿Qué Aprenderás\?$/, 'competencies'],
-    [/Metodología del Curso$/, 'methodology'], [/Ruta de Aprendizaje$/, 'route'], [/Libro Guía del Curso$/, 'libro_info'],
+    [/Bienvenida al Curso$/, 'welcome'], [/Audio de Bienvenida$/, 'welcome_audio'], [/¿?Qu[ée] Aprender[áa]s\??$/, 'competencies'],
+    [/Metodolog[íi]a del Curso$/, 'methodology'], [/Ruta de Aprendizaje$/, 'route'], [/Libro Gu[íi]a del Curso$/, 'libro_info'],
     [/Audiolibro del Curso$/, 'audiobook'],
   ];
   for (const [re, kind] of simple) if ((mod === 'label' || mod === 'page') && re.test(t)) return courseOf(kind, `título «${t}»`);
@@ -279,13 +305,18 @@ function titleHint(t: string | undefined, priority: number): Partial<Classified>
 export function classifyByContent(i: ClassifyInput): Classified | null {
   if (i.a.modname !== 'label') return null;
   // Variante de plantilla con prefijo «🗺️ Sección N · …»: se mira lo que sigue.
-  const p = i.plain.replace(/^(?:\S{1,3}\s+)?Secci[óo]n \d{1,2}\s*·\s*/i, '');
+  // y con el número decorativo de la tarjeta adelante («04 🎮 Actividad…»).
+  const p = i.plain.replace(/^(?:\S{1,3}\s+)?Secci[óo]n \d{1,2}\s*·\s*/i, '').replace(/^\d{1,2}\s+(?=\S{1,3}\s)/, '');
   const html = i.a.html.find((h) => h.field === 'intro')?.html ?? '';
   let m: RegExpExecArray | null;
   if ((m = /^(?:\S{1,3}\s+)?(?:M[ÓO]DULO\s+\d{1,2}\s*[·•—–-]\s*)?CAP(?:[ÍI]TULO)?\.?\s+(\d{1,3})\b/i.exec(p))) {
     return chapterOf('text', 'chapter_page', Number(m[1]), `contenido «${p.slice(0, m[0].length)}…»`);
   }
-  if ((m = /^🎮\s*Actividad Interactiva\s*·\s*Cap[íi]tulo\s+(\d{1,3})\b/i.exec(p))) return chapterOf('cta', 'game_description', Number(m[1]), 'contenido «🎮 Actividad Interactiva · Capítulo N»');
+  const title = (i.a.title || i.a.name || '').replace(/\s+/g, ' ').trim();
+  if ((m = /^🎮\s*Actividad Interactiva\s*[·:]?\s*Cap[íi]tulo\s+(\d{1,3})\b/i.exec(title))) return chapterOf('cta', 'game_description', Number(m[1]), 'título «🎮 Actividad Interactiva Capítulo N: …»');
+  // Juego escrito por el docente con el capítulo entre paréntesis («🧠 MarketingLand: … (Capítulo 8)»).
+  if ((m = /^\S{1,3}\s+[^:]{2,60}:.*\(Cap[íi]tulo (\d{1,3})\)/.exec(p.slice(0, 200)))) return chapterOf('cta', 'game_description', Number(m[1]), 'contenido «<juego>: … (Capítulo N)»');
+  if ((m = /^🎮\s*Actividad Interactiva\s*[·:]?\s*Cap[íi]tulo\s+(\d{1,3})\b/i.exec(p))) return chapterOf('cta', 'game_description', Number(m[1]), 'contenido «🎮 Actividad Interactiva · Capítulo N»');
   if ((m = /^(?:🎯\s*)?Practicar\b.*?\bCap(?:[íi]tulo)?\.?\s+(\d{1,3})\b/i.exec(p.slice(0, 80)))) return chapterOf('cta', 'practice_cta', Number(m[1]), 'contenido «🎯 Practicar … Cap N»');
   if (/^✅\s*Evaluaci[óo]n de Unidad/i.test(p)) {
     const u = /\bUnidad\s+(\d{1,2})\b/i.exec(p.slice(0, 200));
@@ -294,11 +325,11 @@ export function classifyByContent(i: ClassifyInput): Classified | null {
   if (/^(?:\S{1,3}\s+)?(?:Examen Final|EVALUACI[ÓO]N FINAL)/i.test(p)) return courseOf('final_exam_info', 'contenido «Examen Final»');
   const sec = i.sectionInfo?.kind;
   if (sec === 'welcome') {
-    if (/^CampusCloud · Curso en l[íi]nea/i.test(p)) return courseOf('welcome', 'contenido «CampusCloud · Curso en línea» (sección 0)');
+    if (/^(?:\S{1,3}\s+)?CampusCloud · Curso en l[íi]nea/i.test(p)) return courseOf('welcome', 'contenido «CampusCloud · Curso en línea» (sección 0)');
     if (/<audio\b/i.test(html) || /Audio de Bienvenida/i.test(p.slice(0, 60))) return courseOf('welcome_audio', 'contenido con <audio> (sección 0)');
     if (/^(?:\S{1,3}\s+)?¿Qu[ée] Aprender[áa]s\?/i.test(p)) return courseOf('competencies', 'contenido «¿Qué Aprenderás?» (sección 0)');
-    if (/^(?:\S{1,3}\s+)?(?:Metodolog[íi]a|¿C[óo]mo funciona)/i.test(p)) return courseOf('methodology', 'contenido «Metodología» (sección 0)');
-    if (/^(?:\S{1,3}\s+)?(?:Introducci[óo]n al Curso|Estrategia y Duraci[óo]n)/i.test(p)) return courseOf('course_info', 'contenido «Introducción / Estrategia» (sección 0)');
+    if (/^(?:\S{1,3}\s+)?(?:Metodolog[íi]a|¿?C[óo]mo funciona)/i.test(p)) return courseOf('methodology', 'contenido «Metodología» (sección 0)');
+    if (/^(?:\S{1,3}\s+)?(?:Introducci[óo]n al Curso|Objetivos del curso|Estrategia (?:metodol[óo]gica )?y Duraci[óo]n)/i.test(p)) return courseOf('course_info', 'contenido «Introducción / Estrategia» (sección 0)');
   }
   if (sec === 'route') {
     if (/^(?:\S{1,3}\s+)?Ruta de Aprendizaje/i.test(p)) return courseOf('route', 'contenido «Ruta de Aprendizaje» (sección 1)');
@@ -318,12 +349,23 @@ export function classifyByReexportTitle(i: ClassifyInput): Classified | null {
   const mod = i.a.modname;
   let m: RegExpExecArray | null;
   if (mod === 'hvp' && (m = /^Cap[íi]tulo (\d{1,3}):\s*(.*)$/.exec(t))) return chapterOf('video', 'video', Number(m[1]), 'título «Capítulo N: …» (hvp)', titleHint(m[2], 3));
-  if (mod === 'scorm' && (m = /Actividad Interactiva Cap[íi]tulo (\d{1,3})\b/.exec(t))) return chapterOf('game', 'game', Number(m[1]), 'título «Actividad Interactiva Capítulo N»');
+  if (mod === 'scorm' && (m = /Actividad Interactiva Cap(?:[íi]tulo|\.)?\s*(\d{1,3})\b/i.exec(t))) return chapterOf('game', 'game', Number(m[1]), 'título «Actividad Interactiva Capítulo N»');
   if (mod === 'quiz' && (m = /^Examen (?:Final )?Unidad (\d{1,2})\b/.exec(t))) return courseOf('exam', `título «${t}»`, { unit: Number(m[1]) });
   if (mod === 'quiz' && /^Examen Final/.test(t)) return courseOf('final_exam', `título «${t}»`);
   if (mod === 'resource' && /Libro Gu[íi]a/i.test(t)) return courseOf('libro', `título «${t}»`);
-  if (mod === 'page' && /^Audio de Bienvenida/i.test(t)) return courseOf('welcome_audio', `título «${t}»`);
-  if (mod === 'page' && /^Audio ?libro/i.test(t)) return courseOf('audiobook', `título «${t}»`);
+  if ((mod === 'page' || mod === 'resource') && /^Audio de (?:Bienvenida|Introducci[óo]n)/i.test(t)) return courseOf('welcome_audio', `título «${t}»`);
+  if ((mod === 'page' || mod === 'resource') && /^Audio ?libro/i.test(t)) return courseOf('audiobook', `título «${t}»`);
+  // Libro Guía partido a mano por unidad («📘 Capítulos 1, 2 y 3…», «📘 Libro Unidad 2: …»).
+  if (mod === 'resource' && /^📘\s*(?:Libro|Cap[íi]tulos)\b/.test(t)) return courseOf('libro', `título «${t}» (Libro Guía por partes)`);
+  if (mod === 'label' && i.sectionInfo?.kind === 'welcome' && /^Bienvenid[ao]\b/i.test(t)) return courseOf('welcome', `título «${t}» (sección 0)`);
+  // Moodle deja vacío el nombre de algunas actividades: el comienzo de su descripción (intro) dice qué son.
+  if (!t || mod === 'hvp') {
+    const p = i.plain.replace(/^\d{1,2}\s+/, '');
+    if (mod === 'hvp' && (m = /^(?:\S{1,3}\s+)?Cap[íi]tulo (\d{1,3}):\s*(.*)$/.exec(p))) return chapterOf('video', 'video', Number(m[1]), 'descripción «🎬 Capítulo N: …» (hvp)', titleHint(m[2].slice(0, 120), 1));
+    if (mod === 'scorm' && (m = /^(?:\S{1,3}\s+)?Actividad Interactiva\s*[·:]?\s*Cap[íi]tulo\s+(\d{1,3})\b/i.exec(p))) return chapterOf('game', 'game', Number(m[1]), 'descripción «🎮 Actividad Interactiva · Capítulo N» (scorm sin nombre)');
+    if (mod === 'quiz' && (m = /^(?:\S{1,3}\s+)?Examen (?:Final )?Unidad (\d{1,2})\b/.exec(p))) return courseOf('exam', 'descripción «📝 Examen Unidad N» (quiz sin nombre)', { unit: Number(m[1]) });
+    if (mod === 'quiz' && /^(?:\S{1,3}\s+)?Examen Final/.test(p)) return courseOf('final_exam', 'descripción «Examen Final» (quiz sin nombre)');
+  }
   if (mod === 'forum') return courseOf('forum', 'foro del curso');
   return null;
 }
