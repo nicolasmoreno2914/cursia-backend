@@ -238,6 +238,11 @@ jobs:
       - name: Check r107 Taller de cursos — lector seguro + identificación (puro, sintéticos)
         run: node scripts/r107/check-r107-identify.js --ci
 
+      # r107 B2: inventario (modelo único WorkshopCourse + adaptadores por familia) del Taller de cursos. --ci = solo
+      # sintéticos v3 y dañados generados en el momento (exactitud contra el builder, tokens, determinismo).
+      - name: Check r107 Taller de cursos — inventario (puro, sintéticos)
+        run: node scripts/r107/check-r107-inventory.js --ci
+
       # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
       - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
         env:

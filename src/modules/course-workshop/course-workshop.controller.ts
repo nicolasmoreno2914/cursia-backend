@@ -40,4 +40,11 @@ export class CourseWorkshopController {
   get(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.workshop.get(actorOf(user), id);
   }
+
+  // r107 B2 · GET /api/v1/course-workshop/sessions/:id/inventory → { status: ready | building | failed, inventory, error }
+  // (409 WORKSHOP_NOT_IDENTIFIED si la sesión todavía no se identificó). Mismas compuertas que GET /:id.
+  @Get('sessions/:id/inventory')
+  inventory(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.workshop.getInventory(actorOf(user), id);
+  }
 }

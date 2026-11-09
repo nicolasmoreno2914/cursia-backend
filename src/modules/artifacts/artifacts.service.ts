@@ -185,6 +185,10 @@ export function isDynamicArtifactRow(row: { type?: string | null; item_run_id?: 
   return String(row?.type ?? '').startsWith('dynamic_') || row?.item_run_id != null || row?.manifest_id != null;
 }
 
+/** r107 B2: el .mbz original del Taller (lo registra course-workshop.service) no se borra por DELETE /artifacts/:id. */
+export const WORKSHOP_ORIGINAL_ARTIFACT_TYPE = 'workshop_original';
+export const ARTIFACT_WORKSHOP_ORIGINAL_IMMUTABLE = 'artifact_workshop_original_immutable';
+
 /** r107 (fix P1-1): el objeto de Storage pesa más que el tope de la lectura (nunca se materializa entero). */
 export const STORAGE_OBJECT_TOO_LARGE = 'storage_object_too_large';
 export class StorageObjectTooLargeError extends Error {
@@ -196,24 +200,64 @@ export class StorageObjectTooLargeError extends Error {
 }
 
 /**
+ * r107 B2 (N2): la descarga del cuerpo superó su plazo (proporcional al tamaño, ver `cappedBodyTimeoutMs`). Distinto de
+ * «Storage caído» (StorageUnavailableError, encabezados que no llegan): acá la conexión andaba pero lenta.
+ */
+export const STORAGE_DOWNLOAD_TIMEOUT = 'storage_download_timeout';
+export class StorageDownloadTimeoutError extends Error {
+  readonly code = STORAGE_DOWNLOAD_TIMEOUT;
+  constructor(readonly timeoutMs: number, readonly receivedBytes: number, readonly expectedBytes: number | null) {
+    super(`${STORAGE_DOWNLOAD_TIMEOUT}: el cuerpo no terminó de llegar en ${Math.round(timeoutMs / 1000)} s (recibidos ${receivedBytes}${expectedBytes !== null ? ` de ${expectedBytes}` : ''} bytes)`);
+    this.name = 'StorageDownloadTimeoutError';
+  }
+}
+
+/**
+ * r107 B2 (N2): plazo del CUERPO de una descarga con tope: el pedido (timeoutMs, mínimo) o 60 s + 1 s por cada 512 KiB
+ * esperados (≥ 4 Mbit/s sostenidos), lo que sea mayor. 300 MB → 11 min, por debajo de los 15 min en que el Taller da por
+ * interrumpida una identificación. Antes el cuerpo quedaba atado al presupuesto de reintentos de Storage (100 s).
+ */
+export function cappedBodyTimeoutMs(expectedBytes: number | null, minMs = 60_000): number {
+  const bytes = expectedBytes !== null && Number.isFinite(expectedBytes) && expectedBytes > 0 ? expectedBytes : 0;
+  return Math.max(minMs, 60_000 + Math.ceil(bytes / (512 * 1024)) * 1000);
+}
+
+const declaredLength = (res: Response): number | null => {
+  const h = res.headers.get('content-length');
+  return h !== null && /^\s*\d{1,15}\s*$/.test(h) ? Number(h) : null;
+};
+
+/**
  * r107 (fix P1-1): lee el cuerpo de una respuesta en flujo con tope duro sobre los bytes RECIBIDOS. `content-length`
  * mayor que el tope → rechazo sin leer; el flujo que lo pasa → `abort()` + rechazo. Pura sobre `Response` (testeable).
+ * r107 B2 (N1): un solo buffer RESERVADO por `content-length` (o por `sizeHint`, p. ej. el tamaño del HEAD) y cada trozo
+ * se copia en su lugar: el pico de memoria es ~1× el objeto (antes `Buffer.concat` copiaba con los trozos vivos: 2×).
+ * Sin tamaño conocido, o si llegan más bytes que los reservados (el objeto cambió), cae a la lista de trozos. Nada a disco.
  */
-export async function readBodyCapped(res: Response, maxBytes: number, abort: () => void, onChunk?: (chunk: Buffer) => void): Promise<Buffer> {
-  const declared = Number(res.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > maxBytes) {
+export async function readBodyCapped(
+  res: Response,
+  maxBytes: number,
+  abort: () => void,
+  onChunk?: (chunk: Buffer) => void,
+  opts: { sizeHint?: number | null } = {},
+): Promise<Buffer> {
+  const declared = declaredLength(res);
+  if (declared !== null && declared > maxBytes) {
     abort();
     try { await res.body?.cancel(); } catch { /* ya abortado */ }
     throw new StorageObjectTooLargeError(maxBytes, declared);
   }
-  const chunks: Buffer[] = [];
-  let seen = 0;
   if (!res.body) return Buffer.alloc(0);
+  const hint = declared ?? (typeof opts.sizeHint === 'number' && Number.isSafeInteger(opts.sizeHint) && opts.sizeHint >= 0 && opts.sizeHint <= maxBytes ? opts.sizeHint : null);
+  let out: Buffer | null = hint !== null ? Buffer.allocUnsafe(hint) : null;
+  let chunks: Buffer[] | null = out ? null : [];
+  let seen = 0;
   const reader = res.body.getReader();
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    const at = seen;
     seen += chunk.length;
     if (seen > maxBytes) {
       abort();
@@ -221,9 +265,15 @@ export async function readBodyCapped(res: Response, maxBytes: number, abort: () 
       throw new StorageObjectTooLargeError(maxBytes, seen);
     }
     if (onChunk) onChunk(chunk);
-    chunks.push(chunk);
+    if (out) {
+      if (seen <= out.length) chunk.copy(out, at);
+      else { chunks = [out.subarray(0, at), Buffer.from(chunk)]; out = null; }
+    } else {
+      chunks!.push(chunk);
+    }
   }
-  return Buffer.concat(chunks, seen);
+  if (out) return seen === out.length ? out : out.subarray(0, seen);
+  return Buffer.concat(chunks!, seen);
 }
 
 /** Re-review N3: tope del DELETE HTTP a Storage en remove() (ms). */
@@ -590,7 +640,7 @@ export class ArtifactsService {
   async downloadStorageObjectCapped(
     bucket: string,
     storagePath: string,
-    opts: { maxBytes: number; timeoutMs?: number; onChunk?: (chunk: Buffer) => void },
+    opts: { maxBytes: number; timeoutMs?: number; onChunk?: (chunk: Buffer) => void; sizeHint?: number | null; bodyTimeoutMs?: number },
   ): Promise<Buffer> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
@@ -601,9 +651,34 @@ export class ArtifactsService {
     const encodedPath = assertSafeStoragePath(storagePath).map((s) => encodeURIComponent(s)).join('/');
     const url = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
     const cap = new AbortController();
-    const { response: res } = await this.storageRequest('download', 0, (signal) => fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.any([signal, cap.signal]) }), { attemptTimeoutMs: opts.timeoutMs ?? 60_000 });
+    // r107 B2 (N2): el timeout del intento (y el presupuesto de reintentos de Storage, 100 s) cubre SOLO hasta los
+    // encabezados; el cuerpo tiene su propio plazo, proporcional al tamaño (`cappedBodyTimeoutMs`), y si se vence el error
+    // lo dice (StorageDownloadTimeoutError) en vez de parecer «Storage caído / no se pudo leer».
+    const { response: res } = await this.storageRequest('download', 0, async (signal) => {
+      const untilHeaders = new AbortController();
+      const onAbort = () => untilHeaders.abort(signal.reason);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        return await fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.any([untilHeaders.signal, cap.signal]) });
+      } finally {
+        signal.removeEventListener('abort', onAbort);
+      }
+    }, { attemptTimeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000) });
     if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
-    return readBodyCapped(res, opts.maxBytes, () => cap.abort(), opts.onChunk);
+    const expected = declaredLength(res) ?? (typeof opts.sizeHint === 'number' ? opts.sizeHint : null);
+    const bodyMs = opts.bodyTimeoutMs ?? cappedBodyTimeoutMs(expected, opts.timeoutMs ?? 60_000);
+    let received = 0;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; cap.abort(); }, bodyMs);
+    try {
+      return await readBodyCapped(res, opts.maxBytes, () => cap.abort(), (c) => { received += c.length; if (opts.onChunk) opts.onChunk(c); }, { sizeHint: opts.sizeHint });
+    } catch (err) {
+      if (timedOut) throw new StorageDownloadTimeoutError(bodyMs, received, expected);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
@@ -850,6 +925,11 @@ export class ArtifactsService {
             for update`, [id, ownerId])
         : await qr.query(`select * from public.artifacts where id = $1 and owner_id = $2 for update`, [id, ownerId]);
       if (!row) throw new NotFoundException(`Artifact ${id} not found`);
+      // r107 B2: el .mbz ORIGINAL de una sesión del Taller es inmutable (diseño §2 regla 3): es la base de todas sus
+      // versiones y del inventario. Solo este tipo; los demás siguen igual.
+      if (row.type === WORKSHOP_ORIGINAL_ARTIFACT_TYPE) {
+        throw new ForbiddenException({ code: ARTIFACT_WORKSHOP_ORIGINAL_IMMUTABLE, message: 'El original de una sesión del Taller de cursos no se puede borrar: es la base de sus versiones.' });
+      }
       // DoD follow-up (R4): un .mbz QA / degradado NUEVO es solo de SUPER_ADMIN; para el dueño no existe
       // (mismo 404 que GET /artifacts/:id) — nunca se borra la fila ni el objeto `qa-internal/`.
       if (!opts.allowAdminOnlyPackage && isAdminOnlyPackageArtifact(row)) throw new NotFoundException(`Artifact ${id} not found`);
