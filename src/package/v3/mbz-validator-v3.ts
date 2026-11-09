@@ -265,6 +265,24 @@ const GUIDED_PRACTICE_RE = /^cv3:ch:([^:]+):guided_practice$/;
 const SOLUTION_MARKERS_RE = APPLICATION_SOLUTION_MARKERS_RE;
 
 export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectations): Promise<MbzV3ValidationResult> {
+  return runValidateMbzV3(mbz, exp);
+}
+
+/**
+ * r107 B3 (Taller de cursos): el validador SIN expectativas — para un paquete v3 cuyo curso no está en la base (o la
+ * base no guarda sus facts). Corre SOLO las reglas que leen los bytes del paquete, con la misma lógica (no una copia):
+ *   FILES_INTEGRITY (blobs, sha1, tamaños, huérfanos, inforef, dueño, @@PLUGINFILE@@) · STRUCTURE de ids, module.xml,
+ *   grade_itemref, availability, idnumber cv3:, secuencias · TOKEN_INVALID (tokens, cursia-cta, enlaces muertos) ·
+ *   CLEAN_SAFE de los labels · H5P_FILES / H5P_LIBRARIES / H5P_PARTIAL_LIBRARY_CLOSURE (salvo «tipo según facts») ·
+ *   LIBRO (PDF %PDF-…%%EOF o HTML que cierra en </html>; sin LIBRO_CTA, que depende de la versión del builder).
+ * Nada que dependa de facts, del perfil ni de la versión del builder (secciones, notas, completion, cifras, audio,
+ * certificado, cobertura del Manifest, libro en línea…) se evalúa: un «ok» acá NO equivale a validateMbzV3 con facts.
+ */
+export async function validateMbzV3Structure(mbz: Buffer): Promise<MbzV3ValidationResult> {
+  return runValidateMbzV3(mbz, null);
+}
+
+async function runValidateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectations | null): Promise<MbzV3ValidationResult> {
   const issues: MbzV3Issue[] = [];
   const add = (code: string, where: string, message: string) => issues.push({ code, where, message });
   const zip = await JSZip.loadAsync(mbz);
@@ -290,7 +308,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (buf.length > BIN_CACHE_MAX_BYTES && !keepBlobs.has(p)) binCache.delete(p);
     return buf;
   };
-  const { facts, resolved } = exp;
+  // r107 B3: sin expectativas (`exp` null) solo corren las reglas que no las usan (ver validateMbzV3Structure).
+  const { facts, resolved } = exp ?? ({} as Partial<MbzV3ValidationExpectations>);
 
   const mb = await text('moodle_backup.xml');
   if (!mb) {
@@ -464,6 +483,246 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const expected = acts.filter((a) => a.sectionid === secnum).map((a) => a.mid);
     if (JSON.stringify(seq) !== JSON.stringify(expected)) add('STRUCTURE', dir, `sequence ${seq.join(',')} ≠ actividades de la sección ${expected.join(',')}`);
     for (const m of seq) if (!byMid.has(m)) add('STRUCTURE', dir, `sequence referencia el módulo ${m} inexistente`);
+  }
+
+  // ── r107 B3: reglas que NO dependen de facts ni del perfil ──────────────────────────────────────────────────────
+  // Todo lo de arriba (archivos, ids, secciones) y estas cuatro piezas leen SOLO los bytes del paquete. Con expectativas
+  // se llaman en su lugar de siempre (mismo orden de hallazgos); sin ellas (`validateMbzV3Structure`: el Taller con un
+  // curso que la base no puede describir) son lo único que corre. Nada de lo que depende de facts se evalúa sin facts.
+  const backupCourseId = num(tag(mb, 'original_course_id'));
+  const backupCourseCtx = num(tag(mb, 'original_course_contextid'));
+  // #583 (builder 3.11.0): la descripción del recurso del Libro Guía (antes un label aparte) pasa las mismas reglas.
+  const labels = acts.filter((a) => a.modname === 'label' || (a.modname === 'resource' && a.idnumber === 'cv3:shell:libro' && a.intro.trim() !== ''));
+  const libro = acts.find((a) => a.idnumber === 'cv3:shell:libro');
+  const h5pActs = acts.filter((a) => a.modname === 'h5pactivity');
+  const pageContent = new Map<number, string>();
+  const bookChapters = new Map<number, Array<{ id: number; pagenum: number; subchapter: string; title: string; content: string; hidden: string }>>();
+  const cleanSafe = (a: ParsedActivity): void => {
+    const lint = lintCleanSafe(a.intro);
+    if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
+  };
+  const checkSurfaces = async (): Promise<void> => {
+    // T6 (r57): los tokens, @@PLUGINFILE@@ y enlaces se revisan en TODO HTML visible del paquete: el intro de cada
+    // actividad y el contenido de cada página (mod_page/content), cada uno contra SU filearea.
+    pageContent.clear();
+    for (const a of acts.filter((x) => x.modname === 'page')) pageContent.set(a.mid, unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? ''));
+    // r78: capítulos de cada libro de Moodle (mod_book): su contenido es HTML visible como el de una página.
+    bookChapters.clear();
+    for (const a of acts.filter((x) => x.modname === 'book')) {
+      const bx = (await text(`${a.dir}/book.xml`)) ?? '';
+      bookChapters.set(a.mid, blocks(tag(bx, 'chapters') ?? '', 'chapter').map((c) => ({
+        id: num(/<chapter id="(\d+)"/.exec(c)?.[1]), pagenum: num(tag(c, 'pagenum')), subchapter: tag(c, 'subchapter') ?? '', title: unxml(tag(c, 'title') ?? ''),
+        content: unxml(tag(c, 'content') ?? ''), hidden: tag(c, 'hidden') ?? '',
+      })));
+    }
+    for (const a of acts) {
+      const comp = a.modname === 'label' ? 'mod_label' : `mod_${a.modname}`;
+      const surfaces: Array<{ html: string; filearea: string; where: string }> = [{ html: `${a.intro}`, filearea: 'intro', where: a.idnumber }];
+      if (pageContent.has(a.mid)) surfaces.push({ html: pageContent.get(a.mid) as string, filearea: 'content', where: `${a.idnumber}#content` });
+      for (const ch of bookChapters.get(a.mid) ?? []) surfaces.push({ html: ch.content, filearea: 'chapter', where: `${a.idnumber}#chapter-${ch.id}` });
+      for (const s of surfaces) {
+        if (s.html.includes('cursia-cta://')) add('TOKEN_INVALID', s.where, 'botón de navegación con marcador cursia-cta sin resolver');
+        for (const m of s.html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@\$/g)) {
+          // r78: capítulo de un libro del paquete (`$@BOOKVIEWBYIDCH*mid*capítulo@$`): libro y capítulo existen.
+          if (m[1] === 'BOOKVIEWBYIDCH') {
+            const bk = m[2] ? byMid.get(Number(m[2])) : undefined;
+            if (!bk || bk.modname !== 'book' || !m[3] || !(bookChapters.get(bk.mid) ?? []).some((c) => c.id === Number(m[3]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a un capítulo de un libro del paquete`);
+            continue;
+          }
+          if (m[3]) {
+            add('TOKEN_INVALID', s.where, `token ${m[0]} con dos ids (solo BOOKVIEWBYIDCH los lleva)`);
+            continue;
+          }
+          // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
+          if (m[1] === 'COURSESECTIONBYID') {
+            if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a una sección del paquete`);
+            continue;
+          }
+          // r60 (D2): página del curso del backup (+ `&section=n` en los botones a secciones de paquetes < 4.4).
+          if (m[1] === 'COURSEVIEWBYID') {
+            if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
+            const after = s.html.slice((m.index ?? 0) + m[0].length);
+            const sec = /^&(?:amp;)?section=(\d+)/.exec(after);
+            if (sec && !sectionIds.has(Number(sec[1]))) add('TOKEN_INVALID', s.where, `token ${m[0]}&section=${sec[1]} no resuelve a una sección del paquete`);
+            continue;
+          }
+          // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
+          if (m[1] === 'BADGESVIEWBYID') {
+            if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
+            continue;
+          }
+          const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
+          const target = m[2] ? byMid.get(Number(m[2])) : undefined;
+          if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);
+        }
+        // T6 (r57): un enlace muerto (href="#", vacío o javascript:) es un token saneado o inventado: nunca se entrega.
+        for (const m of s.html.matchAll(/\bhref\s*=\s*(["'])\s*(#?|javascript:[^"']*)\s*\1/gi)) {
+          add('TOKEN_INVALID', s.where, `enlace muerto href=${m[1]}${m[2]}${m[1]} (un destino del paquete que no resolvió)`);
+        }
+        for (const m of s.html.matchAll(/@@PLUGINFILE@@\/([^"'?&<>\s]+)/g)) {
+          const name = decodeURIComponent(m[1]);
+          if (name.startsWith('..')) continue; // ruta del embed.php (se resuelve a wwwroot)
+          if (!files.some((f) => f.ctx === a.ctx && f.component === comp && f.filearea === s.filearea && f.filename === name)) {
+            add('FILES_INTEGRITY', s.where, `@@PLUGINFILE@@/${name} sin archivo en su filearea ${s.filearea}`);
+          }
+        }
+      }
+    }
+  };
+  /** `activityTypeOf`: tipo h5p que facts declara para la actividad del capítulo (null = sin facts: esa regla no aplica). */
+  const checkH5p = async (activityTypeOf: ((chapterId: string) => string | null | undefined) | null): Promise<void> => {
+    // ── H5P ── r55 (R7): TODO .h5p del curso es solo contenido (h5p.json + content/): sus librerías vienen del pack
+    // del sitio (v3 si hay QuestionSet 1.21, caso ramificado o «Repaso»). Una carpeta de librería en el paquete es
+    // H5P_LIBRARIES; y si trae alguna, su clausura de dependencias debe ser completa (H5P_PARTIAL_LIBRARY_CLOSURE): una
+    // clausura parcial de una librería instalada cuelga `H5PValidator::isValidPackage` (dialogcards-diagnosis.md).
+    const profileKeys = new Set(CURSIA_H5P_PROFILE_V3.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
+    const mainRefs = CURSIA_H5P_PROFILE_V3.mainLibraries as Record<string, { majorVersion: number; minorVersion: number }>;
+    for (const a of h5pActs) {
+      const mine = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_h5pactivity' && f.filename !== '.');
+      const pkg = mine.find((f) => f.filearea === 'package');
+      if (!pkg) {
+        add('H5P_FILES', a.idnumber, 'falta la entrada package del .h5p');
+        continue;
+      }
+      // V542 I2: UNA sola copia (el embed inline usa la de `package`); una segunda copia = dos contenidos
+      // H5P sobre el mismo estado xAPI → «Data Reset» y progreso perdido.
+      // Fix round 1 (M7): solo otra copia del PAQUETE (.h5p o el mismo blob) cuenta; un medio del intro (imagen) no.
+      const copies = mine.filter((f) => f !== pkg && (/\.h5p$/i.test(f.filename) || f.hash === pkg.hash));
+      if (copies.length) add('H5P_FILES', a.idnumber, `más de una copia del .h5p (${[pkg, ...copies].map((f) => f.filearea).join(', ')}): el estado se duplica`);
+      if (!a.intro.includes(`url=@@PLUGINFILE@@/../package/0/${pkg.filename}&`)) add('H5P_FILES', a.idnumber, 'el intro no embebe el .h5p del filearea package');
+      const blob = await bin(`files/${pkg.hash.slice(0, 2)}/${pkg.hash}`);
+      if (!blob) continue;
+      try {
+        // Solo el directorio central + h5p.json (+ library.json de cada carpeta, si las hubiera): los JS/CSS nunca se inflan.
+        const hz = await JSZip.loadAsync(blob);
+        const names = Object.keys(hz.files).filter((n) => !hz.files[n].dir);
+        const extra = names.filter((n) => n !== 'h5p.json' && !n.startsWith('content/'));
+        const hjFile = hz.file('h5p.json');
+        if (!hjFile) {
+          add('H5P_LIBRARIES', a.idnumber, 'el paquete no tiene h5p.json');
+          continue;
+        }
+        const hj = JSON.parse(await hjFile.async('string'));
+        // T6 (r57): un .h5p sin content/content.json (o ilegible) se restaura vacío.
+        const cj = hz.file('content/content.json');
+        if (!cj) add('H5P_FILES', a.idnumber, 'el paquete no tiene content/content.json');
+        else {
+          try {
+            JSON.parse(await cj.async('string'));
+          } catch {
+            add('H5P_FILES', a.idnumber, 'content/content.json no es JSON válido');
+          }
+        }
+        const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
+        if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${tops.slice(0, 5).join(', ')} (las librerías vienen del pack del sitio)`);
+        // Clausura: toda dependencia (preloaded/dynamic/editor) de un library.json incluido debe venir incluida.
+        if (tops.length) {
+          const bundled = new Set<string>();
+          const deps: string[] = [];
+          for (const d of tops) {
+            const lf = hz.file(`${d}/library.json`);
+            if (!lf) continue;
+            const lj = JSON.parse(await lf.async('string'));
+            bundled.add(`${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}`);
+            for (const k of ['preloadedDependencies', 'dynamicDependencies', 'editorDependencies']) {
+              for (const dep of (lj[k] ?? []) as Array<{ machineName: string; majorVersion: number; minorVersion: number }>) deps.push(`${dep.machineName} ${dep.majorVersion}.${dep.minorVersion}`);
+            }
+          }
+          const missing = [...new Set(deps.filter((x) => !bundled.has(x)))].sort();
+          if (missing.length) add('H5P_PARTIAL_LIBRARY_CLOSURE', a.idnumber, `carpetas de librería con dependencias que no vienen en el paquete: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5})` : ''}`);
+        }
+        const main = mainRefs[hj.mainLibrary];
+        if (!main) add('H5P_LIBRARIES', a.idnumber, `librería principal fuera del perfil: ${hj.mainLibrary}`);
+        else {
+          const first = (hj.preloadedDependencies ?? [])[0];
+          if (!first || first.machineName !== hj.mainLibrary || first.majorVersion !== main.majorVersion || first.minorVersion !== main.minorVersion) {
+            add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} declarado ${first ? `${first.majorVersion}.${first.minorVersion}` : '(nada)'} ≠ perfil v3 ${main.majorVersion}.${main.minorVersion}`);
+          }
+        }
+        // G6 M7: la librería principal debe corresponder al rol (video → IV; actividad → tipo de facts: h5pType del Manifest o, legacy, R-012 del UUID; calificable en Moodle).
+        const role = /^cv3:ch:([^:]+):(video|activity|review_cards)$/.exec(a.idnumber);
+        if (role && role[2] === 'review_cards' && hj.mainLibrary !== 'H5P.Dialogcards') {
+          add('H5P_LIBRARIES', a.idnumber, `un «Repaso» debe ser H5P.Dialogcards (vino ${hj.mainLibrary})`);
+        }
+        if (role && role[2] === 'video' && hj.mainLibrary !== 'H5P.InteractiveVideo') {
+          add('H5P_LIBRARIES', a.idnumber, `un video debe ser H5P.InteractiveVideo (vino ${hj.mainLibrary})`);
+        }
+        if (role && role[2] === 'activity') {
+          // EV5-C: el tipo esperado sale de facts (resolveActivityType del Manifest), nunca del hash directo.
+          const factType = activityTypeOf ? activityTypeOf(role[1]) : null;
+          const want = factType ? ACTIVITY_MAIN_LIBRARY[factType] : undefined;
+          if (activityTypeOf && !want) add('H5P_LIBRARIES', a.idnumber, `facts no declara un tipo h5p para la actividad del capítulo ${role[1]}`);
+          if (!H5P_MOODLE_GRADING[hj.mainLibrary]?.gradable) add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} no es calificable en Moodle (R-011)`);
+          if (want && hj.mainLibrary !== want) add('H5P_LIBRARIES', a.idnumber, `la actividad del capítulo debe ser ${want} (R-012), vino ${hj.mainLibrary}`);
+        }
+        for (const d of hj.preloadedDependencies ?? []) {
+          const k = `${d.machineName} ${d.majorVersion}.${d.minorVersion}`;
+          if (!profileKeys.has(k)) add('H5P_LIBRARIES', a.idnumber, `dependencia fuera del perfil v3 (pack del sitio): ${k}`);
+        }
+      } catch (err) {
+        add('H5P_LIBRARIES', a.idnumber, `no se pudo leer el .h5p: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    for (const p of keepBlobs) {
+      keepBlobs.delete(p);
+      const hit = binCache.get(p);
+      if (hit && ((await hit)?.length ?? 0) > BIN_CACHE_MAX_BYTES) binCache.delete(p);
+    }
+  };
+  const checkLibro = async (builderVersion: string | undefined): Promise<void> => {
+    // ── Libro Guía ──
+    const libroFiles = libro ? files.filter((f) => f.ctx === libro.ctx && f.component === 'mod_resource' && f.filearea === 'content' && f.filename !== '.') : [];
+    const lf = libroFiles[0];
+    // r19: un paquete ≥ 3.13.0 (o cuyo Libro ya es PDF, con expectativas sin versión) sigue las reglas del PDF;
+    // el botón (LIBRO_CTA) solo se exige con la versión declarada ≥ 3.13.0.
+    const libroIsPdf = builderVersionAtLeast(builderVersion, '3.13.0') || (!!lf && (lf.mimetype === 'application/pdf' || /\.pdf$/i.test(lf.filename)));
+    if (libroIsPdf) {
+      // r19 (L1/L5): un ÚNICO archivo, PDF real (application/pdf, .pdf), en el contexto del propio recurso.
+      if (!libro || !lf) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
+      else {
+        if (libroFiles.length !== 1) add('LIBRO', 'cv3:shell:libro', `el recurso debe tener exactamente 1 archivo (tiene ${libroFiles.length})`);
+        const others = files.filter((f) => f !== lf && f.filename !== '.' && (f.hash === lf.hash || /^libro_guia/i.test(f.filename)));
+        if (others.length) add('LIBRO', 'cv3:shell:libro', `copia del Libro Guía fuera del recurso: ${others.map((f) => `${f.component}/${f.filearea}/${f.filename}`).join(', ')}`);
+        if (lf.mimetype !== 'application/pdf' || !/^libro_guia[a-z0-9_]*\.pdf$/.test(lf.filename)) add('LIBRO', 'cv3:shell:libro', `el Libro Guía debe ser un PDF libro_guia*.pdf (es ${lf.filename}, ${lf.mimetype || 'sin mimetype'})`);
+        if (!libro.inforefFiles.includes(lf.id)) add('LIBRO', 'cv3:shell:libro', 'inforef del recurso no referencia el PDF');
+        const pdf = await bin(`files/${lf.hash.slice(0, 2)}/${lf.hash}`);
+        if (!pdf) add('LIBRO', 'cv3:shell:libro', 'falta el blob del PDF');
+        else if (pdf.subarray(0, 5).toString('latin1') !== '%PDF-' || !/%%EOF\s*$/.test(pdf.subarray(-32).toString('latin1'))) add('LIBRO', 'cv3:shell:libro', 'el PDF no empieza en %PDF- o no cierra en %%EOF (truncado)');
+        // r19 (L4): botón «Abrir Libro Guía» hacia su PROPIO moduleid, en una pestaña nueva.
+        if (builderVersionAtLeast(builderVersion, '3.13.0')) {
+          const anchors = [...libro.intro.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
+          const tok = `$@RESOURCEVIEWBYID*${libro.mid}@$`;
+          // r78 (3.18.0): además, UN botón «Leer en el celular» hacia el libro en línea (mod_book) del paquete.
+          const online = builderVersionAtLeast(builderVersion, '3.18.0');
+          const pdfA = anchors.filter((x) => /Abrir Libro Guía/.test(extractText(x[2])));
+          const ok = anchors.length === (online ? 2 : 1) && pdfA.length === 1 && pdfA[0][1].includes(`href="${tok}"`) && /\btarget="_blank"/.test(pdfA[0][1]) && /\brel="[^"]*\bnoopener\b[^"]*"/.test(pdfA[0][1]);
+          if (!ok) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba exactamente un botón «Abrir Libro Guía» con href="${tok}" target="_blank" rel="noopener…"${online ? ' y uno «Leer en el celular»' : ''} (hay ${anchors.length} enlace(s))`);
+          if (online) {
+            const bk = acts.find((x) => x.idnumber === LIBRO_HTML_IDNUMBER);
+            const onA = anchors.filter((x) => /Leer en el celular/.test(extractText(x[2])));
+            if (!bk || onA.length !== 1 || !onA[0][1].includes(`href="$@BOOKVIEWBYID*${bk.mid}@$"`)) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba un botón «Leer en el celular» hacia $@BOOKVIEWBYID*${bk ? bk.mid : '?'}@$`);
+          }
+        }
+      }
+    } else {
+      const lhtml = lf ? await text(`files/${lf.hash.slice(0, 2)}/${lf.hash}`) : null;
+      if (!lhtml) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
+      else {
+        if (!/<\/html>\s*$/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'no cierra en </html>');
+        if (!/<style>[\s\S]*@media print[\s\S]*<\/style>/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'sin <style> con CSS de impresión');
+      }
+    }
+  };
+  if (!exp) {
+    for (const a of labels) cleanSafe(a);
+    await checkSurfaces();
+    await checkH5p(null);
+    await checkLibro(undefined);
+    return {
+      ok: issues.length === 0,
+      issues,
+      stats: { activities: acts.length, labels: labels.filter((a) => a.modname === 'label').length, graded: acts.filter((a) => a.grade !== null).length, h5p: h5pActs.length, files: files.length },
+    };
   }
 
   // ── EV6: layout de secciones (una por capítulo / evaluación; cierre al final) ──
@@ -951,8 +1210,6 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (gradeCrit.length) add('COURSE_COMPLETION', 'completion.xml', 'curso sin nota con criterio de nota del curso');
   }
 
-  const backupCourseId = num(tag(mb, 'original_course_id'));
-  const backupCourseCtx = num(tag(mb, 'original_course_contextid'));
   // Fix 0b: el ÚNICO módulo oculto del paquete es el label para docentes del certificado (si hay insignia).
   // EV6 P2-B4: sin insignia, el único oculto posible es la nota para docentes de las evaluaciones.
   const checkHidden = (allowed: string | null): void => {
@@ -1101,8 +1358,6 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // ── labels: CLEAN_SAFE, menciones, cifras, tokens ──
   const chapterById = new Map(facts.chapters.map((c) => [c.id, c]));
   const moduleById = new Map(facts.modules.map((m) => [m.id, m]));
-  // #583 (builder 3.11.0): la descripción del recurso del Libro Guía (antes un label aparte) pasa las mismas reglas.
-  const labels = acts.filter((a) => a.modname === 'label' || (a.modname === 'resource' && a.idnumber === 'cv3:shell:libro' && a.intro.trim() !== ''));
   const allowedFor = (a: ParsedActivity): Record<ResourceKind, boolean> | null => {
     const chm = /^cv3:ch:([^:]+):/.exec(a.idnumber);
     if (chm) {
@@ -1130,8 +1385,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     return { video: cc.videos > 0 || facts.chapters.some((c) => c.videoPendingNotice === true), activity: cc.activities > 0, exam: cc.exams > 0 || cc.finalExam, final_exam: cc.finalExam, presentation: true, other: false };
   };
   for (const a of labels) {
-    const lint = lintCleanSafe(a.intro);
-    if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
+    cleanSafe(a);
     const txt = extractText(a.intro);
     const allowed = allowedFor(a);
     const mn = /^cv3:module_next:(.+)$/.exec(a.idnumber);
@@ -1226,72 +1480,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (ch.videoPending === true && hasVideo) add('STRUCTURE', `cv3:ch:${ch.id}:video`, 'video pendiente (vista previa) empaquetado como actividad');
     if (hasNotice !== (ch.videoPendingNotice === true)) add('STRUCTURE', `cv3:ch:${ch.id}:video_pending`, `aviso de video pendiente ${hasNotice ? 'sin' : 'faltante con'} video pendiente mencionado`);
   }
-  // T6 (r57): los tokens, @@PLUGINFILE@@ y enlaces se revisan en TODO HTML visible del paquete: el intro de cada
-  // actividad y el contenido de cada página (mod_page/content), cada uno contra SU filearea.
-  const pageContent = new Map<number, string>();
-  for (const a of acts.filter((x) => x.modname === 'page')) pageContent.set(a.mid, unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? ''));
-  // r78: capítulos de cada libro de Moodle (mod_book): su contenido es HTML visible como el de una página.
-  const bookChapters = new Map<number, Array<{ id: number; pagenum: number; subchapter: string; title: string; content: string; hidden: string }>>();
-  for (const a of acts.filter((x) => x.modname === 'book')) {
-    const bx = (await text(`${a.dir}/book.xml`)) ?? '';
-    bookChapters.set(a.mid, blocks(tag(bx, 'chapters') ?? '', 'chapter').map((c) => ({
-      id: num(/<chapter id="(\d+)"/.exec(c)?.[1]), pagenum: num(tag(c, 'pagenum')), subchapter: tag(c, 'subchapter') ?? '', title: unxml(tag(c, 'title') ?? ''),
-      content: unxml(tag(c, 'content') ?? ''), hidden: tag(c, 'hidden') ?? '',
-    })));
-  }
-  for (const a of acts) {
-    const comp = a.modname === 'label' ? 'mod_label' : `mod_${a.modname}`;
-    const surfaces: Array<{ html: string; filearea: string; where: string }> = [{ html: `${a.intro}`, filearea: 'intro', where: a.idnumber }];
-    if (pageContent.has(a.mid)) surfaces.push({ html: pageContent.get(a.mid) as string, filearea: 'content', where: `${a.idnumber}#content` });
-    for (const ch of bookChapters.get(a.mid) ?? []) surfaces.push({ html: ch.content, filearea: 'chapter', where: `${a.idnumber}#chapter-${ch.id}` });
-    for (const s of surfaces) {
-      if (s.html.includes('cursia-cta://')) add('TOKEN_INVALID', s.where, 'botón de navegación con marcador cursia-cta sin resolver');
-      for (const m of s.html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@\$/g)) {
-        // r78: capítulo de un libro del paquete (`$@BOOKVIEWBYIDCH*mid*capítulo@$`): libro y capítulo existen.
-        if (m[1] === 'BOOKVIEWBYIDCH') {
-          const bk = m[2] ? byMid.get(Number(m[2])) : undefined;
-          if (!bk || bk.modname !== 'book' || !m[3] || !(bookChapters.get(bk.mid) ?? []).some((c) => c.id === Number(m[3]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a un capítulo de un libro del paquete`);
-          continue;
-        }
-        if (m[3]) {
-          add('TOKEN_INVALID', s.where, `token ${m[0]} con dos ids (solo BOOKVIEWBYIDCH los lleva)`);
-          continue;
-        }
-        // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
-        if (m[1] === 'COURSESECTIONBYID') {
-          if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a una sección del paquete`);
-          continue;
-        }
-        // r60 (D2): página del curso del backup (+ `&section=n` en los botones a secciones de paquetes < 4.4).
-        if (m[1] === 'COURSEVIEWBYID') {
-          if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
-          const after = s.html.slice((m.index ?? 0) + m[0].length);
-          const sec = /^&(?:amp;)?section=(\d+)/.exec(after);
-          if (sec && !sectionIds.has(Number(sec[1]))) add('TOKEN_INVALID', s.where, `token ${m[0]}&section=${sec[1]} no resuelve a una sección del paquete`);
-          continue;
-        }
-        // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
-        if (m[1] === 'BADGESVIEWBYID') {
-          if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
-          continue;
-        }
-        const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
-        const target = m[2] ? byMid.get(Number(m[2])) : undefined;
-        if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);
-      }
-      // T6 (r57): un enlace muerto (href="#", vacío o javascript:) es un token saneado o inventado: nunca se entrega.
-      for (const m of s.html.matchAll(/\bhref\s*=\s*(["'])\s*(#?|javascript:[^"']*)\s*\1/gi)) {
-        add('TOKEN_INVALID', s.where, `enlace muerto href=${m[1]}${m[2]}${m[1]} (un destino del paquete que no resolvió)`);
-      }
-      for (const m of s.html.matchAll(/@@PLUGINFILE@@\/([^"'?&<>\s]+)/g)) {
-        const name = decodeURIComponent(m[1]);
-        if (name.startsWith('..')) continue; // ruta del embed.php (se resuelve a wwwroot)
-        if (!files.some((f) => f.ctx === a.ctx && f.component === comp && f.filearea === s.filearea && f.filename === name)) {
-          add('FILES_INTEGRITY', s.where, `@@PLUGINFILE@@/${name} sin archivo en su filearea ${s.filearea}`);
-        }
-      }
-    }
-  }
+  await checkSurfaces();
 
   // UX r18 (problemas 1 y 4): orden de la sección 0 (hero con tema justo bajo el encabezado de Moodle,
   // foro de avisos al final) y botón «Iniciar actividad» solo hacia una actividad que NO se embebe.
@@ -1337,104 +1526,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // ── EV6 P2-B5: banco aleatorio, página gated, fugas de respuestas ──
   for (const i of examChecksV3(await readExamPackageV3(zip), { facts, examBankPlans: exp.examBankPlans })) add(i.code, i.where, i.message);
 
-  // ── H5P ── r55 (R7): TODO .h5p del curso es solo contenido (h5p.json + content/): sus librerías vienen del pack
-  // del sitio (v3 si hay QuestionSet 1.21, caso ramificado o «Repaso»). Una carpeta de librería en el paquete es
-  // H5P_LIBRARIES; y si trae alguna, su clausura de dependencias debe ser completa (H5P_PARTIAL_LIBRARY_CLOSURE): una
-  // clausura parcial de una librería instalada cuelga `H5PValidator::isValidPackage` (dialogcards-diagnosis.md).
-  const profileKeys = new Set(CURSIA_H5P_PROFILE_V3.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
-  const mainRefs = CURSIA_H5P_PROFILE_V3.mainLibraries as Record<string, { majorVersion: number; minorVersion: number }>;
-  const h5pActs = acts.filter((a) => a.modname === 'h5pactivity');
-  for (const a of h5pActs) {
-    const mine = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_h5pactivity' && f.filename !== '.');
-    const pkg = mine.find((f) => f.filearea === 'package');
-    if (!pkg) {
-      add('H5P_FILES', a.idnumber, 'falta la entrada package del .h5p');
-      continue;
-    }
-    // V542 I2: UNA sola copia (el embed inline usa la de `package`); una segunda copia = dos contenidos
-    // H5P sobre el mismo estado xAPI → «Data Reset» y progreso perdido.
-    // Fix round 1 (M7): solo otra copia del PAQUETE (.h5p o el mismo blob) cuenta; un medio del intro (imagen) no.
-    const copies = mine.filter((f) => f !== pkg && (/\.h5p$/i.test(f.filename) || f.hash === pkg.hash));
-    if (copies.length) add('H5P_FILES', a.idnumber, `más de una copia del .h5p (${[pkg, ...copies].map((f) => f.filearea).join(', ')}): el estado se duplica`);
-    if (!a.intro.includes(`url=@@PLUGINFILE@@/../package/0/${pkg.filename}&`)) add('H5P_FILES', a.idnumber, 'el intro no embebe el .h5p del filearea package');
-    const blob = await bin(`files/${pkg.hash.slice(0, 2)}/${pkg.hash}`);
-    if (!blob) continue;
-    try {
-      // Solo el directorio central + h5p.json (+ library.json de cada carpeta, si las hubiera): los JS/CSS nunca se inflan.
-      const hz = await JSZip.loadAsync(blob);
-      const names = Object.keys(hz.files).filter((n) => !hz.files[n].dir);
-      const extra = names.filter((n) => n !== 'h5p.json' && !n.startsWith('content/'));
-      const hjFile = hz.file('h5p.json');
-      if (!hjFile) {
-        add('H5P_LIBRARIES', a.idnumber, 'el paquete no tiene h5p.json');
-        continue;
-      }
-      const hj = JSON.parse(await hjFile.async('string'));
-      // T6 (r57): un .h5p sin content/content.json (o ilegible) se restaura vacío.
-      const cj = hz.file('content/content.json');
-      if (!cj) add('H5P_FILES', a.idnumber, 'el paquete no tiene content/content.json');
-      else {
-        try {
-          JSON.parse(await cj.async('string'));
-        } catch {
-          add('H5P_FILES', a.idnumber, 'content/content.json no es JSON válido');
-        }
-      }
-      const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
-      if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${tops.slice(0, 5).join(', ')} (las librerías vienen del pack del sitio)`);
-      // Clausura: toda dependencia (preloaded/dynamic/editor) de un library.json incluido debe venir incluida.
-      if (tops.length) {
-        const bundled = new Set<string>();
-        const deps: string[] = [];
-        for (const d of tops) {
-          const lf = hz.file(`${d}/library.json`);
-          if (!lf) continue;
-          const lj = JSON.parse(await lf.async('string'));
-          bundled.add(`${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}`);
-          for (const k of ['preloadedDependencies', 'dynamicDependencies', 'editorDependencies']) {
-            for (const dep of (lj[k] ?? []) as Array<{ machineName: string; majorVersion: number; minorVersion: number }>) deps.push(`${dep.machineName} ${dep.majorVersion}.${dep.minorVersion}`);
-          }
-        }
-        const missing = [...new Set(deps.filter((x) => !bundled.has(x)))].sort();
-        if (missing.length) add('H5P_PARTIAL_LIBRARY_CLOSURE', a.idnumber, `carpetas de librería con dependencias que no vienen en el paquete: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5})` : ''}`);
-      }
-      const main = mainRefs[hj.mainLibrary];
-      if (!main) add('H5P_LIBRARIES', a.idnumber, `librería principal fuera del perfil: ${hj.mainLibrary}`);
-      else {
-        const first = (hj.preloadedDependencies ?? [])[0];
-        if (!first || first.machineName !== hj.mainLibrary || first.majorVersion !== main.majorVersion || first.minorVersion !== main.minorVersion) {
-          add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} declarado ${first ? `${first.majorVersion}.${first.minorVersion}` : '(nada)'} ≠ perfil v3 ${main.majorVersion}.${main.minorVersion}`);
-        }
-      }
-      // G6 M7: la librería principal debe corresponder al rol (video → IV; actividad → tipo de facts: h5pType del Manifest o, legacy, R-012 del UUID; calificable en Moodle).
-      const role = /^cv3:ch:([^:]+):(video|activity|review_cards)$/.exec(a.idnumber);
-      if (role && role[2] === 'review_cards' && hj.mainLibrary !== 'H5P.Dialogcards') {
-        add('H5P_LIBRARIES', a.idnumber, `un «Repaso» debe ser H5P.Dialogcards (vino ${hj.mainLibrary})`);
-      }
-      if (role && role[2] === 'video' && hj.mainLibrary !== 'H5P.InteractiveVideo') {
-        add('H5P_LIBRARIES', a.idnumber, `un video debe ser H5P.InteractiveVideo (vino ${hj.mainLibrary})`);
-      }
-      if (role && role[2] === 'activity') {
-        // EV5-C: el tipo esperado sale de facts (resolveActivityType del Manifest), nunca del hash directo.
-        const factType = chapterById.get(role[1])?.activityType ?? null;
-        const want = factType ? ACTIVITY_MAIN_LIBRARY[factType] : undefined;
-        if (!want) add('H5P_LIBRARIES', a.idnumber, `facts no declara un tipo h5p para la actividad del capítulo ${role[1]}`);
-        if (!H5P_MOODLE_GRADING[hj.mainLibrary]?.gradable) add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} no es calificable en Moodle (R-011)`);
-        if (want && hj.mainLibrary !== want) add('H5P_LIBRARIES', a.idnumber, `la actividad del capítulo debe ser ${want} (R-012), vino ${hj.mainLibrary}`);
-      }
-      for (const d of hj.preloadedDependencies ?? []) {
-        const k = `${d.machineName} ${d.majorVersion}.${d.minorVersion}`;
-        if (!profileKeys.has(k)) add('H5P_LIBRARIES', a.idnumber, `dependencia fuera del perfil v3 (pack del sitio): ${k}`);
-      }
-    } catch (err) {
-      add('H5P_LIBRARIES', a.idnumber, `no se pudo leer el .h5p: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-  for (const p of keepBlobs) {
-    keepBlobs.delete(p);
-    const hit = binCache.get(p);
-    if (hit && ((await hit)?.length ?? 0) > BIN_CACHE_MAX_BYTES) binCache.delete(p);
-  }
+  await checkH5p((chId) => chapterById.get(chId)?.activityType ?? null);
 
   // ── audio ──
   const audioCheck = async (idnumber: string, expectSeconds: number, extra: (txt: string) => string[]) => {
@@ -1495,49 +1587,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     }
   }
 
-  // ── Libro Guía ──
-  const libro = acts.find((a) => a.idnumber === 'cv3:shell:libro');
-  const libroFiles = libro ? files.filter((f) => f.ctx === libro.ctx && f.component === 'mod_resource' && f.filearea === 'content' && f.filename !== '.') : [];
-  const lf = libroFiles[0];
-  // r19: un paquete ≥ 3.13.0 (o cuyo Libro ya es PDF, con expectativas sin versión) sigue las reglas del PDF;
-  // el botón (LIBRO_CTA) solo se exige con la versión declarada ≥ 3.13.0.
-  const libroIsPdf = builderVersionAtLeast(exp.builderVersion, '3.13.0') || (!!lf && (lf.mimetype === 'application/pdf' || /\.pdf$/i.test(lf.filename)));
-  if (libroIsPdf) {
-    // r19 (L1/L5): un ÚNICO archivo, PDF real (application/pdf, .pdf), en el contexto del propio recurso.
-    if (!libro || !lf) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
-    else {
-      if (libroFiles.length !== 1) add('LIBRO', 'cv3:shell:libro', `el recurso debe tener exactamente 1 archivo (tiene ${libroFiles.length})`);
-      const others = files.filter((f) => f !== lf && f.filename !== '.' && (f.hash === lf.hash || /^libro_guia/i.test(f.filename)));
-      if (others.length) add('LIBRO', 'cv3:shell:libro', `copia del Libro Guía fuera del recurso: ${others.map((f) => `${f.component}/${f.filearea}/${f.filename}`).join(', ')}`);
-      if (lf.mimetype !== 'application/pdf' || !/^libro_guia[a-z0-9_]*\.pdf$/.test(lf.filename)) add('LIBRO', 'cv3:shell:libro', `el Libro Guía debe ser un PDF libro_guia*.pdf (es ${lf.filename}, ${lf.mimetype || 'sin mimetype'})`);
-      if (!libro.inforefFiles.includes(lf.id)) add('LIBRO', 'cv3:shell:libro', 'inforef del recurso no referencia el PDF');
-      const pdf = await bin(`files/${lf.hash.slice(0, 2)}/${lf.hash}`);
-      if (!pdf) add('LIBRO', 'cv3:shell:libro', 'falta el blob del PDF');
-      else if (pdf.subarray(0, 5).toString('latin1') !== '%PDF-' || !/%%EOF\s*$/.test(pdf.subarray(-32).toString('latin1'))) add('LIBRO', 'cv3:shell:libro', 'el PDF no empieza en %PDF- o no cierra en %%EOF (truncado)');
-      // r19 (L4): botón «Abrir Libro Guía» hacia su PROPIO moduleid, en una pestaña nueva.
-      if (builderVersionAtLeast(exp.builderVersion, '3.13.0')) {
-        const anchors = [...libro.intro.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
-        const tok = `$@RESOURCEVIEWBYID*${libro.mid}@$`;
-        // r78 (3.18.0): además, UN botón «Leer en el celular» hacia el libro en línea (mod_book) del paquete.
-        const online = builderVersionAtLeast(exp.builderVersion, '3.18.0');
-        const pdfA = anchors.filter((x) => /Abrir Libro Guía/.test(extractText(x[2])));
-        const ok = anchors.length === (online ? 2 : 1) && pdfA.length === 1 && pdfA[0][1].includes(`href="${tok}"`) && /\btarget="_blank"/.test(pdfA[0][1]) && /\brel="[^"]*\bnoopener\b[^"]*"/.test(pdfA[0][1]);
-        if (!ok) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba exactamente un botón «Abrir Libro Guía» con href="${tok}" target="_blank" rel="noopener…"${online ? ' y uno «Leer en el celular»' : ''} (hay ${anchors.length} enlace(s))`);
-        if (online) {
-          const bk = acts.find((x) => x.idnumber === LIBRO_HTML_IDNUMBER);
-          const onA = anchors.filter((x) => /Leer en el celular/.test(extractText(x[2])));
-          if (!bk || onA.length !== 1 || !onA[0][1].includes(`href="$@BOOKVIEWBYID*${bk.mid}@$"`)) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba un botón «Leer en el celular» hacia $@BOOKVIEWBYID*${bk ? bk.mid : '?'}@$`);
-        }
-      }
-    }
-  } else {
-    const lhtml = lf ? await text(`files/${lf.hash.slice(0, 2)}/${lf.hash}`) : null;
-    if (!lhtml) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
-    else {
-      if (!/<\/html>\s*$/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'no cierra en </html>');
-      if (!/<style>[\s\S]*@media print[\s\S]*<\/style>/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'sin <style> con CSS de impresión');
-    }
-  }
+  await checkLibro(exp.builderVersion);
 
   // ── r78: Libro Guía en línea (mod_book), builder ≥ 3.18.0 ──
   if (builderVersionAtLeast(exp.builderVersion, '3.18.0')) {
