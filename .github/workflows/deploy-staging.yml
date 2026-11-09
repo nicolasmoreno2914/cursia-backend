@@ -240,6 +240,11 @@ jobs:
       - name: Check r107 Taller de cursos — inventario (puro, sintéticos)
         run: node scripts/r107/check-r107-inventory.js --ci
 
+      # r107 B3: diagnóstico técnico T01–T12 (hallazgos, semáforo, arreglo sugerido). --ci = sintéticos v3 + dañados
+      # generados en el momento (cada uno da EXACTAMENTE su falla) + un V1 mínimo armado acá (Libro, SCORM, hvp).
+      - name: Check r107 Taller de cursos — diagnóstico técnico (puro, sintéticos)
+        run: node scripts/r107/check-r107-diagnosis.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -880,6 +885,11 @@ jobs:
                # producción). Aditiva e idempotente; requiere [5i].
                echo "━━━ [5j] r107 B2: Taller de cursos (inventario + índice de huella) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r107-b2-inventory.js
+
+               # r107 B3: diagnóstico técnico (workshop_diagnoses + workshop_findings, tablas NUEVAS, RLS + sin
+               # anon/authenticated). Staging-only (EXCLUDED del plan de producción). Aditiva e idempotente; requiere [5i].
+               echo "━━━ [5k] r107 B3: Taller de cursos (diagnóstico técnico) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r107-b3-diagnosis.js
 
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
