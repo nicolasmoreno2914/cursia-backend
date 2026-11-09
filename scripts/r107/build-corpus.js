@@ -94,7 +94,9 @@ async function firstLabel(zip) {
 }
 async function injectIntoLabel(zip, html) {
   const l = await firstLabel(zip);
-  zip.file(`activities/${l.dir}/label.xml`, l.xml.replace(/<intro>/, '<intro>' + xmlEsc(html)));
+  // r107 B2: función como reemplazo — con un string, el `$&` que forman el final de un token (`…@$`) y `&quot;` se
+  // expandía a «todo el match» (el mismo bug de String.replace del changelog #1 de CLAUDE.md) y rompía el token.
+  zip.file(`activities/${l.dir}/label.xml`, l.xml.replace(/<intro>/, () => '<intro>' + xmlEsc(html)));
   return l.dir;
 }
 

@@ -16,6 +16,20 @@
 //   W7  identificación interrumpida (proceso reiniciado) → GET la marca fallida reintentable; el POST la reintenta
 //   W8  Storage caído al descargar → failed reintentable (nunca identified); sin la tabla → 503 COURSE_WORKSHOP_NOT_MIGRATED
 //   W9  guard del flag: apagado / fuera de la lista → 404; lista inválida → 500
+//   W10–W13 fixes de la revisión de B1 (TOCTOU, alcance por institución, reclamos, catálogo recortado)
+//   r107 B2:
+//   W1  + workshop_sessions.inventory e índices parciales de la huella (N3) en artifacts, CONCURRENTLY, idempotentes; un
+//       índice INVÁLIDO se rehace; el script de B2 se niega sin MIGRATION_ENV=staging
+//   W3  + al identificar se persiste el inventario (sin HTML) y su resumen en la sesión
+//   W14 fuente recuperada: artifacts del curso identificado (mismo dueño, no deshabilitados) enganchados por uuid / snapshot
+//   W15 GET …/inventory con las compuertas de B1 (ajeno 404, SA, miembro solo en enforce; sin identificar → 409)
+//   W16 original verificado: inventario faltante → se reconstruye igual; original cambiado → failed WORKSHOP_ORIGINAL_CHANGED
+//   W17 DELETE /artifacts/:id de workshop_original → 403 con motivo (y los demás tipos se borran igual)
+//   W18 índices N3 presentes, válidos y usados por la consulta de la huella
+//   W19–W22 fix round 2 (reconstrucción acotada, original borrado, fuente con dueño y alcance)
+//   W23–W26 fix round 3: 403 con «404» en la ruta = transitorio (status estructurado); un proceso que muere a mitad de
+//       la reconstrucción gasta su intento; carril de 1 estricto entre sondeos concurrentes; una falla determinista se
+//       reintenta UNA vez con otra versión del armado
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -112,13 +126,18 @@ function rawZip(entries) {
     const withClient = async (db, fn) => { const c = new Client({ host: '127.0.0.1', port, user: 'postgres', database: db }); await c.connect(); try { return await fn(c); } finally { await c.end(); } };
     await withClient('postgres', async (c) => { await c.query(`create database ${DB}`); await c.query(`create database r107empty`); });
     const SQL = fs.readFileSync(path.join(REPO, 'supabase-migration-r107-workshop-sessions.sql'), 'utf8');
+    const SQL_B2 = fs.readFileSync(path.join(REPO, 'supabase-migration-r107-b2-inventory.sql'), 'utf8');
+    const MIG_B2 = require(path.join(REPO, 'scripts/migrate-r107-b2-inventory.js'));
     // Tablas existentes mínimas (forma de staging: courses.id serial, artifacts.owner_id uuid, course_id text).
     const BASE = `
       create role anon nologin; create role authenticated nologin;
       create table public.courses (id serial primary key, owner_id varchar(36), institution_id uuid, title varchar(255) not null, metadata jsonb);
       create table public.artifacts (id uuid primary key default gen_random_uuid(), owner_id uuid not null, course_id text, job_id uuid, type text not null,
         storage_provider varchar(50) default 'supabase', storage_bucket text default 'cursia-artifacts', storage_path text not null, filename text,
-        mime_type text, size_bytes bigint, checksum_sha256 text, metadata jsonb default '{}', created_at timestamptz default now(), updated_at timestamptz default now());`;
+        mime_type text, size_bytes bigint, checksum_sha256 text, metadata jsonb default '{}', created_at timestamptz default now(), updated_at timestamptz default now(),
+        module_id uuid, chapter_id uuid, status text, manifest_id integer, manifest_item_key text, item_run_id uuid);
+      create table public.course_modules (id uuid primary key default gen_random_uuid(), course_id integer, position integer not null);
+      create table public.course_chapters (id uuid primary key default gen_random_uuid(), course_id integer, module_id uuid, position integer not null);`;
 
     await check('W1 migración aditiva e idempotente (dos veces, con roles de Supabase); RLS; el script se niega sin MIGRATION_ENV=staging', async () => {
       await withClient(DB, async (c) => {
@@ -127,12 +146,29 @@ function rawZip(entries) {
         const before = await colsOf();
         await c.query(SQL);
         await c.query(SQL);
+        // B2: la columna (en transacción) y los índices CONCURRENTLY (sueltos), dos veces.
+        for (let i = 0; i < 2; i++) {
+          await c.query('reset lock_timeout');
+          await c.query('begin'); await c.query(SQL_B2); await c.query('commit');
+          // Fix round 2 (P2-9): el tope corto de la migración NO queda en la sesión para el CREATE INDEX CONCURRENTLY.
+          eq((await c.query('show lock_timeout')).rows[0].lock_timeout, '0', 'lock_timeout después del commit (set local)');
+          await MIG_B2.applyIndexes(c);
+          eq([(await c.query('show lock_timeout')).rows[0].lock_timeout, (await c.query('show statement_timeout')).rows[0].statement_timeout], ['0', '0'], 'applyIndexes restaura los topes');
+        }
+        assert(/set lock_timeout = '10min'/.test(fs.readFileSync(path.join(REPO, 'scripts/migrate-r107-b2-inventory.js'), 'utf8')), 'CIC con tope propio amplio');
+        const idx = async () => (await c.query(`select c.relname, i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname like 'artifacts_mbz_%' order by 1`)).rows;
+        eq(await idx(), [{ relname: 'artifacts_mbz_checksum_sha256_idx', indisvalid: true }, { relname: 'artifacts_mbz_validated_sha256_idx', indisvalid: true }], 'índices N3');
+        // Un índice INVÁLIDO (CREATE INDEX CONCURRENTLY cortado) se descarta y se rehace (IF NOT EXISTS lo daría por hecho).
+        await c.query(`update pg_index set indisvalid = false where indexrelid = 'public.artifacts_mbz_checksum_sha256_idx'::regclass`);
+        await MIG_B2.applyIndexes(c);
+        eq((await idx())[0], { relname: 'artifacts_mbz_checksum_sha256_idx', indisvalid: true }, 'índice inválido rehecho');
+        eq(MIG_B2.indexStatements(fs.readFileSync(path.join(REPO, 'supabase-migration-r107-artifacts-checksum-index.sql'), 'utf8')).length, 2, 'dos sentencias de índice');
         const t = await c.query(`select relrowsecurity from pg_class where relname = 'workshop_sessions'`);
         eq(t.rows.map((x) => x.relrowsecurity), [true], 'RLS');
         const g = await c.query(`select has_table_privilege('authenticated', 'public.workshop_sessions', 'select') a, has_table_privilege('anon', 'public.workshop_sessions', 'insert') b`);
         eq([g.rows[0].a, g.rows[0].b], [false, false], 'sin acceso para anon/authenticated');
         const cols = await c.query(`select column_name from information_schema.columns where table_name = 'workshop_sessions' order by ordinal_position`);
-        eq(cols.rows.map((x) => x.column_name), ['id', 'owner_id', 'institution_id', 'status', 'original_artifact_id', 'storage_path', 'original_sha1', 'original_size', 'container', 'family', 'identified_course_id', 'identification', 'builder_version', 'error', 'created_at', 'updated_at'], 'columnas');
+        eq(cols.rows.map((x) => x.column_name), ['id', 'owner_id', 'institution_id', 'status', 'original_artifact_id', 'storage_path', 'original_sha1', 'original_size', 'container', 'family', 'identified_course_id', 'identification', 'builder_version', 'error', 'created_at', 'updated_at', 'inventory'], 'columnas');
         eq(await colsOf(), before, 'courses / artifacts intactas');
         let bad = null;
         try { await c.query(`insert into public.workshop_sessions (owner_id, storage_path, status) values (gen_random_uuid(), 'x', 'ready')`); } catch (e) { bad = e.code; }
@@ -140,6 +176,8 @@ function rawZip(entries) {
       });
       const res = spawnSync(process.execPath, [path.join(REPO, 'scripts/migrate-r107-workshop-sessions.js')], { env: { ...cleanEnv(), DB_HOST: '127.0.0.1', DB_PORT: String(port), DB_USER: 'postgres', DB_NAME: DB }, encoding: 'utf8', cwd: os.tmpdir() });
       assert(res.status !== 0 && /MIGRATION_ENV/.test(res.stderr), `debió negarse: ${res.status} ${res.stderr}`);
+      const res2 = spawnSync(process.execPath, [path.join(REPO, 'scripts/migrate-r107-b2-inventory.js')], { env: { ...cleanEnv(), DB_HOST: '127.0.0.1', DB_PORT: String(port), DB_USER: 'postgres', DB_NAME: DB }, encoding: 'utf8', cwd: os.tmpdir() });
+      assert(res2.status !== 0 && /MIGRATION_ENV/.test(res2.stderr), `B2 debió negarse: ${res2.status} ${res2.stderr}`);
     });
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
@@ -169,10 +207,13 @@ function rawZip(entries) {
       async downloadStorageObjectCapped(bucket, p, opts) {
         this.downloads++;
         if (this.down) { const { StorageUnavailableError } = D('modules/artifacts/storage-resilience.js'); throw new StorageUnavailableError('download', 'simulado'); }
-        if (!objects.has(p)) throw new Error('404');
+        // Respuestas HTTP como las de downloadStorageObjectCapped real: error con el status estructurado (fix round 3, N2).
+        const httpErr = (status, body) => (ART.StorageHttpError ? new ART.StorageHttpError(status, body, `${bucket}/${p}`) : Object.assign(new Error(`Supabase Storage download failed: ${status} ${bucket}/${p}`), { status }));
+        if (this.httpStatus) throw httpErr(this.httpStatus, null);
+        if (!objects.has(p)) throw httpErr(404, 'not_found');
         const b = objects.get(p);
         const body = new ReadableStream({ start(c) { for (let i = 0; i < b.length; i += 1 << 20) c.enqueue(new Uint8Array(b.buffer, b.byteOffset + i, Math.min(1 << 20, b.length - i))); c.close(); } });
-        return ART.readBodyCapped(new Response(body), opts.maxBytes, () => { this.aborted = (this.aborted || 0) + 1; }, opts.onChunk);
+        return ART.readBodyCapped(new Response(body), opts.maxBytes, () => { this.aborted = (this.aborted || 0) + 1; }, opts.onChunk, { sizeHint: opts.sizeHint });
       },
       async create(dto, ownerId) {
         ART.assertWritableStoragePath(ownerId, dto.storage_bucket ?? 'cursia-artifacts', dto.storage_path);
@@ -219,6 +260,12 @@ function rawZip(entries) {
       const arts = await ds.query(`select type, checksum_sha256, size_bytes::int s, metadata->>'workshopSessionId' sid, course_id from public.artifacts where type = 'workshop_original'`);
       eq(arts, [{ type: 'workshop_original', checksum_sha256: MBZ_SHA256, s: MBZ.length, sid: s1.id, course_id: null }], 'artifact original');
       eq(g.originalArtifactId !== null, true, 'enlazado');
+      // B2: inventario persistido al identificar (forma sin HTML) + resumen en la sesión.
+      const [iv] = await ds.query(`select inventory from public.workshop_sessions where id = $1`, [s1.id]);
+      assert(iv.inventory, 'inventario persistido');
+      eq([iv.inventory.schema, iv.inventory.family, iv.inventory.chapters.length, iv.inventory.htmlOmitted, iv.inventory.sourceLookup.status], [1, 'v2-dynamic', 1, true, 'none'], 'inventario');
+      assert(iv.inventory.activities.every((a) => a.html.every((h) => h.html === '' && /^[0-9a-f]{40}$/.test(h.sha1))), 'sin HTML, con sha1');
+      eq([g.inventory.chapters, g.inventory.activities > 10, g.inventory.error], [1, true, null], 'resumen en la sesión');
       const again = await svc.markUploaded(OWNER, s1.id);
       eq(again.status, 'identified', 'idempotente');
       eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_original'`))[0].n, 1, 'sin duplicar');
@@ -396,6 +443,322 @@ function rawZip(entries) {
       const [row] = await ds.query(`select identification->'catalog' as c from public.workshop_sessions where id = $1`, [res.session.id]);
       eq(row.c.truncated, true, 'recorte registrado');
       assert(g.identification.notes.some((n) => /muchos cursos/.test(n)), 'nota visible del recorte');
+    });
+
+    // Uuid del capítulo del sintético 1x1 (lo trae el paquete en la clave del builder / el nombre del .h5p).
+    const CH_UUID = sim.built.expectations.facts.chapters[0].id;
+    let s14;
+    await check('W14 fuente recuperada: artifacts del curso identificado (mismo dueño, no deshabilitados) por uuid del capítulo y snapshot', async () => {
+      await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, chapter_id, created_at) values ($1, $2, 'dynamic_content_md', $3, $4, now() - interval '1 day')`, [OWNER.id, String(own.id), `${OWNER.id}/c/old.md`, CH_UUID]);
+      const [md] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, chapter_id) values ($1, $2, 'dynamic_content_md', $3, $4) returning id::text as id`, [OWNER.id, String(own.id), `${OWNER.id}/c/new.md`, CH_UUID]);
+      const [snap] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path) values ($1, 'fe-uuid-1', 'content_snapshot', $2) returning id::text as id`, [OWNER.id, `${OWNER.id}/fe-uuid-1/snap.json`]);
+      await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, chapter_id) values ($1, $2, 'dynamic_content_md', $3, $4)`, [OTHER.id, String(own.id), `${OTHER.id}/c/ajeno.md`, CH_UUID]);
+      await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, chapter_id, status) values ($1, $2, 'dynamic_video_interactions_json', $3, $4, 'disabled')`, [OWNER.id, String(own.id), `${OWNER.id}/c/off.json`, CH_UUID]);
+      const res = await svc.createSession(OWNER, { filename: 'f.mbz', sizeBytes: MBZ.length });
+      s14 = res.session.id;
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(OWNER, s14);
+      await settle(s14);
+      const r = await svc.getInventory(OWNER, s14);
+      eq([r.status, r.inventory.sourceLookup.status, r.inventory.sourceLookup.courseId], ['ready', 'found', Number(own.id)], 'fuente encontrada');
+      const ch = r.inventory.chapters[0];
+      eq(ch.builderUuid, CH_UUID, 'uuid del capítulo leído del paquete');
+      const ids = ch.source.map((x) => `${x.type}:${x.matchedBy}:${x.entryHint || ''}`).sort();
+      eq(ids, ['content_snapshot:course:libro_cap1.md', 'dynamic_content_md:chapter_uuid:'], 'fuente del capítulo');
+      eq(ch.source.find((x) => x.type === 'dynamic_content_md').artifactId, md.id, 'la más reciente');
+      const texts = r.inventory.activities.filter((a) => a.role === 'text');
+      assert(texts.length && texts.every((a) => a.source.some((x) => x.artifactId === md.id)), 'el md llega a los textos del capítulo');
+      assert(r.inventory.activities.some((a) => a.kind === 'libro' && a.source.some((x) => x.artifactId === snap.id && x.entryHint === 'libro_guia_completo.html')), 'snapshot → Libro Guía');
+      const all = JSON.stringify(r.inventory);
+      assert(!all.includes('ajeno.md') && !all.includes('off.json'), 'nada de otro dueño ni deshabilitado');
+      assert(!JSON.stringify(r.inventory).includes(`${OTHER.id}/`), 'ninguna ruta ajena');
+    });
+
+    await check('W15 GET …/inventory: ajeno 404, SuperAdmin ve, miembro solo con RBAC enforce; sin identificar → 409 WORKSHOP_NOT_IDENTIFIED', async () => {
+      await rejects(svc.getInventory(OTHER, s14), 404, null, 'ajeno');
+      await rejects(svc.getInventory(OWNER, 'no-uuid'), 404, null, 'id inválido');
+      eq((await svc.getInventory(ADMIN, s14)).status, 'ready', 'SA');
+      const pending = await svc.createSession(OWNER, { filename: 'p.mbz', sizeBytes: 10 });
+      await rejects(svc.getInventory(OWNER, pending.session.id), 409, 'WORKSHOP_NOT_IDENTIFIED', 'sin identificar');
+      process.env.CURSIA_RBAC_MODE = 'enforce';
+      let sid;
+      try {
+        const res = await svc.createSession(OWNER, { filename: 'i.mbz', sizeBytes: MBZ.length }, INST);
+        sid = res.session.id;
+        objects.set(res.upload.storagePath, MBZ);
+        await svc.markUploaded(OWNER, sid);
+        await settle(sid);
+        eq((await svc.getInventory(MEMBER, sid)).status, 'ready', 'miembro con permiso (enforce)');
+        await rejects(svc.getInventory(OTHER, sid), 404, null, 'no miembro');
+      } finally {
+        process.env.CURSIA_RBAC_MODE = 'off';
+      }
+      await rejects(svc.getInventory(MEMBER, sid), 404, null, 'RBAC off: solo el dueño');
+    });
+
+    await check('W16 original verificado: inventario faltante → se reconstruye IGUAL desde el original; original cambiado → failed WORKSHOP_ORIGINAL_CHANGED', async () => {
+      const [before] = await ds.query(`select inventory::text as t from public.workshop_sessions where id = $1`, [s14]);
+      await ds.query(`update public.workshop_sessions set inventory = null where id = $1`, [s14]);
+      const b = await svc.getInventory(OWNER, s14);
+      eq([b.status, b.inventory], ['building', null], 'se reconstruye en segundo plano');
+      await settle(`inventory:${s14}`);
+      const [after] = await ds.query(`select inventory::text as t from public.workshop_sessions where id = $1`, [s14]);
+      eq(after.t, before.t, 'el inventario reconstruido es el mismo (determinista)');
+      eq((await svc.getInventory(OWNER, s14)).status, 'ready', 'listo');
+      const v = await svc.loadVerifiedOriginal(s14);
+      eq([v.sha1, v.buffer.length], [sha('sha1', MBZ), MBZ.length], 'original verificado');
+      // El dueño reemplaza el objeto (políticas own-folder) por otro del MISMO tamaño.
+      const path14 = SVC.workshopStoragePath(OWNER.id, s14);
+      const tampered = Buffer.from(MBZ); tampered[tampered.length - 30] ^= 0xff;
+      objects.set(path14, tampered);
+      await rejects(svc.loadVerifiedOriginal(s14), 409, 'WORKSHOP_ORIGINAL_CHANGED', 'uso posterior del original');
+      let g = await svc.get(OWNER, s14);
+      eq([g.status, g.error.code, g.error.retryable], ['failed', 'WORKSHOP_ORIGINAL_CHANGED', false], 'sesión fallida');
+      const r = await svc.getInventory(OWNER, s14);
+      eq([r.status, r.error.code], ['failed', 'WORKSHOP_ORIGINAL_CHANGED'], 'inventario: failed con el motivo');
+      eq((await svc.markUploaded(OWNER, s14)).status, 'failed', 'no se reintenta');
+      // Mismo caso por el camino de la reconstrucción del inventario (sesión de B1 sin inventario).
+      const res = await svc.createSession(OWNER, { filename: 'g.mbz', sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(OWNER, res.session.id);
+      await settle(res.session.id);
+      await ds.query(`update public.workshop_sessions set inventory = null where id = $1`, [res.session.id]);
+      objects.set(res.upload.storagePath, tampered);
+      eq((await svc.getInventory(OWNER, res.session.id)).status, 'building', 'reconstrucción');
+      await settle(`inventory:${res.session.id}`);
+      g = await svc.get(OWNER, res.session.id);
+      eq([g.status, g.error.code], ['failed', 'WORKSHOP_ORIGINAL_CHANGED'], 'la reconstrucción no inventaría un original cambiado');
+      const [iv] = await ds.query(`select inventory from public.workshop_sessions where id = $1`, [res.session.id]);
+      eq(iv.inventory, null, 'sin inventario de bytes ajenos');
+      objects.set(path14, MBZ);
+    });
+
+    await check('W17 DELETE /artifacts/:id de workshop_original → 403 con motivo; otro tipo del mismo dueño se borra igual', async () => {
+      const ARTS = new ART.ArtifactsService({ manager: { connection: ds } }, { get: () => undefined });
+      const [orig] = await ds.query(`select id::text as id from public.artifacts where type = 'workshop_original' and owner_id = $1 limit 1`, [OWNER.id]);
+      const body = await rejects(ARTS.remove(orig.id, OWNER.id), 403, 'artifact_workshop_original_immutable', 'original');
+      assert(/no se puede borrar/.test(body.message), 'motivo');
+      eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [orig.id]))[0].n, 1, 'la fila sigue');
+      await rejects(ARTS.remove(orig.id, ADMIN.id, { allowAdminOnlyPackage: true }), 404, null, 'SA: no es suyo → 404 (igual que antes)');
+      // Fix round 2 (P2-8): otra fila (legacy) que comparte la RUTA del original → se borra la fila, NUNCA el objeto.
+      const [origRow] = await ds.query(`select storage_path from public.artifacts where id = $1`, [orig.id]);
+      const [twin] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path) values ($1, 'x', 'mbz_final', $2) returning id::text as id`, [OWNER.id, origRow.storage_path]);
+      let deletes = 0;
+      ARTS.deleteStorageObject = async () => { deletes++; };
+      await ARTS.remove(twin.id, OWNER.id);
+      eq([(await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [twin.id]))[0].n, deletes], [0, 0], 'fila gemela borrada, objeto del original intacto');
+      const [other] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path) values ($1, 'x', 'mbz_final', 'compartido/x.mbz') returning id::text as id`, [OWNER.id]);
+      await ARTS.remove(other.id, OWNER.id);
+      eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [other.id]))[0].n, 0, 'otro tipo: borrado como siempre');
+    });
+
+    await check('W18 índices N3: presentes, válidos y cada rama de la consulta de la huella los usa (Index Cond)', async () => {
+      const plan = (where) => ds.transaction(async (m) => {
+        await m.query('set local enable_seqscan = off');
+        const r = await m.query(`explain select a.id from public.artifacts a where a.type in ('mbz_final', 'dynamic_mbz') and ${where}`, [MBZ_SHA256]);
+        return r.map((x) => x['QUERY PLAN']).join('\n');
+      });
+      const p1 = await plan('a.checksum_sha256 = $1');
+      assert(/artifacts_mbz_checksum_sha256_idx/.test(p1) && /Index Cond: \(checksum_sha256 = /.test(p1), `rama checksum_sha256:\n${p1}`);
+      const p2 = await plan(`a.metadata->>'validatedSha256' = $1`);
+      assert(/artifacts_mbz_validated_sha256_idx/.test(p2) && /Index Cond: \(\(metadata ->> 'validatedSha256'/.test(p2), `rama validatedSha256:\n${p2}`);
+      const p3 = await plan(`(a.checksum_sha256 = $1 or a.metadata->>'validatedSha256' = $1)`);
+      assert(!/Seq Scan/.test(p3) && /artifacts_mbz_/.test(p3), `consulta con OR:\n${p3}`);
+    });
+
+    // ── Fix round 2 (B2-review.md) ──
+    const newIdentified = async (fn = 'r2.mbz') => {
+      const res = await svc.createSession(OWNER, { filename: fn, sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(OWNER, res.session.id);
+      await settle(res.session.id);
+      return res;
+    };
+    const poll = async (sid, n) => { const out = []; for (let i = 0; i < n; i++) { out.push((await svc.getInventory(OWNER, sid)).status); await settle(`inventory:${sid}`); } return out; };
+
+    await check('W19 P1-3 armado que falla (determinista): no reintentable; 10 sondeos → 0 descargas nuevas; nunca ocupa los lugares de identificación', async () => {
+      const real = svc.inventoryBuilder;
+      svc.inventoryBuilder = async () => { throw new Error('armado roto a propósito'); };
+      let res;
+      try { res = await newIdentified('r2-roto.mbz'); } finally { svc.inventoryBuilder = real; }
+      const g = await svc.get(OWNER, res.session.id);
+      eq([g.status, g.inventory.error.code, g.inventory.error.retryable], ['identified', 'WORKSHOP_INVENTORY_FAILED', false], 'la identificación queda; el inventario falla visible y no reintentable');
+      const d0 = storage.downloads;
+      eq([...new Set(await poll(res.session.id, 10))], ['failed'], '10 sondeos → failed');
+      eq(storage.downloads - d0, 0, 'ninguna descarga por sondear');
+      // Una sesión sin inventario (B1) cuyo armado falla: UNA reconstrucción, y después failed para siempre.
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [res.session.id]);
+      svc.inventoryBuilder = async () => { throw new Error('armado roto a propósito'); };
+      const d1 = storage.downloads;
+      try {
+        const st = await poll(res.session.id, 10);
+        eq([st[0], st[st.length - 1]], ['building', 'failed'], 'building una vez, después failed');
+      } finally { svc.inventoryBuilder = real; }
+      eq(storage.downloads - d1, 1, 'una sola descarga en 10 sondeos');
+      // Con los 2 lugares de identificación ocupados, la reconstrucción corre igual (carril propio).
+      const r2 = await newIdentified('r2-carril.mbz');
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [r2.session.id]);
+      const prevRunning = svc.running;
+      svc.running = SVC.IDENTIFY_CONCURRENCY;
+      try {
+        eq((await svc.getInventory(OWNER, r2.session.id)).status, 'building', 'arranca');
+        const done = await Promise.race([settle(`inventory:${r2.session.id}`).then(() => 'ok'), new Promise((r) => setTimeout(() => r('colgada'), 5000))]);
+        eq(done, 'ok', 'no espera los lugares de identificación');
+      } finally { svc.running = prevRunning; }
+      eq((await svc.getInventory(OWNER, r2.session.id)).status, 'ready', 'listo');
+    });
+
+    await check('W20 P1-3 Storage caído al reconstruir: reintento con espera (1 descarga por intento, ninguna por sondeo) y tope de 3 intentos → failed', async () => {
+      const res = await newIdentified('r2-caido.mbz');
+      const sid = res.session.id;
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [sid]);
+      const realNow = svc.now;
+      let t = Date.now();
+      svc.now = () => new Date(t);
+      storage.down = true;
+      const d0 = storage.downloads;
+      try {
+        await poll(sid, 6);
+        eq(storage.downloads - d0, 1, 'intento 1: una descarga en 6 sondeos');
+        let r = await svc.getInventory(OWNER, sid);
+        eq([r.status, r.error && r.error.retryable, !!r.retryAt], ['building', true, true], 'espera programada, visible');
+        t += SVC.INVENTORY_REBUILD_BACKOFF_MS + 1000;
+        await poll(sid, 4);
+        eq(storage.downloads - d0, 2, 'intento 2 recién pasada la espera');
+        t += 4 * SVC.INVENTORY_REBUILD_BACKOFF_MS + 1000;
+        await poll(sid, 4);
+        eq(storage.downloads - d0, 3, 'intento 3');
+        t += 100 * SVC.INVENTORY_REBUILD_BACKOFF_MS;
+        r = await svc.getInventory(OWNER, sid);
+        await settle(`inventory:${sid}`);
+        eq([r.status, r.error.retryable, storage.downloads - d0], ['failed', false, 3], 'agotados los intentos: terminal, sin más descargas');
+      } finally { storage.down = false; svc.now = realNow; }
+    });
+
+    await check('W21 P2-1 original BORRADO del Storage después de identificar → failed WORKSHOP_ORIGINAL_MISSING (terminal), también al reconstruir', async () => {
+      const res = await newIdentified('r2-borrado.mbz');
+      objects.delete(res.upload.storagePath);
+      await rejects(svc.loadVerifiedOriginal(res.session.id), 409, 'WORKSHOP_ORIGINAL_MISSING', 'uso posterior');
+      let g = await svc.get(OWNER, res.session.id);
+      eq([g.status, g.error.code, g.error.retryable], ['failed', 'WORKSHOP_ORIGINAL_MISSING', false], 'sesión terminal');
+      eq((await svc.getInventory(OWNER, res.session.id)).error.code, 'WORKSHOP_ORIGINAL_MISSING', 'inventario: failed con el motivo');
+      const r2 = await newIdentified('r2-borrado2.mbz');
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [r2.session.id]);
+      objects.delete(r2.upload.storagePath);
+      const d0 = storage.downloads;
+      await poll(r2.session.id, 5);
+      g = await svc.get(OWNER, r2.session.id);
+      eq([g.status, g.error.code, storage.downloads - d0], ['failed', 'WORKSHOP_ORIGINAL_MISSING', 1], 'reconstrucción: una descarga y terminal');
+    });
+
+    await check('W22 P2-7 fuente: cada referencia lleva el dueño de su fila; si el curso sale del alcance de la sesión, la reconstrucción no usa su fuente', async () => {
+      const [iv] = await ds.query(`select inventory from public.workshop_sessions where id = $1`, [s14]);
+      // s14 falló en W16 (original cambiado); se usa otra sesión identificada por huella al curso propio.
+      const res = await newIdentified('r2-fuente.mbz');
+      const r = await svc.getInventory(OWNER, res.session.id);
+      const refs = r.inventory.chapters[0].source || [];
+      assert(refs.length && refs.every((x) => x.ownerId === OWNER.id), `dueño en cada referencia: ${JSON.stringify(refs.map((x) => x.ownerId))}`);
+      // El curso pasa a otro dueño (sale del alcance): al reconstruir, sin fuente y con el motivo.
+      await ds.query(`update public.courses set owner_id = $2 where id = $1`, [own.id, OTHER.id]);
+      try {
+        await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [res.session.id]);
+        await poll(res.session.id, 1);
+        const r2 = await svc.getInventory(OWNER, res.session.id);
+        eq([r2.status, r2.inventory.sourceLookup.status], ['ready', 'error'], 'sin fuente');
+        assert(/alcance/.test(r2.inventory.sourceLookup.detail), r2.inventory.sourceLookup.detail);
+        eq(JSON.stringify(r2.inventory).includes('"dynamic_content_md"'), false, 'ninguna referencia del curso fuera de alcance');
+      } finally {
+        await ds.query(`update public.courses set owner_id = $2 where id = $1`, [own.id, OWNER.id]);
+      }
+      void iv;
+    });
+
+    // ── Fix round 3 (B2-review.md «Re-review 1») ──
+    const nullInventory = (sid) => ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [sid]);
+
+    await check('W23 N2 «original borrado» SOLO por el status: 403 con «a404» en la ruta → transitorio (503, la sesión sigue identificada); 404 → terminal', async () => {
+      const U = { id: 'a4040400-e400-4b40-8404-400404400404', email: 'cuatro@ejemplo.edu' };
+      const res = await svc.createSession(U, { filename: 'r3.mbz', sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(U, res.session.id);
+      await settle(res.session.id);
+      eq((await svc.get(U, res.session.id)).status, 'identified', 'identificada');
+      assert(/404|400/.test(res.upload.storagePath), 'la ruta tiene los dígitos que confundían al regex');
+      storage.httpStatus = 403;
+      try {
+        await rejects(svc.loadVerifiedOriginal(res.session.id), 503, null, '403 = transitorio');
+        storage.httpStatus = 401;
+        await rejects(svc.loadVerifiedOriginal(res.session.id), 503, null, '401 = transitorio');
+        storage.httpStatus = 503;
+        await rejects(svc.loadVerifiedOriginal(res.session.id), 503, null, '5xx = transitorio');
+      } finally { storage.httpStatus = 0; }
+      eq((await svc.get(U, res.session.id)).status, 'identified', 'la sesión no se tocó');
+      objects.delete(res.upload.storagePath);
+      await rejects(svc.loadVerifiedOriginal(res.session.id), 409, 'WORKSHOP_ORIGINAL_MISSING', '404 = borrado');
+    });
+
+    await check('W24 N1 un proceso que muere a mitad de la reconstrucción GASTA su intento: 3 reclamos (cada 15 min) y después failed sin más descargas', async () => {
+      const res = await newIdentified('r3-oom.mbz');
+      const sid = res.session.id;
+      await nullInventory(sid);
+      let t = Date.now();
+      const hang = new Promise(() => {});
+      const dead = [];
+      const d0 = storage.downloads;
+      for (let i = 0; i < 3; i++) {
+        // «Proceso» nuevo cada vez; el armado se cuelga (OOM / pm2 reload simulado: nunca termina ni escribe nada).
+        const p = new SVC.CourseWorkshopService(ds, storage, permissions);
+        p.now = () => new Date(t);
+        p.inventoryBuilder = () => hang;
+        eq((await p.getInventory(OWNER, sid)).status, 'building', `reclamo ${i + 1}`);
+        await new Promise((r) => setTimeout(r, 300)); // que llegue a descargar y colgarse en el armado
+        dead.push(p);
+        t += SVC.IDENTIFY_STALE_MS + 60_000; // el reclamo vence
+      }
+      eq(storage.downloads - d0, 3, 'una descarga por intento');
+      const [row] = await ds.query(`select identification->'inventory' as inv from public.workshop_sessions where id = $1`, [sid]);
+      eq(Number(row.inv.attempts), 3, 'los 3 intentos quedaron contados al reclamar');
+      const p4 = new SVC.CourseWorkshopService(ds, storage, permissions);
+      p4.now = () => new Date(t);
+      const r = await p4.getInventory(OWNER, sid);
+      await new Promise((res2) => setTimeout(res2, 200));
+      eq([r.status, storage.downloads - d0], ['failed', 3], 'tope: failed, sin un 4.º intento');
+    });
+
+    await check('W25 N3 carril de 1 estricto: dos sondeos CONCURRENTES de sesiones distintas → una sola reconstrucción a la vez', async () => {
+      const a = await newIdentified('r3-a.mbz');
+      const b = await newIdentified('r3-b.mbz');
+      await nullInventory(a.session.id);
+      await nullInventory(b.session.id);
+      let running = 0;
+      let max = 0;
+      const real = svc.inventoryBuilder;
+      svc.inventoryBuilder = async (...args) => { running++; max = Math.max(max, running); await new Promise((r) => setTimeout(r, 150)); running--; return real(...args); };
+      try {
+        await Promise.all([svc.getInventory(OWNER, a.session.id), svc.getInventory(OWNER, b.session.id)]);
+        const keys = [...svc.inFlight.keys()].filter((k) => k.startsWith('inventory:'));
+        eq(keys.length, 1, 'una sola reconstrucción lanzada');
+        await Promise.all(keys.map((k) => settle(k)));
+        // El segundo sondeo de la otra sesión arranca recién ahora, cuando el carril quedó libre.
+        await Promise.all([svc.getInventory(OWNER, a.session.id), svc.getInventory(OWNER, b.session.id)]);
+        for (const k of [...svc.inFlight.keys()].filter((x) => x.startsWith('inventory:'))) await settle(k);
+      } finally { svc.inventoryBuilder = real; }
+      eq(max, 1, 'nunca dos armados a la vez');
+      eq([(await svc.getInventory(OWNER, a.session.id)).status, (await svc.getInventory(OWNER, b.session.id)).status], ['ready', 'ready'], 'las dos listas');
+    });
+
+    await check('W26 N4 falla determinista: terminal para su versión del armado; con otra versión (deploy con el arreglo) se reconstruye UNA vez', async () => {
+      const res = await newIdentified('r3-version.mbz');
+      const sid = res.session.id;
+      const [row] = await ds.query(`select original_sha1 from public.workshop_sessions where id = $1`, [sid]);
+      const failInfo = (codeVersion) => ({ builtAt: new Date().toISOString(), forSha1: row.original_sha1, codeVersion, attempts: 1, error: { code: 'WORKSHOP_INVENTORY_FAILED', message: 'x', retryable: false } });
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = jsonb_set(identification, '{inventory}', $2::jsonb) where id = $1`, [sid, JSON.stringify(failInfo(D('modules/course-workshop/inventory.js').INVENTORY_CODE_VERSION || 'actual'))]);
+      const d0 = storage.downloads;
+      eq((await poll(sid, 3))[2], 'failed', 'misma versión del armado: terminal');
+      eq(storage.downloads - d0, 0, 'sin descargas');
+      await ds.query(`update public.workshop_sessions set identification = jsonb_set(identification, '{inventory}', $2::jsonb) where id = $1`, [sid, JSON.stringify(failInfo('version-vieja'))]);
+      const st = await poll(sid, 4);
+      eq([st[0], st[st.length - 1], storage.downloads - d0], ['building', 'ready', 1], 'otra versión: una reconstrucción y listo');
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

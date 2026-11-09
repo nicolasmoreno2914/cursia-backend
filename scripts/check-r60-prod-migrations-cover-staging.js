@@ -45,6 +45,8 @@ const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
   'migrate-r99-activation.js': { sql: 'supabase-migration-r99-activation.sql' },
   // r107: «Taller de cursos» (workshop_sessions), staging-only hasta aprobación del owner.
   'migrate-r107-workshop-sessions.js': { sql: 'supabase-migration-r107-workshop-sessions.sql' },
+  // r107 B2: inventario + índices de la huella (dos .sql: la columna en transacción, los índices CONCURRENTLY sueltos).
+  'migrate-r107-b2-inventory.js': { sql: 'supabase-migration-r107-b2-inventory.sql', extraSql: ['supabase-migration-r107-artifacts-checksum-index.sql'] },
 };
 const STAGING_ONLY_REASON = /^r(75|79\.1|81|83|99|107): staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).
@@ -78,9 +80,13 @@ function workflowMigrations(yml) {
 }
 /** .sql que aplica un scripts/migrate-*.js (el único supabase-migration-*.sql que nombra). */
 function sqlOfScript(script) {
-  const src = read(`scripts/${script}`);
-  const files = [...new Set(src.match(/supabase-migration-[\w-]+\.sql/g) || [])];
+  const files = allSqlOfScript(script);
   return files.length === 1 ? files[0] : null;
+}
+/** r107 B2: todos los .sql que nombra (un script staging-only puede aplicar más de uno: `extraSql`). */
+function allSqlOfScript(script) {
+  const src = read(`scripts/${script}`);
+  return [...new Set(src.match(/supabase-migration-[\w-]+\.sql/g) || [])].sort();
 }
 
 /** Hallazgos de cobertura/orden para un plan dado (puro: lo usa también la autoprueba). */
@@ -97,10 +103,14 @@ function coverageFindings(stagingScripts, plan) {
       const exScript = excluded.get(`scripts/${script}`);
       if (!exScript || !STAGING_ONLY_REASON.test(exScript)) errs.push(`${script}: staging-only r75 pero falta en EXCLUDED con el motivo «r75: staging-only hasta aprobación del owner»`);
       if (so.sql) {
-        if (sqlOfScript(script) !== so.sql) errs.push(`${script}: se esperaba que aplique ${so.sql} (aplica ${sqlOfScript(script)})`);
-        const exSql = excluded.get(so.sql);
-        if (!exSql || !STAGING_ONLY_REASON.test(exSql)) errs.push(`${so.sql}: staging-only r75 pero falta en EXCLUDED con el motivo «r75: staging-only hasta aprobación del owner»`);
-        if (planFiles.includes(so.sql)) errs.push(`${so.sql}: staging-only r75 pero está en el plan de producción`);
+        const want = [so.sql, ...(so.extraSql || [])].sort();
+        const got = allSqlOfScript(script);
+        if (JSON.stringify(got) !== JSON.stringify(want)) errs.push(`${script}: se esperaba que aplique ${want.join(' + ')} (aplica ${got.join(' + ') || 'ninguno'})`);
+        for (const f of want) {
+          const exSql = excluded.get(f);
+          if (!exSql || !STAGING_ONLY_REASON.test(exSql)) errs.push(`${f}: staging-only r75 pero falta en EXCLUDED con el motivo «r75: staging-only hasta aprobación del owner»`);
+          if (planFiles.includes(f)) errs.push(`${f}: staging-only r75 pero está en el plan de producción`);
+        }
       }
       continue;
     }

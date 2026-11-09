@@ -235,6 +235,11 @@ jobs:
       - name: Check r107 Taller de cursos — lector seguro + identificación (puro, sintéticos)
         run: node scripts/r107/check-r107-identify.js --ci
 
+      # r107 B2: inventario (modelo único WorkshopCourse + adaptadores por familia) del Taller de cursos. --ci = solo
+      # sintéticos v3 y dañados generados en el momento (exactitud contra el builder, tokens, determinismo).
+      - name: Check r107 Taller de cursos — inventario (puro, sintéticos)
+        run: node scripts/r107/check-r107-inventory.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -869,6 +874,12 @@ jobs:
                # producción). Aditiva e idempotente. Sin la tabla la API del Taller responde 503; flag COURSE_WORKSHOP apagado → 404.
                echo "━━━ [5i] r107: Taller de cursos (workshop_sessions) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r107-workshop-sessions.js
+
+               # r107 B2: workshop_sessions.inventory (columna nullable de la tabla nueva de r107) + índices parciales de la
+               # huella en artifacts (CREATE INDEX CONCURRENTLY: no bloquea escrituras). Staging-only (EXCLUDED del plan de
+               # producción). Aditiva e idempotente; requiere [5i].
+               echo "━━━ [5j] r107 B2: Taller de cursos (inventario + índice de huella) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r107-b2-inventory.js
 
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
