@@ -33,7 +33,7 @@
 //   r107 B3 (diagnóstico técnico):
 //   W27 migración B3 aditiva e idempotente (dos veces): workshop_diagnoses + workshop_findings, RLS, sin anon/authenticated,
 //       FK en cascada, CHECKs; workshop_sessions / courses / artifacts intactas; el script se niega sin MIGRATION_ENV=staging
-//   W28 POST …/diagnosis → 202 running → ready: informe + hallazgos persistidos (uno por fila, en orden), semáforo verde
+//   W28 POST …/diagnosis → 202 queued → running → ready: informe + hallazgos persistidos (uno por fila, en orden), semáforo verde
 //       del sintético sano; GET devuelve lo mismo
 //   W29 idempotente: re-POST (también concurrente) → el mismo diagnóstico, NINGÚN run ni fila nueva; un paquete dañado
 //       → sus hallazgos con su arreglo sugerido
@@ -41,6 +41,12 @@
 //       sin las tablas → 503 COURSE_WORKSHOP_NOT_MIGRATED
 //   W31 original cambiado → NO diagnostica: 409 WORKSHOP_ORIGINAL_CHANGED (sesión failed), 0 runs, 0 hallazgos; también si
 //       cambia entre el POST y la corrida (el diagnóstico queda failed con ese código)
+//   Fix round 1:
+//   W33 P1-1 carril PROPIO de 1: 5 diagnósticos concurrentes → nunca más de 1 corriendo, ninguno ocupa un lugar de
+//       identificación (una identificación termina mientras el carril está ocupado); P2-7: los que esperan quedan
+//       `queued` y NO vencen aunque pasen 15 min; re-POST de uno en cola no duplica nada; 1 descarga por diagnóstico
+//   W34 P1-1 presupuesto de memoria: un original cuyo estimado lo supera → failed WORKSHOP_DIAGNOSIS_TOO_LARGE, visible,
+//       no reintentable, sin descargarlo
 //   W32 un run interrumpido (proceso reiniciado) → GET lo marca fallido reintentable; el POST lo reclama y termina; una
 //       falla determinista del diagnóstico es terminal (no se reintenta sola)
 //
@@ -800,13 +806,13 @@ function rawZip(entries) {
     const DGN = D('modules/course-workshop/diagnosis/diagnose.js');
     const settleD = (sid) => settle(`diagnosis:${sid}`);
     let dsid;
-    await check('W28 POST …/diagnosis → 202 running → ready: informe + hallazgos persistidos en orden; GET devuelve lo mismo', async () => {
+    await check('W28 POST …/diagnosis → 202 queued → running → ready: informe + hallazgos persistidos en orden; GET devuelve lo mismo', async () => {
       const res = await newIdentified('b3-sano.mbz');
       dsid = res.session.id;
       eq((await svc.getDiagnosis(OWNER, dsid)).status, 'not_started', 'antes de pedirlo');
       const runs0 = svc.diagnosisRuns;
       const a = await svc.startDiagnosis(OWNER, dsid);
-      eq([a.status, a.codeVersion, a.report], ['running', DGN.DIAGNOSIS_CODE_VERSION, null], '202 running');
+      eq([a.status, a.codeVersion, a.report], ['queued', DGN.DIAGNOSIS_CODE_VERSION, null], '202 en cola (fix round 1: running recién al tomar el carril)');
       await settleD(dsid);
       const g = await svc.getDiagnosis(OWNER, dsid);
       eq([g.status, g.error, svc.diagnosisRuns - runs0], ['ready', null, 1], 'listo, un run');
@@ -892,7 +898,7 @@ function rawZip(entries) {
       // (a) cambia entre el POST y la corrida: el run verifica el original y falla sin diagnosticar.
       objects.set(res.upload.storagePath, tampered);
       const runs0 = svc.diagnosisRuns;
-      eq((await svc.startDiagnosis(OWNER, sid)).status, 'running', '202');
+      eq((await svc.startDiagnosis(OWNER, sid)).status, 'queued', '202');
       await settleD(sid);
       eq(svc.diagnosisRuns - runs0, 0, 'no se diagnosticó');
       const g = await svc.getDiagnosis(OWNER, sid);
@@ -938,6 +944,60 @@ function rawZip(entries) {
       const runs0 = svc.diagnosisRuns;
       eq((await svc.startDiagnosis(OWNER, res2.session.id)).status, 'failed', 're-POST: la misma falla');
       eq(svc.diagnosisRuns - runs0, 0, 'no se reintenta sola');
+    });
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    await check('W33 P1-1/P2-7 carril propio de 1: 5 concurrentes → máx. 1 corriendo, 0 lugares de identificación; en cola no vence; re-POST no duplica', async () => {
+      const sids = [];
+      for (let i = 0; i < 5; i++) sids.push((await newIdentified(`b3-carril-${i}.mbz`)).session.id);
+      const real = svc.diagnosisRunner;
+      let open = false; let cur = 0; let max = 0; let idSlots = 0;
+      svc.diagnosisRunner = async (input) => {
+        cur++; max = Math.max(max, cur); idSlots = Math.max(idSlots, svc.runningCount);
+        while (!open) await sleep(5);
+        cur--;
+        return real(input);
+      };
+      const d0 = storage.downloads;
+      try {
+        const st = await Promise.all(sids.map((sid) => svc.startDiagnosis(OWNER, sid)));
+        eq([...new Set(st.map((x) => x.status))], ['queued'], 'todos en cola al responder');
+        await sleep(80);
+        eq([svc.diagnosisRunningCount, svc.runningCount], [1, 0], 'uno en el carril, ningún lugar de identificación');
+        // Una identificación corre y TERMINA mientras el carril del diagnóstico está ocupado.
+        const during = await newIdentified('b3-carril-durante.mbz');
+        eq((await svc.get(OWNER, during.session.id)).status, 'identified', 'la identificación no espera al diagnóstico');
+        const rows = await ds.query(`select status, count(*)::int n from public.workshop_diagnoses where session_id = any($1::uuid[]) group by status order by status`, [sids]);
+        eq(rows.map((r) => [r.status, r.n]), [['queued', 4], ['running', 1]], '4 en cola, 1 corriendo');
+        // P2-7: uno en cola desde hace 20 min (más que el plazo de running) NO se da por interrumpido ni se duplica.
+        const [q] = await ds.query(`select d.session_id from public.workshop_diagnoses d where d.session_id = any($1::uuid[]) and d.status = 'queued' limit 1`, [sids]);
+        await ds.query(`update public.workshop_diagnoses set updated_at = now() - interval '20 minutes' where session_id = $1`, [q.session_id]);
+        eq((await svc.getDiagnosis(OWNER, q.session_id)).status, 'queued', 'en cola: no vence a los 15 min');
+        const again = await svc.startDiagnosis(OWNER, q.session_id);
+        eq(again.status, 'queued', 're-POST: el mismo en cola');
+        open = true;
+        for (const sid of sids) await settleD(sid);
+      } finally { svc.diagnosisRunner = real; open = true; }
+      eq([max, idSlots], [1, 0], 'nunca más de 1 a la vez, nunca en un lugar de identificación');
+      for (const sid of sids) eq((await svc.getDiagnosis(OWNER, sid)).status, 'ready', `listo ${sid}`);
+      // 5 diagnósticos + la identificación de «durante» = 6 descargas; el re-POST no agregó ninguna.
+      eq(storage.downloads - d0, 6, 'una descarga por diagnóstico (y la de la identificación)');
+    });
+
+    await check('W34 P1-1 presupuesto de memoria: original demasiado grande → failed WORKSHOP_DIAGNOSIS_TOO_LARGE visible, sin descargarlo', async () => {
+      const res = await newIdentified('b3-grande.mbz');
+      const saved = svc.diagnosisMemoryBudgetBytes;
+      const d0 = storage.downloads; const runs0 = svc.diagnosisRuns;
+      svc.diagnosisMemoryBudgetBytes = MBZ.length * 4; // estimado = 5 × tamaño > presupuesto
+      try {
+        const a = await svc.startDiagnosis(OWNER, res.session.id);
+        eq([a.status, a.error && a.error.code, a.error && a.error.retryable], ['failed', 'WORKSHOP_DIAGNOSIS_TOO_LARGE', false], 'falla visible');
+        assert(/MB/.test(a.error.message), 'motivo con tamaños');
+        await settleD(res.session.id);
+        eq((await svc.getDiagnosis(OWNER, res.session.id)).error.code, 'WORKSHOP_DIAGNOSIS_TOO_LARGE', 'GET igual');
+        eq((await svc.startDiagnosis(OWNER, res.session.id)).status, 'failed', 're-POST: la misma falla');
+        eq([storage.downloads - d0, svc.diagnosisRuns - runs0], [0, 0], 'no se descargó ni corrió');
+      } finally { svc.diagnosisMemoryBudgetBytes = saved; }
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

@@ -2,7 +2,7 @@
 -- Cursia — r107 B3 «Taller de cursos»: diagnóstico técnico (T01–T12) de la sesión.
 --
 --   workshop_diagnoses  UN diagnóstico por (sesión, sha1 del original, versión del armado del diagnóstico): estado
---                       (running → ready | failed + error visible), reclamo (claim_id: solo quien lo tiene escribe) y el
+--                       (queued → running → ready | failed + error visible), reclamo (claim_id: solo quien lo tiene escribe) y el
 --                       INFORME con semáforo por curso / capítulo / actividad y conteos por check — sin la lista de
 --                       hallazgos, que va en workshop_findings. Re-pedir el diagnóstico del mismo original no duplica
 --                       nada (índice único); un original nuevo o una versión nueva del armado = otra fila.
@@ -27,7 +27,7 @@ create table if not exists public.workshop_diagnoses (
   session_id     uuid not null references public.workshop_sessions(id) on delete cascade,
   original_sha1  text not null check (original_sha1 ~ '^[0-9a-f]{40}$'),
   code_version   text not null check (length(code_version) between 1 and 40),
-  status         text not null default 'running' check (status in ('running', 'ready', 'failed')),
+  status         text not null default 'queued' check (status in ('queued', 'running', 'ready', 'failed')),
   claim_id       text null,
   report         jsonb null,
   error          jsonb null,
@@ -36,6 +36,10 @@ create table if not exists public.workshop_diagnoses (
   created_at     timestamptz not null default now(),
   updated_at     timestamptz not null default now()
 );
+-- Fix round 1 (P2-7): estado `queued` (esperando el carril del proceso). Idempotente también sobre una tabla creada antes
+-- con el CHECK sin `queued` (solo pruebas locales: la tabla todavía no existe en staging).
+alter table public.workshop_diagnoses drop constraint if exists workshop_diagnoses_status_check;
+alter table public.workshop_diagnoses add constraint workshop_diagnoses_status_check check (status in ('queued', 'running', 'ready', 'failed'));
 create unique index if not exists workshop_diagnoses_version_uidx on public.workshop_diagnoses (session_id, original_sha1, code_version);
 
 create table if not exists public.workshop_findings (
