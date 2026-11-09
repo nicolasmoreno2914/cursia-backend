@@ -101,6 +101,11 @@ function indexStatements(sql) {
 /** CREATE INDEX CONCURRENTLY idempotente: si el índice existe pero quedó inválido (intento cortado), se rehace. */
 async function applyIndexes(client) {
   const sql = fs.readFileSync(path.resolve(__dirname, '..', INDEX_SQL), 'utf8');
+  // Fix round 2 (P2-9): CREATE INDEX CONCURRENTLY espera a las transacciones viejas y esa espera respeta lock_timeout; con
+  // el tope corto de una migración normal el índice quedaba INVÁLIDO ante cualquier transacción larga. Topes propios,
+  // amplios pero finitos (el deploy no se cuelga para siempre), solo para esta sesión.
+  await client.query(`set lock_timeout = '10min'`);
+  await client.query(`set statement_timeout = '30min'`);
   for (const stmt of indexStatements(sql)) {
     const name = (/create index concurrently if not exists (\w+)/i.exec(stmt) || [])[1];
     if (!name) throw new Error('sentencia de índice sin nombre: ' + stmt.slice(0, 80));
@@ -113,6 +118,8 @@ async function applyIndexes(client) {
     }
     await client.query(stmt);
   }
+  await client.query('reset lock_timeout');
+  await client.query('reset statement_timeout');
 }
 
 async function main() {

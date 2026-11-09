@@ -309,13 +309,28 @@ export function classifyByContent(i: ClassifyInput): Classified | null {
   const p = i.plain.replace(/^(?:\S{1,3}\s+)?Secci[óo]n \d{1,2}\s*·\s*/i, '').replace(/^\d{1,2}\s+(?=\S{1,3}\s)/, '');
   const html = i.a.html.find((h) => h.field === 'intro')?.html ?? '';
   let m: RegExpExecArray | null;
+  // Fix round 2 (P1-1): la tarjeta de la presentación Gamma también empieza con «Capítulo N» (el distintivo antes del
+  // <h2>: mbz-builder.service.ts gammaLabelHtml, 31-course-production.js _cpBuildGammaLabelHtml) — se reconoce PRIMERO por
+  // su plantilla: «Presentación del capítulo», enlace a gamma.app, o 📊 + «diapositivas».
+  if (/Presentaci[óo]n del cap[íi]tulo/i.test(p) || /gamma\.app\//i.test(html) || (/📊/.test(p) && /diapositivas/i.test(p))) {
+    const n = /\bCap[íi]tulo\s+(\d{1,3})\b/i.exec(p.slice(0, 160));
+    return n
+      ? chapterOf('presentation', 'presentation', Number(n[1]), 'contenido de la tarjeta de presentación («Presentación del capítulo» / gamma.app / diapositivas)')
+      : unknownOf('tarjeta de presentación sin número de capítulo al comienzo', 'contenido de la tarjeta de presentación');
+  }
   if ((m = /^(?:\S{1,3}\s+)?(?:M[ÓO]DULO\s+\d{1,2}\s*[·•—–-]\s*)?CAP(?:[ÍI]TULO)?\.?\s+(\d{1,3})\b/i.exec(p))) {
-    return chapterOf('text', 'chapter_page', Number(m[1]), `contenido «${p.slice(0, m[0].length)}…»`);
+    // La página del capítulo (capN_video_interactivo.html) trae su firma: instrucciones del video / el video embebido.
+    if (/Instrucciones|video|📺|<iframe|H5P/i.test(html)) return chapterOf('text', 'chapter_page', Number(m[1]), `contenido «${p.slice(0, m[0].length)}…» + firma de la página del capítulo`);
+    return unknownOf(`empieza con «${p.slice(0, m[0].length)}» pero no tiene la firma de la página del capítulo (instrucciones / video)`, 'contenido «CAPÍTULO N»');
   }
   const title = (i.a.title || i.a.name || '').replace(/\s+/g, ' ').trim();
   if ((m = /^🎮\s*Actividad Interactiva\s*[·:]?\s*Cap[íi]tulo\s+(\d{1,3})\b/i.exec(title))) return chapterOf('cta', 'game_description', Number(m[1]), 'título «🎮 Actividad Interactiva Capítulo N: …»');
-  // Juego escrito por el docente con el capítulo entre paréntesis («🧠 MarketingLand: … (Capítulo 8)»).
-  if ((m = /^\S{1,3}\s+[^:]{2,60}:.*\(Cap[íi]tulo (\d{1,3})\)/.exec(p.slice(0, 200)))) return chapterOf('cta', 'game_description', Number(m[1]), 'contenido «<juego>: … (Capítulo N)»');
+  // Juego escrito por el docente con el capítulo entre paréntesis («🧠 MarketingLand: … (Capítulo 8)»): solo con emoji o
+  // vocabulario de JUEGO (fix round 2, P2-6) — «📌 Nota: repasa … (Capítulo 3)» no es una descripción de juego.
+  const game = /^(\S{1,3})\s+([^:]{2,60}):.*\(Cap[íi]tulo (\d{1,3})\)/.exec(p.slice(0, 200));
+  if (game && (/^(?:🎮|🧩|🧠|🕹️?|🎲|🃏|🏆|🎯)$/u.test(game[1]) || /juego|videojuego|quiz|trivia|reto|desaf[íi]o|clasificador|pasapalabra|ruleta|land\b/i.test(game[2]))) {
+    return chapterOf('cta', 'game_description', Number(game[3]), 'contenido «<juego>: … (Capítulo N)»');
+  }
   if ((m = /^🎮\s*Actividad Interactiva\s*[·:]?\s*Cap[íi]tulo\s+(\d{1,3})\b/i.exec(p))) return chapterOf('cta', 'game_description', Number(m[1]), 'contenido «🎮 Actividad Interactiva · Capítulo N»');
   if ((m = /^(?:🎯\s*)?Practicar\b.*?\bCap(?:[íi]tulo)?\.?\s+(\d{1,3})\b/i.exec(p.slice(0, 80)))) return chapterOf('cta', 'practice_cta', Number(m[1]), 'contenido «🎯 Practicar … Cap N»');
   if (/^✅\s*Evaluaci[óo]n de Unidad/i.test(p)) {

@@ -21,6 +21,11 @@
 //      curso del backup (otro curso → `external`, con su `#module-N` resuelto aparte), HVPEMBEDBYID contra el moduleid del
 //      hvp (huérfano / roto), id de instancia (FORUMVIEWBYF), BOOKVIEWBYIDCH, *INDEX, PLUGINFILEBYCONTEXT del curso
 //
+//   V11–V15 (fix round 2, B2-review.md): tarjeta Gamma en re-export = presentation (P1-1; local: un V1 real con Gamma
+//      «re-exportado»); re-export de un v3 = mismos roles por la clave del builder (P1-2); referencias exactas en bytes de
+//      campos y tokens (P2-2); tokens de resúmenes y preguntas + COURSESECTIONBYID por id + una versión por pregunta
+//      (P2-3/4/5); ubicación por el uuid del capítulo antes que la sección o el vecino (P2-6)
+//
 //   --census <survey.json> (local, fix round 1): TODO el censo real (survey-corpus.js): 0 excepciones salvo los rechazos
 //      tipados del lector; unknown 0 en V1 y v2; por familia se imprimen capítulos, paquetes sin capítulos, unknown y los
 //      estados de los tokens (y el detalle de los no ok)
@@ -197,6 +202,116 @@ async function censusMode(surveyPath) {
   });
   console.log(`\n${fail ? '❌' : '✅'} check-r107-inventory --census: ${ok} ok, ${fail} fallidos`);
   process.exit(fail ? 1 : 0);
+}
+
+// Fix round 2: «re-export de Moodle» simulado sobre un paquete real o sintético — Moodle renombra cada label con el
+// comienzo de su texto o «labelNNN» (en label.xml y en moodle_backup.xml); el idnumber sobrevive. Opcionalmente quita la
+// clave del builder (re-export de un curso sin clave).
+async function simulateReexport(buf, { dropKeys = false } = {}) {
+  const JSZip = require('jszip');
+  const z = await JSZip.loadAsync(buf);
+  let mb = await z.file('moodle_backup.xml').async('string');
+  const dirs = new Set();
+  z.forEach((p) => { const m = /^activities\/(label_\d+)\//.exec(p); if (m) dirs.add(m[1]); });
+  for (const d of dirs) {
+    const id = d.split('_')[1];
+    const lp = `activities/${d}/label.xml`;
+    if (z.file(lp)) z.file(lp, (await z.file(lp).async('string')).replace(/<name>[^<]*<\/name>/, () => `<name>label${id}</name>`));
+    mb = mb.replace(new RegExp(`(<moduleid>${id}</moduleid>[\\s\\S]*?<title>)[^<]*(</title>)`), (_m, a, b) => `${a}label${id}${b}`);
+    if (dropKeys) {
+      const mp = `activities/${d}/module.xml`;
+      if (z.file(mp)) z.file(mp, (await z.file(mp).async('string')).replace(/<idnumber>[^<]*<\/idnumber>/, '<idnumber></idnumber>'));
+    }
+  }
+  z.file('moodle_backup.xml', mb);
+  return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+// Fix round 2: paquete mínimo de re-export con la tarjeta Gamma EXACTA de mbz-builder.service.ts gammaLabelHtml (label
+// 20), la página del capítulo (21), una nota del docente con «(Capítulo 3)» (22), un juego del docente (23) y el hvp (24).
+async function gammaReexportFixture() {
+  const JSZip = require('jszip');
+  const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const gamma = '<div class="cc-responsive" style="width:100%;"><div style="background:#0A1628;border-radius:20px;padding:28px;">'
+    + '<span style="display:inline-block;padding:5px 16px;">Capítulo 3</span><h2 style="font-size:22px;">Fundamentos de la medición</h2>'
+    + '<h3 style="font-size:11px;"><span>📊</span>Presentación del capítulo</h3><p>10 diapositivas con lo esencial de este capítulo</p>'
+    + '<a href="@@PLUGINFILE@@/capitulo-3.pdf" target="_blank">Ver presentación</a></div></div>';
+  const page = '<div><p>MÓDULO 1 · CAPÍTULO 3</p><h2>Fundamentos de la medición</h2><p>📌 Instrucciones: mira el video interactivo.</p></div>';
+  const note = '<p>📌 Nota: repasa el glosario antes del examen (Capítulo 3)</p>';
+  const game = '<p>🧩 Clasificador Estratégico: arrastra cada concepto (Capítulo 3)</p>';
+  const acts = [[20, 'label', 'label20', gamma], [21, 'label', 'label21', page], [22, 'label', 'label22', note], [23, 'label', 'label23', game], [24, 'hvp', 'Capítulo 3: Fundamentos', '']];
+  const z = new JSZip();
+  z.file('moodle_backup.xml', `<?xml version="1.0" encoding="UTF-8"?><moodle_backup><information><name>backup-moodle2-course-9-x.mbz</name><original_course_id>9</original_course_id>`
+    + `<original_course_fullname>Re-export Gamma</original_course_fullname><contents><activities>`
+    + acts.map(([id, mod, t]) => `<activity><moduleid>${id}</moduleid><sectionid>40</sectionid><modulename>${mod}</modulename><title>${esc(t)}</title><directory>activities/${mod}_${id}</directory></activity>`).join('')
+    + `</activities><sections><section><sectionid>40</sectionid><title>Unidad 1</title><directory>sections/section_40</directory></section></sections></contents></information></moodle_backup>`);
+  z.file('sections/section_40/section.xml', '<section id="40"><number>2</number><name>Unidad 1</name><summary></summary><sequence>20,21,22,23,24</sequence><visible>1</visible></section>');
+  for (const [id, mod, t, html] of acts) {
+    z.file(`activities/${mod}_${id}/module.xml`, `<module id="${id}"><modulename>${mod}</modulename><sectionid>40</sectionid><sectionnumber>2</sectionnumber><idnumber></idnumber><visible>1</visible></module>`);
+    z.file(`activities/${mod}_${id}/${mod}.xml`, `<activity id="${id}" moduleid="${id}" modulename="${mod}" contextid="${200 + id}"><${mod} id="${id}"><name>${esc(t)}</name><intro>${esc(html)}</intro></${mod}></activity>`);
+  }
+  z.file('files.xml', '<files></files>');
+  return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+// Fix round 2: paquete mínimo para P2-2/P2-3/P2-4/P2-5 — sección id 12 / número 2, resumen de sección y de curso con
+// tokens, quiz 31 con un banco de 2 entradas (la 900 con versiones 1 y 2; la 901 pedida en versión 1) y un token en el
+// enunciado de una pregunta, un token roto seguido de `"`, y texto no ASCII antes de los tokens (bytes ≠ caracteres).
+async function r2Fixture() {
+  const JSZip = require('jszip');
+  const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const z = new JSZip();
+  const acts = [[30, 'label', '🎯 Practicar — Cap 1'], [31, 'quiz', '📝 Examen Unidad 1'], [32, 'forum', 'Avisos']];
+  z.file('moodle_backup.xml', `<?xml version="1.0" encoding="UTF-8"?><moodle_backup><information><name>r2.mbz</name><original_course_id>5</original_course_id>`
+    + `<original_course_contextid>2</original_course_contextid><original_course_fullname>R2</original_course_fullname><contents><activities>`
+    + acts.map(([id, mod, t]) => `<activity><moduleid>${id}</moduleid><sectionid>12</sectionid><modulename>${mod}</modulename><title>${t}</title><directory>activities/${mod}_${id}</directory></activity>`).join('')
+    + `</activities><sections><section><sectionid>12</sectionid><title>Módulo 1 — Uno</title><directory>sections/section_12</directory></section></sections></contents></information></moodle_backup>`);
+  z.file('course/course.xml', `<course id="5" contextid="2"><summary>${esc('<p>Ver el <a href="$@QUIZVIEWBYID*31@$">examen</a></p>')}</summary></course>`);
+  z.file('sections/section_12/section.xml', `<section id="12"><number>2</number><name>Módulo 1 — Uno</name><summary>${esc('<p>Avisos: <a href="$@FORUMVIEWBYID*32@$">foro</a></p>')}</summary><sequence>30,31,32</sequence><visible>1</visible></section>`);
+  const labelHtml = '<p>Ñandú «ñ» — señal: <a href="$@COURSESECTIONBYID*2@$">número</a> <a href="$@COURSESECTIONBYID*12@$">id</a> <a href="$@QUIZVIEWBYID*31@$">quiz</a> <iframe src="$@SCORMVIEWBYID*7@"></iframe></p>';
+  const inst = { 30: 1, 31: 2, 32: 3 };
+  for (const [id, mod, t] of acts) {
+    const extra = mod === 'quiz'
+      ? '<question_instances><question_instance id="1"><slot>1</slot><question_reference id="1"><questionbankentryid>900</questionbankentryid><version>$@NULL@$</version></question_reference></question_instance>'
+        + '<question_instance id="2"><slot>2</slot><question_reference id="2"><questionbankentryid>901</questionbankentryid><version>1</version></question_reference></question_instance></question_instances>'
+      : '';
+    z.file(`activities/${mod}_${id}/module.xml`, `<module id="${id}"><modulename>${mod}</modulename><sectionid>12</sectionid><sectionnumber>2</sectionnumber><idnumber></idnumber><visible>1</visible></module>`);
+    z.file(`activities/${mod}_${id}/${mod}.xml`, `<activity id="${inst[id]}" moduleid="${id}" modulename="${mod}" contextid="${100 + id}"><${mod} id="${inst[id]}"><name>${esc(t)}</name><intro>${id === 30 ? esc(labelHtml) : ''}</intro>${extra}</${mod}></activity>`);
+  }
+  const q = (qid, name, text) => `<question id="${qid}"><name>${name}</name><questiontext>${esc(text)}</questiontext><qtype>multichoice</qtype><plugin_qtype_multichoice_question><answers><answer id="${qid}0"><answertext>a</answertext><fraction>1.0000000</fraction></answer></answers></plugin_qtype_multichoice_question></question>`;
+  z.file('questions.xml', '<question_categories><question_category id="1"><name>Banco</name><contextid>131</contextid><contextinstanceid>31</contextinstanceid><question_bank_entries>'
+    + '<question_bank_entry id="900"><question_version><question_versions id="1"><version>1</version><questions>' + q(500, 'v1', 'Vieja') + '</questions></question_versions>'
+    + '<question_versions id="2"><version>2</version><questions>' + q(501, 'v2', '<p>Nueva: <a href="$@COURSEVIEWBYID*5@$">curso</a> y <a href="$@LABELVIEWBYID*30@$">x</a></p>') + '</questions></question_versions></question_version></question_bank_entry>'
+    + '<question_bank_entry id="901"><question_version><question_versions id="3"><version>1</version><questions>' + q(510, 'e2v1', 'Pedida') + '</questions></question_versions>'
+    + '<question_versions id="4"><version>2</version><questions>' + q(511, 'e2v2', 'Más nueva') + '</questions></question_versions></question_version></question_bank_entry>'
+    + '</question_bank_entries></question_category></question_categories>');
+  z.file('files.xml', '<files></files>');
+  return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+// Fix round 2 (P2-6): A-S con el label de síntesis del capítulo 2 (clave cv3:ch:<uuid cap 2>) movido al FINAL de la
+// sección del capítulo 1 y sin número en el título: manda el uuid (capítulo 2), no la sección ni el vecino.
+async function movedKeyFixture(base) {
+  const JSZip = require('jszip');
+  const z = await JSZip.loadAsync(base);
+  const dirs = [];
+  z.forEach((p) => { const m = /^activities\/(label_\d+)\/module\.xml$/.exec(p); if (m) dirs.push(m[1]); });
+  let victim = null;
+  for (const d of dirs.sort()) {
+    const mx = await z.file(`activities/${d}/module.xml`).async('string');
+    const lx = await z.file(`activities/${d}/label.xml`).async('string');
+    if (/:synthesis</.test(mx) && /<name>Capítulo 2 · Síntesis<\/name>/.test(lx)) { victim = { d, mid: d.split('_')[1], mx, lx }; break; }
+  }
+  if (!victim) throw new Error('A-S sin síntesis del capítulo 2');
+  z.file(`activities/${victim.d}/label.xml`, victim.lx.replace('<name>Capítulo 2 · Síntesis</name>', '<name>Síntesis</name>'));
+  let mb = await z.file('moodle_backup.xml').async('string');
+  mb = mb.replace(new RegExp(`(<moduleid>${victim.mid}</moduleid>[\\s\\S]*?<title>)[^<]*(</title>)`), (_m, a, b) => `${a}Síntesis${b}`);
+  z.file('moodle_backup.xml', mb);
+  const from = (await z.file('sections/section_3/section.xml').async('string'));
+  z.file('sections/section_3/section.xml', from.replace(new RegExp(`(<sequence>[^<]*?)\\b${victim.mid},?`), '$1').replace(/,<\/sequence>/, '</sequence>'));
+  const to = await z.file('sections/section_2/section.xml').async('string');
+  z.file('sections/section_2/section.xml', to.replace(/<\/sequence>/, `,${victim.mid}</sequence>`));
+  return { buf: await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), moduleId: Number(victim.mid) };
 }
 
 const unknownActs = (inv) => inv.activities.filter((a) => a.role === 'unknown' || (a.placement.scope === 'course' && a.kind === 'unknown'));
@@ -418,6 +533,19 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
     ];
     const structure = { chapters: [{ id: 'aaaaaaaa-0000-4000-8000-000000000002', number: 4, moduleId: 'm' }], modules: [] };
     const c = INV.attachSources(inv, { courseId: 7, rows, structure });
+    // Fix round 2 (P2-7): con uuids en el paquete, la posición NO engancha nada (exacto o nada).
+    assert(!JSON.stringify(c).includes('"b-pos"'), 'con uuids del builder no se engancha por posición');
+    // Sin uuids (legacy) y la MISMA cantidad de capítulos: por posición; con otra cantidad, nada.
+    const legacy = JSON.parse(JSON.stringify(inv));
+    for (const ch of legacy.chapters) ch.builderUuid = null;
+    for (const m of legacy.modules) m.builderUuid = null;
+    const st9 = { chapters: legacy.chapters.map((ch, i) => ({ id: `aaaaaaaa-0000-4000-8000-00000000000${i}`, number: ch.number, moduleId: 'm' })), modules: [] };
+    const posRow = [{ id: 'b-pos', type: 'dynamic_video_interactions_json', ownerId: 'owner-x', chapterId: st9.chapters[3].id, moduleId: null, itemKey: null, createdAt: null }];
+    const cl = INV.attachSources(legacy, { courseId: 7, rows: posRow, structure: st9 });
+    const v4 = cl.activities.find((a) => a.placement.chapterNumber === 4 && a.role === 'video');
+    assert(v4 && v4.source.some((s) => s.artifactId === 'b-pos' && s.matchedBy === 'chapter_position' && s.ownerId === 'owner-x'), 'por posición (course_chapters), con el dueño de la fila');
+    const cl2 = INV.attachSources(legacy, { courseId: 7, rows: posRow, structure: { chapters: st9.chapters.slice(0, 5), modules: [] } });
+    assert(!JSON.stringify(cl2).includes('"b-pos"'), 'otra cantidad de capítulos → no se adivina por posición');
     eq([c.sourceLookup.status, c.sourceLookup.courseId], ['found', 7], 'estado');
     const s1 = c.chapters[0].source;
     assert(s1.some((s) => s.artifactId === 'a-new' && s.matchedBy === 'chapter_uuid') && !s1.some((s) => s.artifactId === 'a-old'), `cap 1: la más reciente por uuid ${JSON.stringify(s1)}`);
@@ -425,8 +553,6 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
     const text1 = c.activities.filter((a) => a.placement.chapterNumber === 1 && a.role === 'text');
     assert(text1.length && text1.every((a) => (a.source || []).some((s) => s.artifactId === 'a-new')), 'el md del capítulo llega a sus actividades de texto');
     assert(c.activities.filter((a) => a.placement.chapterNumber === 1 && a.role === 'game').every((a) => !(a.source || []).some((s) => s.artifactId === 'a-new')), 'el md NO se engancha al juego');
-    const v4 = c.activities.find((a) => a.placement.chapterNumber === 4 && a.role === 'video');
-    assert(v4 && v4.source.some((s) => s.artifactId === 'b-pos' && s.matchedBy === 'chapter_position'), 'por posición (course_chapters)');
     const e1 = c.activities.find((a) => a.kind === 'exam' && a.unit === 1);
     assert(e1.source.some((s) => s.artifactId === 'c-exam' && s.matchedBy === 'module_uuid'), 'examen del módulo por uuid');
     const fin = c.activities.find((a) => a.kind === 'final_exam');
@@ -517,6 +643,101 @@ const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0') + '%';
     eq(lab.tokens.filter((x) => x.status === 'malformed').length, 1, 'hvp roto por $&');
     eq(inv.activities.find((a) => a.moduleId === 11).referencedBy, [10], 'el hvp lo referencia el label');
     eq(inv.activities.find((a) => a.moduleId === 12).referencedBy, [10], 'el foro (por instancia) también');
+  });
+
+  // ── Fix round 2 (revisión B2-review.md) ──
+  const AS = fixtures.find((x) => x.id === 'synthetic:v3-A-S');
+  const asInv = built.get(AS.id).inv;
+  const roleKey = (inv) => inv.activities.map((a) => [a.moduleId, a.placement.scope, a.placement.chapterNumber, a.role, a.kind].join(':'));
+
+  await check('V11 P1-1 re-export: la tarjeta Gamma es `presentation` (no texto); página del capítulo con su firma = text; nota del docente con «(Capítulo N)» = unknown, juego = cta', async () => {
+    const inv = (await inventoryOf(await gammaReexportFixture(), 'backup-moodle2-course-9-x.mbz')).inv;
+    eq(inv.family, 'moodle-reexport', 'familia');
+    const r = (mid) => { const a = inv.activities.find((x) => x.moduleId === mid); return [a.role, a.kind, a.placement.chapterNumber]; };
+    eq(r(20), ['presentation', 'presentation', 3], 'tarjeta Gamma (HTML exacto de gammaLabelHtml)');
+    eq(r(21), ['text', 'chapter_page', 3], 'página del capítulo');
+    eq(r(22), [null, 'unknown', null], 'nota del docente: no es un juego');
+    eq(r(23), ['cta', 'game_description', 3], 'juego del docente (🧩 … (Capítulo N))');
+    eq(r(24), ['video', 'video', 3], 'hvp');
+    // Real (solo local): un V1 con Gamma del censo, «re-exportado» (labels renombrados por Moodle): cada presentación sigue siéndolo.
+    const survey = path.join(os.homedir(), 'cursia-test-env/work/r107/survey/survey.json');
+    if (!CI && fs.existsSync(survey)) {
+      const rec = JSON.parse(fs.readFileSync(survey, 'utf8')).find((x) => /Electricidad_Básica_con_multimedia \(1\)\.mbz$/.test(x.file) && fs.existsSync(x.file));
+      if (rec) {
+        const orig = (await inventoryOf(fs.readFileSync(rec.file), path.basename(rec.file))).inv;
+        const re = (await inventoryOf(await simulateReexport(fs.readFileSync(rec.file)), 'backup-moodle2-course-1-electricidad.mbz')).inv;
+        eq(re.family, 'moodle-reexport', 'familia del real re-exportado');
+        const pres = orig.activities.filter((a) => a.role === 'presentation').map((a) => a.moduleId);
+        assert(pres.length === 9, `presentaciones en el V1 real: ${pres.length}`);
+        eq(re.activities.filter((a) => pres.includes(a.moduleId)).map((a) => [a.role, a.placement.chapterNumber]), orig.activities.filter((a) => pres.includes(a.moduleId)).map((a) => ['presentation', a.placement.chapterNumber]), 'las 9 presentaciones del real re-exportado');
+        console.log(`   real re-exportado: ${path.basename(rec.file)} — 9/9 presentaciones`);
+      }
+    }
+  });
+
+  await check('V12 P1-2 re-export de un v3 (labels renombrados por Moodle, idnumber intacto): mismos roles, capítulos y uuids que el original', async () => {
+    const inv = (await inventoryOf(await simulateReexport(bufs.get(AS.id)), 'backup-moodle2-course-1-a-s.mbz')).inv;
+    eq(inv.family, 'moodle-reexport', 'familia');
+    eq(roleKey(inv), roleKey(asInv), 'rol / capítulo por actividad');
+    eq(inv.chapters.map((c) => c.builderUuid), asInv.chapters.map((c) => c.builderUuid), 'uuid de cada capítulo');
+    eq(inv.stats.unknownChapterRoles + inv.stats.unknownCourseKinds, 0, 'sin unknown');
+  });
+
+  await check('V13 P2-2 referencias exactas en bytes: rawSha1 / rawBytes / rawOffset de cada campo y offsets de cada token = bytes del paquete; token roto con su contexto escapado', async () => {
+    for (const f of [AS, ...fixtures.filter((x) => /token$/.test(x.mutation || ''))]) {
+      const buf = bufs.get(f.id);
+      const pkg = await R.openMbz(buf);
+      const inv = built.get(f.id).inv;
+      const cache = new Map();
+      const entry = async (n) => { if (!cache.has(n)) cache.set(n, await pkg.readEntry(n)); return cache.get(n); };
+      let fields = 0;
+      let toks = 0;
+      for (const a of inv.activities) for (const h of a.html) {
+        const b = await entry(h.entry);
+        const raw = b.subarray(h.rawOffset, h.rawOffset + h.rawBytes);
+        assert(require('crypto').createHash('sha1').update(raw).digest('hex') === h.rawSha1, `${f.id} ${h.entry} ${h.field}: rawSha1`);
+        fields++;
+        for (const t of a.tokens.filter((x) => x.field === h.field && x.entry === h.entry)) {
+          for (const off of t.rawByteOffsets) {
+            const at = b.subarray(h.rawOffset + off, h.rawOffset + off + Buffer.byteLength(t.token)).toString('utf8');
+            assert(at === t.token, `${f.id} ${a.dir}: en el byte ${h.rawOffset + off} hay «${at}», no «${t.token}»`);
+            toks++;
+          }
+        }
+      }
+      assert(fields > 10 && toks > 0, `${f.id}: ${fields} campos / ${toks} tokens`);
+    }
+    const inv = (await inventoryOf(await r2Fixture(), 'r2.mbz')).inv;
+    const lab = inv.activities.find((a) => a.moduleId === 30);
+    const bad = lab.tokens.find((t) => t.status === 'malformed');
+    eq([bad.token, bad.context.startsWith('&quot;')], ['$@SCORMVIEWBYID*7@', true], 'token roto: el texto exacto y el contexto tal cual está en el XML');
+    const h = lab.html[0];
+    assert(h.rawBytes > h.length, `rawBytes (${h.rawBytes}) en bytes, length (${h.length}) en caracteres`);
+  });
+
+  await check('V14 P2-3/P2-4/P2-5: tokens de resúmenes de sección y curso y de preguntas (referencias completas); COURSESECTIONBYID solo por id; una versión por pregunta del banco', async () => {
+    const inv = (await inventoryOf(await r2Fixture(), 'r2.mbz')).inv;
+    const A = (mid) => inv.activities.find((a) => a.moduleId === mid);
+    eq(A(32).referencedBySections, [12], 'el resumen de la sección apunta al foro');
+    eq(A(31).referencedByCourse, true, 'el resumen del curso apunta al examen');
+    eq(inv.sections[0].tokens.map((t) => t.status), ['ok'], 'tokens del resumen de la sección');
+    eq(inv.courseSummary.tokens.map((t) => [t.token, t.status]), [['$@QUIZVIEWBYID*31@$', 'ok']], 'tokens del resumen del curso');
+    eq(A(30).referencedBy, [31], 'una pregunta del quiz apunta al label → el quiz lo referencia');
+    const qt = A(31).tokens.filter((t) => /^question:501:/.test(t.field)).map((t) => t.status).sort();
+    eq(qt, ['ok', 'ok'], 'tokens del enunciado de la pregunta vigente');
+    const sec = A(30).tokens.filter((t) => t.kind === 'COURSESECTIONBYID').map((t) => [t.token, t.status]);
+    eq(sec, [['$@COURSESECTIONBYID*2@$', 'orphan'], ['$@COURSESECTIONBYID*12@$', 'ok']], 'COURSESECTIONBYID: el número 2 NO es un id de sección');
+    const ex = A(31).exam;
+    eq(ex.questions.map((q) => [q.id, q.bankEntryId, q.version, q.otherVersions]), [[501, 900, 2, [500]], [510, 901, 1, [511]]], 'última versión por entrada; la pedida por la ranura');
+    eq(inv.exams[0].questions, 2, 'el banco no se infla con versiones viejas');
+  });
+
+  await check('V15 P2-6 ubicación: una actividad con clave del capítulo 2 en la sección del capítulo 1 y sin número en el título → capítulo 2 (uuid), no la sección ni el vecino', async () => {
+    const { buf, moduleId } = await movedKeyFixture(bufs.get(AS.id));
+    const inv = (await inventoryOf(buf, 'v3-A-S-movido.mbz')).inv;
+    const a = inv.activities.find((x) => x.moduleId === moduleId);
+    eq([a.placement.chapterNumber, a.placement.by, a.role], [2, 'builder_key', 'text'], 'por el uuid del capítulo');
+    eq(a.sectionNumber, 2, 'sigue físicamente en la sección del capítulo 1');
   });
 
   console.log(`\n${fail ? '❌' : '✅'} check-r107-inventory: ${ok} ok, ${fail} fallidos`);

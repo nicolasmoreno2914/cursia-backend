@@ -143,7 +143,15 @@ function rawZip(entries) {
         await c.query(SQL);
         await c.query(SQL);
         // B2: la columna (en transacción) y los índices CONCURRENTLY (sueltos), dos veces.
-        for (let i = 0; i < 2; i++) { await c.query('begin'); await c.query(SQL_B2); await c.query('commit'); await MIG_B2.applyIndexes(c); }
+        for (let i = 0; i < 2; i++) {
+          await c.query('reset lock_timeout');
+          await c.query('begin'); await c.query(SQL_B2); await c.query('commit');
+          // Fix round 2 (P2-9): el tope corto de la migración NO queda en la sesión para el CREATE INDEX CONCURRENTLY.
+          eq((await c.query('show lock_timeout')).rows[0].lock_timeout, '0', 'lock_timeout después del commit (set local)');
+          await MIG_B2.applyIndexes(c);
+          eq([(await c.query('show lock_timeout')).rows[0].lock_timeout, (await c.query('show statement_timeout')).rows[0].statement_timeout], ['0', '0'], 'applyIndexes restaura los topes');
+        }
+        assert(/set lock_timeout = '10min'/.test(fs.readFileSync(path.join(REPO, 'scripts/migrate-r107-b2-inventory.js'), 'utf8')), 'CIC con tope propio amplio');
         const idx = async () => (await c.query(`select c.relname, i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname like 'artifacts_mbz_%' order by 1`)).rows;
         eq(await idx(), [{ relname: 'artifacts_mbz_checksum_sha256_idx', indisvalid: true }, { relname: 'artifacts_mbz_validated_sha256_idx', indisvalid: true }], 'índices N3');
         // Un índice INVÁLIDO (CREATE INDEX CONCURRENTLY cortado) se descarta y se rehace (IF NOT EXISTS lo daría por hecho).
@@ -525,6 +533,13 @@ function rawZip(entries) {
       assert(/no se puede borrar/.test(body.message), 'motivo');
       eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [orig.id]))[0].n, 1, 'la fila sigue');
       await rejects(ARTS.remove(orig.id, ADMIN.id, { allowAdminOnlyPackage: true }), 404, null, 'SA: no es suyo → 404 (igual que antes)');
+      // Fix round 2 (P2-8): otra fila (legacy) que comparte la RUTA del original → se borra la fila, NUNCA el objeto.
+      const [origRow] = await ds.query(`select storage_path from public.artifacts where id = $1`, [orig.id]);
+      const [twin] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path) values ($1, 'x', 'mbz_final', $2) returning id::text as id`, [OWNER.id, origRow.storage_path]);
+      let deletes = 0;
+      ARTS.deleteStorageObject = async () => { deletes++; };
+      await ARTS.remove(twin.id, OWNER.id);
+      eq([(await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [twin.id]))[0].n, deletes], [0, 0], 'fila gemela borrada, objeto del original intacto');
       const [other] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path) values ($1, 'x', 'mbz_final', 'compartido/x.mbz') returning id::text as id`, [OWNER.id]);
       await ARTS.remove(other.id, OWNER.id);
       eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [other.id]))[0].n, 0, 'otro tipo: borrado como siempre');
@@ -542,6 +557,113 @@ function rawZip(entries) {
       assert(/artifacts_mbz_validated_sha256_idx/.test(p2) && /Index Cond: \(\(metadata ->> 'validatedSha256'/.test(p2), `rama validatedSha256:\n${p2}`);
       const p3 = await plan(`(a.checksum_sha256 = $1 or a.metadata->>'validatedSha256' = $1)`);
       assert(!/Seq Scan/.test(p3) && /artifacts_mbz_/.test(p3), `consulta con OR:\n${p3}`);
+    });
+
+    // ── Fix round 2 (B2-review.md) ──
+    const newIdentified = async (fn = 'r2.mbz') => {
+      const res = await svc.createSession(OWNER, { filename: fn, sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(OWNER, res.session.id);
+      await settle(res.session.id);
+      return res;
+    };
+    const poll = async (sid, n) => { const out = []; for (let i = 0; i < n; i++) { out.push((await svc.getInventory(OWNER, sid)).status); await settle(`inventory:${sid}`); } return out; };
+
+    await check('W19 P1-3 armado que falla (determinista): no reintentable; 10 sondeos → 0 descargas nuevas; nunca ocupa los lugares de identificación', async () => {
+      const real = svc.inventoryBuilder;
+      svc.inventoryBuilder = async () => { throw new Error('armado roto a propósito'); };
+      let res;
+      try { res = await newIdentified('r2-roto.mbz'); } finally { svc.inventoryBuilder = real; }
+      const g = await svc.get(OWNER, res.session.id);
+      eq([g.status, g.inventory.error.code, g.inventory.error.retryable], ['identified', 'WORKSHOP_INVENTORY_FAILED', false], 'la identificación queda; el inventario falla visible y no reintentable');
+      const d0 = storage.downloads;
+      eq([...new Set(await poll(res.session.id, 10))], ['failed'], '10 sondeos → failed');
+      eq(storage.downloads - d0, 0, 'ninguna descarga por sondear');
+      // Una sesión sin inventario (B1) cuyo armado falla: UNA reconstrucción, y después failed para siempre.
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [res.session.id]);
+      svc.inventoryBuilder = async () => { throw new Error('armado roto a propósito'); };
+      const d1 = storage.downloads;
+      try {
+        const st = await poll(res.session.id, 10);
+        eq([st[0], st[st.length - 1]], ['building', 'failed'], 'building una vez, después failed');
+      } finally { svc.inventoryBuilder = real; }
+      eq(storage.downloads - d1, 1, 'una sola descarga en 10 sondeos');
+      // Con los 2 lugares de identificación ocupados, la reconstrucción corre igual (carril propio).
+      const r2 = await newIdentified('r2-carril.mbz');
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [r2.session.id]);
+      const prevRunning = svc.running;
+      svc.running = SVC.IDENTIFY_CONCURRENCY;
+      try {
+        eq((await svc.getInventory(OWNER, r2.session.id)).status, 'building', 'arranca');
+        const done = await Promise.race([settle(`inventory:${r2.session.id}`).then(() => 'ok'), new Promise((r) => setTimeout(() => r('colgada'), 5000))]);
+        eq(done, 'ok', 'no espera los lugares de identificación');
+      } finally { svc.running = prevRunning; }
+      eq((await svc.getInventory(OWNER, r2.session.id)).status, 'ready', 'listo');
+    });
+
+    await check('W20 P1-3 Storage caído al reconstruir: reintento con espera (1 descarga por intento, ninguna por sondeo) y tope de 3 intentos → failed', async () => {
+      const res = await newIdentified('r2-caido.mbz');
+      const sid = res.session.id;
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [sid]);
+      const realNow = svc.now;
+      let t = Date.now();
+      svc.now = () => new Date(t);
+      storage.down = true;
+      const d0 = storage.downloads;
+      try {
+        await poll(sid, 6);
+        eq(storage.downloads - d0, 1, 'intento 1: una descarga en 6 sondeos');
+        let r = await svc.getInventory(OWNER, sid);
+        eq([r.status, r.error && r.error.retryable, !!r.retryAt], ['building', true, true], 'espera programada, visible');
+        t += SVC.INVENTORY_REBUILD_BACKOFF_MS + 1000;
+        await poll(sid, 4);
+        eq(storage.downloads - d0, 2, 'intento 2 recién pasada la espera');
+        t += 4 * SVC.INVENTORY_REBUILD_BACKOFF_MS + 1000;
+        await poll(sid, 4);
+        eq(storage.downloads - d0, 3, 'intento 3');
+        t += 100 * SVC.INVENTORY_REBUILD_BACKOFF_MS;
+        r = await svc.getInventory(OWNER, sid);
+        await settle(`inventory:${sid}`);
+        eq([r.status, r.error.retryable, storage.downloads - d0], ['failed', false, 3], 'agotados los intentos: terminal, sin más descargas');
+      } finally { storage.down = false; svc.now = realNow; }
+    });
+
+    await check('W21 P2-1 original BORRADO del Storage después de identificar → failed WORKSHOP_ORIGINAL_MISSING (terminal), también al reconstruir', async () => {
+      const res = await newIdentified('r2-borrado.mbz');
+      objects.delete(res.upload.storagePath);
+      await rejects(svc.loadVerifiedOriginal(res.session.id), 409, 'WORKSHOP_ORIGINAL_MISSING', 'uso posterior');
+      let g = await svc.get(OWNER, res.session.id);
+      eq([g.status, g.error.code, g.error.retryable], ['failed', 'WORKSHOP_ORIGINAL_MISSING', false], 'sesión terminal');
+      eq((await svc.getInventory(OWNER, res.session.id)).error.code, 'WORKSHOP_ORIGINAL_MISSING', 'inventario: failed con el motivo');
+      const r2 = await newIdentified('r2-borrado2.mbz');
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [r2.session.id]);
+      objects.delete(r2.upload.storagePath);
+      const d0 = storage.downloads;
+      await poll(r2.session.id, 5);
+      g = await svc.get(OWNER, r2.session.id);
+      eq([g.status, g.error.code, storage.downloads - d0], ['failed', 'WORKSHOP_ORIGINAL_MISSING', 1], 'reconstrucción: una descarga y terminal');
+    });
+
+    await check('W22 P2-7 fuente: cada referencia lleva el dueño de su fila; si el curso sale del alcance de la sesión, la reconstrucción no usa su fuente', async () => {
+      const [iv] = await ds.query(`select inventory from public.workshop_sessions where id = $1`, [s14]);
+      // s14 falló en W16 (original cambiado); se usa otra sesión identificada por huella al curso propio.
+      const res = await newIdentified('r2-fuente.mbz');
+      const r = await svc.getInventory(OWNER, res.session.id);
+      const refs = r.inventory.chapters[0].source || [];
+      assert(refs.length && refs.every((x) => x.ownerId === OWNER.id), `dueño en cada referencia: ${JSON.stringify(refs.map((x) => x.ownerId))}`);
+      // El curso pasa a otro dueño (sale del alcance): al reconstruir, sin fuente y con el motivo.
+      await ds.query(`update public.courses set owner_id = $2 where id = $1`, [own.id, OTHER.id]);
+      try {
+        await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [res.session.id]);
+        await poll(res.session.id, 1);
+        const r2 = await svc.getInventory(OWNER, res.session.id);
+        eq([r2.status, r2.inventory.sourceLookup.status], ['ready', 'error'], 'sin fuente');
+        assert(/alcance/.test(r2.inventory.sourceLookup.detail), r2.inventory.sourceLookup.detail);
+        eq(JSON.stringify(r2.inventory).includes('"dynamic_content_md"'), false, 'ninguna referencia del curso fuera de alcance');
+      } finally {
+        await ds.query(`update public.courses set owner_id = $2 where id = $1`, [own.id, OWNER.id]);
+      }
+      void iv;
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

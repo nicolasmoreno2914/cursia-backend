@@ -37,6 +37,8 @@ export const WORKSHOP_SOURCE_TYPES: readonly string[] = Object.freeze([
 export interface SourceArtifactRow {
   id: string;
   type: string;
+  /** Dueño de la fila (en una institución puede ser otro miembro): quien lea la fuente re-autoriza con esto. */
+  ownerId?: string | null;
   chapterId: string | null;
   moduleId: string | null;
   itemKey: string | null;
@@ -92,12 +94,16 @@ export function attachSources(course: WorkshopCourse, input: { courseId: number;
     if (!target.source.some((s) => s.artifactId === ref.artifactId && s.entryHint === ref.entryHint)) target.source.push(ref);
   };
   const ref = (r: SourceArtifactRow, scope: WorkshopSourceRef['scope'], matchedBy: WorkshopSourceRef['matchedBy'], entryHint: string | null = null): WorkshopSourceRef => ({
-    artifactId: r.id, type: r.type, scope, matchedBy, itemKey: r.itemKey, entryHint, createdAt: r.createdAt,
+    artifactId: r.id, type: r.type, ownerId: r.ownerId ?? null, scope, matchedBy, itemKey: r.itemKey, entryHint, createdAt: r.createdAt,
   });
   const chByUuid = new Map(c.chapters.filter((ch) => ch.builderUuid).map((ch) => [ch.builderUuid as string, ch]));
   const chByNum = new Map(c.chapters.map((ch) => [ch.number, ch]));
-  const structCh = new Map((input.structure?.chapters ?? []).map((s) => [s.id, s]));
-  const structMod = new Map((input.structure?.modules ?? []).map((s) => [s.id, s]));
+  // Fix round 2 (P2-7): la POSICIÓN solo se usa cuando el paquete no trae uuids del builder (con uuids, el enganche es
+  // exacto o no es) y la estructura tiene exactamente tantos capítulos / módulos como el paquete; si no, no se adivina.
+  const positionOkCh = c.chapters.every((ch) => !ch.builderUuid) && (input.structure?.chapters.length ?? -1) === c.chapters.length;
+  const positionOkMod = c.modules.every((m) => !m.builderUuid) && (input.structure?.modules.length ?? -1) === c.modules.length;
+  const structCh = new Map(positionOkCh ? (input.structure?.chapters ?? []).map((s) => [s.id, s]) : []);
+  const structMod = new Map(positionOkMod ? (input.structure?.modules ?? []).map((s) => [s.id, s]) : []);
   const modByUuid = new Map(c.modules.filter((m) => m.builderUuid).map((m) => [m.builderUuid as string, m]));
   let attached = 0;
 
@@ -179,5 +185,7 @@ export const INVENTORY_PERSIST_MAX_BYTES = 8 * 1024 * 1024;
 export function persistableInventory(course: WorkshopCourse): WorkshopCourse & { htmlOmitted: true } {
   const c: WorkshopCourse = JSON.parse(stableStringify(course));
   for (const a of c.activities) for (const h of a.html) (h as { html: string }).html = '';
+  for (const sct of c.sections) for (const h of sct.html) (h as { html: string }).html = '';
+  for (const h of c.courseSummary.html) (h as { html: string }).html = '';
   return { ...c, htmlOmitted: true };
 }

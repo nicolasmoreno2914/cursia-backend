@@ -939,7 +939,9 @@ export class ArtifactsService {
       );
       // Qué filas impiden borrar el objeto: para una fila dynamic, cualquier
       // otra; para una legacy, solo las dynamic (entre legacy, semántica de main).
-      const blocking = isDynamicArtifactRow(row) ? sharers : sharers.filter(isDynamicArtifactRow);
+      // r107 B2 (fix round 2, P2-8): una fila `workshop_original` que comparte la ruta SIEMPRE bloquea el borrado del objeto
+      // (el original de una sesión del Taller es inmutable aunque se borre otra fila que lo nombre).
+      const blocking = isDynamicArtifactRow(row) ? sharers : sharers.filter((x) => isDynamicArtifactRow(x) || x.type === WORKSHOP_ORIGINAL_ARTIFACT_TYPE);
       deleteObject = blocking.length === 0;
       if (!deleteObject) {
         this.logger.log(`remove(${row.id}): ${blocking.length} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);

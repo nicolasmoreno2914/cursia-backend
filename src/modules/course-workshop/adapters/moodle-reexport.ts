@@ -4,6 +4,7 @@
  * moduleids / contextos / secciones, puede traer usuarios, logs y librerías H5P, y reescribe el nombre de los labels
  * (comienzo del texto o «labelNNN»). Se usa lo que Moodle deja:
  *
+ *   0. CLAVE del builder (`idnumber` cvN:…): sobrevive al backup/restore de Moodle y es exacta (fix round 2, P1-2).
  *   1. Títulos de actividades que no son label (los conserva Moodle o los editó el docente): `classifyByReexportTitle`
  *      (hvp «Capítulo N: T» → video; scorm «Actividad Interactiva Capítulo N» → game; quiz «Examen [Final] Unidad N» →
  *      exam; «Examen Final…» → final_exam; resource «Libro Guia» → libro; page «Audio de Bienvenida» / «Audiolibro»).
@@ -14,11 +15,11 @@
  * Roles esperados: algún texto o video, y el juego.
  */
 import { FamilyAdapter } from '../course-model';
-import { classifyByContent, classifyByReexportTitle, classifyByV1Title, noRule, sectionInfoOf } from './common';
+import { classifyByContent, classifyByDynamicKey, classifyByReexportTitle, classifyByV1Title, noRule, sectionInfoOf } from './common';
 
 export const moodleReexportAdapter: FamilyAdapter = {
   family: 'moodle-reexport',
   expectedChapterRoles: [['text', 'video'], ['game']],
   section: sectionInfoOf,
-  classify: (i) => classifyByReexportTitle(i) ?? classifyByV1Title(i) ?? classifyByContent(i) ?? noRule(i, 'moodle-reexport'),
+  classify: (i) => classifyByDynamicKey(i) ?? classifyByReexportTitle(i) ?? classifyByV1Title(i) ?? classifyByContent(i) ?? noRule(i, 'moodle-reexport'),
 };

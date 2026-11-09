@@ -16,6 +16,8 @@
 --   alter table public.workshop_sessions drop column if exists inventory;
 -- ════════════════════════════════════════════════════════════════════════
 
-set lock_timeout = '5s';
+-- `set local`: el tope vale solo para esta transacción (fix round 2, P2-9: con `set` a secas seguía en la sesión y lo
+-- heredaba el CREATE INDEX CONCURRENTLY de después).
+set local lock_timeout = '5s';
 
 alter table public.workshop_sessions add column if not exists inventory jsonb null;

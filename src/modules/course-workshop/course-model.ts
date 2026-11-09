@@ -47,12 +47,26 @@ export interface WorkshopHtmlField {
   field: string;
   /** Entrada exacta del paquete que contiene el campo. */
   entry: string;
+  /** HTML desescapado (xmlUnescape). */
   html: string;
+  /** sha1 del HTML desescapado (UTF-8). */
   sha1: string;
+  /** Largo del HTML desescapado en CARACTERES (unidades UTF-16 de JS), no en bytes: para bytes, `rawBytes`. */
   length: number;
+  /**
+   * Referencia EXACTA a los bytes del paquete (fix round 2, P2-2) — lo que el motor de parches de B4 verifica antes de
+   * tocar el campo: sha1 y largo en BYTES del contenido tal cual está escapado en el XML (entre `<campo>` y `</campo>`), y
+   * su desplazamiento en bytes dentro de `entry`.
+   */
+  rawSha1: string;
+  rawBytes: number;
+  rawOffset: number;
   /** Archivos referenciados con `@@PLUGINFILE@@/<nombre>` (decodificados, en orden, sin repetir). */
   pluginfiles: string[];
 }
+
+/** Contenido crudo (escapado) de cada campo: los tokens se leen de acá (offsets en bytes del paquete). No se serializa. */
+const RAW_FIELD = new WeakMap<object, string>();
 
 export interface WorkshopFile {
   fileId: number;
@@ -93,6 +107,13 @@ export interface WorkshopToken {
   field: string;
   entry: string;
   count: number;
+  /**
+   * Desplazamientos en BYTES de cada aparición dentro del contenido CRUDO (escapado) del campo — sumar `rawOffset` del
+   * campo para el desplazamiento en la entrada (P2-2). `token` es siempre texto que aparece tal cual en esos bytes.
+   */
+  rawByteOffsets: number[];
+  /** Solo `malformed`: lo que sigue a la `@` (crudo, escapado como en el paquete), para mostrarlo. */
+  context: string | null;
   /** `#module-N` / `#section-N` que sigue al token (enlaces «al curso» que apuntan a una actividad), resuelto aparte. */
   anchor: { type: 'module' | 'section'; id: number; actual: string | null; status: 'ok' | 'orphan' } | null;
 }
@@ -115,6 +136,11 @@ export interface WorkshopQuestion {
   answers: WorkshopQuestionAnswer[];
   /** Emparejamiento: pares enunciado → respuesta. */
   matches: Array<{ html: string; answer: string }>;
+  /** Moodle 4: entrada del banco y versión de ESTA pregunta (null en Moodle 3.x). */
+  bankEntryId: number | null;
+  version: number | null;
+  /** Ids de las OTRAS versiones de la misma entrada (no cuentan como preguntas del examen). */
+  otherVersions: number[];
 }
 
 export interface WorkshopExam {
@@ -133,6 +159,8 @@ export interface WorkshopExam {
 export interface WorkshopSourceRef {
   artifactId: string;
   type: string;
+  /** Dueño de la fila de artifacts (B4/B5 re-autorizan cada lectura de la fuente con él y el alcance de la sesión). */
+  ownerId: string | null;
   scope: 'chapter' | 'module' | 'course';
   /** Cómo se enganchó: id de capítulo/módulo del builder (exacto), posición, clave del item, o snapshot del curso. */
   matchedBy: 'chapter_uuid' | 'chapter_position' | 'module_uuid' | 'module_position' | 'item_key' | 'course';
@@ -181,8 +209,11 @@ export interface WorkshopActivity {
   html: WorkshopHtmlField[];
   files: WorkshopFile[];
   tokens: WorkshopToken[];
-  /** moduleids de las actividades cuyos tokens apuntan a esta (B4 `remove_activity`). */
+  /** moduleids de las actividades cuyos tokens apuntan a esta (B4 `remove_activity`), incluidas preguntas de un quiz. */
   referencedBy: number[];
+  /** Ids de las secciones cuyo resumen apunta a esta, y si el resumen del curso la nombra (P2-3). */
+  referencedBySections: number[];
+  referencedByCourse: boolean;
   exam: WorkshopExam | null;
   /** Fuente del generador en la base (null = no hay o el curso no se identificó). */
   source: WorkshopSourceRef[] | null;
@@ -204,6 +235,9 @@ export interface WorkshopSection {
   kind: 'welcome' | 'route' | 'module' | 'chapter' | 'exam' | 'final' | 'closing' | 'other';
   moduleNumber: number | null;
   chapterNumber: number | null;
+  /** Resumen de la sección y sus tokens (P2-3). */
+  html: WorkshopHtmlField[];
+  tokens: WorkshopToken[];
 }
 
 export interface WorkshopChapter {
@@ -261,6 +295,8 @@ export interface WorkshopCourse {
   chapters: WorkshopChapter[];
   /** moduleids de las actividades fuera de capítulos, en orden. */
   courseActivities: number[];
+  /** Resumen del curso (course/course.xml) y sus tokens (P2-3). */
+  courseSummary: { html: WorkshopHtmlField[]; tokens: WorkshopToken[] };
   activities: WorkshopActivity[];
   exams: Array<{ moduleId: number; final: boolean; unit: number | null; slots: number; questions: number }>;
   libro: Array<{ moduleId: number; format: 'html' | 'pdf' | 'book' | 'other' | 'none'; filename: string | null }>;
@@ -295,6 +331,8 @@ export interface RawSection {
   entry: string | null;
   sequence: number[];
   visible: boolean | null;
+  /** `<summary>` de la sección (campo HTML con sus bytes crudos). */
+  html: WorkshopHtmlField[];
 }
 
 export interface RawActivity {
@@ -317,7 +355,7 @@ export interface RawActivity {
   html: WorkshopHtmlField[];
   /** quiz.xml: cantidad de question_instances + ids referenciados directamente (questionid / questionbankentryid). */
   quizSlots: number;
-  quizRefs: { questionIds: number[]; entryIds: number[] };
+  quizRefs: { questionIds: number[]; entryIds: Array<{ entryId: number; version: number | null }> };
   missingFolder: boolean;
   entries: string[];
 }
@@ -328,8 +366,8 @@ export interface RawQuestionCategory {
   contextId: number | null;
   contextInstanceId: number | null;
   questions: WorkshopQuestion[];
-  /** question_bank_entry id → question ids (Moodle ≥ 4). */
-  entries: Map<number, number[]>;
+  /** question_bank_entry id → versiones (Moodle ≥ 4), de menor a mayor. */
+  entries: Map<number, Array<{ version: number; questionId: number }>>;
 }
 
 export interface RawCourse {
@@ -344,6 +382,8 @@ export interface RawCourse {
   /** `<course id>` de course/course.xml (Moodle lo escribe igual que original_course_id; se aceptan los dos). */
   courseXmlId: number | null;
   originalCourseContextId: number | null;
+  /** `<summary>` de course/course.xml. */
+  courseHtml: WorkshopHtmlField[];
   moodleRelease: string | null;
   backupRelease: string | null;
   originalWwwroot: string | null;
@@ -390,23 +430,45 @@ export function pluginfileRefs(html: string): string[] {
   return out;
 }
 
-function htmlField(field: string, entry: string, escaped: string | null): WorkshopHtmlField | null {
+/** Primer `<name>…</name>` desde `from`: contenido crudo y su índice (carácter) en `xml`. */
+function tagAt(xml: string, name: string, from = 0, to = xml.length): { value: string; index: number } | null {
+  const open = `<${name}>`;
+  const i = xml.indexOf(open, from);
+  if (i < 0 || i >= to) return null;
+  const j = xml.indexOf(`</${name}>`, i + open.length);
+  if (j < 0 || j > to) return null;
+  return { value: xml.slice(i + open.length, j), index: i + open.length };
+}
+
+/** Campo HTML con su referencia exacta (bytes crudos). `byteOffset` = desplazamiento en bytes del contenido en la entrada. */
+export function htmlField(field: string, entry: string, escaped: string | null, byteOffset = 0): WorkshopHtmlField | null {
   if (escaped === null) return null;
   const html = xmlUnescape(escaped);
-  return { field, entry, html, sha1: sha1Hex(html), length: html.length, pluginfiles: pluginfileRefs(html) };
+  const f: WorkshopHtmlField = {
+    field, entry, html, sha1: sha1Hex(html), length: html.length,
+    rawSha1: sha1Hex(escaped), rawBytes: Buffer.byteLength(escaped, 'utf8'), rawOffset: byteOffset, pluginfiles: pluginfileRefs(html),
+  };
+  RAW_FIELD.set(f, escaped);
+  return f;
 }
+const rawOf = (f: WorkshopHtmlField): string => RAW_FIELD.get(f) ?? f.html;
+const byteAt = (xml: string, charIndex: number): number => Buffer.byteLength(xml.slice(0, charIndex), 'utf8');
 
 /** Campos HTML de la actividad según su tipo (el primer <intro> / <content> del XML del tipo; capítulos del book). */
 function htmlFieldsOf(modname: string, entry: string, xml: string): WorkshopHtmlField[] {
   const out: WorkshopHtmlField[] = [];
-  const push = (f: WorkshopHtmlField | null) => { if (f) out.push(f); };
-  push(htmlField('intro', entry, tag(xml, 'intro')));
-  if (modname === 'page') push(htmlField('content', entry, tag(xml, 'content')));
+  const at = (field: string, name: string, from = 0, to = xml.length) => {
+    const t = tagAt(xml, name, from, to);
+    const f = t ? htmlField(field, entry, t.value, byteAt(xml, t.index)) : null;
+    if (f) out.push(f);
+  };
+  at('intro', 'intro');
+  if (modname === 'page') at('content', 'content');
   if (modname === 'book') {
-    for (const c of (tag(xml, 'chapters') ?? '').matchAll(/<chapter id="(\d+)">([\s\S]*?)<\/chapter>/g)) push(htmlField(`chapter:${c[1]}`, entry, tag(c[2], 'content')));
+    for (const c of xml.matchAll(/<chapter id="(\d+)">([\s\S]*?)<\/chapter>/g)) at(`chapter:${c[1]}`, 'content', c.index ?? 0, (c.index ?? 0) + c[0].length);
   }
-  if (modname === 'assign') push(htmlField('activity', entry, tag(xml, 'activity')));
-  if (modname === 'url') push(htmlField('externalurl', entry, tag(xml, 'externalurl')));
+  if (modname === 'assign') at('activity', 'activity');
+  if (modname === 'url') at('externalurl', 'externalurl');
   return out;
 }
 
@@ -447,7 +509,7 @@ function parseQuestion(id: number, b: string, cat: { id: number; name: string } 
     matches.push({ html: xmlUnescape(tag(mm[1], 'questiontext') ?? ''), answer: xmlUnescape(tag(mm[1], 'answertext') ?? '') });
   }
   const ch = cat ? /^Cap[ií]tulo\s+(\d{1,3})\b/i.exec(cat.name) : null;
-  return {
+  const q: WorkshopQuestion = {
     id,
     name: tagText(b, 'name') ?? '',
     qtype: (tag(b, 'qtype') ?? '').trim(),
@@ -458,8 +520,21 @@ function parseQuestion(id: number, b: string, cat: { id: number; name: string } 
     chapterNumber: ch ? Number(ch[1]) : null,
     answers,
     matches,
+    bankEntryId: null,
+    version: null,
+    otherVersions: [],
   };
+  // Texto crudo de los campos con HTML de la pregunta (P2-3: sus tokens también cuentan).
+  const raws: Array<[string, string]> = [];
+  for (const k of ['questiontext', 'generalfeedback']) { const v = tag(b, k); if (v) raws.push([k, v]); }
+  for (const a of b.matchAll(/<answer id="(\d+)">([\s\S]*?)<\/answer>/g)) {
+    const at = tag(a[2], 'answertext'); if (at) raws.push([`answer:${a[1]}`, at]);
+    const fb = tag(a[2], 'feedback'); if (fb) raws.push([`feedback:${a[1]}`, fb]);
+  }
+  QUESTION_RAW.set(q, raws);
+  return q;
 }
+const QUESTION_RAW = new WeakMap<WorkshopQuestion, Array<[string, string]>>();
 
 /** questions.xml (Moodle 3.x y 4.x): categorías con su contexto, preguntas y entradas del banco. */
 export function parseQuestionsXml(xml: string): RawQuestionCategory[] {
@@ -475,12 +550,26 @@ export function parseQuestionsXml(xml: string): RawQuestionCategory[] {
       entries: new Map(),
     };
     for (const e of body.matchAll(/<question_bank_entry id="(\d+)">([\s\S]*?)<\/question_bank_entry>/g)) {
-      const ids: number[] = [];
-      for (const q of e[2].matchAll(/<question id="(\d+)">([\s\S]*?)<\/question>/g)) {
-        ids.push(Number(q[1]));
-        cat.questions.push(parseQuestion(Number(q[1]), q[2], cat));
-      }
-      cat.entries.set(Number(e[1]), ids);
+      const entryId = Number(e[1]);
+      const versions: Array<{ version: number; questionId: number }> = [];
+      const qs: WorkshopQuestion[] = [];
+      // Fix round 2 (P2-5): cada <question_versions> es UNA versión de la misma pregunta.
+      const blocks = [...e[2].matchAll(/<question_versions id="\d+">([\s\S]*?)<\/question_versions>/g)];
+      const parts = blocks.length ? blocks.map((v) => v[1]) : [e[2]];
+      parts.forEach((part, idx) => {
+        const ver = int(tag(part, 'version')) ?? idx + 1;
+        for (const q of part.matchAll(/<question id="(\d+)">([\s\S]*?)<\/question>/g)) {
+          const pq = parseQuestion(Number(q[1]), q[2], cat);
+          pq.bankEntryId = entryId;
+          pq.version = ver;
+          versions.push({ version: ver, questionId: pq.id });
+          qs.push(pq);
+        }
+      });
+      versions.sort((x, y) => x.version - y.version || x.questionId - y.questionId);
+      for (const q of qs) q.otherVersions = versions.filter((v) => v.questionId !== q.id).map((v) => v.questionId);
+      cat.questions.push(...qs);
+      cat.entries.set(entryId, versions);
     }
     if (!cat.entries.size) {
       // Moodle 3.x: <questions><question id> directo en la categoría.
@@ -547,6 +636,7 @@ export async function readRawCourse(
       entry: x ? entry : null,
       sequence: seq,
       visible: x ? (tag(x, 'visible') ?? '').trim() !== '0' : null,
+      html: (() => { const t = x ? tagAt(x, 'summary') : null; const f = t && entry ? htmlField('summary', entry, t.value, byteAt(x as string, t.index)) : null; return f ? [f] : []; })(),
     });
   }
 
@@ -582,12 +672,16 @@ export async function readRawCourse(
     if (moduleXmlId !== null && moduleXmlId !== a.moduleId) issues.push({ code: 'moduleid_mismatch', target: a.dir, detail: `module.xml dice ${moduleXmlId}, moodle_backup.xml dice ${a.moduleId}` });
     const typeEntry = `${a.dir}/${a.modname}.xml`;
     let quizSlots = 0;
-    const quizRefs = { questionIds: [] as number[], entryIds: [] as number[] };
+    const quizRefs = { questionIds: [] as number[], entryIds: [] as Array<{ entryId: number; version: number | null }> };
     if (typX && a.modname === 'quiz') {
       const qi = tag(typX, 'question_instances') ?? '';
       quizSlots = (qi.match(/<question_instance id=/g) || []).length;
       for (const m of qi.matchAll(/<questionid>(\d+)<\/questionid>/g)) quizRefs.questionIds.push(Number(m[1]));
-      for (const m of qi.matchAll(/<questionbankentryid>(\d+)<\/questionbankentryid>/g)) quizRefs.entryIds.push(Number(m[1]));
+      // Referencia a una entrada del banco: la versión pedida (`$@NULL@$` = la última).
+      for (const m of qi.matchAll(/<question_reference id="\d+">([\s\S]*?)<\/question_reference>/g)) {
+        const e = int(tag(m[1], 'questionbankentryid'));
+        if (e !== null) quizRefs.entryIds.push({ entryId: e, version: int(tag(m[1], 'version')) });
+      }
     }
     activities.push({
       moduleId: a.moduleId,
@@ -647,6 +741,7 @@ export async function readRawCourse(
     originalCourseId: int(tag(mb, 'original_course_id')),
     courseXmlId: int(/<course id="(\d+)"/.exec(texts.get('course/course.xml') ?? '')?.[1]),
     originalCourseContextId: int(tag(mb, 'original_course_contextid')),
+    courseHtml: (() => { const cx = texts.get('course/course.xml'); const t = cx ? tagAt(cx, 'summary') : null; const f = t ? htmlField('summary', 'course/course.xml', t.value, byteAt(cx as string, t.index)) : null; return f ? [f] : []; })(),
     moodleRelease: tagText(mb, 'moodle_release'),
     backupRelease: tagText(mb, 'backup_release'),
     originalWwwroot: tagText(mb, 'original_wwwroot'),
@@ -702,26 +797,49 @@ export interface TokenContext {
   bookChapters: Map<number, Set<number>>;
 }
 
-export function extractTokens(html: string, where: { field: string; entry: string }, ctx: TokenContext): WorkshopToken[] {
+/**
+ * Tokens de un campo. Se lee el contenido CRUDO (escapado) del XML — los tokens no llevan caracteres que `xmlEsc` escape,
+ * así que el texto es el mismo, pero los desplazamientos (en bytes) y el contexto de un token roto quedan exactos respecto
+ * del paquete. También acepta HTML ya desescapado (pruebas).
+ */
+export function extractTokens(raw: string, where: { field: string; entry: string }, ctx: TokenContext): WorkshopToken[] {
   const byText = new Map<string, WorkshopToken>();
-  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@\$/g)) {
+  // Bytes acumulados: los matches salen en orden, se mide solo el tramo nuevo.
+  const occ: Array<{ index: number; m: RegExpMatchArray; malformed: boolean }> = [];
+  for (const m of raw.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@(\$)?/g)) occ.push({ index: m.index ?? 0, m, malformed: m[4] === undefined });
+  let lastChar = 0;
+  let lastByte = 0;
+  for (const { index, m, malformed } of occ) {
+    lastByte += Buffer.byteLength(raw.slice(lastChar, index), 'utf8');
+    lastChar = index;
     const kind = m[1];
+    const text = m[0];
+    if (malformed) {
+      // `$@KIND*id@` sin el `$` final (p. ej. un String.replace que expandió `$&`): Moodle lo deja literal.
+      const context = raw.slice(index + text.length, index + text.length + 16);
+      const key = `${text}${context}`;
+      const prev = byText.get(key);
+      if (prev) { prev.count++; prev.rawByteOffsets.push(lastByte); continue; }
+      byText.set(key, { token: text, kind, targetId: m[2] !== undefined ? Number(m[2]) : null, targetModuleId: null, expected: null, actual: null, status: 'malformed', field: where.field, entry: where.entry, count: 1, rawByteOffsets: [lastByte], context, anchor: null });
+      continue;
+    }
     if (kind === 'NULL') continue; // `$@NULL@$` es el nulo de Moodle, no un enlace
-    const after = html.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 40);
+    const after = raw.slice(index + text.length, index + text.length + 40);
     const am = /^#(module|section)-(\d+)/.exec(after);
-    const key = am ? `${m[0]}${am[0]}` : m[0];
+    const key = am ? `${text}${am[0]}` : text;
     const prev = byText.get(key);
-    if (prev) { prev.count++; continue; }
+    if (prev) { prev.count++; prev.rawByteOffsets.push(lastByte); continue; }
     const id = m[2] !== undefined ? Number(m[2]) : null;
     const id2 = m[3] !== undefined ? Number(m[3]) : null;
     let expected: string | null = null;
     let actual: string | null = null;
     let status: TokenStatus = 'unchecked';
     let base: string | null;
-    let letter: RegExpExecArray | null;
+    let letter: RegExpExecArray | null = null;
     if (kind === 'COURSESECTIONBYID') {
+      // Moodle codifica el ID de la sección (no su número): solo contra ids (fix round 2, P2-4).
       expected = 'section';
-      actual = id !== null && (ctx.sectionIds.has(id) || ctx.sectionNumbers.has(id)) ? 'section' : null;
+      actual = id !== null && ctx.sectionIds.has(id) ? 'section' : null;
       status = actual ? 'ok' : 'orphan';
     } else if (/^PLUGINFILEBYCONTEXT/.test(kind)) {
       expected = 'context';
@@ -754,17 +872,11 @@ export function extractTokens(html: string, where: { field: string; entry: strin
     let anchor: WorkshopToken['anchor'] = null;
     if (am) {
       const aid = Number(am[2]);
-      const ok = am[1] === 'module' ? ctx.modnameByMid.has(aid) : ctx.sectionIds.has(aid) || ctx.sectionNumbers.has(aid);
+      // El ancla `#section-N` de course/view.php sí es el NÚMERO de la sección.
+      const ok = am[1] === 'module' ? ctx.modnameByMid.has(aid) : ctx.sectionNumbers.has(aid);
       anchor = { type: am[1] as 'module' | 'section', id: aid, actual: am[1] === 'module' ? ctx.modnameByMid.get(aid) ?? null : ok ? 'section' : null, status: ok ? 'ok' : 'orphan' };
     }
-    byText.set(key, { token: m[0], kind, targetId: id, targetModuleId, expected, actual, status, field: where.field, entry: where.entry, count: 1, anchor });
-  }
-  // Tokens rotos: `$@KIND*id@` sin el `$` final (p. ej. un String.replace que expandió `$&`): Moodle los deja literales.
-  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@(?!\$)/g)) {
-    const text = html.slice(m.index ?? 0, (m.index ?? 0) + m[0].length + 12);
-    const prev = byText.get(text);
-    if (prev) { prev.count++; continue; }
-    byText.set(text, { token: text, kind: m[1], targetId: m[2] !== undefined ? Number(m[2]) : null, expected: null, actual: null, targetModuleId: null, status: 'malformed', field: where.field, entry: where.entry, count: 1, anchor: null });
+    byText.set(key, { token: text, kind, targetId: id, targetModuleId, expected, actual, status, field: where.field, entry: where.entry, count: 1, rawByteOffsets: [lastByte], context: null, anchor });
   }
   return [...byText.values()];
 }
@@ -887,16 +999,22 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
     bookChapters,
   };
 
-  // Clasificación + ubicación en capítulos.
+  // Clasificación (pasada 1) — y el mapa uuid del capítulo → número de las actividades que dicen las dos cosas.
+  const classified = ordered.map(({ a, s, pos }) => {
+    const info = s ? sectionInfo.get(s) ?? null : null;
+    const main = a.html.find((h) => h.field === 'content' && h.html.trim()) ?? a.html.find((h) => h.field === 'intro') ?? null;
+    return { a, s, pos, info, c: adapter.classify({ a, section: s, sectionInfo: info, plain: plainText(main?.html ?? '') }) };
+  });
+  const uuidToNumber = new Map<string, number>();
+  for (const { c } of classified) if (c.scope === 'chapter' && c.chapterUuid && c.chapter != null && !uuidToNumber.has(c.chapterUuid)) uuidToNumber.set(c.chapterUuid, c.chapter);
+
+  // Ubicación en capítulos (pasada 2): número explícito > uuid del capítulo (clave del builder) > sección > vecino.
   const activities: WorkshopActivity[] = [];
   const titleHints = new Map<number, { text: string; priority: number; evidence: string }>();
   const chapterUuid = new Map<number, string>();
   let lastChapterInSection: { section: RawSection | null; chapter: number } | null = null;
   const moduleTitles = new Map<number, string>();
-  for (const { a, s, pos } of ordered) {
-    const info = s ? sectionInfo.get(s) ?? null : null;
-    const main = a.html.find((h) => h.field === 'content' && h.html.trim()) ?? a.html.find((h) => h.field === 'intro') ?? null;
-    const c = adapter.classify({ a, section: s, sectionInfo: info, plain: plainText(main?.html ?? '') });
+  for (const { a, s, pos, info, c } of classified) {
     if (c.moduleTitle && c.unit != null && !moduleTitles.has(c.unit)) moduleTitles.set(c.unit, c.moduleTitle);
     let placement: ActivityPlacement = { scope: 'course', chapterNumber: null, by: 'none' };
     let role: ChapterRole | null = null;
@@ -904,13 +1022,17 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
     let unknownReason = c.unknownReason ?? null;
     if (c.scope === 'chapter') {
       let n = c.chapter ?? null;
-      let by: ActivityPlacement['by'] = c.placementBy ?? (n !== null ? 'number' : 'none');
+      let by: ActivityPlacement['by'] = n !== null ? (c.placementBy === 'builder_key' ? 'builder_key' : 'number') : 'none';
+      if (n === null && c.chapterUuid && uuidToNumber.has(c.chapterUuid)) { n = uuidToNumber.get(c.chapterUuid)!; by = 'builder_key'; }
       if (n === null && info?.chapter != null) { n = info.chapter; by = 'section'; }
-      if (n === null && lastChapterInSection && lastChapterInSection.section === s) { n = lastChapterInSection.chapter; by = 'position'; }
+      // Con uuid del capítulo nunca se hereda del vecino: si el uuid no se pudo numerar, no se inventa (fix round 2, P2-6).
+      if (n === null && !c.chapterUuid && lastChapterInSection && lastChapterInSection.section === s) { n = lastChapterInSection.chapter; by = 'position'; }
       if (n === null) {
         // Rol de capítulo sin capítulo al que pertenecer: no se inventa uno.
         kind = 'unknown';
-        unknownReason = `parece de capítulo (${c.evidence}) pero ni la actividad, ni su sección, ni la anterior dicen de cuál`;
+        unknownReason = c.chapterUuid
+          ? `clave del builder con el capítulo ${c.chapterUuid} que ninguna actividad numera (${c.evidence})`
+          : `parece de capítulo (${c.evidence}) pero ni la actividad, ni su sección, ni la anterior dicen de cuál`;
       } else {
         placement = { scope: 'chapter', chapterNumber: n, by };
         role = c.role ?? 'unknown';
@@ -921,12 +1043,15 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
         }
         if (c.chapterUuid && !chapterUuid.has(n)) chapterUuid.set(n, c.chapterUuid);
       }
+    } else {
+      // Una actividad del curso en el medio corta la herencia por vecino.
+      lastChapterInSection = null;
     }
     const files = (a.contextId !== null ? raw.filesByContext.get(a.contextId) ?? [] : [])
       .filter((f) => f.filename !== '.' || f.filesize > 0)
       .slice()
       .sort((x, y) => x.fileId - y.fileId);
-    const tokens = a.html.flatMap((h) => extractTokens(h.html, h, tokenCtx));
+    const tokens = a.html.flatMap((h) => extractTokens(rawOf(h), h, tokenCtx));
     const bk = /^cv\d+:(ch|exam|exam_info|module_intro|module_next|exam_explanations|shell|final_exam|final_exam_info|final_exam_next|final_exam_explanations)(?::([0-9a-f-]{36}))?(?::(.+))?$/.exec(a.idnumber ?? '');
     activities.push({
       moduleId: a.moduleId,
@@ -952,6 +1077,8 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
       files,
       tokens,
       referencedBy: [],
+      referencedBySections: [],
+      referencedByCourse: false,
       exam: null,
       source: null,
       entries: a.entries,
@@ -959,25 +1086,20 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
     });
   }
 
-  // Referencias inversas (tokens que apuntan a cada actividad).
-  const actByMid = new Map<number, WorkshopActivity>();
-  for (const x of activities) if (!actByMid.has(x.moduleId)) actByMid.set(x.moduleId, x);
-  for (const x of activities) {
-    for (const t of x.tokens) {
-      if (t.targetModuleId === null) continue;
-      const target = actByMid.get(t.targetModuleId);
-      if (target && !target.referencedBy.includes(x.moduleId)) target.referencedBy.push(x.moduleId);
-    }
-  }
-  for (const x of activities) x.referencedBy.sort((p, q) => p - q);
-
-  // Exámenes: preguntas del banco por contexto del quiz + referencias directas.
+  // Exámenes: preguntas del banco por contexto del quiz + referencias directas. Moodle 4: una sola versión por entrada
+  // (la que pide la ranura; si no pide ninguna, la última) — las otras quedan en `otherVersions` (fix round 2, P2-5).
   const qById = new Map<number, WorkshopQuestion>();
-  const qByEntry = new Map<number, number[]>();
+  const qByEntry = new Map<number, Array<{ version: number; questionId: number }>>();
   for (const c of raw.categories) {
     for (const q of c.questions) if (!qById.has(q.id)) qById.set(q.id, q);
-    for (const [e, ids] of c.entries) qByEntry.set(e, ids);
+    for (const [e, vs] of c.entries) qByEntry.set(e, vs);
   }
+  const pickVersion = (entryId: number, version: number | null): number | null => {
+    const vs = qByEntry.get(entryId) ?? [];
+    if (!vs.length) return null;
+    if (version !== null) return vs.find((v) => v.version === version)?.questionId ?? null;
+    return vs[vs.length - 1].questionId;
+  };
   const giftOf = (final: boolean, unit: number | null): string | null => {
     const re = final ? /(^|\/)examen_final\.gift$/ : unit !== null ? new RegExp(`(^|/)examen_unidad${unit}\\.gift$`) : null;
     if (!re) return null;
@@ -987,17 +1109,49 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
     if (x.modname !== 'quiz') continue;
     const ra = byMid.get(x.moduleId)!;
     const ids: number[] = [];
-    const add = (id: number) => { if (!ids.includes(id) && qById.has(id)) ids.push(id); };
+    const add = (id: number | null) => { if (id !== null && !ids.includes(id) && qById.has(id)) ids.push(id); };
+    // Una entrada que una ranura pide en una versión concreta cuenta con ESA versión, también como parte del banco.
+    const pinned = new Map(ra.quizRefs.entryIds.map((r) => [r.entryId, r.version] as [number, number | null]));
     for (const c of raw.categories) {
       if ((x.contextId !== null && c.contextId === x.contextId) || (c.contextInstanceId === x.moduleId && c.contextId !== null && x.contextId === null)) {
-        for (const q of c.questions) add(q.id);
+        for (const [e] of c.entries) add(pickVersion(e, pinned.get(e) ?? null));
+        if (!c.entries.size) for (const q of c.questions) add(q.id);
       }
     }
-    for (const e of ra.quizRefs.entryIds) for (const id of qByEntry.get(e) ?? []) add(id);
+    for (const r of ra.quizRefs.entryIds) add(pickVersion(r.entryId, r.version));
     for (const id of ra.quizRefs.questionIds) add(id);
     const final = x.kind === 'final_exam';
-    x.exam = { final, unit: final ? null : x.unit, slots: ra.quizSlots, questions: ids.map((id) => qById.get(id)!), giftEntry: giftOf(final, final ? null : x.unit) };
+    const questions = ids.map((id) => qById.get(id)!);
+    x.exam = { final, unit: final ? null : x.unit, slots: ra.quizSlots, questions, giftEntry: giftOf(final, final ? null : x.unit) };
+    // P2-3: los tokens del texto de las preguntas son referencias DEL quiz.
+    for (const q of questions) for (const [field, rawText] of QUESTION_RAW.get(q) ?? []) x.tokens.push(...extractTokens(rawText, { field: `question:${q.id}:${field}`, entry: 'questions.xml' }, tokenCtx));
   }
+
+  // Referencias inversas (tokens que apuntan a cada actividad): actividades (y sus preguntas), secciones, curso.
+  const actByMid = new Map<number, WorkshopActivity>();
+  for (const x of activities) if (!actByMid.has(x.moduleId)) actByMid.set(x.moduleId, x);
+  for (const x of activities) {
+    for (const t of x.tokens) {
+      if (t.targetModuleId === null) continue;
+      const target = actByMid.get(t.targetModuleId);
+      if (target && !target.referencedBy.includes(x.moduleId)) target.referencedBy.push(x.moduleId);
+    }
+  }
+  const sectionTokens = new Map<RawSection, WorkshopToken[]>();
+  for (const sct of secs) {
+    const tks = sct.html.flatMap((h) => extractTokens(rawOf(h), h, tokenCtx));
+    sectionTokens.set(sct, tks);
+    for (const t of tks) {
+      const target = t.targetModuleId !== null ? actByMid.get(t.targetModuleId) : undefined;
+      if (target && !target.referencedBySections.includes(sct.id)) target.referencedBySections.push(sct.id);
+    }
+  }
+  const courseTokens = raw.courseHtml.flatMap((h) => extractTokens(rawOf(h), h, tokenCtx));
+  for (const t of courseTokens) {
+    const target = t.targetModuleId !== null ? actByMid.get(t.targetModuleId) : undefined;
+    if (target) target.referencedByCourse = true;
+  }
+  for (const x of activities) { x.referencedBy.sort((p, q) => p - q); x.referencedBySections.sort((p, q) => p - q); }
 
   // Capítulos.
   const chapterNums = [...new Set(activities.filter((x) => x.placement.scope === 'chapter').map((x) => x.placement.chapterNumber as number))].sort((p, q) => p - q);
@@ -1050,7 +1204,7 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
 
   const sections: WorkshopSection[] = secs.map((s) => {
     const i = sectionInfo.get(s)!;
-    return { id: s.id, number: s.number, name: s.name || s.title, dir: s.dir, entry: s.entry, sequence: s.sequence, visible: s.visible, kind: i.kind, moduleNumber: i.module, chapterNumber: i.chapter };
+    return { id: s.id, number: s.number, name: s.name || s.title, dir: s.dir, entry: s.entry, sequence: s.sequence, visible: s.visible, kind: i.kind, moduleNumber: i.module, chapterNumber: i.chapter, html: s.html, tokens: sectionTokens.get(s) ?? [] };
   });
 
   const inAct = new Set<number>();
@@ -1067,6 +1221,7 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
   for (const x of activities) if (x.role) byRole[x.role]++;
   const tokensStat: Record<TokenStatus, number> = { ok: 0, orphan: 0, wrong_type: 0, external: 0, malformed: 0, unchecked: 0 };
   for (const x of activities) for (const t of x.tokens) tokensStat[t.status] += t.count;
+  for (const t of [...[...sectionTokens.values()].flat(), ...courseTokens]) tokensStat[t.status] += t.count;
 
   return {
     schema: WORKSHOP_INVENTORY_SCHEMA,
@@ -1085,6 +1240,7 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
     modules,
     chapters,
     courseActivities: activities.filter((x) => x.placement.scope === 'course').map((x) => x.moduleId),
+    courseSummary: { html: raw.courseHtml, tokens: courseTokens },
     activities,
     exams: activities.filter((x) => x.exam).map((x) => ({ moduleId: x.moduleId, final: x.exam!.final, unit: x.exam!.unit, slots: x.exam!.slots, questions: x.exam!.questions.length })),
     libro: activities.filter((x) => x.kind === 'libro' || x.kind === 'libro_mobile').map((x) => ({ moduleId: x.moduleId, ...(x.modname === 'book' ? { format: 'book' as const, filename: null } : libroFormat(x.files)) })),

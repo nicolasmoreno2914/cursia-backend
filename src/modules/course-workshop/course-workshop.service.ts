@@ -17,7 +17,7 @@ import {
 } from './identify';
 import { WorkshopCourse, stableStringify } from './course-model';
 import {
-  INVENTORY_PERSIST_MAX_BYTES, SourceArtifactRow, SourceStructure, WORKSHOP_SOURCE_TYPES, attachSources, buildInventory, persistableInventory,
+  INVENTORY_PERSIST_MAX_BYTES, InventoryMeta, SourceArtifactRow, SourceStructure, WORKSHOP_SOURCE_TYPES, attachSources, buildInventory, persistableInventory,
 } from './inventory';
 
 /**
@@ -60,7 +60,17 @@ export const WORKSHOP_ERRORS = Object.freeze({
   NOT_IDENTIFIED: 'WORKSHOP_NOT_IDENTIFIED',
   INVENTORY_FAILED: 'WORKSHOP_INVENTORY_FAILED',
   INVENTORY_TOO_LARGE: 'WORKSHOP_INVENTORY_TOO_LARGE',
+  ORIGINAL_MISSING: 'WORKSHOP_ORIGINAL_MISSING',
 });
+
+/**
+ * Fix round 2 (P1-3): la reconstrucción del inventario desde el original (sesiones sin inventario) se intenta a lo sumo
+ * INVENTORY_REBUILD_MAX_ATTEMPTS veces por versión del original (sha1), y SOLO ante fallas transitorias de Storage, con
+ * espera creciente entre intentos (1, 4, 16 min). Una falla del armado es determinista para los mismos bytes: no se reintenta.
+ * Corre en su propio carril (1 por proceso): nunca ocupa los lugares de las identificaciones.
+ */
+export const INVENTORY_REBUILD_MAX_ATTEMPTS = 3;
+export const INVENTORY_REBUILD_BACKOFF_MS = 60_000;
 
 /** Fix P2-7: límites SOLO de la lista para la heurística (las coincidencias exactas se consultan aparte). */
 export const WORKSHOP_CATALOG_LIMITS = Object.freeze({ courses: 1000, artifacts: 5000 });
@@ -152,6 +162,8 @@ export interface WorkshopInventoryResponse {
   status: 'ready' | 'building' | 'failed';
   inventory: (WorkshopCourse & { htmlOmitted: true }) | null;
   builtAt: string | null;
+  /** Si hay un reintento programado (falla transitoria de Storage), cuándo. */
+  retryAt: string | null;
   error: { code: string; message: string; retryable: boolean } | null;
 }
 
@@ -185,6 +197,10 @@ export class CourseWorkshopService {
   /** Identificaciones en curso de este proceso (las pruebas las esperan). */
   readonly inFlight = new Map<string, Promise<void>>();
   now: () => Date = () => new Date();
+  /** Armado del inventario (puro). Reemplazable SOLO en pruebas (simular un armado que falla). */
+  inventoryBuilder: (pkg: MbzPackage, meta: InventoryMeta) => Promise<WorkshopCourse> = buildInventory;
+  /** Carril propio de la reconstrucción del inventario (1 por proceso; no usa el semáforo de las identificaciones). */
+  private rebuildBusy = false;
 
   constructor(
     private readonly dataSource: DataSource,
@@ -446,7 +462,7 @@ export class CourseWorkshopService {
       const result = identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope, catalog, catalogTruncated: truncated });
       // B2: inventario con los MISMOS bytes recién hasheados (son los que quedan como original: verificado por
       // construcción). Una falla del inventario no tumba la identificación, pero queda visible (identification.inventory).
-      const inv = await this.composeInventory(pkg, { family: result.family, builderLine: result.builder.line, builderVersion: result.builder.version }, result.courseId);
+      const inv = await this.composeInventory(pkg, { family: result.family, builderLine: result.builder.line, builderVersion: result.builder.version }, result.courseId, scope);
       const identification = {
         ...(row.identification ?? {}),
         sha256,
@@ -484,9 +500,10 @@ export class CourseWorkshopService {
 
   /**
    * Descarga el original de la sesión con tope (fix P1-1), memoria ~1× (N1) y plazo del cuerpo según el tamaño (N2),
-   * calculando sha1 y sha256 por trozo. Nunca lanza: devuelve los bytes o la falla para la sesión.
+   * calculando sha1 y sha256 por trozo. Nunca lanza: devuelve los bytes o la falla para la sesión. `missing` = Storage
+   * respondió que el objeto no existe (400/404), distinto de «Storage no responde».
    */
-  private async downloadOriginal(row: Row, sizeHint: number | null): Promise<{ buf: Buffer; sha1: string; sha256: string } | { fail: { code: string; message: string; retryable: boolean } }> {
+  private async downloadOriginal(row: Row, sizeHint: number | null): Promise<{ buf: Buffer; sha1: string; sha256: string } | { fail: { code: string; message: string; retryable: boolean; missing?: boolean } }> {
     const h1 = createHash('sha1');
     const h256 = createHash('sha256');
     try {
@@ -509,20 +526,33 @@ export class CourseWorkshopService {
           message: `La descarga del archivo desde el almacenamiento se cortó por tiempo: llegaron ${mb(e.receivedBytes)}${e.expectedBytes !== null ? ` de ${mb(e.expectedBytes)}` : ''} MB en ${Math.round(e.timeoutMs / 1000)} s. Vuelve a intentarlo; si se repite, avísanos (la conexión con el almacenamiento está lenta).` } };
       }
       this.logger.warn(`workshop ${row.id}: no se pudo descargar el original (${err instanceof Error ? err.message.slice(0, 200) : String(err)})`);
-      return { fail: { code: isStorageUnavailableError(err) ? WORKSHOP_ERRORS.STORAGE_UNAVAILABLE : WORKSHOP_ERRORS.UPLOAD_NOT_FOUND, message: 'No se pudo leer el archivo subido; vuelve a intentarlo en unos minutos.', retryable: true } };
+      const unavailable = isStorageUnavailableError(err);
+      // `downloadStorageObjectCapped`: «Supabase Storage download failed: <status> …»; el Storage falso de las pruebas: «404».
+      const missing = !unavailable && /(^|\D)(400|404)(\D|$)/.test(err instanceof Error ? err.message : String(err));
+      return { fail: { code: unavailable ? WORKSHOP_ERRORS.STORAGE_UNAVAILABLE : WORKSHOP_ERRORS.UPLOAD_NOT_FOUND, message: 'No se pudo leer el archivo subido; vuelve a intentarlo en unos minutos.', retryable: true, missing } };
     }
   }
 
   /**
    * B2 (original alterable, B1-report riesgo 1): el original de una sesión YA identificada, verificado contra el sha1 /
-   * sha256 / tamaño guardados. El dueño puede reemplazar el objeto con su SDK (políticas own-folder): si los bytes no
-   * coinciden, la sesión pasa a `failed` con WORKSHOP_ORIGINAL_CHANGED (no reintentable: el original nunca se reemplaza)
-   * y se lanza 409 con ese código. Todo uso posterior del original (inventario, diagnóstico, parches) pasa por acá.
+   * sha256 / tamaño guardados. El dueño puede reemplazar o BORRAR el objeto con su SDK (políticas own-folder):
+   *  - otros bytes (o > 300 MB) → la sesión pasa a `failed` con WORKSHOP_ORIGINAL_CHANGED, 409;
+   *  - el objeto ya no existe (Storage 400/404) → `failed` con WORKSHOP_ORIGINAL_MISSING, 409 (fix round 2, P2-1);
+   * los dos terminales (el original nunca se reemplaza). Storage caído / lento → 503, la sesión no cambia.
+   * Todo uso posterior del original (inventario, diagnóstico, parches) pasa por acá.
    */
   async loadVerifiedOriginal(sessionId: string): Promise<{ buffer: Buffer; sha1: string; sha256: string }> {
     const [row] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS} from public.workshop_sessions where id = $1`, [sessionId]);
     if (!row) throw new NotFoundException('Sesión del Taller no encontrada');
     return this.verifiedOriginalOf(row);
+  }
+
+  private async failOriginal(row: Row, code: string, message: string): Promise<never> {
+    await this.q(this.dataSource,
+      `update public.workshop_sessions set status = 'failed', error = $2::jsonb, updated_at = now() where id = $1 and status = 'identified'`,
+      [row.id, JSON.stringify({ code, message, retryable: false })]);
+    this.logger.warn(`workshop ${row.id}: original no utilizable (${code})`);
+    throw new ConflictException({ code, message });
   }
 
   private async verifiedOriginalOf(row: Row): Promise<{ buffer: Buffer; sha1: string; sha256: string }> {
@@ -532,18 +562,18 @@ export class CourseWorkshopService {
     const size = row.original_size === null || row.original_size === undefined ? null : Number(row.original_size);
     const dl = await this.downloadOriginal(row, size);
     if ('fail' in dl) {
-      // Un objeto que ahora pesa más de 300 MB tampoco es el original.
+      if (dl.fail.missing) {
+        return this.failOriginal(row, WORKSHOP_ERRORS.ORIGINAL_MISSING,
+          'El archivo original de esta sesión ya no está en el almacenamiento (se borró después de verificarlo). Crea una sesión nueva subiendo el .mbz otra vez.');
+      }
+      // Un objeto que ahora pesa más de 300 MB tampoco es el original; lo demás es transitorio.
       if (dl.fail.code !== WORKSHOP_ERRORS.FILE_TOO_LARGE) throw new ServiceUnavailableException({ code: dl.fail.code, message: dl.fail.message });
     }
     const wantSha256 = typeof row.identification?.sha256 === 'string' ? row.identification.sha256 : null;
     const same = !('fail' in dl) && dl.sha1 === row.original_sha1 && (wantSha256 === null || dl.sha256 === wantSha256) && (size === null || dl.buf.length === size);
     if (!same) {
-      const message = 'El archivo original de esta sesión cambió en el almacenamiento después de verificarlo (ya no tiene la misma huella): por seguridad no se usa. Crea una sesión nueva subiendo el .mbz otra vez.';
-      await this.q(this.dataSource,
-        `update public.workshop_sessions set status = 'failed', error = $2::jsonb, updated_at = now() where id = $1 and status = 'identified'`,
-        [row.id, JSON.stringify({ code: WORKSHOP_ERRORS.ORIGINAL_CHANGED, message, retryable: false })]);
-      this.logger.warn(`workshop ${row.id}: el original cambió en Storage (sha1 esperado ${row.original_sha1}, visto ${'fail' in dl ? 'demasiado grande' : dl.sha1})`);
-      throw new ConflictException({ code: WORKSHOP_ERRORS.ORIGINAL_CHANGED, message });
+      return this.failOriginal(row, WORKSHOP_ERRORS.ORIGINAL_CHANGED,
+        'El archivo original de esta sesión cambió en el almacenamiento después de verificarlo (ya no tiene la misma huella): por seguridad no se usa. Crea una sesión nueva subiendo el .mbz otra vez.');
     }
     return { buffer: (dl as { buf: Buffer }).buf, sha1: row.original_sha1, sha256: (dl as { sha256: string }).sha256 };
   }
@@ -553,12 +583,13 @@ export class CourseWorkshopService {
   /**
    * Arma el inventario (pura) + la fuente del generador si el curso se identificó, y la forma persistida. Nunca lanza:
    * una falla queda en `info.error` (visible en la sesión y en GET …/inventory), jamás como inventario vacío «listo».
+   * Fix round 2 (P1-3): una falla del ARMADO es determinista para los mismos bytes → no reintentable.
    */
-  private async composeInventory(pkg: MbzPackage, meta: { family: WorkshopFamily; builderLine: BuilderLine | string; builderVersion: string | null }, courseId: number | null) {
+  private async composeInventory(pkg: MbzPackage, meta: { family: WorkshopFamily; builderLine: BuilderLine | string; builderVersion: string | null }, courseId: number | null, scope: IdentifyScope) {
     const builtAt = this.now().toISOString();
     try {
-      let course = await buildInventory(pkg, meta);
-      if (courseId !== null) course = attachSources(course, await this.loadSources(courseId));
+      let course = await this.inventoryBuilder(pkg, meta);
+      if (courseId !== null) course = attachSources(course, await this.loadSources(courseId, scope));
       const json = stableStringify(persistableInventory(course));
       const bytes = Buffer.byteLength(json);
       if (bytes > INVENTORY_PERSIST_MAX_BYTES) {
@@ -573,21 +604,28 @@ export class CourseWorkshopService {
       };
     } catch (err) {
       this.logger.error(`workshop: el inventario falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-      return { json: null, info: { builtAt, error: { code: WORKSHOP_ERRORS.INVENTORY_FAILED, message: 'No se pudo armar el inventario del paquete; vuelve a intentarlo. Si se repite, avísanos.', retryable: true } } };
+      return { json: null, info: { builtAt, error: { code: WORKSHOP_ERRORS.INVENTORY_FAILED, message: 'No se pudo armar el inventario de este paquete (falla con estos mismos bytes: no se reintenta sola). Avísanos para revisarlo.', retryable: false } } };
     }
   }
 
   /**
    * Fuente que el generador guardó para el curso identificado (B2 §3): artifacts de los tipos de `WORKSHOP_SOURCE_TYPES`
-   * del curso (id numérico o uuid del frontend) y de SU dueño, más la estructura (course_chapters / course_modules) para
+   * del curso (id numérico o uuid del frontend) y de SU dueño, más la estructura (course_modules / course_chapters) para
    * enganchar por posición. Solo referencias. Columnas o tablas que falten en un entorno viejo → se consulta sin ellas.
+   * Fix round 2 (P2-7): el curso se vuelve a verificar contra el ALCANCE de la sesión en cada lectura (también al
+   * reconstruir), cada referencia lleva el dueño de su fila, y la numeración por posición es la del builder: módulos por
+   * su posición (aunque no tengan capítulos) y capítulos en ese orden, incluidos los de práctica.
    */
-  async loadSources(courseId: number): Promise<{ courseId: number; rows: SourceArtifactRow[]; structure: SourceStructure | null } | { courseId: number; error: string }> {
+  async loadSources(courseId: number, scope: IdentifyScope): Promise<{ courseId: number; rows: SourceArtifactRow[]; structure: SourceStructure | null } | { courseId: number; error: string }> {
     try {
-      const [c] = await this.dataSource.query(`select id, owner_id::text as owner_id, metadata->>'courseId' as fe from public.courses where id = $1`, [courseId]);
+      const [c] = await this.dataSource.query(`select id, owner_id::text as owner_id, institution_id::text as institution_id, metadata->>'courseId' as fe from public.courses where id = $1`, [courseId]);
       if (!c) return { courseId, rows: [], structure: null };
+      const inScope = scope.institutionId
+        ? String(c.institution_id ?? '').toLowerCase() === scope.institutionId.toLowerCase()
+        : String(c.owner_id ?? '').toLowerCase() === scope.ownerId.toLowerCase();
+      if (!inScope) return { courseId, error: 'El curso identificado ya no está en el alcance de esta sesión: no se usa su fuente.' };
       const refs = [String(c.id), ...(c.fe ? [String(c.fe)] : [])];
-      const sql = (full: boolean) => `select a.id::text as id, a.type,
+      const sql = (full: boolean) => `select a.id::text as id, a.type, a.owner_id::text as owner_id,
           ${full ? 'a.chapter_id::text' : 'null::text'} as chapter_id, ${full ? 'a.module_id::text' : 'null::text'} as module_id,
           ${full ? 'a.manifest_item_key' : 'null::text'} as item_key, a.created_at
         from public.artifacts a
@@ -603,18 +641,18 @@ export class CourseWorkshopService {
       }
       let structure: SourceStructure | null = null;
       try {
+        const mods = await this.dataSource.query(`select id::text as id from public.course_modules where course_id = $1 order by position`, [courseId]);
         const st = await this.dataSource.query(
           `select ch.id::text as id, m.id::text as module_id from public.course_chapters ch join public.course_modules m on m.id = ch.module_id
             where ch.course_id = $1 order by m.position, ch.position`, [courseId]);
-        const modules: SourceStructure['modules'] = [];
-        for (const r of st) if (!modules.some((m) => m.id === r.module_id)) modules.push({ id: r.module_id, number: modules.length + 1 });
+        const modules: SourceStructure['modules'] = mods.map((m: any, i: number) => ({ id: m.id, number: i + 1 }));
         structure = { chapters: st.map((r: any, i: number) => ({ id: r.id, number: i + 1, moduleId: r.module_id })), modules };
       } catch (err) {
         if (!['42P01', '42703'].includes(String((err as { code?: string })?.code))) throw err;
       }
       return {
         courseId,
-        rows: rows.map((r) => ({ id: String(r.id), type: String(r.type), chapterId: r.chapter_id ?? null, moduleId: r.module_id ?? null, itemKey: r.item_key ?? null, createdAt: r.created_at ? iso(r.created_at) : null })),
+        rows: rows.map((r) => ({ id: String(r.id), type: String(r.type), ownerId: r.owner_id ?? null, chapterId: r.chapter_id ?? null, moduleId: r.module_id ?? null, itemKey: r.item_key ?? null, createdAt: r.created_at ? iso(r.created_at) : null })),
         structure,
       };
     } catch (err) {
@@ -623,13 +661,17 @@ export class CourseWorkshopService {
     }
   }
 
-  /** GET …/sessions/:id/inventory — mismas compuertas que GET …/:id. */
+  /**
+   * GET …/sessions/:id/inventory — mismas compuertas que GET …/:id. Fix round 2 (P1-3): un sondeo NUNCA dispara una
+   * descarga por sí solo: la reconstrucción se reclama en la base (una a la vez por sesión, entre procesos), se intenta a
+   * lo sumo INVENTORY_REBUILD_MAX_ATTEMPTS veces por versión del original y respeta la espera entre intentos.
+   */
   async getInventory(actor: WorkshopActor, id: string): Promise<WorkshopInventoryResponse> {
     let row = await this.loadForActor(actor, id, 'courses.view');
     row = await this.expireIfStale(row);
     const info = row.identification?.inventory ?? null;
-    const base = { sessionId: row.id, builtAt: typeof info?.builtAt === 'string' ? info.builtAt : null };
-    if (row.status === 'failed' && row.error?.code === WORKSHOP_ERRORS.ORIGINAL_CHANGED) {
+    const base = { sessionId: row.id, builtAt: typeof info?.builtAt === 'string' ? info.builtAt : null, retryAt: null as string | null };
+    if (row.status === 'failed' && (row.error?.code === WORKSHOP_ERRORS.ORIGINAL_CHANGED || row.error?.code === WORKSHOP_ERRORS.ORIGINAL_MISSING)) {
       return { ...base, status: 'failed', inventory: null, error: { code: String(row.error.code), message: String(row.error.message), retryable: false } };
     }
     if (row.status !== 'identified') {
@@ -639,17 +681,33 @@ export class CourseWorkshopService {
     if (r?.inventory) return { ...base, status: 'ready', inventory: r.inventory, error: null };
     const err = info?.error && typeof info.error === 'object' ? { code: String(info.error.code), message: String(info.error.message), retryable: info.error.retryable === true } : null;
     if (err && !err.retryable) return { ...base, status: 'failed', inventory: null, error: err };
-    this.startInventoryRebuild(row.id);
-    return { ...base, status: 'building', inventory: null, error: err };
+    const retryAt = typeof info?.nextAttemptAt === 'string' ? info.nextAttemptAt : null;
+    if (retryAt && new Date(retryAt).getTime() > this.now().getTime()) return { ...base, status: 'building', inventory: null, error: err, retryAt };
+    await this.startInventoryRebuild(row);
+    return { ...base, status: 'building', inventory: null, error: err, retryAt };
   }
 
-  /** Reconstrucción en segundo plano (una por sesión, con el mismo semáforo que la identificación). */
-  private startInventoryRebuild(id: string): void {
-    const key = `inventory:${id}`;
-    if (this.inFlight.has(key)) return;
-    const p = this.withSlot(() => this.rebuildInventory(id))
-      .catch((err) => this.logger.error(`workshop ${id}: la reconstrucción del inventario terminó con error: ${err instanceof Error ? err.message : String(err)}`))
-      .finally(() => this.inFlight.delete(key));
+  /**
+   * Reconstrucción en segundo plano. Reclamo en la base (`identification.inventory.rebuildClaimAt`, condicional: otro
+   * sondeo u otro proceso no lanza una segunda) + carril propio de 1 por proceso (no usa los lugares de identificación).
+   */
+  private async startInventoryRebuild(row: Row): Promise<void> {
+    const key = `inventory:${row.id}`;
+    if (this.inFlight.has(key) || this.rebuildBusy) return;
+    const claimed = returningRows(await this.q(this.dataSource,
+      `update public.workshop_sessions
+          set identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{inventory}',
+                coalesce(identification->'inventory', '{}'::jsonb) || jsonb_build_object('rebuildClaimAt', $2::text))
+        where id = $1 and status = 'identified' and inventory is null
+          and (identification->'inventory'->>'rebuildClaimAt' is null
+               or (identification->'inventory'->>'rebuildClaimAt')::timestamptz < $2::timestamptz - ($3::int * interval '1 millisecond'))
+        returning id`,
+      [row.id, this.now().toISOString(), IDENTIFY_STALE_MS]));
+    if (!claimed.length) return;
+    this.rebuildBusy = true;
+    const p = this.rebuildInventory(row.id)
+      .catch((e) => this.logger.error(`workshop ${row.id}: la reconstrucción del inventario terminó con error: ${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => { this.rebuildBusy = false; this.inFlight.delete(key); });
     this.inFlight.set(key, p);
   }
 
@@ -657,17 +715,29 @@ export class CourseWorkshopService {
   async rebuildInventory(id: string): Promise<void> {
     const [row] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS}, inventory is not null as has_inventory from public.workshop_sessions where id = $1`, [id]);
     if (!row || row.status !== 'identified' || (row as Row & { has_inventory?: boolean }).has_inventory) return;
-    const saveInfo = (info: unknown, json: string | null) => this.q(this.dataSource,
+    const prev = row.identification?.inventory ?? {};
+    // Los intentos se cuentan por VERSIÓN del original (sha1): otro original empieza de cero.
+    const attempts = prev.forSha1 === row.original_sha1 && Number.isInteger(prev.attempts) ? Number(prev.attempts) : 0;
+    const saveInfo = (info: Record<string, unknown>, json: string | null) => this.q(this.dataSource,
       `update public.workshop_sessions set inventory = $2::jsonb, identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{inventory}', $3::jsonb), updated_at = now()
         where id = $1 and status = 'identified' and inventory is null`,
-      [id, json, JSON.stringify(info)]);
+      [id, json, JSON.stringify({ ...info, forSha1: row.original_sha1, attempts: attempts + 1 })]);
     let original;
     try {
       original = await this.verifiedOriginalOf(row);
     } catch (err) {
       const body = (err as { getResponse?: () => any })?.getResponse?.();
-      if (body?.code === WORKSHOP_ERRORS.ORIGINAL_CHANGED) return; // la sesión ya quedó failed con el motivo
-      await saveInfo({ builtAt: this.now().toISOString(), error: { code: body?.code ?? WORKSHOP_ERRORS.INVENTORY_FAILED, message: body?.message ?? 'No se pudo leer el original para armar el inventario; vuelve a intentarlo.', retryable: true } }, null);
+      if (body?.code === WORKSHOP_ERRORS.ORIGINAL_CHANGED || body?.code === WORKSHOP_ERRORS.ORIGINAL_MISSING) return; // la sesión ya quedó failed
+      // Transitorio (Storage caído / lento): reintento con espera creciente; agotados los intentos, terminal.
+      const last = attempts + 1 >= INVENTORY_REBUILD_MAX_ATTEMPTS;
+      const nextAttemptAt = last ? null : new Date(this.now().getTime() + INVENTORY_REBUILD_BACKOFF_MS * Math.pow(4, attempts)).toISOString();
+      await saveInfo({
+        builtAt: this.now().toISOString(), nextAttemptAt,
+        error: {
+          code: body?.code ?? WORKSHOP_ERRORS.INVENTORY_FAILED, retryable: !last,
+          message: last ? `No se pudo leer el original para armar el inventario después de ${INVENTORY_REBUILD_MAX_ATTEMPTS} intentos; avísanos.` : (body?.message ?? 'No se pudo leer el original para armar el inventario; se reintenta solo en unos minutos.'),
+        },
+      }, null);
       return;
     }
     let pkg: MbzPackage;
@@ -679,7 +749,8 @@ export class CourseWorkshopService {
     }
     const builderLine = String(row.identification?.result?.builder?.line ?? 'unknown');
     const builderVersion = typeof row.identification?.result?.builder?.version === 'string' ? row.identification.result.builder.version : null;
-    const inv = await this.composeInventory(pkg, { family: (row.family ?? 'prototype') as WorkshopFamily, builderLine, builderVersion }, row.identified_course_id ?? null);
+    const scope: IdentifyScope = { ownerId: row.owner_id, institutionId: row.institution_id ?? null };
+    const inv = await this.composeInventory(pkg, { family: (row.family ?? 'prototype') as WorkshopFamily, builderLine, builderVersion }, row.identified_course_id ?? null, scope);
     await saveInfo(inv.info, inv.json);
   }
 
