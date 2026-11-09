@@ -1,11 +1,11 @@
 import {
   BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException, Optional, ServiceUnavailableException,
 } from '@nestjs/common';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { isSuperAdminEmail } from '../../auth/super-admin';
-import { ArtifactsService } from '../artifacts/artifacts.service';
+import { ArtifactsService, STORAGE_OBJECT_TOO_LARGE, assertWritableStoragePath } from '../artifacts/artifacts.service';
 import { isStorageUnavailableError } from '../artifacts/storage-resilience';
 import { rbacMode } from '../authz/authz-flags';
 import { PermissionService } from '../authz/permission.service';
@@ -44,7 +44,12 @@ export const WORKSHOP_ERRORS = Object.freeze({
   IDENTIFICATION_FAILED: 'WORKSHOP_IDENTIFICATION_FAILED',
   IDENTIFICATION_INTERRUPTED: 'WORKSHOP_IDENTIFICATION_INTERRUPTED',
   STORAGE_UNAVAILABLE: 'WORKSHOP_STORAGE_UNAVAILABLE',
+  UPLOAD_CHANGED: 'WORKSHOP_UPLOAD_CHANGED',
+  ORIGINAL_CHANGED: 'WORKSHOP_ORIGINAL_CHANGED',
 });
+
+/** Fix P2-7: límites SOLO de la lista para la heurística (las coincidencias exactas se consultan aparte). */
+export const WORKSHOP_CATALOG_LIMITS = Object.freeze({ courses: 1000, artifacts: 5000 });
 
 export const WORKSHOP_BUCKET = 'cursia-artifacts';
 export const WORKSHOP_MAX_UPLOAD_BYTES = MBZ_READER_LIMITS.maxPackageBytes; // 300 MB (diseño §11)
@@ -127,7 +132,6 @@ interface Row {
 type Q = { query: (sql: string, params?: unknown[]) => Promise<any> };
 
 const iso = (d: Date | string) => (d instanceof Date ? d.toISOString() : new Date(d).toISOString());
-const sha = (algo: 'sha1' | 'sha256', b: Buffer) => createHash(algo).update(b).digest('hex');
 
 /** Nombre de archivo que se guarda (solo para mostrarlo y para la regla de re-exporte de Moodle); nunca forma una ruta. */
 export function sanitizeUploadFilename(raw: unknown): string | null {
@@ -289,18 +293,24 @@ export class CourseWorkshopService {
         [row.id, JSON.stringify({ code: WORKSHOP_ERRORS.FILE_TOO_LARGE, message: `El archivo subido pesa ${Math.round(bytes / 1048576)} MB; el máximo es ${Math.round(WORKSHOP_MAX_UPLOAD_BYTES / 1048576)} MB.`, retryable: false })]));
       return this.toRecord(r);
     }
+    // Fix P2-6: el reclamo es de la BASE (UPDATE condicional) y lleva un token: solo quien tiene el token vigente puede
+    // escribir el resultado; un reintento tras la expiración cambia el token y la ejecución vieja (otro proceso, un
+    // pm2 reload) ya no puede pisar nada ni registrar un segundo original.
+    const claimId = randomUUID();
     const claimed = returningRows(await this.q(this.dataSource,
-      `update public.workshop_sessions set status = 'identifying', error = null, updated_at = now()
+      `update public.workshop_sessions
+          set status = 'identifying', error = null, updated_at = now(),
+              identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{claim}', jsonb_build_object('id', $2::text, 'at', now(), 'headBytes', $3::bigint))
         where id = $1 and (status = 'uploaded' or (status = 'failed' and coalesce((error->>'retryable')::boolean, false)))
         returning *`,
-      [row.id]));
+      [row.id, claimId, bytes]));
     if (!claimed.length) {
       const [cur] = await this.q<Row[]>(this.dataSource, `select * from public.workshop_sessions where id = $1`, [row.id]);
       return this.toRecord(cur);
     }
     // Sin await (202). Nunca una promesa rechazada sin dueño (tumbaría el proceso): si hasta el registro del fallo
     // falla (base caída), queda `identifying` y IDENTIFY_STALE_MS la libera al leerla.
-    const p = this.withSlot(() => this.runIdentification(row.id))
+    const p = this.withSlot(() => this.runIdentification(row.id, claimId))
       .catch((err) => this.logger.error(`workshop ${row.id}: la identificación terminó con error: ${err instanceof Error ? err.message : String(err)}`))
       .finally(() => this.inFlight.delete(row.id));
     this.inFlight.set(row.id, p);
@@ -309,8 +319,17 @@ export class CourseWorkshopService {
 
   // ── identificación ──
 
-  private async withSlot(fn: () => Promise<void>): Promise<void> {
-    if (this.running >= IDENTIFY_CONCURRENCY) await new Promise<void>((r) => this.waiting.push(r));
+  /** Identificaciones corriendo ahora en este proceso (las pruebas lo leen). */
+  get runningCount(): number {
+    return this.running;
+  }
+
+  /**
+   * Fix P2-1: semáforo de IDENTIFY_CONCURRENCY. El que despierta VUELVE a mirar (`while`): entre el `running--` de quien
+   * termina y la continuación del que esperaba puede colarse otra llamada; sin el re-chequeo corrían 3 a la vez.
+   */
+  async withSlot(fn: () => Promise<void>): Promise<void> {
+    while (this.running >= IDENTIFY_CONCURRENCY) await new Promise<void>((r) => this.waiting.push(r));
     this.running++;
     try {
       await fn();
@@ -325,61 +344,107 @@ export class CourseWorkshopService {
     if (row.status !== 'identifying' || this.inFlight.has(row.id)) return row;
     if (this.now().getTime() - new Date(row.updated_at).getTime() < IDENTIFY_STALE_MS) return row;
     const [r] = returningRows(await this.q(this.dataSource,
-      `update public.workshop_sessions set status = 'failed', error = $2::jsonb, updated_at = now() where id = $1 and status = 'identifying' returning *`,
-      [row.id, JSON.stringify({ code: WORKSHOP_ERRORS.IDENTIFICATION_INTERRUPTED, message: 'La identificación se interrumpió; vuelve a intentarlo.', retryable: true })]));
+      `update public.workshop_sessions set status = 'failed', error = $2::jsonb, updated_at = now()
+        where id = $1 and status = 'identifying' and updated_at < now() - ($3::int * interval '1 millisecond') returning *`,
+      [row.id, JSON.stringify({ code: WORKSHOP_ERRORS.IDENTIFICATION_INTERRUPTED, message: 'La identificación se interrumpió; vuelve a intentarlo.', retryable: true }), IDENTIFY_STALE_MS]));
     return r ?? row;
   }
 
-  /** Corre la identificación de una sesión ya `identifying`. Nunca lanza: todo termina en `identified` o `failed`. */
-  async runIdentification(id: string): Promise<void> {
+  /**
+   * Corre la identificación de una sesión `identifying` cuyo reclamo vigente es `claimId`. Nunca lanza: termina en
+   * `identified` o `failed`; si el reclamo ya no es suyo (expiró y otro lo tomó) no escribe nada.
+   */
+  async runIdentification(id: string, claimId: string): Promise<void> {
     const [row] = await this.q<Row[]>(this.dataSource, `select * from public.workshop_sessions where id = $1`, [id]);
-    if (!row || row.status !== 'identifying') return;
-    const fail = async (code: string, message: string, retryable: boolean, extra: Record<string, unknown> = {}) => {
+    if (!row || row.status !== 'identifying' || row.identification?.claim?.id !== claimId) return;
+    const CLAIMED = `id = $1 and status = 'identifying' and identification->'claim'->>'id' = $2`;
+    const fail = async (code: string, message: string, retryable: boolean, extra: { sha1?: string; size?: number } = {}) => {
       await this.q(this.dataSource,
-        `update public.workshop_sessions set status = 'failed', error = $2::jsonb, original_sha1 = coalesce($3, original_sha1),
-                original_size = coalesce($4, original_size), container = coalesce($5, container), updated_at = now()
-          where id = $1 and status = 'identifying'`,
-        [id, JSON.stringify({ code, message, retryable }), extra.sha1 ?? null, extra.size ?? null, extra.container ?? null]);
+        `update public.workshop_sessions set status = 'failed', error = $3::jsonb, original_sha1 = coalesce($4, original_sha1),
+                original_size = coalesce($5, original_size), updated_at = now()
+          where ${CLAIMED}`,
+        [id, claimId, JSON.stringify({ code, message, retryable }), extra.sha1 ?? null, extra.size ?? null]);
     };
+
+    // 1. Descarga EN FLUJO con tope duro (fix P1-1) y hashes incrementales (fix P2-4): nada de 300 MB de una vez.
+    const h1 = createHash('sha1');
+    const h256 = createHash('sha256');
     let buf: Buffer;
     try {
-      buf = await this.artifacts.downloadStorageObject(WORKSHOP_BUCKET, row.storage_path, DOWNLOAD_TIMEOUT_MS);
+      buf = await this.artifacts.downloadStorageObjectCapped(WORKSHOP_BUCKET, row.storage_path, {
+        maxBytes: WORKSHOP_MAX_UPLOAD_BYTES,
+        timeoutMs: DOWNLOAD_TIMEOUT_MS,
+        onChunk: (c) => { h1.update(c); h256.update(c); },
+      });
     } catch (err) {
+      if ((err as { code?: string })?.code === STORAGE_OBJECT_TOO_LARGE) {
+        await fail(WORKSHOP_ERRORS.FILE_TOO_LARGE, `El archivo subido pesa más de ${Math.round(WORKSHOP_MAX_UPLOAD_BYTES / 1048576)} MB (el máximo).`, false);
+        return;
+      }
       this.logger.warn(`workshop ${id}: no se pudo descargar el original (${err instanceof Error ? err.message.slice(0, 200) : String(err)})`);
       await fail(isStorageUnavailableError(err) ? WORKSHOP_ERRORS.STORAGE_UNAVAILABLE : WORKSHOP_ERRORS.UPLOAD_NOT_FOUND,
         'No se pudo leer el archivo subido; vuelve a intentarlo en unos minutos.', true);
       return;
     }
-    const sha1 = sha('sha1', buf);
-    const sha256 = sha('sha256', buf);
+    const sha1 = h1.digest('hex');
+    const sha256 = h256.digest('hex');
     const size = buf.length;
+    // Se verifica lo DESCARGADO, no el HEAD: si el objeto cambió entre el HEAD y la descarga, se pide reintentar (el
+    // reintento vuelve a hacer HEAD y a hashear lo que llegue).
+    const headBytes = Number(row.identification?.claim?.headBytes);
+    if (Number.isFinite(headBytes) && headBytes !== size) {
+      await fail(WORKSHOP_ERRORS.UPLOAD_CHANGED, 'El archivo cambió mientras lo verificábamos; vuelve a intentarlo cuando termine de subirse.', true);
+      return;
+    }
+
+    // 2. Lector seguro + hechos del paquete. Todo rechazo acá es ENTRADA MALFORMADA → no reintentable (fix P2-3).
+    let pkg;
+    let facts;
     try {
-      if (size > WORKSHOP_MAX_UPLOAD_BYTES) {
-        await fail(WORKSHOP_ERRORS.FILE_TOO_LARGE, `El archivo subido pesa ${Math.round(size / 1048576)} MB; el máximo es ${Math.round(WORKSHOP_MAX_UPLOAD_BYTES / 1048576)} MB.`, false);
-        return;
+      pkg = await openMbz(buf);
+      facts = await readPackageFacts(pkg, row.identification?.upload?.filename ?? null);
+    } catch (err) {
+      if (isMbzReaderError(err) || err instanceof PackageFactsError) {
+        await fail(`WORKSHOP_${err.code.toUpperCase()}`, err.message, false, { sha1, size });
+      } else {
+        this.logger.warn(`workshop ${id}: paquete ilegible (${err instanceof Error ? err.name : typeof err})`);
+        await fail('WORKSHOP_CORRUPT', 'El archivo está dañado o no tiene el formato de una copia de Moodle; vuelve a descargarlo y súbelo otra vez.', false, { sha1, size });
       }
-      const pkg = await openMbz(buf);
-      const facts = await readPackageFacts(pkg, row.identification?.upload?.filename ?? null);
-      const scope: IdentifyScope = { ownerId: row.owner_id, institutionId: rbacMode() === 'enforce' ? row.institution_id : null };
-      const catalog = await this.loadCatalog(scope);
-      const result = identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope, catalog });
-      const artifactId = await this.registerOriginal(row, { sha1, sha256, size, container: pkg.container, family: result.family });
+      return;
+    }
+
+    // 3. Catálogo del alcance de la sesión + identificación + registro atómico. Fallas de base: reintentables.
+    try {
+      const scope: IdentifyScope = { ownerId: row.owner_id, institutionId: row.institution_id ?? null };
+      const { catalog, truncated } = await this.loadCatalog(scope, {
+        sha256, courseIds: [facts.cursiaMeta?.courseId ?? null, facts.v3NameCourseId].filter((x): x is number => typeof x === 'number'), title: facts.title,
+      });
+      const result = identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope, catalog, catalogTruncated: truncated });
       const identification = {
         ...(row.identification ?? {}),
         sha256,
         facts: { title: facts.title, activities: facts.activities, sections: facts.sections, entryCount: facts.entryCount, moodleRelease: facts.moodleRelease, backupName: facts.backupName },
+        catalog: { size: catalog.length, truncated },
         result,
         identifiedAt: this.now().toISOString(),
       };
-      await this.q(this.dataSource,
-        `update public.workshop_sessions
-            set status = 'identified', original_artifact_id = $2, original_sha1 = $3, original_size = $4, container = $5, family = $6,
-                identified_course_id = $7, identification = $8::jsonb, builder_version = $9, error = null, updated_at = now()
-          where id = $1 and status = 'identifying'`,
-        [id, artifactId, sha1, size, pkg.container, result.family, result.courseId, JSON.stringify(identification), builderVersionColumn(result)]);
+      const container = pkg.container;
+      await this.dataSource.transaction(async (m) => {
+        // Una sola registración por objeto, aunque corran dos procesos: lock por ruta + verificación del reclamo.
+        await m.query(`select pg_advisory_xact_lock(hashtext('workshop_original:' || $1))`, [row.storage_path]);
+        const [still] = await this.q<any[]>(m, `select 1 as ok from public.workshop_sessions where ${CLAIMED} for update`, [id, claimId]);
+        if (!still) return; // el reclamo ya no es nuestro: no se escribe nada
+        const artifactId = await this.registerOriginal(m, row, { sha1, sha256, size, container, family: result.family });
+        await this.q(m,
+          `update public.workshop_sessions
+              set status = 'identified', original_artifact_id = $3, original_sha1 = $4, original_size = $5, container = $6, family = $7,
+                  identified_course_id = $8, identification = $9::jsonb, builder_version = $10, error = null, updated_at = now()
+            where ${CLAIMED}`,
+          [id, claimId, artifactId, sha1, size, container, result.family, result.courseId, JSON.stringify(identification), builderVersionColumn(result)]);
+      });
     } catch (err) {
-      if (isMbzReaderError(err) || err instanceof PackageFactsError) {
-        await fail(`WORKSHOP_${err.code.toUpperCase()}`, err.message, false, { sha1, size });
+      if ((err as { code?: string })?.code === WORKSHOP_ERRORS.ORIGINAL_CHANGED) {
+        await fail(WORKSHOP_ERRORS.ORIGINAL_CHANGED, 'El original ya registrado de esta sesión tiene otros bytes; crea una sesión nueva para subir otro archivo.', false, { sha1, size });
         return;
       }
       this.logger.error(`workshop ${id}: identificación falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
@@ -387,61 +452,103 @@ export class CourseWorkshopService {
     }
   }
 
-  /** Catálogo del alcance: cursos del dueño (y de su institución solo en enforce) con sus paquetes .mbz registrados. */
-  async loadCatalog(scope: IdentifyScope): Promise<CatalogCourse[]> {
-    const courses = await this.q<any[]>(this.dataSource,
-      `select c.id, c.title, c.owner_id::text as owner_id, c.institution_id::text as institution_id, c.metadata->>'courseId' as frontend_id
-         from public.courses c
-        where c.owner_id::text = $1 or ($2::text is not null and c.institution_id::text = $2::text)
-        order by c.id desc limit 1000`,
-      [scope.ownerId, scope.institutionId]);
-    if (!courses.length) return [];
-    const owners = [...new Set(courses.map((c) => String(c.owner_id ?? '')).filter(Boolean))];
-    const arts = await this.q<any[]>(this.dataSource,
-      `select a.id::text as id, a.type, a.owner_id::text as owner_id, a.course_id::text as course_ref, a.checksum_sha256, a.size_bytes,
-              a.metadata->>'builderVersion' as builder_version, a.metadata->>'activityCount' as activity_count, a.metadata->>'validatedSha256' as validated_sha256
-         from public.artifacts a
-        where a.type in ('mbz_final', 'dynamic_mbz') and a.owner_id::text = any($1::text[])
-        order by a.created_at desc limit 5000`,
-      [owners]);
+  /**
+   * Catálogo del ALCANCE de la sesión (fix P1-2: institución → solo sus cursos; sin institución → solo los del dueño).
+   * Fix P2-7: las coincidencias EXACTAS (huella sha256, ids que nombra el paquete, título igual) se buscan con consultas
+   * directas y sin límite; solo la lista para la heurística se recorta, y si se recorta queda dicho (`truncated`).
+   */
+  async loadCatalog(scope: IdentifyScope, exact: { sha256?: string | null; courseIds?: number[]; title?: string | null } = {}): Promise<{ catalog: CatalogCourse[]; truncated: boolean }> {
+    const inst = scope.institutionId ? scope.institutionId.toLowerCase() : null;
+    const scopeSql = (alias: string, p: number) => (inst ? `${alias}.institution_id::text = $${p}` : `${alias}.owner_id::text = $${p}`);
+    const scopeVal = inst ?? scope.ownerId;
+    const COURSE_COLS = `c.id, c.title, c.owner_id::text as owner_id, c.institution_id::text as institution_id, c.metadata->>'courseId' as frontend_id`;
+    const ART_COLS = `a.id::text as id, a.type, a.owner_id::text as owner_id, a.course_id::text as course_ref, a.checksum_sha256, a.size_bytes,
+      a.metadata->>'builderVersion' as builder_version, a.metadata->>'activityCount' as activity_count, a.metadata->>'validatedSha256' as validated_sha256`;
+    const ART_JOIN = `join public.courses c on c.owner_id::text = a.owner_id::text and (c.id::text = a.course_id::text or c.metadata->>'courseId' = a.course_id::text)`;
+
+    // Exactas (sin límite de lista): artifacts con la huella; cursos con los ids que nombra el paquete o el mismo título.
+    const sha = /^[0-9a-f]{64}$/.test(String(exact.sha256 ?? '')) ? String(exact.sha256) : null;
+    const hashArts = sha
+      ? await this.q<any[]>(this.dataSource,
+        `select ${ART_COLS}, c.id as c_id, c.title as c_title, c.institution_id::text as c_institution_id, c.metadata->>'courseId' as c_frontend_id
+           from public.artifacts a ${ART_JOIN}
+          where a.type in ('mbz_final', 'dynamic_mbz') and (a.checksum_sha256 = $2 or a.metadata->>'validatedSha256' = $2) and ${scopeSql('c', 1)}`,
+        [scopeVal, sha])
+      : [];
+    const ids = (exact.courseIds ?? []).filter((n) => Number.isSafeInteger(n) && n > 0);
+    const exactCourses = ids.length || exact.title
+      ? await this.q<any[]>(this.dataSource,
+        `select ${COURSE_COLS} from public.courses c
+          where ${scopeSql('c', 1)} and (c.id = any($2::int[]) or ($3::text is not null and lower(btrim(c.title)) = lower(btrim($3::text))))
+          limit 200`,
+        [scopeVal, ids, exact.title ?? null])
+      : [];
+
+    // Heurística: los más recientes del alcance, con límite declarado.
+    const COURSE_LIMIT = WORKSHOP_CATALOG_LIMITS.courses;
+    const recent = await this.q<any[]>(this.dataSource,
+      `select ${COURSE_COLS} from public.courses c where ${scopeSql('c', 1)} order by c.id desc limit ${COURSE_LIMIT + 1}`, [scopeVal]);
+    let truncated = recent.length > COURSE_LIMIT;
+    const byId = new Map<number, CatalogCourse>();
     const byKey = new Map<string, CatalogCourse>();
-    const out: CatalogCourse[] = courses.map((c) => {
-      const cc: CatalogCourse = { courseId: Number(c.id), title: String(c.title ?? ''), ownerId: c.owner_id ?? null, institutionId: c.institution_id ?? null, packages: [] };
+    const addCourse = (c: any) => {
+      const id = Number(c.id);
+      if (byId.has(id)) return byId.get(id);
+      const cc: CatalogCourse = { courseId: id, title: String(c.title ?? ''), ownerId: c.owner_id ?? null, institutionId: c.institution_id ?? null, packages: [] };
+      byId.set(id, cc);
       byKey.set(`${c.owner_id}|${c.id}`, cc);
       if (c.frontend_id) byKey.set(`${c.owner_id}|${String(c.frontend_id)}`, cc);
       return cc;
-    });
-    for (const a of arts) {
+    };
+    for (const h of hashArts) addCourse({ id: h.c_id, title: h.c_title, owner_id: h.owner_id, institution_id: h.c_institution_id, frontend_id: h.c_frontend_id });
+    for (const c of [...exactCourses, ...recent.slice(0, COURSE_LIMIT)]) addCourse(c);
+    if (!byId.size) return { catalog: [], truncated };
+    const owners = [...new Set([...byId.values()].map((c) => String(c.ownerId ?? '')).filter(Boolean))];
+    const ART_LIMIT = WORKSHOP_CATALOG_LIMITS.artifacts;
+    const arts = await this.q<any[]>(this.dataSource,
+      `select ${ART_COLS} from public.artifacts a
+        where a.type in ('mbz_final', 'dynamic_mbz') and a.owner_id::text = any($1::text[])
+        order by a.created_at desc limit ${ART_LIMIT + 1}`,
+      [owners]);
+    if (arts.length > ART_LIMIT) truncated = true;
+    const seen = new Set<string>();
+    for (const a of [...hashArts, ...arts.slice(0, ART_LIMIT)]) {
+      if (seen.has(a.id)) continue;
+      seen.add(a.id);
       // Mismo criterio que resolveArtifact: el curso del artifact es el de su referencia Y del mismo dueño.
       const cc = byKey.get(`${a.owner_id}|${String(a.course_ref ?? '')}`);
       if (!cc) continue;
-      const sha256 = /^[0-9a-f]{64}$/.test(String(a.checksum_sha256 ?? '')) ? String(a.checksum_sha256) : /^[0-9a-f]{64}$/.test(String(a.validated_sha256 ?? '')) ? String(a.validated_sha256) : null;
+      const s256 = /^[0-9a-f]{64}$/.test(String(a.checksum_sha256 ?? '')) ? String(a.checksum_sha256) : /^[0-9a-f]{64}$/.test(String(a.validated_sha256 ?? '')) ? String(a.validated_sha256) : null;
       const ac = Number(a.activity_count);
       cc.packages.push({
-        artifactId: a.id, type: a.type, sha256, sizeBytes: a.size_bytes === null || a.size_bytes === undefined ? null : Number(a.size_bytes),
+        artifactId: a.id, type: a.type, sha256: s256, sizeBytes: a.size_bytes === null || a.size_bytes === undefined ? null : Number(a.size_bytes),
         builderVersion: a.builder_version ?? null, activityCount: Number.isInteger(ac) && ac > 0 ? ac : null,
       });
     }
-    return out;
+    return { catalog: [...byId.values()], truncated };
   }
 
-  /** Registra (una sola vez) el artifact `workshop_original` que apunta al objeto subido. */
-  private async registerOriginal(row: Row, v: { sha1: string; sha256: string; size: number; container: string; family: string }): Promise<string> {
-    const [existing] = await this.q<any[]>(this.dataSource,
-      `select id::text as id from public.artifacts where type = 'workshop_original' and owner_id::text = $1 and storage_path = $2 limit 1`,
+  /**
+   * Registra (una sola vez, idempotente) el artifact `workshop_original`, DENTRO de la transacción con el lock por ruta.
+   * Ya existe con los mismos bytes → se reutiliza; con otros bytes → ORIGINAL_CHANGED (el original nunca se reemplaza).
+   */
+  private async registerOriginal(m: Q, row: Row, v: { sha1: string; sha256: string; size: number; container: string; family: string }): Promise<string> {
+    assertWritableStoragePath(row.owner_id, WORKSHOP_BUCKET, row.storage_path);
+    const [existing] = await this.q<any[]>(m,
+      `select id::text as id, checksum_sha256 from public.artifacts where type = 'workshop_original' and owner_id::text = $1 and storage_path = $2 order by created_at asc limit 1`,
       [row.owner_id, row.storage_path]);
-    if (existing) return existing.id;
-    const a = await this.artifacts.create({
-      type: 'workshop_original',
-      storage_path: row.storage_path,
-      storage_bucket: WORKSHOP_BUCKET,
-      storage_provider: 'supabase',
-      filename: row.identification?.upload?.filename ?? 'original.mbz',
-      mime_type: 'application/vnd.moodle.backup',
-      size_bytes: v.size,
-      checksum_sha256: v.sha256,
-      metadata: { workshopSessionId: row.id, sha1: v.sha1, container: v.container, family: v.family },
-    } as any, row.owner_id);
+    if (existing) {
+      if (existing.checksum_sha256 && existing.checksum_sha256 !== v.sha256) {
+        throw Object.assign(new Error('workshop_original con otros bytes'), { code: WORKSHOP_ERRORS.ORIGINAL_CHANGED });
+      }
+      return existing.id;
+    }
+    const [a] = await this.q<any[]>(m,
+      `insert into public.artifacts (owner_id, course_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, size_bytes, checksum_sha256, metadata)
+       values ($1, null, 'workshop_original', 'supabase', $2, $3, $4, 'application/vnd.moodle.backup', $5, $6, $7::jsonb)
+       returning id::text as id`,
+      [row.owner_id, WORKSHOP_BUCKET, row.storage_path, row.identification?.upload?.filename ?? 'original.mbz', v.size, v.sha256,
+        JSON.stringify({ workshopSessionId: row.id, sha1: v.sha1, container: v.container, family: v.family })]);
     return a.id;
   }
 

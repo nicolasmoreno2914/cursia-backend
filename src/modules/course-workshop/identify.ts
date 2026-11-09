@@ -203,13 +203,21 @@ export interface IdentifyInput {
   sizeBytes: number;
   scope: IdentifyScope;
   catalog: readonly CatalogCourse[];
+  /** Fix P2-7: el catálogo de la HEURÍSTICA se recortó (las coincidencias exactas se buscan aparte, sin límite). */
+  catalogTruncated?: boolean;
 }
 
 const lc = (s: string | null | undefined) => String(s ?? '').trim().toLowerCase();
 
+/**
+ * Fix P1-2: el alcance es UNO solo, igual que la autorización del resto de la app en enforce:
+ *  - sesión de una institución X → SOLO cursos de X (ni los personales del dueño ni los de otra institución suya: un
+ *    miembro de X que lee la sesión nunca ve títulos / ids de fuera de X);
+ *  - sesión sin institución → SOLO cursos del dueño (lo que el dueño ya ve).
+ */
 export function inScope(c: Pick<CatalogCourse, 'ownerId' | 'institutionId'>, scope: IdentifyScope): boolean {
-  if (c.ownerId && lc(c.ownerId) === lc(scope.ownerId)) return true;
-  return !!scope.institutionId && !!c.institutionId && lc(c.institutionId) === lc(scope.institutionId);
+  if (scope.institutionId) return !!c.institutionId && lc(c.institutionId) === lc(scope.institutionId);
+  return !!c.ownerId && lc(c.ownerId) === lc(scope.ownerId);
 }
 
 /** Título comparable: sin tildes, minúsculas, sin prefijos entre corchetes, solo letras/números con un espacio. */
@@ -240,6 +248,8 @@ const HEURISTIC = Object.freeze({
   activitiesNear: 0.1, // ±10 %
   sizeExact: 0.15,
   v3NameMarker: 0.3,
+  /** Fix P2-2: cursia_meta sin corroborar = candidato medio; con la estructura llega a 0,75 (< alta): nunca identifica sola. */
+  cursiaMetaUnconfirmed: 0.5,
   high: 0.85,
   medium: 0.6,
   low: 0.35,
@@ -268,16 +278,21 @@ export function identifyPackage(input: IdentifyInput): IdentificationResult {
   const builderFromPackage = { line, version: null as string | null, source: (line === 'unknown' ? 'none' : 'package') as IdentificationResult['builder']['source'] };
   const titleN = normalizeTitle(facts.title);
 
-  // a. cursia_meta
+  if (input.catalogTruncated) notes.push('Tu cuenta tiene muchos cursos: los parecidos se buscaron entre los más recientes (las coincidencias exactas, en todos).');
+
+  // a. cursia_meta — fix P2-2: hoy ningún builder la escribe, así que es una DECLARACIÓN del paquete, no una prueba. Es
+  //    exacta solo si se corrobora: el curso está en el alcance, el título coincide y la estructura no la contradice.
+  //    Sin corroborar, solo suma a la heurística (y su versión de builder no se usa).
+  const metaCourse = facts.cursiaMeta && facts.cursiaMeta.courseId !== null ? byId.get(facts.cursiaMeta.courseId) ?? null : null;
   if (facts.cursiaMeta) {
     const meta = facts.cursiaMeta;
-    const builder = meta.builderVersion ? { line, version: meta.builderVersion, source: 'cursia_meta' as const } : builderFromPackage;
-    if (meta.courseId !== null && byId.has(meta.courseId)) {
-      return { ...base, method: 'cursia_meta', confidence: 'exact', courseId: meta.courseId, builder };
+    const acts = metaCourse ? metaCourse.packages.map((p) => p.activityCount).filter((n): n is number => typeof n === 'number' && n > 0) : [];
+    const structureOk = !acts.length || facts.activities <= 0 || acts.some((n) => Math.abs(n - facts.activities) <= Math.max(1, Math.round(n * 0.1)));
+    if (metaCourse && titleN && normalizeTitle(metaCourse.title) === titleN && structureOk) {
+      const builder = meta.builderVersion ? { line, version: meta.builderVersion, source: 'cursia_meta' as const } : builderFromPackage;
+      return { ...base, method: 'cursia_meta', confidence: 'exact', courseId: metaCourse.courseId, builder };
     }
-    notes.push('El paquete trae la marca de Cursia, pero su curso no está en tu cuenta: se identifica por otras señas.');
-    builderFromPackage.version = builder.version;
-    builderFromPackage.source = builder.source;
+    if (!metaCourse) notes.push('El paquete trae la marca de Cursia, pero su curso no está en tu cuenta: se identifica por otras señas.');
   }
 
   // b. huella del paquete (sha256 del artifact registrado por el servidor)
@@ -326,6 +341,10 @@ export function identifyPackage(input: IdentifyInput): IdentificationResult {
     if (input.sizeBytes > 0 && c.packages.some((p) => Number(p.sizeBytes) === input.sizeBytes)) {
       score += HEURISTIC.sizeExact;
       reasons.push('mismo tamaño que un paquete del curso');
+    }
+    if (metaCourse && metaCourse.courseId === c.courseId) {
+      score += HEURISTIC.cursiaMetaUnconfirmed;
+      reasons.push('el paquete declara este curso (marca cursia_meta) pero el título o la estructura no coinciden');
     }
     if (markerCourse && markerCourse.courseId === c.courseId) {
       score += HEURISTIC.v3NameMarker;

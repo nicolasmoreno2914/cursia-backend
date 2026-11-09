@@ -296,14 +296,29 @@ function assertNoForeign(r, foreignIds, m) {
         eq([r.courseId, r.candidates.map((c) => c.courseId)], [null, [21, 22]], `${tag} empate`);
       }
 
-      // (e) institución: un curso de la institución de la sesión cuenta; uno de otra institución no.
+      // (e) fix P1-2 — sesión de la institución X: SOLO cursos de X. Ni los personales del dueño ni los de OTRA
+      // institución del MISMO dueño (un miembro de X que lee la sesión no puede ver títulos / ids de fuera de X).
       const INST = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
-      r = I.identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope: { ownerId: OWNER_A, institutionId: INST }, catalog: [
+      const INST2 = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const pkgOf = (art) => [{ artifactId: art, type: 'mbz_final', sha256, sizeBytes: size, builderVersion: null, activityCount: facts.activities }];
+      const outsideX = [
+        { courseId: 31, title: facts.title || 'x', ownerId: OWNER_A, institutionId: INST2, packages: pkgOf('art-own-y') }, // mismo dueño, institución Y
+        { courseId: 32, title: facts.title || 'x', ownerId: OWNER_A, institutionId: null, packages: pkgOf('art-own-personal') },  // mismo dueño, personal
+        { courseId: 33, title: facts.title || 'x', ownerId: OWNER_B, institutionId: INST2, packages: pkgOf('art-foreign') }, // otro dueño, institución Y
+      ];
+      r = I.identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope: { ownerId: OWNER_A, institutionId: INST }, catalog: [...outsideX,
         { courseId: 30, title: 'x', ownerId: OWNER_B, institutionId: INST, packages: [{ artifactId: 'art-i', type: 'mbz_final', sha256, sizeBytes: size, builderVersion: null, activityCount: null }] }] });
-      eq([r.method, r.courseId], ['package_hash', 30], `${tag} institución`);
-      r = I.identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope: { ownerId: OWNER_A, institutionId: INST }, catalog: [
-        { courseId: 31, title: 'x', ownerId: OWNER_B, institutionId: 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee', packages: [{ artifactId: 'art-foreign', type: 'mbz_final', sha256, sizeBytes: size, builderVersion: null, activityCount: null }] }] });
-      assertNoForeign(r, [31], `${tag} otra institución`);
+      eq([r.method, r.courseId], ['package_hash', 30], `${tag} institución X (curso de otro miembro de X)`);
+      assertNoForeign(r, [31, 32, 33], `${tag} institución X`);
+      assert(!/art-own-/.test(JSON.stringify(r)), `${tag} institución X: filtró un paquete de fuera de X`);
+      r = I.identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope: { ownerId: OWNER_A, institutionId: INST }, catalog: outsideX });
+      assertNoForeign(r, [31, 32, 33], `${tag} solo fuera de X`);
+      assert(!/art-own-/.test(JSON.stringify(r)), `${tag} solo fuera de X: filtró un paquete de fuera de X`);
+      eq([r.method, r.courseId], ['none', null], `${tag} solo fuera de X → solo el paquete`);
+      // sesión personal (sin institución): solo los cursos del dueño — nunca uno de una institución de otro dueño.
+      r = I.identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope: SCOPE_A, catalog: [outsideX[2], outsideX[0]] });
+      eq([r.method, r.courseId], ['package_hash', 31], `${tag} sesión personal: curso del dueño`);
+      assertNoForeign(r, [33], `${tag} sesión personal`);
     }
     console.log(`     escenarios: ${JSON.stringify(tally)} sobre ${opened.length} fixtures`);
   });
@@ -318,8 +333,17 @@ function assertNoForeign(r, foreignIds, m) {
     const pkg = await R.openMbz(buf);
     const facts = await I.readPackageFacts(pkg, 'curso.mbz');
     eq(facts.cursiaMeta, { schema: 1, courseId: 4242, builderVersion: '3.20.0' }, 'marca leída');
-    let r = I.identifyPackage({ facts, sha1: sha('sha1', buf), sha256: sha('sha256', buf), sizeBytes: buf.length, scope: SCOPE_A, catalog: [{ courseId: 4242, title: 'otro', ownerId: OWNER_A, institutionId: null, packages: [] }] });
-    eq([r.method, r.confidence, r.courseId, r.builder.version, r.builder.source], ['cursia_meta', 'exact', 4242, '3.20.0', 'cursia_meta'], 'exacta');
+    const run = (catalog) => I.identifyPackage({ facts, sha1: sha('sha1', buf), sha256: sha('sha256', buf), sizeBytes: buf.length, scope: SCOPE_A, catalog });
+    // fix P2-2: corroborada (curso del alcance + mismo título + estructura compatible) → exacta, con su versión.
+    let r = run([{ courseId: 4242, title: facts.title, ownerId: OWNER_A, institutionId: null, packages: [] }]);
+    eq([r.method, r.confidence, r.courseId, r.builder.version, r.builder.source], ['cursia_meta', 'exact', 4242, '3.20.0', 'cursia_meta'], 'exacta corroborada');
+    // sin corroborar: otro título → NO exacta; queda como candidato con el motivo, y su versión de builder no se usa.
+    r = run([{ courseId: 4242, title: 'Un curso con otro nombre', ownerId: OWNER_A, institutionId: null, packages: [] }]);
+    assert(r.method !== 'cursia_meta' && r.confidence !== 'exact' && r.builder.source !== 'cursia_meta', `sin corroborar no es exacta: ${r.method}/${r.confidence}`);
+    assert(r.candidates.some((c) => c.courseId === 4242 && c.reasons.some((x) => /cursia_meta/.test(x))), 'candidato con la seña');
+    // mismo título pero estructura que la contradice (actividades muy distintas) → no exacta.
+    r = run([{ courseId: 4242, title: facts.title, ownerId: OWNER_A, institutionId: null, packages: [{ artifactId: 'z', type: 'mbz_final', sha256: null, sizeBytes: null, builderVersion: null, activityCount: facts.activities * 3 + 10 }] }]);
+    assert(r.method !== 'cursia_meta', 'estructura contradictoria → no exacta');
     r = I.identifyPackage({ facts, sha1: sha('sha1', buf), sha256: sha('sha256', buf), sizeBytes: buf.length, scope: SCOPE_A, catalog: [{ courseId: 4242, title: facts.title, ownerId: OWNER_B, institutionId: null, packages: [] }] });
     assertNoForeign(r, [4242], 'marca a otra cuenta');
     assert(r.notes.some((n) => /no está en tu cuenta/.test(n)), 'avisa sin nombrar el curso ajeno');
@@ -345,6 +369,17 @@ function assertNoForeign(r, foreignIds, m) {
   hostile.push(['tar.gz con ../evil', rawTarGz([{ name: 'moodle_backup.xml', data: MIN_BACKUP() }, { name: '../evil', data: Buffer.from('x') }]), 'unsafe_path', /«\.\.»/]);
   hostile.push(['tar.gz con ruta absoluta', rawTarGz([{ name: '/tmp/evil', data: Buffer.from('x') }]), 'unsafe_path', /absoluta/]);
   hostile.push(['tar.gz con enlace simbólico', rawTarGz([{ name: 'files/link', type: '2', link: '/etc/passwd' }]), 'unsafe_path', /enlace/]);
+  {
+    // fix P2-5: dos entradas del directorio central apuntando al MISMO bloque comprimido (bomba superpuesta).
+    const one = rawZip([{ name: 'a', data: Buffer.alloc(4096, 1), deflate: true }]);
+    const cdStart = one.readUInt32LE(one.length - 6);
+    const cdLen = one.readUInt32LE(one.length - 10);
+    const ch = Buffer.from(one.subarray(cdStart, cdStart + cdLen));
+    const ch2 = Buffer.from(ch); ch2[46] = 'b'.charCodeAt(0);
+    const eocd = Buffer.from(one.subarray(one.length - 22));
+    eocd.writeUInt16LE(2, 8); eocd.writeUInt16LE(2, 10); eocd.writeUInt32LE(cdLen * 2, 12);
+    hostile.push(['zip con entradas superpuestas (mismos datos comprimidos)', Buffer.concat([one.subarray(0, cdStart), ch, ch2, eocd]), 'zip_bomb', /superpuestos/]);
+  }
   hostile.push(['tar.gz bomba (64 MB de ceros)', rawTarGz([{ name: 'moodle_backup.xml', data: MIN_BACKUP() }, { name: 'files/00/bomba', data: big }]), 'zip_bomb', /bomba|expande/]);
 
   await check(`I5 ${hostile.length} paquetes hostiles → rechazados con código y motivo claro, sin escribir nada`, async () => {
@@ -398,6 +433,111 @@ function assertNoForeign(r, foreignIds, m) {
     try { await I.readPackageFacts(noBackup, 'x.mbz'); } catch (e) { e6 = e; }
     eq(e6 && e6.code, 'missing_moodle_backup', 'sin moodle_backup.xml');
     eq(writes.slice(w0), [], 'escrituras a disco');
+  });
+
+  await check('I5d fix P2-5/P2-3: presupuesto acumulado de lectura; 3000 paquetes mutados al azar → SOLO MbzReaderError (nunca RangeError ni fallo genérico)', async () => {
+    const w0 = writes.length;
+    // presupuesto: 30 entradas de 100 KB, tope acumulado 1 MB → la lectura de todas se corta con read_budget_exceeded.
+    const many = rawZip(Array.from({ length: 30 }, (_, i) => ({ name: `files/${i}`, data: crypto.randomBytes(100000) })));
+    const pkg = await R.openMbz(many, { maxReadBytes: 1000000 });
+    let e1 = null;
+    try { await pkg.readEntries(pkg.entries.map((e) => e.name)); } catch (e) { e1 = e; }
+    eq(e1 && e1.code, 'read_budget_exceeded', 'zip: presupuesto acumulado');
+    const tpkg = await R.openMbz(rawTarGz(Array.from({ length: 12 }, (_, i) => ({ name: `files/${i}`, data: crypto.randomBytes(100000) }))), { maxReadBytes: 500000 });
+    let e2 = null;
+    try { for (const e of tpkg.entries) await tpkg.readEntry(e.name); } catch (e) { e2 = e; }
+    eq(e2 && e2.code, 'read_budget_exceeded', 'tar.gz: presupuesto acumulado (entre llamadas)');
+    eq(R.MBZ_READER_LIMITS.maxReadBytes, 1024 * 1024 * 1024, 'default 1 GB');
+    // P2-3 directo: cualquier falla interna al interpretar el paquete sale como `corrupt` (no reintentable), nunca cruda.
+    const wrap = (thrower) => R.asReaderError(async () => thrower());
+    for (const [label, thrower] of [
+      ['RangeError de readUInt*', () => Buffer.alloc(2).readUInt32LE(0)],
+      ['ERR_OUT_OF_RANGE', () => { throw Object.assign(new Error('x'), { code: 'ERR_OUT_OF_RANGE' }); }],
+      ['zlib', () => zlib.inflateRawSync(Buffer.from([0xff, 0xff, 0xff]))],
+      ['error cualquiera', () => { throw new TypeError('boom'); }],
+    ]) {
+      let e = null;
+      try { await wrap(thrower); } catch (x) { e = x; }
+      assert(e instanceof R.MbzReaderError && e.code === 'corrupt' && !/boom|readUInt|ERR_/.test(e.message), `${label}: ${e && e.code} ${e && e.message}`);
+    }
+    let pass = null;
+    try { await wrap(() => { throw new R.MbzReaderError('zip_bomb', 'x'); }); } catch (x) { pass = x; }
+    eq(pass && pass.code, 'zip_bomb', 'un MbzReaderError pasa tal cual');
+    // fuzz: mutaciones deterministas (corte, bytes invertidos, campos de tamaño/offset) sobre un zip y un tar.gz chicos.
+    let seed = 107;
+    const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    const baseZip = rawZip([{ name: 'moodle_backup.xml', data: MIN_BACKUP(), deflate: true }, { name: 'files/00/a', data: Buffer.alloc(3000, 7), deflate: true }, { name: 'b.txt', data: Buffer.from('hola') }]);
+    const baseTar = rawTarGz([{ name: 'moodle_backup.xml', data: MIN_BACKUP() }, { name: 'files/00/a', data: Buffer.alloc(3000, 7) }]);
+    const bad = [];
+    let rejected = 0;
+    for (let i = 0; i < 3000; i++) {
+      const base = i % 2 ? baseTar : baseZip;
+      let b = Buffer.from(base);
+      const k = rnd(4);
+      if (k === 0) b = b.subarray(0, 4 + rnd(b.length - 4));
+      else if (k === 1) for (let j = 0; j < 1 + rnd(6); j++) b[4 + rnd(b.length - 4)] ^= 1 + rnd(255);
+      else if (k === 2) { const o = Math.max(4, b.length - 22 - rnd(Math.min(b.length - 4, 200))); b.writeUInt32LE(rnd(2) ? 0xffffffff : rnd(1 << 20), Math.min(o, b.length - 4)); }
+      else { const o = 4 + rnd(Math.max(1, b.length - 8)); b.writeUInt16LE(0xffff, Math.min(o, b.length - 2)); }
+      try {
+        const p = await R.openMbz(b);
+        for (const e of p.entries) await p.readEntry(e.name);
+      } catch (e) {
+        rejected++;
+        if (!(e instanceof R.MbzReaderError)) bad.push(`${i}: ${e && e.name} ${e && e.message}`.slice(0, 160));
+      }
+    }
+    eq(bad.slice(0, 5), [], 'errores no tipados');
+    assert(rejected > 1000, `el fuzz debería rechazar la mayoría (${rejected})`);
+    console.log(`     fuzz: 3000 mutaciones, ${rejected} rechazadas, todas MbzReaderError`);
+    eq(writes.slice(w0), [], 'escrituras a disco');
+  });
+
+  await check('I7 fix P2-1: semáforo de identificación — 5 a la vez y 200 en ráfaga con microtareas → nunca más de 2 corriendo', async () => {
+    const svc = new SVC.CourseWorkshopService(null, null, null);
+    let cur = 0;
+    let max = 0;
+    let done = 0;
+    let seed = 7;
+    const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    const task = async () => {
+      cur++; max = Math.max(max, cur);
+      assert(svc.runningCount <= SVC.IDENTIFY_CONCURRENCY, `runningCount ${svc.runningCount}`);
+      for (let i = rnd(5); i > 0; i--) await Promise.resolve();
+      if (rnd(3) === 0) await new Promise((r) => setImmediate(r));
+      cur--; done++;
+    };
+    await Promise.all(Array.from({ length: 5 }, () => svc.withSlot(task)));
+    eq([max, done], [2, 5], '5 concurrentes');
+    // Ráfaga: cada tarea, al terminar, encola otra en una microtarea (la ventana exacta del bug: running-- antes de que
+    // el que esperaba retome).
+    max = 0; done = 0;
+    const all = [];
+    let spawned = 0;
+    // Cada nueva llamada llega tras una cadena de `then` de profundidad aleatoria: algunas caen justo después del `finally`
+    // de la tarea que termina y antes de que retome la que esperaba.
+    const later = (fn) => { let p = Promise.resolve(); for (let i = rnd(8); i > 0; i--) p = p.then(() => undefined); p.then(fn); };
+    const spawn = () => { if (spawned >= 200) return; spawned++; all.push(svc.withSlot(async () => { await task(); later(spawn); later(spawn); })); };
+    for (let i = 0; i < 6; i++) spawn();
+    while (all.length < 200 || done < 200) { await Promise.all(all.slice()); if (done >= spawned && spawned >= 200) break; }
+    eq([max <= 2, done, svc.runningCount], [true, 200, 0], `ráfaga (máximo visto ${max})`);
+  });
+
+  await check('I8 fix P1-1: lectura del cuerpo con tope sobre bytes recibidos (content-length grande → sin leer; flujo que lo pasa → abort)', async () => {
+    let aborted = 0;
+    const big = new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(10)); c.close(); } }), { headers: { 'content-length': String(500) } });
+    let e1 = null;
+    try { await ART.readBodyCapped(big, 100, () => aborted++); } catch (e) { e1 = e; }
+    eq([e1 && e1.code, aborted], ['storage_object_too_large', 1], 'content-length > tope');
+    let pulled = 0;
+    const endless = new Response(new ReadableStream({ pull(c) { pulled++; c.enqueue(new Uint8Array(64 * 1024)); } }));
+    let e2 = null;
+    try { await ART.readBodyCapped(endless, 1024 * 1024, () => aborted++); } catch (e) { e2 = e; }
+    eq([e2 && e2.code, aborted], ['storage_object_too_large', 2], 'flujo sin fin → abort');
+    assert(pulled < 40, `leyó de más: ${pulled} trozos de 64 KB`);
+    const chunks = [];
+    const okRes = new Response(Buffer.from('hola mundo'));
+    const b = await ART.readBodyCapped(okRes, 100, () => aborted++, (c) => chunks.push(c.length));
+    eq([b.toString(), chunks.reduce((x, y) => x + y, 0), aborted], ['hola mundo', 10, 2], 'normal + onChunk');
   });
 
   await check('I5c nombres de entrada: normalización (./ del tar, carpetas) y rechazos', async () => {

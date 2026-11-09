@@ -16,6 +16,10 @@
  * Errores: `MbzReaderError` con `code` estable y `message` en español para el usuario (ningún detalle interno).
  */
 import * as zlib from 'zlib';
+import { promisify } from 'util';
+
+// Fix P2-4: inflado asíncrono (pool de libuv) — un moodle_backup.xml de 64 MB no bloquea el event loop de la API.
+const inflateRawAsync = promisify(zlib.inflateRaw) as (buf: Buffer, opts: zlib.ZlibOptions) => Promise<Buffer>;
 
 export type MbzContainer = 'zip' | 'tar.gz';
 
@@ -32,6 +36,12 @@ export interface MbzReaderLimits {
   ratioMinBytes: number;
   /** Largo máximo de un nombre de entrada. */
   maxNameLength: number;
+  /**
+   * Fix P2-5: presupuesto ACUMULADO de bytes descomprimidos que se pueden leer de UN paquete abierto (todas las
+   * llamadas a readEntry / readEntries / readText suman). Corta un inventario de B2/B3 que intentara materializar los
+   * 2 GB declarados (p. ej. miles de entradas chicas que no llegan al umbral de la razón).
+   */
+  maxReadBytes: number;
 }
 
 /**
@@ -46,6 +56,7 @@ export const MBZ_READER_LIMITS: Readonly<MbzReaderLimits> = Object.freeze({
   maxCompressionRatio: 200,
   ratioMinBytes: 8 * 1024 * 1024,
   maxNameLength: 1024,
+  maxReadBytes: 1024 * 1024 * 1024,
 });
 
 export type MbzReaderErrorCode =
@@ -58,7 +69,8 @@ export type MbzReaderErrorCode =
   | 'unsupported_entry'
   | 'corrupt'
   | 'entry_not_found'
-  | 'entry_too_large';
+  | 'entry_too_large'
+  | 'read_budget_exceeded';
 
 export class MbzReaderError extends Error {
   constructor(readonly code: MbzReaderErrorCode, message: string, readonly entry?: string) {
@@ -157,6 +169,9 @@ interface ZipEntryInternal extends MbzEntry {
   method: number;
   crc32: number;
   localHeaderOffset: number;
+  /** Rango de los datos comprimidos [dataStart, dataEnd) (fix P2-5: detección de entradas superpuestas). */
+  dataStart: number;
+  dataEnd: number;
 }
 
 const SIG_EOCD = 0x06054b50;
@@ -259,18 +274,25 @@ function parseZip(buf: Buffer, limits: MbzReaderLimits): ZipEntryInternal[] {
       throw new MbzReaderError('zip_bomb', `El paquete se expande a más de ${MB(limits.maxTotalUncompressedBytes)} al descomprimirlo. No parece un curso; no se abre.`);
     }
     if (localHeaderOffset + 30 > buf.length) throw corrupt(`entrada fuera del archivo (${n.name.slice(0, 80)})`);
-    out.push({ name: n.name, size, compressedSize, method, crc32: crc, localHeaderOffset });
+    if (buf.readUInt32LE(localHeaderOffset) !== SIG_LOCAL) throw corrupt(`cabecera local de ${n.name.slice(0, 80)}`);
+    const dataStart = localHeaderOffset + 30 + buf.readUInt16LE(localHeaderOffset + 26) + buf.readUInt16LE(localHeaderOffset + 28);
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > cdOffset) throw corrupt(`datos de ${n.name.slice(0, 80)} fuera de su lugar`);
+    out.push({ name: n.name, size, compressedSize, method, crc32: crc, localHeaderOffset, dataStart, dataEnd });
+  }
+  // Fix P2-5: dos entradas que comparten bytes comprimidos (bomba «superpuesta», Fifield 2019) → el paquete entero fuera.
+  const byStart = [...out].sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
+  for (let i = 1; i < byStart.length; i++) {
+    if (byStart[i].localHeaderOffset < byStart[i - 1].dataEnd) {
+      throw new MbzReaderError('zip_bomb', `El paquete trae archivos superpuestos (${JSON.stringify(byStart[i].name.slice(0, 80))} reutiliza los datos de otro): es una técnica de «bomba» de compresión. No se abre.`, byStart[i].name);
+    }
   }
   return out;
 }
 
-function readZipEntry(buf: Buffer, e: ZipEntryInternal): Buffer {
-  const lh = e.localHeaderOffset;
-  if (buf.readUInt32LE(lh) !== SIG_LOCAL) throw corrupt(`cabecera local de ${e.name.slice(0, 80)}`);
-  const start = lh + 30 + buf.readUInt16LE(lh + 26) + buf.readUInt16LE(lh + 28);
-  const end = start + e.compressedSize;
-  if (end > buf.length) throw corrupt(`datos de ${e.name.slice(0, 80)} fuera del archivo`);
-  const data = buf.subarray(start, end);
+async function readZipEntry(buf: Buffer, e: ZipEntryInternal): Promise<Buffer> {
+  if (e.dataEnd > buf.length) throw corrupt(`datos de ${e.name.slice(0, 80)} fuera del archivo`);
+  const data = buf.subarray(e.dataStart, e.dataEnd);
   let out: Buffer;
   if (e.method === 0) {
     out = Buffer.from(data);
@@ -280,10 +302,10 @@ function readZipEntry(buf: Buffer, e: ZipEntryInternal): Buffer {
     } else {
       try {
         // El tope de salida es el tamaño declarado: una entrada que se expande más de lo que dice se corta acá.
-        out = zlib.inflateRawSync(data, { maxOutputLength: e.size });
+        out = await inflateRawAsync(data, { maxOutputLength: e.size });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/maxOutputLength|buffer|larger/i.test(msg)) throw bombError(e.name, e.size, e.size / Math.max(1, e.compressedSize));
+        const msg = err instanceof Error ? `${(err as NodeJS.ErrnoException).code ?? ''} ${err.message}` : String(err);
+        if (/maxOutputLength|ERR_BUFFER_TOO_LARGE|buffer|larger/i.test(msg)) throw bombError(e.name, e.size, e.size / Math.max(1, e.compressedSize));
         throw corrupt(`no se pudo descomprimir ${e.name.slice(0, 80)}`);
       }
     }
@@ -524,7 +546,39 @@ async function collectTarGz(buf: Buffer, limits: MbzReaderLimits, names: Set<str
  * claro; nada se escribe a disco.
  */
 export async function openMbz(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): Promise<MbzPackage> {
+  return asReaderError(() => openMbzInner(buf, limitsIn));
+}
+
+/**
+ * Fix P2-3: toda falla que NO sea un `MbzReaderError` mientras se interpreta el paquete (un `RangeError` de
+ * `readUInt*` en un extra / pax construido al borde del buffer, un error de zlib…) es ENTRADA MALFORMADA: se convierte en
+ * `corrupt` (no reintentable, motivo claro), nunca en un fallo genérico que se reintentaría descargando otra vez.
+ */
+export async function asReaderError<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof MbzReaderError) throw err;
+    const code = (err as NodeJS.ErrnoException)?.code;
+    const what = err instanceof RangeError || /^ERR_(OUT_OF_RANGE|BUFFER_OUT_OF_BOUNDS|INVALID_ARG)/.test(String(code ?? ''))
+      ? 'estructura interna inconsistente'
+      : /^Z_|zlib|incorrect header|invalid (block|distance|stored)/i.test(`${code ?? ''} ${err instanceof Error ? err.message : ''}`)
+        ? 'datos comprimidos inválidos'
+        : 'formato no reconocido';
+    throw corrupt(what);
+  }
+}
+
+async function openMbzInner(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): Promise<MbzPackage> {
   const limits = resolveLimits(limitsIn);
+  // Fix P2-5: presupuesto acumulado de lectura de ESTE paquete abierto.
+  let readSoFar = 0;
+  const charge = (name: string, size: number) => {
+    if (readSoFar + size > limits.maxReadBytes) {
+      throw new MbzReaderError('read_budget_exceeded', `Leer ${JSON.stringify(name.slice(0, 120))} superaría los ${MB(limits.maxReadBytes)} que se pueden descomprimir de un paquete. No se continúa.`, name);
+    }
+    readSoFar += size;
+  };
   if (!Buffer.isBuffer(buf) || buf.length === 0) throw new MbzReaderError('not_mbz', 'El archivo está vacío.');
   if (buf.length > limits.maxPackageBytes) {
     throw new MbzReaderError('package_too_large', `El archivo pesa ${MB(buf.length)}; el máximo es ${MB(limits.maxPackageBytes)}.`);
@@ -537,12 +591,13 @@ export async function openMbz(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>):
     const byName = new Map(list.map((e) => [e.name, e]));
     const pub: MbzEntry[] = list.map((e) => ({ name: e.name, size: e.size, compressedSize: e.compressedSize }));
     const totalUncompressedBytes = list.reduce((s, e) => s + e.size, 0);
-    const read = (name: string, opts?: ReadEntryOptions): Buffer => {
+    const read = (name: string, opts?: ReadEntryOptions): Promise<Buffer> => asReaderError(async () => {
       const e = byName.get(name);
       if (!e) throw new MbzReaderError('entry_not_found', `El paquete no tiene ${JSON.stringify(name.slice(0, 120))}.`, name);
       if (opts?.maxBytes !== undefined && e.size > opts.maxBytes) throw entryTooLarge(name, e.size, opts.maxBytes);
+      charge(name, e.size);
       return readZipEntry(buf, e);
-    };
+    });
     return {
       container,
       entries: pub,
@@ -552,13 +607,13 @@ export async function openMbz(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>):
         const e = byName.get(n);
         return e ? { name: e.name, size: e.size, compressedSize: e.compressedSize } : null;
       },
-      readEntry: async (n, o) => read(n, o),
+      readEntry: (n, o) => read(n, o),
       readEntries: async (names, o) => {
         const m = new Map<string, Buffer>();
-        for (const n of names) if (byName.has(n)) m.set(n, read(n, o));
+        for (const n of names) if (byName.has(n)) m.set(n, await read(n, o));
         return m;
       },
-      readText: async (n, o) => (byName.has(n) ? read(n, o).toString('utf8') : null),
+      readText: async (n, o) => (byName.has(n) ? (await read(n, o)).toString('utf8') : null),
     };
   }
 
@@ -572,10 +627,10 @@ export async function openMbz(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>):
       const e = byName.get(n);
       if (!e) continue;
       if (opts?.maxBytes !== undefined && e.size > opts.maxBytes) throw entryTooLarge(n, e.size, opts.maxBytes);
-      want.add(n);
+      if (!want.has(n)) { charge(n, e.size); want.add(n); }
     }
     if (!want.size) return new Map();
-    return collectTarGz(buf, limits, want);
+    return asReaderError(() => collectTarGz(buf, limits, want));
   };
   return {
     container,

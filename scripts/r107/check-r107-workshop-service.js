@@ -149,6 +149,7 @@ function rawZip(entries) {
     const MEMBER = { id: '77777777-8888-4777-8666-555555555555', email: 'miembro@ejemplo.edu' };
     const ADMIN = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', email: 'owner@cursia.test' };
     const INST = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+    const INST2 = 'cccccccc-dddd-4eee-8fff-000000000000';
     process.env.SUPER_ADMIN_EMAILS = ADMIN.email;
 
     // Storage falso en memoria + create() de artifacts con el MISMO control de carpeta del servicio real.
@@ -163,6 +164,16 @@ function rawZip(entries) {
         if (!objects.has(p)) throw new Error('404');
         return objects.get(p);
       },
+      // Mismo lector con tope que el servicio real (ART.readBodyCapped) sobre una respuesta HTTP en memoria.
+      downloads: 0,
+      async downloadStorageObjectCapped(bucket, p, opts) {
+        this.downloads++;
+        if (this.down) { const { StorageUnavailableError } = D('modules/artifacts/storage-resilience.js'); throw new StorageUnavailableError('download', 'simulado'); }
+        if (!objects.has(p)) throw new Error('404');
+        const b = objects.get(p);
+        const body = new ReadableStream({ start(c) { for (let i = 0; i < b.length; i += 1 << 20) c.enqueue(new Uint8Array(b.buffer, b.byteOffset + i, Math.min(1 << 20, b.length - i))); c.close(); } });
+        return ART.readBodyCapped(new Response(body), opts.maxBytes, () => { this.aborted = (this.aborted || 0) + 1; }, opts.onChunk);
+      },
       async create(dto, ownerId) {
         ART.assertWritableStoragePath(ownerId, dto.storage_bucket ?? 'cursia-artifacts', dto.storage_path);
         const [row] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, storage_bucket, filename, mime_type, size_bytes, checksum_sha256, metadata)
@@ -172,8 +183,8 @@ function rawZip(entries) {
     };
     // Permisos falsos (forma de PermissionService): OWNER y MEMBER son miembros activos de INST con courses.view/edit.
     const permissions = {
-      async can(actor, perm, inst) { return (actor.id === MEMBER.id || actor.id === OWNER.id) && inst === INST ? { allowed: true, via: 'role', permission: perm, institutionId: inst, role: 'CREADOR' } : { allowed: false, code: 'resource_not_found', httpStatus: 404, permission: perm, institutionId: inst, reason: 'x' }; },
-      async membershipsOf(id) { return id === OWNER.id || id === MEMBER.id ? [{ institutionId: INST, status: 'active' }] : []; },
+      async can(actor, perm, inst) { return (actor.id === MEMBER.id && inst === INST) || (actor.id === OWNER.id && (inst === INST || inst === INST2)) ? { allowed: true, via: 'role', permission: perm, institutionId: inst, role: 'CREADOR' } : { allowed: false, code: 'resource_not_found', httpStatus: 404, permission: perm, institutionId: inst, reason: 'x' }; },
+      async membershipsOf(id) { return id === OWNER.id ? [{ institutionId: INST, status: 'active' }, { institutionId: INST2, status: 'active' }] : id === MEMBER.id ? [{ institutionId: INST, status: 'active' }] : []; },
     };
     const svc = new SVC.CourseWorkshopService(ds, storage, permissions);
     const settle = async (id) => { const p = svc.inFlight.get(id); if (p) await p; };
@@ -222,8 +233,10 @@ function rawZip(entries) {
       process.env.CURSIA_RBAC_MODE = 'enforce';
       let res;
       try {
-        res = await svc.createSession(OWNER, { filename: 'inst.mbz', sizeBytes: 100 });
-        eq(res.session.institutionId, INST, 'institución activa (única membresía)');
+        eq((await svc.createSession(OWNER, { filename: 'p.mbz', sizeBytes: 100 })).session.institutionId, null, 'dos membresías sin header → sesión personal');
+        res = await svc.createSession(OWNER, { filename: 'inst.mbz', sizeBytes: 100 }, INST);
+        eq(res.session.institutionId, INST, 'institución del header (verificada)');
+        eq((await svc.createSession(MEMBER, { filename: 'm.mbz', sizeBytes: 100 })).session.institutionId, INST, 'única membresía');
         eq((await svc.get(MEMBER, res.session.id)).id, res.session.id, 'miembro con permiso');
         await rejects(svc.get(OTHER, res.session.id), 404, null, 'no miembro');
         await rejects(svc.createSession(OTHER, { filename: 'x.mbz', sizeBytes: 10 }, INST), 403, null, 'header de una institución ajena');
@@ -288,6 +301,101 @@ function rawZip(entries) {
       await ds2.initialize();
       const svc2 = new SVC.CourseWorkshopService(ds2, storage, permissions);
       await rejects(svc2.createSession(OWNER, { filename: 'x.mbz', sizeBytes: 10 }), 503, 'COURSE_WORKSHOP_NOT_MIGRATED', 'sin migrar');
+    });
+
+    await check('W10 fix P1-1: el objeto se reemplaza entre el HEAD y la descarga — más grande que 300 MB → abort + failed (no reintentable); distinto tamaño → reintentable', async () => {
+      const res = await svc.createSession(OWNER, { filename: 't.mbz', sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(OWNER, res.session.id); // HEAD ve el chico
+      objects.set(res.upload.storagePath, Buffer.alloc(SVC.WORKSHOP_MAX_UPLOAD_BYTES + 2 * 1024 * 1024)); // TOCTOU
+      const ab0 = storage.aborted || 0;
+      await settle(res.session.id);
+      let g = await svc.get(OWNER, res.session.id);
+      eq([g.status, g.error.code, g.error.retryable, g.originalArtifactId], ['failed', 'WORKSHOP_FILE_TOO_LARGE', false, null], 'grande');
+      eq((storage.aborted || 0) - ab0, 1, 'la descarga se abortó en el tope');
+      const r2 = await svc.createSession(OWNER, { filename: 't2.mbz', sizeBytes: MBZ.length });
+      objects.set(r2.upload.storagePath, MBZ);
+      await svc.markUploaded(OWNER, r2.session.id);
+      objects.set(r2.upload.storagePath, MBZ.subarray(0, MBZ.length - 100));
+      await settle(r2.session.id);
+      g = await svc.get(OWNER, r2.session.id);
+      eq([g.status, g.error.code, g.error.retryable], ['failed', 'WORKSHOP_UPLOAD_CHANGED', true], 'cambió de tamaño');
+      objects.set(r2.upload.storagePath, MBZ);
+      await svc.markUploaded(OWNER, r2.session.id);
+      await settle(r2.session.id);
+      eq((await svc.get(OWNER, r2.session.id)).status, 'identified', 'reintento con el archivo estable');
+    });
+
+    await check('W11 fix P1-2: dueño en las instituciones X e Y; sesión de X → solo cursos de X (ni Y ni personales); el miembro de X no ve nada de fuera', async () => {
+      process.env.CURSIA_RBAC_MODE = 'enforce';
+      try {
+        // El dueño tiene el MISMO paquete registrado en un curso de Y y en uno personal; un miembro de X, en un curso de X.
+        const [cy] = await ds.query(`insert into public.courses (owner_id, institution_id, title) values ($1, $2, 'Curso de Y') returning id`, [OWNER.id, INST2]);
+        await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, checksum_sha256, size_bytes) values ($1, $2, 'dynamic_mbz', $3, $4, $5)`, [OWNER.id, String(cy.id), `${OWNER.id}/dynamic/y.mbz`, MBZ_SHA256, MBZ.length]);
+        let res = await svc.createSession(OWNER, { filename: 'x.mbz', sizeBytes: MBZ.length }, INST);
+        objects.set(res.upload.storagePath, MBZ);
+        await svc.markUploaded(OWNER, res.session.id);
+        await settle(res.session.id);
+        let g = await svc.get(MEMBER, res.session.id);
+        const leak = (r) => [Number(cy.id), Number(own.id)].filter((id) => r.identifiedCourseId === id || r.identification.candidates.some((c) => c.courseId === id) || JSON.stringify(r).includes('Curso de Y') || JSON.stringify(r).includes('Curso propio'));
+        eq(leak(g), [], 'el miembro de X no ve cursos de Y ni personales');
+        eq([g.status, g.identification.method, g.identifiedCourseId], ['identified', 'none', null], 'sin cursos de X: solo el paquete');
+        // Ahora un curso de X (de otro miembro) con la misma huella → ese.
+        const [cx] = await ds.query(`insert into public.courses (owner_id, institution_id, title) values ($1, $2, 'Curso de X') returning id`, [MEMBER.id, INST]);
+        await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, checksum_sha256, size_bytes) values ($1, $2, 'mbz_final', $3, $4, $5)`, [MEMBER.id, String(cx.id), `${MEMBER.id}/x/a.mbz`, MBZ_SHA256, MBZ.length]);
+        res = await svc.createSession(OWNER, { filename: 'x2.mbz', sizeBytes: MBZ.length }, INST);
+        objects.set(res.upload.storagePath, MBZ);
+        await svc.markUploaded(OWNER, res.session.id);
+        await settle(res.session.id);
+        g = await svc.get(MEMBER, res.session.id);
+        eq([g.identification.method, g.identifiedCourseId], ['package_hash', Number(cx.id)], 'curso de X');
+        eq(leak(g), [], 'sin fugas');
+      } finally {
+        process.env.CURSIA_RBAC_MODE = 'off';
+      }
+    });
+
+    await check('W12 fix P2-6: dos procesos con el mismo reclamo → UN solo workshop_original; un reclamo vencido no escribe nada', async () => {
+      const res = await svc.createSession(OWNER, { filename: 'c.mbz', sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      const claim = (c) => ds.query(`update public.workshop_sessions set status = 'identifying', error = null,
+        identification = jsonb_set(identification, '{claim}', jsonb_build_object('id', $2::text, 'headBytes', $3::bigint)) where id = $1`, [res.session.id, c, MBZ.length]);
+      await claim('c1');
+      const svcB = new SVC.CourseWorkshopService(ds, storage, permissions); // «otro proceso»
+      await Promise.all([svc.runIdentification(res.session.id, 'c1'), svcB.runIdentification(res.session.id, 'c1'), svcB.runIdentification(res.session.id, 'c1')]);
+      eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_original' and storage_path = $1`, [res.upload.storagePath]))[0].n, 1, 'un solo original');
+      eq((await svc.get(OWNER, res.session.id)).status, 'identified', 'identificada');
+      // Reclamo nuevo (c2) en curso; la ejecución vieja (c1) llega tarde → no toca nada.
+      await claim('c2');
+      await svcB.runIdentification(res.session.id, 'c1');
+      const [row] = await ds.query(`select status, identification->'claim'->>'id' as c from public.workshop_sessions where id = $1`, [res.session.id]);
+      eq([row.status, row.c], ['identifying', 'c2'], 'el reclamo vencido no escribió');
+      await svc.runIdentification(res.session.id, 'c2');
+      eq((await svc.get(OWNER, res.session.id)).status, 'identified', 'el vigente sí');
+      eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_original' and storage_path = $1`, [res.upload.storagePath]))[0].n, 1, 'sigue habiendo uno (idempotente)');
+      // Original ya registrado con OTROS bytes → no se reemplaza nunca.
+      objects.set(res.upload.storagePath, Buffer.concat([MBZ.subarray(0, 100), Buffer.alloc(MBZ.length - 100)]));
+      await claim('c3');
+      await svc.runIdentification(res.session.id, 'c3');
+      const g = await svc.get(OWNER, res.session.id);
+      assert(g.status === 'failed' && g.error && !g.error.retryable, `bytes distintos: ${g.status} ${g.error && g.error.code}`);
+    });
+
+    await check('W13 fix P2-7: más cursos que el límite de la heurística → la huella exacta del curso MÁS VIEJO se encuentra igual, y queda dicho que se recortó', async () => {
+      const U = 'dddddddd-eeee-4fff-8000-111111111111';
+      const [old] = await ds.query(`insert into public.courses (owner_id, title) values ($1, 'El más viejo') returning id`, [U]);
+      await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, checksum_sha256, size_bytes) values ($1, $2, 'mbz_final', $3, $4, $5)`, [U, String(old.id), `${U}/old/a.mbz`, MBZ_SHA256, MBZ.length]);
+      await ds.query(`insert into public.courses (owner_id, title) select $1, 'Relleno ' || g from generate_series(1, $2::int) g`, [U, SVC.WORKSHOP_CATALOG_LIMITS.courses + 5]);
+      const actor = { id: U, email: 'muchos@ejemplo.edu' };
+      const res = await svc.createSession(actor, { filename: 'v.mbz', sizeBytes: MBZ.length });
+      objects.set(res.upload.storagePath, MBZ);
+      await svc.markUploaded(actor, res.session.id);
+      await settle(res.session.id);
+      const g = await svc.get(actor, res.session.id);
+      eq([g.identification.method, g.identifiedCourseId], ['package_hash', Number(old.id)], 'huella exacta fuera de la lista recortada');
+      const [row] = await ds.query(`select identification->'catalog' as c from public.workshop_sessions where id = $1`, [res.session.id]);
+      eq(row.c.truncated, true, 'recorte registrado');
+      assert(g.identification.notes.some((n) => /muchos cursos/.test(n)), 'nota visible del recorte');
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

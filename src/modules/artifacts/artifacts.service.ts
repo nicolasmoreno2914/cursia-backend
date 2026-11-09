@@ -185,6 +185,47 @@ export function isDynamicArtifactRow(row: { type?: string | null; item_run_id?: 
   return String(row?.type ?? '').startsWith('dynamic_') || row?.item_run_id != null || row?.manifest_id != null;
 }
 
+/** r107 (fix P1-1): el objeto de Storage pesa más que el tope de la lectura (nunca se materializa entero). */
+export const STORAGE_OBJECT_TOO_LARGE = 'storage_object_too_large';
+export class StorageObjectTooLargeError extends Error {
+  readonly code = STORAGE_OBJECT_TOO_LARGE;
+  constructor(readonly maxBytes: number, readonly seenBytes: number) {
+    super(`${STORAGE_OBJECT_TOO_LARGE}: el objeto supera ${maxBytes} bytes (visto: ${seenBytes})`);
+    this.name = 'StorageObjectTooLargeError';
+  }
+}
+
+/**
+ * r107 (fix P1-1): lee el cuerpo de una respuesta en flujo con tope duro sobre los bytes RECIBIDOS. `content-length`
+ * mayor que el tope → rechazo sin leer; el flujo que lo pasa → `abort()` + rechazo. Pura sobre `Response` (testeable).
+ */
+export async function readBodyCapped(res: Response, maxBytes: number, abort: () => void, onChunk?: (chunk: Buffer) => void): Promise<Buffer> {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    abort();
+    try { await res.body?.cancel(); } catch { /* ya abortado */ }
+    throw new StorageObjectTooLargeError(maxBytes, declared);
+  }
+  const chunks: Buffer[] = [];
+  let seen = 0;
+  if (!res.body) return Buffer.alloc(0);
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    seen += chunk.length;
+    if (seen > maxBytes) {
+      abort();
+      try { await reader.cancel(); } catch { /* ya abortado */ }
+      throw new StorageObjectTooLargeError(maxBytes, seen);
+    }
+    if (onChunk) onChunk(chunk);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, seen);
+}
+
 /** Re-review N3: tope del DELETE HTTP a Storage en remove() (ms). */
 function storageDeleteTimeoutMs(): number {
   const n = Number(process.env.ARTIFACT_STORAGE_DELETE_TIMEOUT_MS);
@@ -538,6 +579,31 @@ export class ArtifactsService {
     const { response: res } = await this.storageRequest('download', 0, (signal) => fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal }), { attemptTimeoutMs: timeoutMs });
     if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
     return Buffer.from(await res.arrayBuffer());
+  }
+
+  /**
+   * r107 B1 (fix P1-1): descarga EN FLUJO con tope duro de bytes REALMENTE recibidos (nunca `arrayBuffer()` sin
+   * límite): un `content-length` mayor que `maxBytes` se rechaza sin leer el cuerpo, y si el flujo pasa el tope se aborta
+   * la conexión. Cada trozo se pasa a `onChunk` (p. ej. hashes incrementales: nada recorre 300 MB de una vez). Lo usa el
+   * Taller para el .mbz del usuario, cuyo objeto el dueño puede reemplazar entre el HEAD y la descarga (TOCTOU).
+   */
+  async downloadStorageObjectCapped(
+    bucket: string,
+    storagePath: string,
+    opts: { maxBytes: number; timeoutMs?: number; onChunk?: (chunk: Buffer) => void },
+  ): Promise<Buffer> {
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    if (!supabaseUrl || !serviceKey) {
+      throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side storage download');
+    }
+    if (!/^[a-z0-9][a-z0-9._-]{0,62}$/.test(bucket)) throw new Error(`STORAGE_PATH_INVALID: bucket ${JSON.stringify(bucket)}`);
+    const encodedPath = assertSafeStoragePath(storagePath).map((s) => encodeURIComponent(s)).join('/');
+    const url = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
+    const cap = new AbortController();
+    const { response: res } = await this.storageRequest('download', 0, (signal) => fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.any([signal, cap.signal]) }), { attemptTimeoutMs: opts.timeoutMs ?? 60_000 });
+    if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
+    return readBodyCapped(res, opts.maxBytes, () => cap.abort(), opts.onChunk);
   }
 
   /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
