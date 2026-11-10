@@ -84,6 +84,9 @@
 //   W63 carril de 1 + presupuesto de memoria (espera; nunca entra → 409)
 //   W64 B5: reclamo + latido entre procesos para entradas / pedidos / aprobaciones
 //   W65 (solo con R107_EXPORT_VERSIONS=<dir>) versiones del flujo completo de un v3 sintético y un V1 real, para --moodle
+//   Fix round 1 (revisión B6): W66 P2-2 aplicar atado a la huella del contenido revisado · W67 P2-3 reclamos agotados tras
+//   subir → objeto borrado · W68 P2-4 presupuesto de memoria compartido (identificación + diagnóstico + aplicar) · W69 P2-1
+//   barrido de B5 sin abrir la sesión · W62 + P2-5 descarga genérica de archivos del Taller bloqueada
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -1655,7 +1658,12 @@ function rawZip(entries) {
       return { sid, p: await plan.getPlan(OWNER, sid) };
     };
     const vrow = async (id) => (await ds.query(`select * from public.workshop_versions where id = $1`, [id]))[0];
-    const applyAll = (sid, p, extra = {}) => apply.apply(OWNER, sid, p.planId, { itemIds: p.items.filter((i) => i.status === 'proposed' && i.available).map((i) => i.id), confirmItemIds: p.items.filter((i) => i.requiresItemConfirm).map((i) => i.id), ...extra });
+    /** Lo que el docente aprueba (fix round 1, P2-2): cada ítem y cada confirmación con la huella que muestra el plan. */
+    const hashOf = (p, id) => { const it = p.items.find((i) => i.id === id); return it ? it.contentHash : 'f'.repeat(64); };
+    const AP = (p, ids, confirmIds = [], over = {}) => {
+      const items = ids.map((id) => ({ id, contentHash: hashOf(p, id) }));
+      return { planHash: AC.planContentHash(items), items, confirm: confirmIds.map((id) => ({ id, contentHash: hashOf(p, id) })), ...over };
+    };
     let b6 = null; // { sid, p, version }
 
     await check('W55 migración B6 aditiva e idempotente: workshop_versions (RLS, sin anon/authenticated, CHECKs: «listo» exige paquete + restoreCheck), sesiones hijas, estados nuevos de plan y aprobación; nada anterior al Taller cambia; el script se niega sin MIGRATION_ENV=staging', async () => {
@@ -1689,20 +1697,20 @@ function rawZip(entries) {
       const rm = p.items.find((i) => i.operation === 'remove_activity');
       eq([edit.stage, rm.stage, rm.requiresItemConfirm, p.combined && p.combined.ok], ['ready', 'ready', true, true], 'plan listo para aplicar');
       const ids = [edit.id, rm.id];
-      const body = await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: ids }), 409, 'WORKSHOP_APPLY_CONFIRM_REQUIRED', 'sin confirmar');
+      const body = await rejects(apply.apply(OWNER, sid, p.planId, AP(p, ids)), 409, 'WORKSHOP_APPLY_CONFIRM_REQUIRED', 'sin confirmar');
       eq([body.missingItemIds, body.warnings.map((w) => w.code)], [[rm.id], ['REMOVALS']], 'los ids que faltan + los avisos otra vez');
-      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: [edit.id], confirmItemIds: [rm.id] }), 409, 'WORKSHOP_APPLY_PLAN_CHANGED', 'no es lo que vio');
-      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: ids, confirmItemIds: [crypto.randomUUID()] }), 400, 'WORKSHOP_APPLY_ITEMS_INVALID', 'confirmación ajena');
-      await rejects(apply.apply(OTHER, sid, p.planId, { itemIds: ids, confirmItemIds: [rm.id] }), 404, null, 'ajeno');
+      await rejects(apply.apply(OWNER, sid, p.planId, AP(p, [edit.id], [rm.id])), 409, 'WORKSHOP_APPLY_PLAN_CHANGED', 'no es lo que vio');
+      await rejects(apply.apply(OWNER, sid, p.planId, AP(p, ids, [crypto.randomUUID()])), 400, 'WORKSHOP_APPLY_ITEMS_INVALID', 'confirmación ajena');
+      await rejects(apply.apply(OTHER, sid, p.planId, AP(p, ids, [rm.id])), 404, null, 'ajeno');
       eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [sid]))[0].n, 0, 'ningún 409 crea una versión');
       const calls0 = aiSim.calls.length; const charges0 = ledger.charges.length;
       let hold; const gate = new Promise((r) => { hold = r; });
       apply.testHook = async (stage) => { if (stage === 'building') await gate; };
-      const r = await apply.apply(OWNER, sid, p.planId, { itemIds: ids, confirmItemIds: [rm.id] });
+      const r = await apply.apply(OWNER, sid, p.planId, AP(p, ids, [rm.id]));
       eq([r.version.status, r.version.number, r.version.parent.kind, r.plan.status], ['queued', 1, 'original', 'applying'], '202 en cola');
       eq((await plan.getPlan(OWNER, sid)).status, 'applying', 'el plan dice applying');
       await rejects(plan.createTextIntake(OWNER, sid, 'Otro cambio'), 409, 'WORKSHOP_PLAN_APPLYING', 'no se edita mientras se aplica');
-      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: ids, confirmItemIds: [rm.id] }), 409, 'WORKSHOP_PLAN_NOT_DRAFT', 'no se aplica dos veces');
+      await rejects(apply.apply(OWNER, sid, p.planId, AP(p, ids, [rm.id])), 409, 'WORKSHOP_PLAN_NOT_DRAFT', 'no se aplica dos veces');
       hold(); await idleA(); apply.testHook = null;
       const v = await apply.getVersion(OWNER, sid, r.version.id);
       eq([v.status, v.number, v.error, v.restoreCheck], ['ready', 1, null, { status: 'not_available', message: AC.RESTORE_NOT_AVAILABLE_MESSAGE }], 'versión lista, sin decir «restaurado»');
@@ -1731,16 +1739,16 @@ function rawZip(entries) {
       const a = await plan.createTextIntake(OWNER, res.session.id, 'Agrega una línea a la bienvenida.');
       await approve(res.session.id, a); await idle();
       const p0 = await plan.getPlan(OWNER, res.session.id);
-      const b0 = await rejects(apply.apply(OWNER, res.session.id, p0.planId, { itemIds: [p0.items[0].id] }), 409, 'WORKSHOP_APPLY_NOT_READY', 'sin generar');
+      const b0 = await rejects(apply.apply(OWNER, res.session.id, p0.planId, AP(p0, [p0.items[0].id])), 409, 'WORKSHOP_APPLY_NOT_READY', 'sin generar');
       assert(/generó su contenido/.test(b0.blocking[0].reason), b0.blocking[0].reason);
       // (b) prueba en seco: vencida y que no pasa
       const { sid, p } = await readyPlanFor('b6-seco.mbz', { remove: false });
       const it = p.items[0];
       const savedCombined = (await ds.query(`select combined from public.workshop_plans where id = $1`, [p.planId]))[0].combined;
       await ds.query(`update public.workshop_plans set combined = jsonb_set(combined, '{itemIds}', '[]'::jsonb) where id = $1`, [p.planId]);
-      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] }), 409, 'WORKSHOP_APPLY_DRY_RUN_STALE', 'vencida');
+      await rejects(apply.apply(OWNER, sid, p.planId, AP(p, [it.id])), 409, 'WORKSHOP_APPLY_DRY_RUN_STALE', 'vencida');
       await ds.query(`update public.workshop_plans set combined = $2::jsonb where id = $1`, [p.planId, JSON.stringify({ ...savedCombined, ok: false, failure: { opIndex: 0, code: 'stale_target', message: 'el campo cambió' }, failedItemId: it.id })]);
-      const bf = await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] }), 409, 'WORKSHOP_APPLY_DRY_RUN_FAILED', 'no pasa');
+      const bf = await rejects(apply.apply(OWNER, sid, p.planId, AP(p, [it.id])), 409, 'WORKSHOP_APPLY_DRY_RUN_FAILED', 'no pasa');
       eq(bf.failedItemId, it.id, 'dice qué ítem');
       eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [sid]))[0].n, 0, 'sin versión');
       // (c) la prueba en seco del plan pasaba pero el motor falla en el worker (la operación quedó vencida en la base)
@@ -1748,7 +1756,9 @@ function rawZip(entries) {
       const goodParams = (await ds.query(`select params from public.workshop_plan_items where id = $1`, [it.id]))[0].params;
       await ds.query(`update public.workshop_plan_items set params = jsonb_set(params, '{expectRawSha1}', to_jsonb($2::text)) where id = $1`, [it.id, '0'.repeat(40)]);
       const puts0 = storage.puts.length;
-      const r = await apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] });
+      const pT = await plan.getPlan(OWNER, sid); // el contenido cambió en la base: el docente lo ve con su huella nueva
+      assert(pT.items[0].contentHash !== it.contentHash, 'la huella cambió con los parámetros');
+      const r = await apply.apply(OWNER, sid, pT.planId, AP(pT, [it.id]));
       await idleA();
       const v = await apply.getVersion(OWNER, sid, r.version.id);
       eq([v.status, v.error.stage, v.error.failedItemId, v.error.retryable, v.artifactId], ['failed', 'engine', it.id, false, null], 'falla visible, con el ítem');
@@ -1757,7 +1767,7 @@ function rawZip(entries) {
       eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_version' and metadata->>'workshopSessionId' = $1`, [sid]))[0].n, 0, 'sin artifact');
       // (d) corregido → el plan vuelve a borrador al editarlo y se reintenta: la MISMA fila, con la falla anterior en el informe
       await ds.query(`update public.workshop_plan_items set params = $2::jsonb where id = $1`, [it.id, JSON.stringify(goodParams)]);
-      const r2 = await apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] });
+      const r2 = await apply.apply(OWNER, sid, p.planId, AP(p, [it.id]));
       await idleA();
       const v2 = await apply.getVersion(OWNER, sid, r2.version.id);
       eq([v2.id, v2.status, v2.report.previousFailures.length, v2.report.previousFailures[0].stage], [v.id, 'ready', 1, 'engine'], 'reintento listo; la falla anterior queda en el informe');
@@ -1767,7 +1777,7 @@ function rawZip(entries) {
       const { sid, p } = await readyPlanFor('b6-mitad.mbz', { remove: false });
       apply.testHook = (stage) => { if (stage === 'register') throw new Error('base caída al registrar (simulada)'); };
       const deleted0 = storage.deleted.length; const puts0 = storage.puts.length;
-      const r = await apply.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      const r = await apply.apply(OWNER, sid, p.planId, AP(p, [p.items[0].id]));
       await idleA(); apply.testHook = null;
       const v = await apply.getVersion(OWNER, sid, r.version.id);
       eq([v.status, v.error.stage, v.error.retryable, v.artifactId, (await plan.getPlan(OWNER, sid)).status], ['failed', 'register', true, null, 'failed'], 'falla visible');
@@ -1776,10 +1786,10 @@ function rawZip(entries) {
       eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_version' and metadata->>'workshopSessionId' = $1`, [sid]))[0].n, 0, 'sin artifact');
       // Storage caído al subir → failed reintentable, nada registrado.
       storage.failPut = true;
-      const r1 = await apply.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      const r1 = await apply.apply(OWNER, sid, p.planId, AP(p, [p.items[0].id]));
       await idleA(); storage.failPut = false;
       eq([(await vrow(r1.version.id)).status, (await vrow(r1.version.id)).error.code], ['failed', 'WORKSHOP_APPLY_UPLOAD_FAILED'], 'subida caída');
-      const r2 = await apply.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      const r2 = await apply.apply(OWNER, sid, p.planId, AP(p, [p.items[0].id]));
       await idleA();
       eq((await apply.getVersion(OWNER, sid, r2.version.id)).status, 'ready', 'reintento listo');
       eq(sha('sha1', objects.get(SVC.workshopStoragePath(OWNER.id, sid))), sha('sha1', MBZ), 'original intacto');
@@ -1792,7 +1802,7 @@ function rawZip(entries) {
       const B = new APS.WorkshopApplyService(ds, storage, svcB);
       let release; const blocked = new Promise((r) => { release = r; });
       A.testHook = async (stage) => { if (stage === 'building') await blocked; };
-      const r = await A.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      const r = await A.apply(OWNER, sid, p.planId, AP(p, [p.items[0].id]));
       for (let i = 0; i < 20 && (await vrow(r.version.id)).status !== 'building'; i++) await new Promise((x) => setTimeout(x, 25));
       eq((await vrow(r.version.id)).status, 'building', 'A la tomó');
       await A.heartbeat();
@@ -1815,7 +1825,7 @@ function rawZip(entries) {
       const q2 = await readyPlanFor('b6-barrido.mbz', { remove: false });
       const C = new APS.WorkshopApplyService(ds, storage, new SVC.CourseWorkshopService(ds, storage, permissions));
       C.simulateDeathForTests(); // C encola y muere antes de correr
-      const r2 = await C.apply(OWNER, q2.sid, q2.p.planId, { itemIds: [q2.p.items[0].id] });
+      const r2 = await C.apply(OWNER, q2.sid, q2.p.planId, AP(q2.p, [q2.p.items[0].id]));
       await ds.query(`update public.workshop_versions set attempts = $2, updated_at = now() - interval '31 seconds' where id = $1`, [r2.version.id, APS.APPLY_MAX_ATTEMPTS]);
       eq(await B.sweep(), 0, 'agotó los reclamos: no se reclama');
       const f = await vrow(r2.version.id);
@@ -1823,8 +1833,114 @@ function rawZip(entries) {
       A.testHook = null;
     });
 
+
     // El servicio A murió en W59: el resto usa uno nuevo sobre el mismo arranque de `svc`.
     const apply2 = new APS.WorkshopApplyService(ds, storage, svc);
+    await check('W66 (fix 1, P2-2) aplicar se ata al CONTENIDO revisado: el plan da la huella por ítem y del plan; mismo id con contenido regenerado → 409 con los ítems cambiados; confirmación de riesgo alto con huella vieja → no vale; huella del plan distinta → 409; forma vieja (itemIds) → 400; el contenido que se congela es el bloqueado', async () => {
+      const { sid, p } = await readyPlanFor('b6-huellas.mbz');
+      const edit = p.items.find((i) => i.operation === 'edit_html');
+      const rm = p.items.find((i) => i.operation === 'remove_activity');
+      assert(/^[0-9a-f]{64}$/.test(edit.contentHash) && p.apply && /^[0-9a-f]{64}$/.test(p.apply.planHash), 'huellas en la vista');
+      eq([p.apply.items.map((x) => x.id), p.apply.confirmRequired.map((x) => x.id)], [[edit.id, rm.id], [rm.id]], 'bloque `apply` del plan');
+      eq(p.apply.planHash, AC.planContentHash(p.apply.items), 'huella del plan = la de sus ítems');
+      await rejects(apply2.apply(OWNER, sid, p.planId, { itemIds: [edit.id, rm.id], confirmItemIds: [rm.id] }), 400, 'WORKSHOP_APPLY_ITEMS_INVALID', 'forma vieja');
+      // El ítem se regenera con el MISMO id (otra pestaña / otro miembro): su contenido cambia.
+      const view = (await ds.query(`select view from public.workshop_plan_items where id = $1`, [edit.id]))[0].view;
+      view.changes[0].after = view.changes[0].after.replace('Actualizado en 2026', 'Actualizado en 2031');
+      const params = (await ds.query(`select params from public.workshop_plan_items where id = $1`, [edit.id]))[0].params;
+      params.change.html = params.change.html.replace('Actualizado en 2026', 'Actualizado en 2031');
+      await ds.query(`update public.workshop_plan_items set view = $2::jsonb, params = $3::jsonb where id = $1`, [edit.id, JSON.stringify(view), JSON.stringify(params)]);
+      const b = await rejects(apply2.apply(OWNER, sid, p.planId, AP(p, [edit.id, rm.id], [rm.id])), 409, 'WORKSHOP_APPLY_PLAN_CHANGED', 'contenido regenerado');
+      eq(b.changedItemIds, [edit.id], 'dice qué ítem cambió');
+      const p2 = await plan.getPlan(OWNER, sid);
+      assert(p2.items.find((i) => i.id === edit.id).contentHash !== edit.contentHash && p2.apply.planHash !== p.apply.planHash, 'huellas nuevas en la vista');
+      // Huella del plan que no corresponde (aunque los ítems sí) → 409.
+      await rejects(apply2.apply(OWNER, sid, p2.planId, AP(p2, [edit.id, rm.id], [rm.id], { planHash: p.apply.planHash })), 409, 'WORKSHOP_APPLY_PLAN_CHANGED', 'huella del plan');
+      // Confirmar el de riesgo alto con una huella que no es la actual → no cuenta como confirmado.
+      const stale = AP(p2, [edit.id, rm.id]); stale.confirm = [{ id: rm.id, contentHash: 'a'.repeat(64) }];
+      const c = await rejects(apply2.apply(OWNER, sid, p2.planId, stale), 409, 'WORKSHOP_APPLY_CONFIRM_REQUIRED', 'confirmación con huella vieja');
+      eq(c.missingItemIds, [rm.id], 'pide confirmarlo de nuevo');
+      eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [sid]))[0].n, 0, 'ningún 409 crea versión');
+      const r = await apply2.apply(OWNER, sid, p2.planId, AP(p2, [edit.id, rm.id], [rm.id]));
+      await apply2.whenIdle();
+      const v = await apply2.getVersion(OWNER, sid, r.version.id);
+      assert(v.status === 'ready' && v.report.items[0].fields[0].after.includes('Actualizado en 2031'), 'se aplicó el contenido que el docente aprobó (el nuevo)');
+      eq([v.report.approval.planHash, v.report.approval.confirm.map((x) => x.id)], [p2.apply.planHash, [rm.id]], 'la aprobación queda en el informe');
+    });
+
+
+    await check('W67 (fix 1, P2-3) caída ENTRE la subida y el registro, hasta agotar los reclamos → la versión queda `failed` con motivo y el paquete subido se BORRA (la ruta queda en la fila antes de subir): nunca un objeto huérfano', async () => {
+      const q = await readyPlanFor('b6-agotada.mbz', { remove: false });
+      const svcD = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const D1 = new APS.WorkshopApplyService(ds, storage, svcD);
+      let unblock; const never = new Promise((r) => { unblock = r; });
+      D1.testHook = async (stage) => { if (stage === 'register') await never; };
+      const r = await D1.apply(OWNER, q.sid, q.p.planId, AP(q.p, [q.p.items[0].id]));
+      for (let i = 0; i < 200 && !(await vrow(r.version.id)).storage_path; i++) await new Promise((x) => setTimeout(x, 25));
+      const mid = await vrow(r.version.id);
+      assert(mid.storage_path && objects.has(mid.storage_path) && mid.status === 'verifying', `subido y sin registrar: ${mid.status} ${mid.storage_path}`);
+      D1.simulateDeathForTests(); // muere ahí (tercera vez)
+      await ds.query(`update public.workshop_versions set attempts = $2, updated_at = now() - interval '31 seconds' where id = $1`, [r.version.id, APS.APPLY_MAX_ATTEMPTS]);
+      const del0 = storage.deleted.length;
+      const E = new APS.WorkshopApplyService(ds, storage, new SVC.CourseWorkshopService(ds, storage, permissions));
+      eq(await E.sweep(), 0, 'no se reclama más');
+      const f = await vrow(r.version.id);
+      eq([f.status, f.error.code, f.artifact_id], ['failed', 'WORKSHOP_APPLY_INTERRUPTED', null], 'failed con motivo');
+      eq([storage.deleted.length - del0, objects.has(mid.storage_path)], [1, false], 'el paquete huérfano se borró');
+      eq((await plan.getPlan(OWNER, q.sid)).status, 'failed', 'plan failed (reintentable)');
+      unblock();
+    });
+
+    await check('W68 (fix 1, P2-4) UN presupuesto de memoria por proceso para todo el trabajo pesado: identificación (3×) + diagnóstico (5,5×) + aplicar (7×) a la vez con un presupuesto de 9× → nunca se supera (esperan en cola, con latido) y los tres terminan; la cuenta de 200 MB con el presupuesto por defecto', async () => {
+      const svcM = new SVC.CourseWorkshopService(ds, storage, permissions);
+      svcM.memoryBudgetBytes = MBZ.length * 9; // aplicar (7×) entra solo; con la identificación (3×) o el diagnóstico (5,5×), no
+      const applyM = new APS.WorkshopApplyService(ds, storage, svcM);
+      const q = await readyPlanFor('b6-memoria-apl.mbz', { remove: false });
+      const dg = await newIdentified('b6-memoria-dg.mbz');
+      let waitedSeen = 0;
+      applyM.testHook = async (stage) => { if (stage === 'building') await new Promise((x) => setTimeout(x, 150)); };
+      const r = await applyM.apply(OWNER, q.sid, q.p.planId, AP(q.p, [q.p.items[0].id]));
+      const idn = await svcM.createSession(OWNER, { filename: 'b6-memoria-id.mbz', sizeBytes: MBZ.length });
+      objects.set(idn.upload.storagePath, MBZ);
+      await svcM.markUploaded(OWNER, idn.session.id);
+      await svcM.startDiagnosis(OWNER, dg.session.id);
+      for (let i = 0; i < 400; i++) {
+        waitedSeen = Math.max(waitedSeen, svcM.memoryWaiting + (svcM.diagnosisRunningCount === 0 && (await svcM.getDiagnosis(OWNER, dg.session.id)).status === 'queued' ? 1 : 0));
+        assert(svcM.reservedMemoryBytes <= svcM.memoryBudgetBytes, `reservado ${svcM.reservedMemoryBytes} > presupuesto ${svcM.memoryBudgetBytes}`);
+        const done = (await vrow(r.version.id)).status === 'ready' && (await svcM.get(OWNER, idn.session.id)).status === 'identified' && (await svcM.getDiagnosis(OWNER, dg.session.id)).status === 'ready';
+        if (done) break;
+        await new Promise((x) => setTimeout(x, 25));
+      }
+      await applyM.whenIdle(); await Promise.all([...svcM.inFlight.values()]);
+      eq([(await vrow(r.version.id)).status, (await svcM.get(OWNER, idn.session.id)).status, (await svcM.getDiagnosis(OWNER, dg.session.id)).status], ['ready', 'identified', 'ready'], 'los tres terminaron');
+      assert(svcM.peakReservedBytes <= svcM.memoryBudgetBytes, `pico ${svcM.peakReservedBytes} ≤ ${svcM.memoryBudgetBytes}`);
+      assert(waitedSeen >= 1, 'alguno esperó lugar');
+      eq(svcM.reservedMemoryBytes, 0, 'sin reservas colgadas');
+      // La cuenta con los números reales: 200 MB, presupuesto por defecto (2 GB).
+      const MB = 1048576; const budget = SVC.workshopMemoryBudgetBytes({});
+      const need = { identify: 200 * MB * SVC.IDENTIFY_MEMORY_FACTOR, diagnosis: 200 * MB * SVC.DIAGNOSIS_MEMORY_FACTOR_TGZ, apply: 200 * MB * AC.APPLY_MEMORY_FACTOR_TGZ };
+      assert(Object.values(need).every((x) => x <= budget), 'cada uno solo entra');
+      assert(need.identify + need.diagnosis + need.apply > budget && need.apply + need.identify > budget && need.apply + need.diagnosis > budget, `los tres juntos (${(need.identify + need.diagnosis + need.apply) / MB} MB) o aplicar con otro superan ${budget / MB} MB: el presupuesto compartido los hace esperar`);
+      applyM.testHook = null;
+    });
+
+    await check('W69 (fix 1, P2-1) BARRIDO de B5 sin abrir la sesión: una aprobación `running` de un proceso muerto (llamada en vuelo) pasa a `ambiguous` con la reserva PENDIENTE (visible para la conciliación); una entrada colgada de otro arranque se marca interrumpida; lo que late no se toca', async () => {
+      const res = await newIdentified('b6-barrido-b5.mbz');
+      const sid = res.session.id;
+      const dead = `${crypto.randomUUID()}.${crypto.randomUUID()}`;
+      const [ap] = await ds.query(`insert into public.workshop_ai_approvals (session_id, created_by, kind, estimate, cap_usd, status, claim_id, reservation_key, calls, updated_at)
+        values ($1, $2, 'interpret', '{}'::jsonb, 0.2, 'running', $3, 'workshop:approval:x', $4::jsonb, now() - interval '40 seconds') returning id`, [sid, OWNER.id, dead, JSON.stringify({ c1: { id: 'c1', kind: 'interpret', attempt: 1, boundUsd: '0.2', status: 'sent', at: new Date().toISOString() } })]);
+      await ds.query(`update public.workshop_ai_approvals set reservation_key = $2 where id = $1`, [ap.id, `workshop:approval:${ap.id}`]);
+      const [live] = await ds.query(`insert into public.workshop_ai_approvals (session_id, created_by, kind, estimate, cap_usd, status, claim_id) values ($1, $2, 'interpret', '{}'::jsonb, 0.2, 'running', $3) returning id`, [sid, OWNER.id, `${crypto.randomUUID()}.${crypto.randomUUID()}`]);
+      const [it] = await ds.query(`insert into public.workshop_intakes (session_id, original_sha1, created_by, source, status, text, claim_id, updated_at) values ($1, $2, $3, 'text', 'interpreting', 'x', $4, now() - interval '40 seconds') returning id`, [sid, sha('sha1', MBZ), OWNER.id, dead]);
+      ledger.settled = [];
+      await plan.sweep();
+      const st = async (t, id) => (await ds.query(`select status from public.${t} where id = $1`, [id]))[0].status;
+      eq([await st('workshop_ai_approvals', ap.id), await st('workshop_ai_approvals', live.id), await st('workshop_intakes', it.id)], ['ambiguous', 'running', 'failed'], 'barrido');
+      eq(ledger.settled.filter((x) => x.key === `workshop:approval:${ap.id}`).length, 0, 'la reserva NO se libera (pudo cobrarse): queda para conciliar');
+      assert(typeof plan.onModuleInit === 'function' && PLS.PLAN_SWEEP_MS === 15000, 'barrido periódico en el arranque del módulo (flag encendido)');
+    });
+
 
     await check('W60 encadenar: sesión HIJA desde la versión 1 (sin subir nada; bytes verificados = la versión; hereda curso y alcance; idempotente) → su plan → versión 2 con padre = v1; cadena original → arreglo 1 → arreglo 2; el original y la v1 no cambian', async () => {
       const { sid, version: v1 } = b6;
@@ -1845,7 +1961,7 @@ function rawZip(entries) {
       const a = await plan.createTextIntake(OWNER, c.session.id, 'Agrega una línea a la bienvenida.');
       await approve(c.session.id, a); await idle(); await generateAll(c.session.id); await idle();
       const pc = await plan.getPlan(OWNER, c.session.id);
-      const r = await apply2.apply(OWNER, c.session.id, pc.planId, { itemIds: [pc.items[0].id] });
+      const r = await apply2.apply(OWNER, c.session.id, pc.planId, AP(pc, [pc.items[0].id]));
       eq([r.version.number, r.version.parent], [2, { kind: 'version', versionId: v1.id }], 'número 2, padre v1');
       await apply2.whenIdle();
       const v2 = await apply2.getVersion(OWNER, c.session.id, r.version.id);
@@ -1891,6 +2007,16 @@ function rawZip(entries) {
       ARTS.deleteStorageObject = async () => { deletes++; };
       await ARTS.remove(twin.id, OWNER.id);
       eq(deletes, 0, 'el objeto de la versión no se borra');
+      // Fix 1 (P2-5): descarga genérica de un archivo del Taller → 403 (va por el Taller, 5 min); los demás tipos igual que antes.
+      const repo = { manager: { connection: ds, query: (q, a) => ds.query(q, a) }, async findOne({ where }) { const [r] = await ds.query(`select id::text id, owner_id::text "ownerId", type, storage_bucket "storageBucket", storage_path "storagePath" from public.artifacts where id = $1 and owner_id = $2`, [where.id, where.ownerId]); return r || null; } };
+      const ARTD = new ART.ArtifactsService(repo, { get: () => undefined });
+      await rejects(ARTD.getDownloadUrl(b6.version.artifactId, OWNER.id), 403, 'artifact_workshop_download_via_workshop', 'versión por la ruta genérica');
+      const [origA] = await ds.query(`select id::text id from public.artifacts where type = 'workshop_original' and owner_id = $1 limit 1`, [OWNER.id]);
+      await rejects(ARTD.getDownloadUrl(origA.id, OWNER.id), 403, 'artifact_workshop_download_via_workshop', 'original por la ruta genérica');
+      await rejects(ARTD.getDownloadUrl(b6.version.artifactId, OWNER.id, 3600, { workshopRoute: true }), 503, 'workshop_download_unavailable', 'sin firma del servidor: nunca la firma el navegador');
+      const [other] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path) values ($1, 'x', 'mbz_final', $2) returning id::text as id`, [OWNER.id, `${OWNER.id}/x/otro.mbz`]);
+      eq((await ARTD.getDownloadUrl(other.id, OWNER.id)).method, 'frontend', 'otro tipo: sin cambios');
+      eq(ART.WORKSHOP_DOWNLOAD_MAX_SECONDS, 300, 'tope de 5 min');
       const POL = D('modules/artifacts/artifact-type-policy.js');
       eq([POL.isServerOnlyArtifactType('workshop_version'), POL.isServerOnlyArtifactType('workshop_original')], [true, true], 'tipos solo del servidor');
     });
@@ -1902,7 +2028,7 @@ function rawZip(entries) {
       apply2.testHook = async (stage) => { if (stage === 'building') { running++; peak = Math.max(peak, running); await new Promise((x) => setTimeout(x, 30)); } if (stage === 'register') running--; };
       const release = await svc.acquireMemory('test:ocupada', svc.memoryBudgetBytes - 1);
       const rs = [];
-      for (const q of plans) rs.push(await apply2.apply(OWNER, q.sid, q.p.planId, { itemIds: [q.p.items[0].id] }));
+      for (const q of plans) rs.push(await apply2.apply(OWNER, q.sid, q.p.planId, AP(q.p, [q.p.items[0].id])));
       await new Promise((x) => setTimeout(x, 80));
       eq((await vrow(rs[0].version.id)).status, 'queued', 'espera memoria (no arrancó)');
       release();
@@ -1913,7 +2039,7 @@ function rawZip(entries) {
       const saved = svc.memoryBudgetBytes;
       svc.memoryBudgetBytes = MBZ.length * 5;
       try {
-        const b = await rejects(apply2.apply(OWNER, big.sid, big.p.planId, { itemIds: [big.p.items[0].id] }), 409, 'WORKSHOP_APPLY_TOO_LARGE', 'nunca entra');
+        const b = await rejects(apply2.apply(OWNER, big.sid, big.p.planId, AP(big.p, [big.p.items[0].id])), 409, 'WORKSHOP_APPLY_TOO_LARGE', 'nunca entra');
         assert(/7× su tamaño/.test(b.message), b.message);
       } finally { svc.memoryBudgetBytes = saved; }
       eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [big.sid]))[0].n, 0, 'sin versión');
@@ -1990,7 +2116,7 @@ function rawZip(entries) {
           if (p0.generation) { await generateAll(sid); await idle(); }
           const p = await plan.getPlan(OWNER, sid);
           assert(p.combined && p.combined.ok, `${k.id}: prueba en seco combinada: ${JSON.stringify(p.combined && p.combined.failure)} ${JSON.stringify(p.items.map((i) => [i.operation, i.requestStatus, i.reason]))}`);
-          const r = await apply2.apply(OWNER, sid, p.planId, { itemIds: p.items.filter((i) => i.available && i.status === 'proposed').map((i) => i.id), confirmItemIds: p.items.filter((i) => i.requiresItemConfirm).map((i) => i.id) });
+          const r = await apply2.apply(OWNER, sid, p.planId, AP(p, p.items.filter((i) => i.available && i.status === 'proposed').map((i) => i.id), p.items.filter((i) => i.requiresItemConfirm).map((i) => i.id)));
           await apply2.whenIdle();
           const v = await apply2.getVersion(OWNER, sid, r.version.id);
           assert(v.status === 'ready', `${k.id}: ${JSON.stringify(v.error)}`);

@@ -209,6 +209,9 @@ export const ARTIFACT_WORKSHOP_ORIGINAL_IMMUTABLE = 'artifact_workshop_original_
 export const WORKSHOP_VERSION_ARTIFACT_TYPE = 'workshop_version';
 export const ARTIFACT_WORKSHOP_VERSION_IMMUTABLE = 'artifact_workshop_version_immutable';
 const WORKSHOP_IMMUTABLE_TYPES: readonly string[] = [WORKSHOP_ORIGINAL_ARTIFACT_TYPE, WORKSHOP_VERSION_ARTIFACT_TYPE];
+/** r107 B6 fix round 1 (P2-5): descarga de archivos del Taller solo por su endpoint, con URL de a lo sumo 5 min. */
+export const ARTIFACT_WORKSHOP_DOWNLOAD_VIA_WORKSHOP = 'artifact_workshop_download_via_workshop';
+export const WORKSHOP_DOWNLOAD_MAX_SECONDS = 300;
 
 /** r107 (fix P1-1): el objeto de Storage pesa más que el tope de la lectura (nunca se materializa entero). */
 export const STORAGE_OBJECT_TOO_LARGE = 'storage_object_too_large';
@@ -783,8 +786,21 @@ export class ArtifactsService {
     id: string,
     ownerId: string,
     expiresInSeconds = 3600,
+    opts: { workshopRoute?: boolean } = {},
   ): Promise<{ url?: string; storagePath: string; bucket: string; method: string }> {
     const artifact = await this.findOne(id, ownerId);
+    // r107 B6 fix round 1 (P2-5): el original y las versiones del Taller se descargan SOLO por su endpoint (compuertas de la
+    // sesión, tamaño revalidado, URL de 5 min). Por la ruta genérica → 403 con la ruta correcta; por la del Taller, nunca
+    // más de WORKSHOP_DOWNLOAD_MAX_SECONDS ni firmado por el navegador (sin service role → 503).
+    if (WORKSHOP_IMMUTABLE_TYPES.includes(artifact.type)) {
+      if (!opts.workshopRoute) {
+        throw new ForbiddenException({ code: ARTIFACT_WORKSHOP_DOWNLOAD_VIA_WORKSHOP, message: 'Este archivo del Taller de cursos se descarga desde el Taller (Versiones → Descargar), con un enlace de 5 minutos.' });
+      }
+      expiresInSeconds = Math.min(clampSignedUrlSeconds(expiresInSeconds), WORKSHOP_DOWNLOAD_MAX_SECONDS);
+      if (!this.config.get<string>('SUPABASE_URL') || !this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY')) {
+        throw new ServiceUnavailableException({ code: 'workshop_download_unavailable', message: 'La descarga de versiones del Taller no está disponible en este entorno (falta la firma del servidor).' });
+      }
+    }
     // LOOP 7 (A4 C1): se firma SOLO un objeto de la carpeta del dueño de la fila (también para filas registradas antes
     // del control en create()). La service role ignora RLS: este es el único control.
     if (!storagePathOwnedBy(artifact.ownerId, artifact.storageBucket, artifact.storagePath, { allowMockFixtures: true })) {

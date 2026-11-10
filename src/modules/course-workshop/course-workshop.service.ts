@@ -105,6 +105,8 @@ export function diagnosisMemoryFactor(container: string | null | undefined): num
   return container === 'tar.gz' ? DIAGNOSIS_MEMORY_FACTOR_TGZ : DIAGNOSIS_MEMORY_FACTOR;
 }
 export const IDENTIFY_MEMORY_FACTOR = 3;
+/** Latido de quien espera lugar en el presupuesto de memoria (fix round 1 de B6, P2-4). */
+export const MEMORY_WAIT_TICK_MS = 10_000;
 export const WORKSHOP_MEMORY_BUDGET_DEFAULT_MB = 2048;
 export function workshopMemoryBudgetBytes(env: Record<string, string | undefined> = process.env): number {
   const raw = (env.COURSE_WORKSHOP_MEMORY_BUDGET_MB ?? '').trim();
@@ -521,7 +523,7 @@ export class CourseWorkshopService {
     // Sin await (202). Nunca una promesa rechazada sin dueño (tumbaría el proceso): si hasta el registro del fallo
     // falla (base caída), queda `identifying` y IDENTIFY_STALE_MS la libera al leerla.
     // Fix round 2 (N2): la identificación reserva su estimado de memoria (el diagnóstico solo arranca si entra).
-    const p = this.withSlot(() => this.withMemory(`identify:${row.id}`, bytes * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row.id, claimId)))
+    const p = this.withSlot(() => this.withMemory(`identify:${row.id}`, bytes * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row.id, claimId), () => this.touchIdentifying(row.id, claimId)))
       .catch((err) => this.logger.error(`workshop ${row.id}: la identificación terminó con error: ${err instanceof Error ? err.message : String(err)}`))
       .finally(() => this.inFlight.delete(row.id));
     this.inFlight.set(row.id, p);
@@ -572,7 +574,7 @@ export class CourseWorkshopService {
         where id = $1 and status = 'uploaded' returning *`,
       [row.id, claimId, v.size]));
     if (!claimed) return { session: this.toRecord(row), created: true };
-    const p = this.withSlot(() => this.withMemory(`identify:${row!.id}`, v.size * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row!.id, claimId)))
+    const p = this.withSlot(() => this.withMemory(`identify:${row!.id}`, v.size * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row!.id, claimId), () => this.touchIdentifying(row!.id, claimId)))
       .catch((err) => this.logger.error(`workshop ${row!.id}: la identificación de la sesión hija terminó con error: ${err instanceof Error ? err.message : String(err)}`))
       .finally(() => this.inFlight.delete(row!.id));
     this.inFlight.set(row.id, p);
@@ -593,6 +595,11 @@ export class CourseWorkshopService {
   }
 
   // ── identificación ──
+
+  /** Latido de una identificación que espera memoria (fix round 1, P2-4): sigue viva para los demás procesos. */
+  private async touchIdentifying(id: string, claimId: string): Promise<void> {
+    await this.q(this.dataSource, `update public.workshop_sessions set updated_at = now() where id = $1 and status = 'identifying' and identification->'claim'->>'id' = $2`, [id, claimId]);
+  }
 
   /** Identificaciones corriendo ahora en este proceso (las pruebas lo leen). */
   get runningCount(): number {
@@ -969,7 +976,8 @@ export class CourseWorkshopService {
       throw e;
     }
     if (!claimed.length) { release(); return; }
-    const p = this.withMemory(`rebuild:${row.id}`, Number(row.original_size ?? 0) * IDENTIFY_MEMORY_FACTOR, () => this.rebuildInventory(row.id))
+    const p = this.withMemory(`rebuild:${row.id}`, Number(row.original_size ?? 0) * IDENTIFY_MEMORY_FACTOR, () => this.rebuildInventory(row.id),
+      () => this.q(this.dataSource, `update public.workshop_sessions set identification = jsonb_set(identification, '{inventory,rebuildClaimAt}', to_jsonb($2::text)) where id = $1 and inventory is null`, [row.id, this.now().toISOString()]).then(() => undefined))
       .catch((e) => this.logger.error(`workshop ${row.id}: la reconstrucción del inventario terminó con error: ${e instanceof Error ? e.message : String(e)}`))
       .finally(() => { release(); this.inFlight.delete(key); });
     this.inFlight.set(key, p);
@@ -1020,28 +1028,39 @@ export class CourseWorkshopService {
 
   // ── diagnóstico técnico (B3) ──
 
-  /** Fix round 2 (N2): reserva `bytes` mientras corre `fn`; al soltar, el diagnóstico en cola puede arrancar. */
-  async withMemory<T>(key: string, bytes: number, fn: () => Promise<T>): Promise<T> {
-    this.memoryReservations.set(key, Math.max(0, bytes));
+  /**
+   * r107 B6 fix round 1 (P2-4): UN presupuesto de memoria por proceso para TODO el trabajo pesado del Taller
+   * (identificación, reconstrucción del inventario, diagnóstico, trabajos del plan, aplicar). Cada uno reserva su
+   * factor × tamaño del original y ESPERA hasta que entre (o hasta que no haya nada reservado: un trabajo solo siempre
+   * puede correr; el que nunca entra lo rechaza antes quien llama). Nada arranca por encima del presupuesto.
+   * `withMemory` (B3) ahora también espera: es `acquireMemory` + soltar al terminar.
+   */
+  async withMemory<T>(key: string, bytes: number, fn: () => Promise<T>, onWaitTick?: () => Promise<void> | void): Promise<T> {
+    const release = await this.acquireMemory(key, bytes, onWaitTick);
     try {
       return await fn();
     } finally {
-      this.memoryReservations.delete(key);
-      this.memoryReleased();
+      release();
     }
   }
 
   /**
-   * r107 B6: reserva de memoria QUE ESPERA (aplicar un plan y los trabajos del plan de B5): arranca solo si su estimado
-   * entra en lo que queda del presupuesto del proceso, o si no hay nada reservado (un trabajo solo siempre puede correr;
-   * el que nunca entra lo rechaza antes quien llama, con su motivo). Devuelve la función que la suelta.
+   * Reserva que ESPERA lugar. Mientras espera, `onWaitTick` corre cada MEMORY_WAIT_TICK_MS (el latido de quien espera:
+   * su fila sigue viva para los demás procesos). Devuelve la función que la suelta.
    */
-  async acquireMemory(key: string, bytes: number): Promise<() => void> {
+  async acquireMemory(key: string, bytes: number, onWaitTick?: () => Promise<void> | void): Promise<() => void> {
     const need = Math.max(0, bytes);
-    while (this.reservedMemoryBytes > 0 && this.reservedMemoryBytes + need > this.memoryBudgetBytes) {
-      await new Promise<void>((r) => this.memoryWaiters.push(r));
+    let tick: ReturnType<typeof setInterval> | null = null;
+    try {
+      while (this.reservedMemoryBytes > 0 && this.reservedMemoryBytes + need > this.memoryBudgetBytes) {
+        if (!tick && onWaitTick) { tick = setInterval(() => { void Promise.resolve(onWaitTick()).catch(() => {}); }, MEMORY_WAIT_TICK_MS); tick.unref?.(); }
+        this.memoryWaiting++;
+        try { await new Promise<void>((r) => this.memoryWaiters.push(r)); } finally { this.memoryWaiting--; }
+      }
+    } finally {
+      if (tick) clearInterval(tick);
     }
-    this.memoryReservations.set(key, need);
+    this.reserveNow(key, need);
     let released = false;
     return () => {
       if (released) return;
@@ -1050,6 +1069,15 @@ export class CourseWorkshopService {
       this.memoryReleased();
     };
   }
+  /** Reserva síncrona (sin await entre el chequeo de quien llama y esto) + el pico observado (las pruebas lo leen). */
+  private reserveNow(key: string, bytes: number): void {
+    this.memoryReservations.set(key, bytes);
+    this.peakReservedBytes = Math.max(this.peakReservedBytes, this.reservedMemoryBytes);
+  }
+  /** Pico de memoria reservada en este proceso (pruebas). */
+  peakReservedBytes = 0;
+  /** Trabajos esperando lugar en el presupuesto (pruebas). */
+  memoryWaiting = 0;
   private readonly memoryWaiters: Array<() => void> = [];
   /** Al soltarse memoria: despierta a los que esperan (vuelven a mirar) y al diagnóstico en cola. */
   private memoryReleased(): void {
@@ -1175,7 +1203,7 @@ export class CourseWorkshopService {
     if (this.reservedMemoryBytes > 0 && this.reservedMemoryBytes + job.bytes > this.memoryBudgetBytes) return;
     this.diagnosisQueue.shift();
     this.diagnosisLane = job.diagnosisId;
-    this.memoryReservations.set(`diagnosis:${job.diagnosisId}`, job.bytes);
+    this.reserveNow(`diagnosis:${job.diagnosisId}`, job.bytes);
     (async () => {
       // P2-7: `running` recién ahora; el latido sigue mientras corre.
       const started = returningRows(await this.q(this.dataSource,

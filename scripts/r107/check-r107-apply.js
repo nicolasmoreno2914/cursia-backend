@@ -20,6 +20,8 @@
 //       carpeta del dueño; encadenar: aplicar sobre la versión 1 produce la 2 con su propio informe
 //   A10 memoria/carril: factores medidos (zip 7×, tar.gz 10×); el tope de subida (200 MB) entra en el presupuesto por defecto
 //   A11 el informe recorta un antes/después enorme con aviso (el paquete lleva el texto completo); mismo plan → mismos bytes
+//   A13 (fix 1, P2-2) huella del contenido revisado: cambia con los parámetros o el antes/después; la del plan, con el
+//       orden y cada ítem; approvalMismatch detecta cambiados / faltantes / sobrantes / huella del plan
 //   A12 Libro v3 (PDF): con la entrada del builder SIN cambios se reproduce byte a byte el PDF del original; con el markdown
 //       nuevo del capítulo → PDF nuevo (lo arma el builder, no la IA) → el motor lo reemplaza en el original (blob +
 //       files.xml) y la versión pasa la compuerta y el validador; fuente que no reproduce / capítulo desconocido / sin
@@ -244,6 +246,24 @@ const sha = (alg, b) => crypto.createHash(alg).update(b).digest('hex');
     eq([bad.ok, bad.stage, bad.code], [false, 'engine', 'WORKSHOP_APPLY_INVALID_CONTENT'], 'no es PDF');
     const stale = await A.runApply({ original: AS, expectedSha1: sha('sha1', AS), items: [item('s', { ...op, pdf: { ...op.pdf, previousSha1: '0'.repeat(40) } })] });
     eq([stale.ok, stale.code], [false, 'WORKSHOP_APPLY_STALE_TARGET'], 'vencido');
+  });
+
+  await check('A13 (fix 1, P2-2) huella del contenido revisado: parámetros y antes/después cambian la huella; la del plan depende de orden e ítems; approvalMismatch', async () => {
+    const base = { operation: 'edit_html', stage: 'ready', params: { op: 'edit_html', target: { moduleId: 1, field: 'intro' }, change: { kind: 'replace', html: '<p>a</p>' } }, view: { changes: [{ before: 'x', after: '<p>a</p>' }], files: [], entries: { added: [], removed: [], modified: [] }, cost: { x: 1 } } };
+    const h = A.itemContentHash(base);
+    assert(/^[0-9a-f]{64}$/.test(h), 'sha256');
+    eq(A.itemContentHash(JSON.parse(JSON.stringify(base))), h, 'estable');
+    eq(A.itemContentHash({ ...base, view: { ...base.view, cost: { x: 2 } } }), h, 'lo que no es contenido (costo) no cuenta');
+    assert(A.itemContentHash({ ...base, params: { ...base.params, change: { kind: 'replace', html: '<p>b</p>' } } }) !== h, 'otro HTML → otra huella');
+    assert(A.itemContentHash({ ...base, view: { ...base.view, changes: [{ before: 'x', after: '<p>b</p>' }] } }) !== h, 'otro después → otra huella');
+    assert(A.itemContentHash({ ...base, params: { op: 'remove_activity', moduleId: 2 }, operation: 'remove_activity' }) !== A.itemContentHash({ ...base, params: { op: 'remove_activity', moduleId: 3 }, operation: 'remove_activity' }), 'quitar otra actividad → otra huella');
+    const items = [{ id: 'A1A1A1A1-1111-4111-8111-111111111111', contentHash: h }, { id: 'b2b2b2b2-2222-4222-8222-222222222222', contentHash: 'c'.repeat(64) }];
+    const ph = A.planContentHash(items);
+    assert(ph !== A.planContentHash([...items].reverse()), 'el orden cuenta');
+    const cur = items.map((x) => ({ ...x, id: x.id.toLowerCase() }));
+    eq(A.approvalMismatch(cur, { planHash: ph, items, confirm: [] }), { changed: [], missing: [], extra: [], planHashOk: true }, 'igual');
+    eq(A.approvalMismatch(cur, { planHash: ph, items: [{ ...items[0], contentHash: 'd'.repeat(64) }, { id: 'e5e5e5e5-5555-4555-8555-555555555555', contentHash: h }], confirm: [] }), { changed: [cur[0].id], missing: [cur[1].id], extra: ['e5e5e5e5-5555-4555-8555-555555555555'], planHashOk: true }, 'cambiado / faltante / sobrante');
+    eq(A.approvalMismatch(cur, { planHash: 'f'.repeat(64), items, confirm: [] }).planHashOk, false, 'huella del plan');
   });
 
   console.log(`\n${fail ? '❌' : '✅'} check-r107-apply --ci: ${ok}/${ok + fail}`);

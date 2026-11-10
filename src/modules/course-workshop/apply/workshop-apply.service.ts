@@ -12,7 +12,7 @@ import { planWarnings } from '../plan/risk';
 import type { PlanItemView } from '../plan/types';
 import type { PatchOperation } from '../patch/types';
 import {
-  APPLY_CODE_VERSION, ApplyCandidate, ApplyRunFail, ApplyRunItem, RESTORE_NOT_AVAILABLE_MESSAGE, RestoreChecker, applyMemoryFactor, chainOf, confirmationsMissing,
+  APPLY_CODE_VERSION, ApplyApproval, ApplyCandidate, approvalMismatch, itemContentHash, planContentHash, ApplyRunFail, ApplyRunItem, RESTORE_NOT_AVAILABLE_MESSAGE, RestoreChecker, applyMemoryFactor, chainOf, confirmationsMissing,
   nextVersionNumber, runApply, selectApplyItems, versionStoragePath,
 } from './apply-core';
 import { LibroV3SourceResolver, SERVER_LIBRO_V3_RESOLVER, regenerateLibroV3Pdf } from './libro-v3';
@@ -21,7 +21,7 @@ import { buildDynamicMbzV3 } from '../../../package/dynamic-mbz-builder-v3';
 /**
  * r107 B6 · Taller de cursos — APLICAR un plan aprobado y VERSIONES (diseño §4 «apply» / «verify» / «version», D9, D10).
  *
- *   POST …/sessions/:id/plans/:planId/apply { itemIds, confirmItemIds } → 202 versión `queued`
+ *   POST …/sessions/:id/plans/:planId/apply { planHash, items: [{id, contentHash}], confirm: [{id, contentHash}] } → 202 versión `queued`
  *     - solo un plan `draft` (o `failed`, para reintentar) cuyos ítems de la Fase 2 tienen su contenido generado, cuya
  *       prueba en seco COMBINADA (sobre el original verificado) sigue pasando para exactamente esos ítems, y con la
  *       confirmación INDIVIDUAL de cada ítem de riesgo alto (`requiresItemConfirm`, B5 P2-4): sin ella → 409 con los ids
@@ -159,6 +159,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     return rows.map((r) => ({
       id: r.id, requestId: r.request_id, operation: r.operation, status: r.status, requestStatus: r.request_status, stage: r.stage, available: r.available === true,
       params: r.params ?? null, requiresItemConfirm: r.requires_item_confirm === true, summary: (r.view as PlanItemView)?.summary ?? r.operation, quote: r.quote, riskLevel: r.risk_level,
+      contentHash: itemContentHash({ operation: r.operation, stage: r.stage, params: r.params ?? null, view: r.view ?? null }),
     }));
   }
 
@@ -168,7 +169,25 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     return planWarnings(rows.map((r) => ({ id: r.id, operation: r.operation, risk: (r.view as PlanItemView).risk, intakeId: r.intake_id, live: r.status === 'proposed' && r.request_status !== 'withdrawn' })));
   }
 
-  async apply(actor: WorkshopActor, sessionId: string, planId: string, body: { itemIds?: unknown; confirmItemIds?: unknown }) {
+  /** Fix round 1 (P2-2): `{ planHash, items: [{id, contentHash}], confirm: [{id, contentHash}] }` → validado (400 si no). */
+  static parseApproval(body: unknown): ApplyApproval {
+    const b = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+    const bad = (m: string) => new BadRequestException({ code: APPLY_ERRORS.ITEMS_REQUIRED, message: m });
+    const hex = (x: unknown) => typeof x === 'string' && /^[0-9a-f]{64}$/.test(x);
+    const list = (raw: unknown, what: string, required: boolean) => {
+      if (raw === undefined && !required) return [];
+      if (!Array.isArray(raw) || (required && !raw.length) || raw.length > 100) throw bad(`Indica ${what} (lista de { id, contentHash } tal como los muestra el plan).`);
+      const out = raw.map((x) => (x && typeof x === 'object' ? x as Record<string, unknown> : {}));
+      if (out.some((x) => typeof x.id !== 'string' || !isUuid(x.id) || !hex(x.contentHash))) throw bad(`${what}: cada uno con su id y su huella de contenido (contentHash).`);
+      const ids = out.map((x) => String(x.id).toLowerCase());
+      if (new Set(ids).size !== ids.length) throw bad(`${what}: sin repetir.`);
+      return out.map((x) => ({ id: String(x.id).toLowerCase(), contentHash: String(x.contentHash) }));
+    };
+    if (!hex(b.planHash)) throw bad('Falta la huella del plan que revisaste (planHash).');
+    return { planHash: String(b.planHash), items: list(b.items, 'los ítems que apruebas aplicar', true), confirm: list(b.confirm, 'las confirmaciones de los cambios de riesgo alto', false) };
+  }
+
+  async apply(actor: WorkshopActor, sessionId: string, planId: string, body: unknown) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
     if (!isUuid(planId)) throw new NotFoundException({ code: APPLY_ERRORS.PLAN_NOT_FOUND, message: 'Plan no encontrado.' });
     const [plan] = await this.q<any[]>(this.dataSource, `select * from public.workshop_plans where id = $1 and session_id = $2 and original_sha1 = $3`, [planId.toLowerCase(), s.id, s.originalSha1]);
@@ -177,27 +196,29 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
       const v = await this.versionOfPlan(plan.id);
       throw new ConflictException({ code: APPLY_ERRORS.PLAN_NOT_DRAFT, message: plan.status === 'applied' ? 'Este plan ya se aplicó: para seguir arreglando, abre una sesión desde su versión.' : 'Este plan ya se está aplicando.', status: plan.status, version: v ? this.versionView(v, s) : null });
     }
-    const ids = (raw: unknown) => (Array.isArray(raw) ? raw : []).filter((x): x is string => typeof x === 'string' && isUuid(x)).map((x) => x.toLowerCase());
-    const wanted = ids(body.itemIds);
-    if (!wanted.length || wanted.length !== (Array.isArray(body.itemIds) ? body.itemIds.length : -1) || new Set(wanted).size !== wanted.length) {
-      throw new BadRequestException({ code: APPLY_ERRORS.ITEMS_REQUIRED, message: 'Indica los ítems del plan que apruebas aplicar (ids válidos, sin repetir).' });
-    }
-    const confirmedRaw = body.confirmItemIds === undefined ? [] : body.confirmItemIds;
-    const confirmed = ids(confirmedRaw);
-    if (!Array.isArray(confirmedRaw) || confirmed.length !== confirmedRaw.length) throw new BadRequestException({ code: APPLY_ERRORS.ITEMS_REQUIRED, message: 'Las confirmaciones tienen que ser ids de ítems del plan.' });
+    const approval = WorkshopApplyService.parseApproval(body);
 
     const items = await this.itemsOf(plan.id);
     const sel = selectApplyItems(items);
     const warnings = await this.planWarningsOf(plan.id);
-    const view = (i: ApplyCandidate) => ({ id: i.id, operation: i.operation, summary: i.summary, risk: i.riskLevel, requiresItemConfirm: i.requiresItemConfirm });
+    const view = (i: ApplyCandidate) => ({ id: i.id, operation: i.operation, summary: i.summary, risk: i.riskLevel, requiresItemConfirm: i.requiresItemConfirm, contentHash: i.contentHash });
     if (sel.blocking.length) throw new ConflictException({ code: APPLY_ERRORS.NOT_READY, message: 'Hay ítems del plan que todavía no se pueden aplicar.', blocking: sel.blocking });
     if (!sel.apply.length) throw new ConflictException({ code: APPLY_ERRORS.EMPTY, message: 'El plan no tiene ítems para aplicar en esta fase.', later: sel.later.map(view) });
     const applyIds = sel.apply.map((i) => i.id);
-    if (wanted.length !== applyIds.length || wanted.some((x) => !applyIds.includes(x))) {
-      throw new ConflictException({ code: APPLY_ERRORS.PLAN_CHANGED, message: 'El plan cambió desde que lo revisaste: vuelve a revisarlo y aprueba otra vez.', items: sel.apply.map(view) });
+    const current = sel.apply.map((i) => ({ id: i.id, contentHash: i.contentHash as string }));
+    const mm = approvalMismatch(current, approval);
+    if (mm.changed.length || mm.missing.length || mm.extra.length || !mm.planHashOk) {
+      throw new ConflictException({
+        code: APPLY_ERRORS.PLAN_CHANGED, message: 'El plan cambió desde que lo revisaste (contenido o ítems): vuelve a revisarlo y aprueba otra vez.',
+        changedItemIds: mm.changed, missingItemIds: mm.missing, extraItemIds: mm.extra, planHash: planContentHash(current), items: sel.apply.map(view),
+      });
     }
+    // Confirmaciones: cada una con la huella del contenido ACTUAL (confirmar un cambio que después cambió no vale).
+    const byId = new Map(sel.apply.map((i) => [i.id, i]));
+    const unknown = approval.confirm.filter((c) => !byId.has(c.id)).map((c) => c.id);
+    if (unknown.length) throw new BadRequestException({ code: APPLY_ERRORS.ITEMS_REQUIRED, message: 'Confirmaste ítems que no están entre los que se aplican.', unknownItemIds: unknown });
+    const confirmed = approval.confirm.filter((c) => byId.get(c.id)?.contentHash === c.contentHash).map((c) => c.id);
     const conf = confirmationsMissing(sel.apply, confirmed);
-    if (conf.unknown.length) throw new BadRequestException({ code: APPLY_ERRORS.ITEMS_REQUIRED, message: 'Confirmaste ítems que no están entre los que se aplican.', unknownItemIds: conf.unknown });
     if (conf.missing.length) {
       throw new ConflictException({
         code: APPLY_ERRORS.CONFIRM_REQUIRED, message: `Confirma uno por uno los ${conf.missing.length} cambio(s) de riesgo alto antes de aplicar.`,
@@ -225,18 +246,23 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     const claimId = `${this.bootId}.${randomUUID()}`;
     const ops = sel.apply.map((i) => i.params as PatchOperation);
     let version: VersionRow | null = null;
+    let raced = false;
     await this.dataSource.transaction(async (m) => {
       const [p] = await this.q<any[]>(m, `select status from public.workshop_plans where id = $1 for update`, [plan.id]);
       if (!p || (p.status !== 'draft' && p.status !== 'failed')) return;
+      // P2-2: el contenido se vuelve a leer BLOQUEADO y se congela ese: si cambió entre la lectura y acá, no se aplica.
+      const locked = await this.q<any[]>(m, `select id, operation, stage, params, view from public.workshop_plan_items where id = any($1::uuid[]) for update`, [applyIds]);
+      const lockedHash = new Map(locked.map((r) => [r.id, itemContentHash({ operation: r.operation, stage: r.stage, params: r.params ?? null, view: r.view ?? null })]));
+      if (locked.length !== applyIds.length || applyIds.some((id) => lockedHash.get(id) !== byId.get(id)?.contentHash)) { raced = true; return; }
       const [prev] = await this.q<VersionRow[]>(m, `select * from public.workshop_versions where plan_id = $1 for update`, [plan.id]);
       const failures = prev ? [...(Array.isArray(prev.report?.previousFailures) ? prev.report.previousFailures : []), ...(prev.error ? [{ ...prev.error, at: iso(prev.finished_at ?? prev.updated_at) }] : [])] : [];
-      const report = JSON.stringify({ previousFailures: failures.slice(-10) });
+      const report = JSON.stringify({ previousFailures: failures.slice(-10), approval: { planHash: approval.planHash, items: approval.items, confirm: approval.confirm, by: actor.id } });
       if (prev && prev.status !== 'failed') return; // otra versión viva del plan (no debería: el plan estaba draft/failed)
       [version] = prev
         ? returningRows(await this.q(m,
           `update public.workshop_versions set status = 'queued', claim_id = $2, attempts = 0, item_ids = $3::jsonb, operations = $4::jsonb, confirmed_item_ids = $5::jsonb,
                   number = $6, parent_version_id = $7, base_sha1 = $8, report = $9::jsonb, diagnosis = null, validation = null, error = null, cost = null,
-                  restore_check = null, restore_check_message = null, created_by = $10, finished_at = null, updated_at = now()
+                  restore_check = null, restore_check_message = null, storage_path = null, artifact_id = null, created_by = $10, finished_at = null, updated_at = now()
             where id = $1 and status = 'failed' returning *`,
           [prev.id, claimId, JSON.stringify(applyIds), JSON.stringify(ops), JSON.stringify(confirmed), number, parentVersionId, s.originalSha1, report, actor.id])) as VersionRow[]
         : await this.q<VersionRow[]>(m,
@@ -245,6 +271,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
           [s.id, plan.id, number, parentVersionId, s.originalSha1, claimId, JSON.stringify(applyIds), JSON.stringify(ops), JSON.stringify(confirmed), report, actor.id]);
       await this.q(m, `update public.workshop_plans set status = 'applying', updated_at = now() where id = $1`, [plan.id]);
     });
+    if (raced) throw new ConflictException({ code: APPLY_ERRORS.PLAN_CHANGED, message: 'El plan cambió mientras lo aprobabas: vuelve a revisarlo y aprueba otra vez.' });
     if (!version) throw new ConflictException({ code: APPLY_ERRORS.PLAN_NOT_DRAFT, message: 'Este plan ya se está aplicando.' });
     this.enqueue((version as VersionRow).id, claimId);
     return { version: this.versionView(version as VersionRow, s), plan: { id: plan.id, status: 'applying' as const }, warnings, later: sel.later.map(view) };
@@ -355,16 +382,34 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     this.dead = true;
   }
 
+  /**
+   * Versión → `failed` (+ plan `failed`) bajo el reclamo dado. Fix round 1 (P2-3): si el paquete ya se había subido
+   * (la ruta queda en la fila ANTES de subir) y no hay artifact, el objeto se borra — en CUALQUIER falla, también al
+   * agotar los reclamos tras caídas entre la subida y el registro: nunca un objeto huérfano.
+   */
   private async failVersion(versionId: string, claimId: string | null, error: { code: string; message: string; retryable: boolean; stage?: string; failedItemId?: string | null }, opts: { conditionalOnClaim?: boolean; diagnosis?: unknown; validation?: unknown } = {}): Promise<boolean> {
-    return this.dataSource.transaction(async (m) => {
+    const failed = await this.dataSource.transaction(async (m) => {
       const [v] = await this.q<VersionRow[]>(m, `select * from public.workshop_versions where id = $1 for update`, [versionId]);
-      if (!v || v.status === 'ready' || v.status === 'failed') return false;
-      if (claimId !== null && v.claim_id !== claimId) return false;
+      if (!v || v.status === 'ready' || v.status === 'failed') return null;
+      if (claimId !== null && v.claim_id !== claimId) return null;
       await this.q(m, `update public.workshop_versions set status = 'failed', claim_id = null, error = $2::jsonb, diagnosis = coalesce($3::jsonb, diagnosis), validation = coalesce($4::jsonb, validation), finished_at = now(), updated_at = now() where id = $1`,
         [versionId, JSON.stringify(error), opts.diagnosis ? JSON.stringify(opts.diagnosis) : null, opts.validation ? JSON.stringify(opts.validation) : null]);
       await this.q(m, `update public.workshop_plans set status = 'failed', updated_at = now() where id = $1 and status = 'applying'`, [v.plan_id]);
-      return true;
+      return v;
     });
+    if (!failed) return false;
+    if (failed.storage_path && !failed.artifact_id) {
+      const s = await this.workshop.planSessionById(failed.session_id);
+      if (s) {
+        try {
+          const gone = await this.artifacts.deleteUnreferencedServerObject(s.ownerId, WORKSHOP_BUCKET, failed.storage_path);
+          if (gone) this.logger.warn(`taller versión ${versionId}: paquete subido sin registrar borrado (${failed.storage_path})`);
+        } catch (err) {
+          this.logger.warn(`taller versión ${versionId}: no se pudo borrar el paquete sin registrar ${failed.storage_path} (${err instanceof Error ? err.message : String(err)})`);
+        }
+      }
+    }
+    return true;
   }
 
   private async baselineOf(s: WorkshopPlanSession): Promise<{ originalSha1: string; report: DiagnosisReport } | null> {
@@ -459,14 +504,17 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
       }
       // Paquete nuevo → Storage (ruta determinista en la carpeta del dueño) → artifact + versión `ready` en una transacción.
       const path = versionStoragePath(s.ownerId, s.id, v.number, res.sha1);
+      // P2-3: la ruta queda en la fila ANTES de subir: si el proceso muere entre la subida y el registro, quien falle la
+      // versión (incluso al agotar los reclamos) sabe qué objeto borrar.
+      const marked = returningRows(await this.q(this.dataSource, `update public.workshop_versions set storage_path = $3, updated_at = now() where id = $1 and claim_id = $2 and status = 'verifying' returning id`, [v.id, claimId, path]));
+      if (!marked.length) return; // el reclamo ya no es nuestro
       await this.testHook?.('upload', v.id);
       try {
         await this.artifacts.putStorageObject({ ownerId: s.ownerId, storagePath: path, buffer: res.package, mimeType: WORKSHOP_VERSION_MIME, storageBucket: WORKSHOP_BUCKET, upsert: true });
       } catch (err) {
         this.logger.warn(`taller versión ${v.id}: no se pudo subir el paquete (${err instanceof Error ? err.message.slice(0, 200) : String(err)})`);
         await fail({ stage: 'upload', code: APPLY_ERRORS.UPLOAD_FAILED, message: 'No se pudo guardar el paquete nuevo en el almacenamiento; vuelve a aplicar en unos minutos.', retryable: true }, { diagnosis: res.diagnosis, validation: res.validation });
-        await this.cleanupOrphan(s.ownerId, path, v.id, claimId);
-        return;
+        return; // failVersion borra lo que haya llegado a subirse
       }
       const cost = await this.costOf(s);
       const filename = `${(s.filename ?? 'curso.mbz').replace(/\.mbz$/i, '')}-v${v.number}.mbz`;
@@ -494,6 +542,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
       } catch (err) {
         this.logger.error(`taller versión ${v.id}: no se pudo registrar la versión: ${err instanceof Error ? err.message : String(err)}`);
         await fail({ stage: 'register', code: APPLY_ERRORS.FAILED, message: 'No se pudo registrar la versión nueva; vuelve a aplicar.', retryable: true }, { diagnosis: res.diagnosis, validation: res.validation });
+        return; // failVersion borró el paquete subido
       }
       if (!registered) await this.cleanupOrphan(s.ownerId, path, v.id, claimId);
     } catch (err) {
@@ -604,7 +653,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     if (bytes === null || bytes !== Number(v.size_bytes)) {
       throw new ConflictException({ code: APPLY_ERRORS.VERSION_CHANGED, message: 'El paquete de esta versión ya no está (o cambió) en el almacenamiento: no se entrega. Avísanos.' });
     }
-    const url = await this.artifacts.getDownloadUrl(v.artifact_id, s.ownerId, VERSION_DOWNLOAD_SECONDS);
+    const url = await this.artifacts.getDownloadUrl(v.artifact_id, s.ownerId, VERSION_DOWNLOAD_SECONDS, { workshopRoute: true });
     return { versionId: v.id, number: v.number, filename: v.report?.filename ?? null, sizeBytes: Number(v.size_bytes), sha256: v.sha256, expiresInSeconds: VERSION_DOWNLOAD_SECONDS, ...url };
   }
 

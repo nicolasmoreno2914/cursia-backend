@@ -168,7 +168,8 @@ export class CourseWorkshopController {
 
   // ── r107 B6 · aplicar el plan + versiones (D10) ──
 
-  // POST /api/v1/course-workshop/sessions/:id/plans/:planId/apply { itemIds, confirmItemIds? } → 202 versión `queued` (sondear
+  // POST /api/v1/course-workshop/sessions/:id/plans/:planId/apply { planHash, items: [{id, contentHash}], confirm?: [{id, contentHash}] }
+  // (lo que da GET …/plan en `apply`) → 202 versión `queued` (sondear
   // GET …/versions/:versionId). 409: ítems sin generar / plan cambiado / falta confirmar uno por uno los de riesgo alto
   // (con los ids y los avisos) / prueba en seco vencida o que no pasa / plan ya aplicado. Aplicar la Fase 2 no usa IA.
   @Post('sessions/:id/plans/:planId/apply')

@@ -1,4 +1,5 @@
-import { BadRequestException, ConflictException, Inject, Injectable, Logger, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Inject, Injectable, Logger, NotFoundException, OnModuleDestroy, OnModuleInit, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { isCourseWorkshopEnabled } from '../../features/course-workshop-flag';
 import { createHash, randomUUID } from 'crypto';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../../common/db/returning-rows';
@@ -25,6 +26,7 @@ import { ApprovalCall, callErrorOutcome, closeReservation } from './approval-led
 import { requestFromFinding } from './from-finding';
 import { AnswerError, checkAnswers, resolveRequest } from './interpret';
 import { planWarnings } from './risk';
+import { itemContentHash, planContentHash, selectApplyItems } from '../apply/apply-core';
 import {
   ClarifyAnswer, DOCUMENT_EXTENSIONS, InterpretedRequest, IntakeSource, LATER_OPERATIONS, MisalignmentWarning, PLAN_CODE_VERSION, PLAN_LIMITS, PlanItemView, RequestStatus,
 } from './types';
@@ -94,6 +96,8 @@ export const PLAN_ERRORS = Object.freeze({
 export const PLAN_STALE_MS = 15 * 60_000;
 export const PLAN_HEARTBEAT_MS = 10_000;
 export const PLAN_HEARTBEAT_STALE_MS = 3 * PLAN_HEARTBEAT_MS;
+/** Fix round 1 (P2-1): barrido de B5 en cada proceso de la API con el flag encendido. */
+export const PLAN_SWEEP_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 2 * 60_000;
 
 type Q = { query: (sql: string, params?: unknown[]) => Promise<any> };
@@ -142,7 +146,7 @@ export function approvalReservationInput(a: { approvalId: string; payer: string;
 }
 
 @Injectable()
-export class WorkshopPlanService {
+export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WorkshopPlanService.name);
   private readonly client: WorkshopAiClient & { simulated?: boolean };
   /** Precios del estimator (catálogo de la base o el seed). Reemplazable en pruebas. */
@@ -1014,7 +1018,7 @@ export class WorkshopPlanService {
    * cierra y su reserva se libera SOLO si ninguna llamada pudo cobrarse (closeApproval). r107 B6: con reclamo + latido
    * entre procesos (ver PLAN_HEARTBEAT_STALE_MS); las filas sin reclamo (anteriores a B6) siguen el plazo de 15 min.
    */
-  private async expireStale(sessionId: string): Promise<void> {
+  private async expireStale(sessionId: string | null): Promise<void> {
     const active = [...this.activeIds];
     const beating = [...this.beating];
     const ABANDONED = `not (id = any($4::uuid[])) and case
@@ -1023,15 +1027,41 @@ export class WorkshopPlanService {
         else updated_at < now() - ($7::int * interval '1 millisecond') end`;
     const P = (extra: unknown[]) => [...extra, PLAN_STALE_MS, active, this.workshop.bootId, beating, PLAN_HEARTBEAT_STALE_MS];
     await this.q(this.dataSource, `update public.workshop_intakes set status = 'failed', error = $2::jsonb, claim_id = null, updated_at = now()
-        where session_id = $1 and status in ('queued', 'interpreting', 'extracting') and ${ABANDONED}`,
+        where ($1::uuid is null or session_id = $1::uuid) and status in ('queued', 'interpreting', 'extracting') and ${ABANDONED}`,
       P([sessionId, JSON.stringify({ code: PLAN_ERRORS.INTERRUPTED, message: 'La interpretación se interrumpió; vuelve a enviar el pedido.', retryable: true })]));
     await this.q(this.dataSource, `update public.workshop_requests set status = 'failed', reason = $2, claim_id = null, updated_at = now()
-        where session_id = $1 and status = 'preparing' and ${ABANDONED}`,
+        where ($1::uuid is null or session_id = $1::uuid) and status = 'preparing' and ${ABANDONED}`,
       P([sessionId, 'La preparación se interrumpió; vuelve a pedir el cambio.']));
-    const stale = await this.q<ApprovalRow[]>(this.dataSource, `select id from public.workshop_ai_approvals where session_id = $1 and $2::text is null and status in ('reserved', 'running') and ${ABANDONED}`,
+    const stale = await this.q<ApprovalRow[]>(this.dataSource, `select id from public.workshop_ai_approvals where ($1::uuid is null or session_id = $1::uuid) and $2::text is null and status in ('reserved', 'running') and ${ABANDONED}`,
       [sessionId, null, PLAN_STALE_MS, active, this.workshop.bootId, beating, PLAN_HEARTBEAT_STALE_MS]);
     for (const a of stale) await this.closeApproval(a.id, 'failed', 'Se interrumpió (reinicio del servidor).');
   }
+
+  /**
+   * r107 B6 fix round 1 (P2-1): BARRIDO periódico (como el de las versiones): sin que nadie abra la sesión, lo que quedó
+   * de un proceso muerto (reclamo sin latido) se cierra — una aprobación con una llamada en vuelo pasa a `ambiguous` (su
+   * reserva sigue PENDIENTE) y aparece en el listado de conciliación del admin.
+   */
+  async sweep(): Promise<void> {
+    if (this.dead) return;
+    await this.expireStale(null);
+  }
+
+  onModuleInit(): void {
+    let on = false;
+    try { on = isCourseWorkshopEnabled(); } catch { on = false; }
+    if (!on) return;
+    this.sweepTimer = setInterval(() => { void this.sweep().catch((e) => this.logger.warn(`taller plan: barrido falló: ${e instanceof Error ? e.message : String(e)}`)); }, PLAN_SWEEP_MS);
+    this.sweepTimer.unref?.();
+  }
+
+  onModuleDestroy(): void {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.sweepTimer = null;
+    this.heartbeatTimer = null;
+  }
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * r107 B6: el plan se edita solo mientras es borrador (o después de una aplicación fallida, que lo vuelve a borrador).
@@ -1114,8 +1144,26 @@ export class WorkshopPlanService {
     const live = (i: ItemRow) => i.status === 'proposed' && byReq.get(i.request_id)?.status !== 'withdrawn';
     const itemViews = items.filter((i) => byReq.has(i.request_id)).map((i) => {
       const r = byReq.get(i.request_id)!;
-      return { id: i.id, requestId: i.request_id, findingId: r.finding_id, quote: r.quote, instruction: r.instruction, status: live(i) ? 'proposed' : 'removed', stage: i.stage, requiresItemConfirm: (i as any).requires_item_confirm === true, requestStatus: r.status, reason: r.reason, ...i.view };
+      return { id: i.id, requestId: i.request_id, findingId: r.finding_id, quote: r.quote, instruction: r.instruction, status: live(i) ? 'proposed' : 'removed', stage: i.stage, requiresItemConfirm: (i as any).requires_item_confirm === true, requestStatus: r.status, reason: r.reason, ...i.view,
+        // r107 B6 fix round 1 (P2-2): huella del contenido que el docente revisa (aplicar la exige).
+        contentHash: itemContentHash({ operation: i.operation, stage: i.stage, params: i.params ?? null, view: i.view ?? null }) };
     });
+    // Lo que el docente aprueba al aplicar (B6): los ítems que entran con su huella, la huella del plan y los que piden
+    // confirmación uno por uno. El POST …/apply manda exactamente esto de vuelta.
+    const sel = selectApplyItems(items.filter((i) => byReq.has(i.request_id)).map((i) => {
+      const r = byReq.get(i.request_id)!;
+      return { id: i.id, requestId: i.request_id, operation: i.operation, status: live(i) ? 'proposed' as const : 'removed' as const, requestStatus: r.status, stage: i.stage, available: i.available, params: i.params ?? null,
+        requiresItemConfirm: (i as any).requires_item_confirm === true, summary: i.view?.summary ?? i.operation, quote: r.quote, riskLevel: i.risk_level,
+        contentHash: itemContentHash({ operation: i.operation, stage: i.stage, params: i.params ?? null, view: i.view ?? null }) };
+    }));
+    const applyItems = sel.apply.map((i) => ({ id: i.id, contentHash: i.contentHash as string }));
+    const applyBlock = {
+      planHash: applyItems.length ? planContentHash(applyItems) : null,
+      items: applyItems,
+      confirmRequired: sel.apply.filter((i) => i.requiresItemConfirm).map((i) => ({ id: i.id, contentHash: i.contentHash as string, summary: i.summary })),
+      blocking: sel.blocking,
+      later: sel.later.map((i) => i.id),
+    };
     const ready = items.filter((i) => live(i) && i.stage === 'ready');
     const totals = planTotals({
       spent: [...intakes.map((x) => usd(x.spent_usd)), ...requests.map((x) => usd(x.spent_usd))],
@@ -1130,6 +1178,8 @@ export class WorkshopPlanService {
       sessionId: s.id, planId: plan?.id ?? null, status: (plan?.status ?? 'draft') as 'draft' | 'applying' | 'applied' | 'failed', appliedVersionId: plan?.applied_version_id ?? null,
       originalSha1: s.originalSha1, planCodeVersion: PLAN_CODE_VERSION,
       items: itemViews,
+      /** r107 B6 (fix round 1, P2-2): lo que se envía a POST …/plans/:planId/apply (huellas del contenido revisado). */
+      apply: applyBlock,
       /** Fix round 1 (P2-4): avisos del plan (quitar actividades, cambios masivos, muchos de riesgo alto). */
       warnings,
       /** Lo que falta aprobar para generar el contenido de los ítems en etapa de estimado (estimado + tope propuesto). */

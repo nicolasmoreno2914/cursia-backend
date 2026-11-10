@@ -20,6 +20,7 @@ import { openMbz } from '../mbz-reader';
 import { builderLineOf, readPackageFacts } from '../identify';
 import { DiagnosisReport } from '../diagnosis/diagnose';
 import { applyPatchPlan } from '../patch/engine';
+import { stableStringify } from '../course-model';
 import type { DiagnosisDelta, FieldChange, OperationReport, PatchOperation } from '../patch/types';
 import { MbzV3Issue, validateMbzV3Structure } from '../../../package/v3/mbz-validator-v3';
 
@@ -69,6 +70,8 @@ export interface ApplyCandidate {
   summary: string;
   quote: string;
   riskLevel: string;
+  /** Fix round 1 (P2-2): huella del contenido revisado (`itemContentHash`). */
+  contentHash?: string;
 }
 
 export interface ApplySelection {
@@ -99,10 +102,47 @@ export function selectApplyItems(items: ApplyCandidate[]): ApplySelection {
 
 /** Confirmaciones individuales (riesgo alto, B5 P2-4): las que faltan y las que no corresponden a ningún ítem que se aplica. */
 export function confirmationsMissing(apply: ApplyCandidate[], confirmed: readonly string[]): { missing: string[]; unknown: string[] } {
+  // (fix round 1, P2-2: el servicio ya filtró las confirmaciones cuya huella no es la del contenido actual)
   const need = new Set(apply.filter((i) => i.requiresItemConfirm).map((i) => i.id));
   const ids = new Set(apply.map((i) => i.id));
   const conf = new Set(confirmed.map((x) => x.toLowerCase()));
   return { missing: [...need].filter((id) => !conf.has(id)), unknown: [...conf].filter((id) => !ids.has(id)) };
+}
+
+// ── lo que el docente revisó (fix round 1, P2-2) ──
+
+/**
+ * Huella del CONTENIDO de un ítem tal como el docente lo ve en el plan: la operación con sus parámetros resueltos (lo que
+ * el motor aplica: destino, HTML nuevo, pregunta, colores…) + el antes/después generado + archivos y entradas. Si el ítem
+ * se vuelve a generar o a interpretar con el mismo id, la huella cambia: aplicar exige la que el docente aprobó.
+ */
+export function itemContentHash(x: { operation: string; stage: string; params: unknown; view: { changes?: unknown; files?: unknown; entries?: unknown } | null }): string {
+  const v = x.view ?? {};
+  return createHash('sha256').update(stableStringify({ operation: x.operation, stage: x.stage, params: x.params ?? null, changes: v.changes ?? [], files: v.files ?? [], entries: v.entries ?? null })).digest('hex');
+}
+
+/** Huella del PLAN que se aplica: los ítems que entran, en orden, cada uno con su huella de contenido. */
+export function planContentHash(items: Array<{ id: string; contentHash: string }>): string {
+  return createHash('sha256').update(items.map((i) => `${i.id.toLowerCase()}:${i.contentHash}`).join('\n')).digest('hex');
+}
+
+/** Lo que el docente envía al aprobar: cada ítem con la huella que vio (y la del plan), las confirmaciones igual. */
+export interface ApplyApproval {
+  planHash: string;
+  items: Array<{ id: string; contentHash: string }>;
+  confirm: Array<{ id: string; contentHash: string }>;
+}
+
+/** Diferencias entre lo aprobado y lo que hay ahora (pura): ítems que cambiaron de contenido, sobran o faltan. */
+export function approvalMismatch(current: Array<{ id: string; contentHash: string }>, a: ApplyApproval): { changed: string[]; missing: string[]; extra: string[]; planHashOk: boolean } {
+  const cur = new Map(current.map((i) => [i.id.toLowerCase(), i.contentHash]));
+  const sent = new Map(a.items.map((i) => [i.id.toLowerCase(), i.contentHash]));
+  return {
+    changed: [...sent].filter(([id, h]) => cur.has(id) && cur.get(id) !== h).map(([id]) => id),
+    missing: [...cur.keys()].filter((id) => !sent.has(id)),
+    extra: [...sent.keys()].filter((id) => !cur.has(id)),
+    planHashOk: planContentHash(current) === a.planHash,
+  };
 }
 
 // ── informe de cambios ──
