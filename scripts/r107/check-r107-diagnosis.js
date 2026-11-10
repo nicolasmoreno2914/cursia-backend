@@ -183,6 +183,16 @@ const B3_MUTATIONS = {
     // Fix round 2 (N3): en un paquete v3 el validador lo marca TOKEN_INVALID (error) — sigue siendo AVISO.
     return { check: 'T04', target: dir, severity: 'warning', code: 'token_external' };
   },
+  // B4 fix 1 (P1-1): un tipo de token que Moodle no conoce (alucinado) → aviso, ya no pasa como «sin verificar».
+  async 'token-unknown-kind'(zip) {
+    const dir = await injectLabel(zip, '<p><a href="$@ACTIVITYVIEWBYID*999@$">Ir</a></p>');
+    // En la línea v3 el validador lo da como TOKEN_INVALID (error) y lo corrobora: la severidad sube (aviso como mínimo).
+    return { check: 'T04', target: dir, code: 'token_unverifiable' };
+  },
+  async 'token-missing-id'(zip) {
+    const dir = await injectLabel(zip, '<p><a href="$@SCORMVIEWBYID@$">Ir</a></p>');
+    return { check: 'T04', target: dir, code: 'token_unverifiable' };
+  },
   async 'token-malformed'(zip) {
     // El bug de `$&` (changelog #1): el `$` final del token se pierde → `$@KIND*id@` que Moodle deja literal.
     const dir = await injectLabel(zip, '<p><a href="$@QUIZVIEWBYID*12@">Ir</a></p>');
@@ -612,6 +622,40 @@ async function censusMode(surveyPath) {
         }
       }
       assert(n > 0, 'ningún hallazgo verificado');
+    });
+
+    await check('D11 (B4 fix 1) arreglos sugeridos PROBADOS con el motor: sección vacía → edit_html; examen del que depende otra actividad → ninguno con motivo; aplicable → ok', async () => {
+      const AS = bases['v3-A-S'].buf;
+      // (a) etiqueta vacía que es la única de su sección (bienvenida del V1 mínimo): quitarla no aplica → reescribirla.
+      const v1 = await miniV1(await audiobookOf(AS));
+      const z1 = await JSZip.loadAsync(v1);
+      await BC.MUTATIONS['empty-label'](z1);
+      const r1 = await diagnose(await z1.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), 'v1.mbz');
+      const e1 = r1.findings.find((x) => x.code === 'empty_activity' && x.scope.activity.dir === 'activities/label_901');
+      assert(e1 && e1.fixPrecheck, 'empty_activity con prueba en seco');
+      eq([e1.fixPrecheck.status, e1.fixPrecheck.original && e1.fixPrecheck.original.operation, e1.suggestedFix && e1.suggestedFix.operation], ['fallback', 'remove_activity', 'edit_html'], 'sección vacía → edit_html');
+      assert(/sección/.test(e1.fixPrecheck.reason), `motivo: ${e1.fixPrecheck.reason}`);
+      // (b) examen sin carpeta que nadie enlaza, pero «Respuestas explicadas» tiene una condición de acceso sobre él.
+      const z2 = await JSZip.loadAsync(AS);
+      const lp = 'activities/label_1048/label.xml';
+      z2.file(lp, (await z2.file(lp).async('string')).split('$@QUIZVIEWBYID*1049@$').join('$@QUIZVIEWBYID*1089@$'));
+      z2.forEach((p2) => { if (p2.startsWith('activities/quiz_1049/')) z2.remove(p2); });
+      const r2 = await diagnose(await z2.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), 'v3.mbz');
+      const e2 = r2.findings.find((x) => x.code === 'listed_missing_folder' && x.scope.activity && x.scope.activity.dir === 'activities/quiz_1049');
+      assert(e2 && e2.fixPrecheck, `listed_missing_folder del examen con prueba en seco (${r2.findings.filter((x) => x.check === 'T01').map(fmt).join(', ')})`);
+      eq([e2.fixPrecheck.status, e2.fixPrecheck.original && e2.fixPrecheck.original.operation, e2.suggestedFix], ['unavailable', 'remove_activity', null], 'dependencia → ninguno');
+      assert(/condición de acceso/.test(e2.fixPrecheck.reason), `motivo: ${e2.fixPrecheck.reason}`);
+      // (c) etiqueta vacía del v3 (otra sección con más actividades): quitarla aplica.
+      const z3 = await JSZip.loadAsync(AS);
+      await BC.MUTATIONS['empty-label'](z3);
+      const r3 = await diagnose(await z3.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), 'v3.mbz');
+      const e3 = r3.findings.find((x) => x.code === 'empty_activity');
+      eq([e3.fixPrecheck.status, e3.suggestedFix.operation], ['ok', 'remove_activity'], 'aplicable');
+      // (d) Libro en PDF / regenerar: la prueba dice qué no prueba.
+      const ph3 = r3.findings.filter((x) => x.suggestedFix && /^regenerate_/.test(x.suggestedFix.operation));
+      for (const x of ph3) eq(x.fixPrecheck.status, 'not_checked', `${fmt(x)} fase 3`);
+      // Todo hallazgo con arreglo trae su prueba.
+      for (const r of [r1, r2, r3]) for (const x of r.findings) if (x.suggestedFix || (x.fixPrecheck && x.fixPrecheck.original)) assert(x.fixPrecheck, `${fmt(x)} sin prueba en seco`);
     });
 
     await check('D10 validador: un error del validador NUNCA queda escondido en un hallazgo de otra familia (info / warning) — semáforo rojo', async () => {

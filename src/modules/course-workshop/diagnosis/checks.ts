@@ -11,7 +11,7 @@
  * su sha1); un blob faltante o alterado es T02 y no se vuelve a reportar como «Libro truncado» o «audio ilegible».
  */
 import { WorkshopFamily } from '../identify';
-import { WorkshopActivity, WorkshopToken, plainText } from '../course-model';
+import { WorkshopActivity, WorkshopToken, plainText, tokenKindShape } from '../course-model';
 import { EXAM_OPTION_FORBIDDEN_RE, normalizeExamText } from '../../course-shell/exam-bank';
 import { VIDEO_MC_LONGEST_MAX_SHARE, videoMcLengthBias } from '../../quality/answer-length-bias';
 import { DiagnosisContext, blobVerified } from './context';
@@ -305,6 +305,17 @@ function tokenFinding(ctx: DiagnosisContext, owner: WorkshopActivity | null, t: 
       title: `${button} ${loc} es un enlace a otro curso del sitio original: no funcionará al restaurar en otro Moodle.`,
       detail: `${t.entry} (${t.field}): ${t.token} apunta al curso ${t.targetId}; el curso de este backup es ${ctx.course.course.originalCourseId}. Moodle no mapea ids de otros cursos al restaurar.`,
       suggestedFix: { operation: 'edit_html', params: editParams(null) } });
+  }
+  // r107 B4 fix round 1 (P1-1): un token de tipo que Moodle no conoce, o de un tipo con id que no lo trae, queda literal
+  // al restaurar (enlace roto) y no se puede verificar: aviso (WWWROOT y los demás tipos sin id siguen bien).
+  if (t.status === 'unchecked') {
+    const sh = tokenKindShape(t.kind);
+    if (sh.shape === 'unknown' || (sh.shape === 'needs_id' && t.targetId === null)) {
+      return f({ ...base, check: 'T04', code: 'token_unverifiable', severity: 'warning',
+        title: `${button} ${loc} usa una dirección interna de Moodle que no se puede verificar: es probable que no abra nada al restaurar.`,
+        detail: `${t.entry} (${t.field}): ${t.token} — ${sh.shape === 'unknown' ? `tipo «${t.kind}» que Moodle no conoce` : `el tipo ${t.kind} necesita un id y no lo trae`}`,
+        suggestedFix: { operation: 'edit_html', params: editParams(null) } });
+    }
   }
   if (t.anchor && t.anchor.status === 'orphan') {
     return f({ ...base, check: 'T04', code: 'anchor_orphan', severity: 'warning',

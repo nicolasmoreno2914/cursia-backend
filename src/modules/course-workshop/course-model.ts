@@ -827,7 +827,28 @@ export const TOKEN_MODNAME: Readonly<Record<string, string>> = Object.freeze({
   GLOSSARY: 'glossary', LESSON: 'lesson', WIKI: 'wiki', WORKSHOP: 'workshop', DATA: 'data', CHAT: 'chat', IMSCP: 'imscp',
   LTI: 'lti', SURVEY: 'survey', BIGBLUEBUTTONBN: 'bigbluebuttonbn',
 });
-const COURSE_TOKENS = new Set(['COURSEVIEWBYID', 'BADGESVIEWBYID', 'GRADEINDEXBYID', 'GRADEREPORTBYID', 'COURSECOMPLETIONBYID', 'COURSEPARTICIPANTSBYID']);
+export const COURSE_TOKENS = new Set(['COURSEVIEWBYID', 'BADGESVIEWBYID', 'GRADEINDEXBYID', 'GRADEREPORTBYID', 'COURSECOMPLETIONBYID', 'COURSEPARTICIPANTSBYID']);
+/** Tipos de token SIN id que existen (Moodle los resuelve sin destino): `$@WWWROOT@$`, `$@NULL@$`. */
+export const IDLESS_TOKENS: ReadonlySet<string> = new Set(['WWWROOT', 'NULL']);
+
+/**
+ * r107 B4 fix round 1 (P1-1) — forma de un tipo de token: `idless` (no lleva id), `needs_id` (tipo conocido que exige
+ * id en su espacio: moduleid, instancia, curso, sección, contexto; BOOKVIEWBYIDCH dos) o `unknown` (no es un token que
+ * Moodle conozca: inventado). Misma tabla que la resolución de `extractTokens`.
+ */
+export function tokenKindShape(kind: string): { shape: 'idless' | 'needs_id' | 'unknown'; ids: number } {
+  if (IDLESS_TOKENS.has(kind)) return { shape: 'idless', ids: 0 };
+  if (kind === 'BOOKVIEWBYIDCH') return { shape: 'needs_id', ids: 2 };
+  if (kind === 'COURSESECTIONBYID' || /^PLUGINFILEBYCONTEXT/.test(kind) || COURSE_TOKENS.has(kind)) return { shape: 'needs_id', ids: 1 };
+  let m = /^(.+?)(?:VIEWBYID|EMBEDBYID)$/.exec(kind);
+  if (m && TOKEN_MODNAME[m[1]]) return { shape: 'needs_id', ids: 1 };
+  m = /^(.+?)VIEWBY([A-Z])$/.exec(kind);
+  if (m && TOKEN_MODNAME[m[1]]) return { shape: 'needs_id', ids: 1 };
+  m = /^(.+?)INDEX$/.exec(kind);
+  if (m && TOKEN_MODNAME[m[1]]) return { shape: 'needs_id', ids: 1 };
+  if (/BYCOURSE$/.test(kind)) return { shape: 'needs_id', ids: 1 };
+  return { shape: 'unknown', ids: 0 };
+}
 
 export interface TokenContext {
   modnameByMid: Map<number, string>;
