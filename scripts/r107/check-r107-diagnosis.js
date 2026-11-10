@@ -658,6 +658,33 @@ async function censusMode(surveyPath) {
       for (const r of [r1, r2, r3]) for (const x of r.findings) if (x.suggestedFix || (x.fixPrecheck && x.fixPrecheck.original)) assert(x.fixPrecheck, `${fmt(x)} sin prueba en seco`);
     });
 
+    await check('D12 (B4 fix 2, N3) la prueba en seco no comparte ni muta parámetros: dos hallazgos con los MISMOS parámetros reciben cada uno su resultado completo', async () => {
+      const P = L('modules/course-workshop/patch/index.js');
+      const v1 = await miniV1(await audiobookOf(bases['v3-A-S'].buf));
+      const z = await JSZip.loadAsync(v1);
+      const p = 'activities/label_910/label.xml';
+      z.file(p, (await z.file(p).async('string')).replace('</intro>', () => esc('<iframe src="$@HVPEMBEDBYID*99999@$"></iframe>') + '</intro>'));
+      const buf = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+      const pkg = await R.openMbz(buf);
+      const facts = await I.readPackageFacts(pkg, 'v1.mbz');
+      const ctx = await DG.buildDiagnosisContext({ pkg, packageBytes: buf, family: I.familyOf(facts), builderLine: I.builderLineOf(facts), builderVersion: null });
+      const raw = DG.diagnoseContext(ctx);
+      const orphan = raw.findings.find((x) => x.code === 'token_orphan' && x.evidence.token === '$@HVPEMBEDBYID*99999@$');
+      assert(orphan && orphan.suggestedFix && orphan.suggestedFix.params.token, 'hallazgo del token en un iframe');
+      const before = JSON.stringify(orphan.suggestedFix.params);
+      const twin = JSON.parse(JSON.stringify(orphan));
+      const shared = [orphan, twin];
+      await P.prevalidateFixes(shared, { pkg, packageBytes: buf, family: ctx.family, course: ctx.course, raw: ctx.raw });
+      for (const x of shared) eq([x.fixPrecheck.status, x.suggestedFix.params.mode, !!x.suggestedFix.params.reason], ['ok', 'replace', true], 'cada uno con mode replace + motivo');
+      assert(shared[0].suggestedFix.params !== shared[1].suggestedFix.params, 'copias propias');
+      eq(JSON.stringify(JSON.parse(before)), before, 'sanity');
+      const again = [JSON.parse(JSON.stringify(orphan)), JSON.parse(JSON.stringify(orphan))];
+      for (const x of again) { x.suggestedFix.params = JSON.parse(before); }
+      const frozen = again.map((x) => Object.freeze(x.suggestedFix.params));
+      await P.prevalidateFixes(again, { pkg, packageBytes: buf, family: ctx.family, course: ctx.course, raw: ctx.raw });
+      eq(frozen.map((x) => JSON.stringify(x)), [before, before], 'los parámetros de entrada no se tocan (congelados)');
+    });
+
     await check('D10 validador: un error del validador NUNCA queda escondido en un hallazgo de otra familia (info / warning) — semáforo rojo', async () => {
       const act = { moduleId: 900, dir: 'activities/quiz_900', modname: 'quiz', title: 'Examen' };
       const scope = { level: 'activity', chapterNumber: null, moduleNumber: 1, activity: act };

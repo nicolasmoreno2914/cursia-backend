@@ -82,7 +82,22 @@ export function occurrenceKey(f: Finding, t: PlanTouch): string {
     || (blob && !!fileKey && t.files.has(fileKey));
   if (!touched) return `id:${f.id}`;
   const entry = blob ? `file:${fileKey ?? ''}` : (f.evidence.entry ?? '');
-  return ['occ', findingSignature(f), entry, f.evidence.excerpt ?? ''].join('|');
+  return ['occ', findingSignature(f), entry, defectKey(f)].join('|');
+}
+
+/**
+ * Fix round 2 (N1): lo que identifica al DEFECTO, no su presentación. El fragmento de evidencia de un hallazgo sobre una
+ * etiqueta (`<a href="#" style="…">Texto</a>`) trae atributos de estilo que una operación puede cambiar sin tocar el
+ * defecto (brand_replace cambia un color del style de un botón muerto): se quitan `style`, `class` y `on*`, y en un
+ * enlace muerto se usa su campo + destino + texto visible (título y detalle del hallazgo, que no llevan estilos).
+ */
+export function defectKey(f: Finding): string {
+  // Enlace muerto: campo + destino (detalle hasta el «—») + texto del botón (el primer «…» del título; el resto del título
+  // nombra la actividad por el comienzo de su texto, que una edición puede cambiar).
+  if (f.code === 'dead_link') return `${f.detail.replace(/\s+—[\s\S]*$/, '')}|${/^El botón «([^»]*)»/.exec(f.title)?.[1] ?? ''}`;
+  const ex = f.evidence.excerpt ?? '';
+  if (!/<[a-zA-Z]/.test(ex)) return ex;
+  return ex.replace(/\s(?:style|class|on[a-z]+)\s*=\s*(?:"[^"]*"?|'[^']*'?|[^\s>]*)/gi, '').replace(/\s+/g, ' ').trim();
 }
 
 /** Compara dos diagnósticos por ocurrencia (solo error / warning). */

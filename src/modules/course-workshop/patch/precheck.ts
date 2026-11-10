@@ -25,8 +25,11 @@ const STRUCTURAL = new Set(['unsupported', 'unavailable', 'invariant', 'target_n
 
 export interface PrecheckInput { pkg: MbzPackage; packageBytes: Buffer; family: WorkshopFamily; course: WorkshopCourse; raw: RawCourse }
 
-/** Por qué una operación estructural no aplica (null = aplica). */
-async function why(fix: SuggestedFix, base: PatchState, inp: PrecheckInput): Promise<string | null> {
+/**
+ * Por qué una operación estructural no aplica (null = aplica). Fix round 2 (N3): NUNCA modifica `fix.params`; lo que
+ * haya que agregar a los parámetros (p. ej. `mode: 'replace'`) va en `extra`, que el llamador aplica a una COPIA.
+ */
+async function why(fix: SuggestedFix, base: PatchState, inp: PrecheckInput, extra: Record<string, unknown>): Promise<string | null> {
   const p = fix.params as Record<string, any>;
   const act = (mid: unknown): WorkshopActivity | undefined => inp.course.activities.find((a) => a.moduleId === mid);
   const ctxOf = (): OpContext => {
@@ -66,7 +69,7 @@ async function why(fix: SuggestedFix, base: PatchState, inp: PrecheckInput): Pro
         if (!loc) return 'el campo no coincide con el paquete';
         try { editToken(loc.raw, p.token, 'unlink'); } catch (e) {
           // No se puede solo quitar el enlace: sigue siendo arreglable reescribiendo el campo (sin el token).
-          if (e instanceof PatchError) { p.mode = 'replace'; p.reason = e.message; }
+          if (e instanceof PatchError) { extra.mode = 'replace'; extra.reason = e.message; }
         }
       }
       return null;
@@ -119,15 +122,29 @@ function fallbackFor(f: Finding, inp: PrecheckInput, reason: string): SuggestedF
 export async function prevalidateFixes(findings: Finding[], inp: PrecheckInput): Promise<void> {
   // Se abre solo si hay algo que probar (en tar.gz carga todas las entradas).
   let base: PatchState | null = null;
-  const memo = new Map<string, string | null>();
+  // Fix round 2 (N3): el memo guarda el resultado COMPLETO (motivo + lo que se agrega a los parámetros) por la clave de
+  // los parámetros tal como vinieron; cada hallazgo recibe su propia copia.
+  const memo = new Map<string, { reason: string | null; extra: Record<string, unknown> }>();
   for (const f of findings) {
     const fx = f.suggestedFix;
     if (!fx) { f.fixPrecheck = null; continue; }
     if (!PHASE2.has(fx.operation)) { f.fixPrecheck = { status: 'not_checked', reason: 'operación de otra fase (regenerar): el motor de la Fase 2 no la puede probar', original: null } as FixPrecheck; continue; }
     const key = JSON.stringify([fx.operation, fx.params]);
-    let reason = memo.get(key);
-    if (reason === undefined) { base ||= await PatchState.create(inp.pkg, inp.packageBytes); reason = await why(fx, base, inp); memo.set(key, reason); }
-    if (reason === null) { f.fixPrecheck = { status: 'ok', reason: (fx.params as any).reason ?? null, original: null }; continue; }
+    let res = memo.get(key);
+    if (res === undefined) {
+      base ||= await PatchState.create(inp.pkg, inp.packageBytes);
+      const extra: Record<string, unknown> = {};
+      const reason = await why({ operation: fx.operation, params: JSON.parse(JSON.stringify(fx.params)) }, base, inp, extra);
+      res = { reason, extra };
+      memo.set(key, res);
+    }
+    const reason = res.reason;
+    if (reason === null) {
+      const params = { ...JSON.parse(JSON.stringify(fx.params)), ...res.extra };
+      f.suggestedFix = { operation: fx.operation, params };
+      f.fixPrecheck = { status: 'ok', reason: (params as any).reason ?? null, original: null };
+      continue;
+    }
     const alt = fallbackFor(f, inp, reason);
     f.fixPrecheck = { status: alt ? 'fallback' : 'unavailable', reason, original: fx };
     f.suggestedFix = alt;

@@ -82,17 +82,28 @@ export const DIAGNOSIS_HEARTBEAT_STALE_MS = 3 * DIAGNOSIS_HEARTBEAT_MS;
 /**
  * Fix round 1 (P1-1) / round 2 (N2): memoria del proceso de la API para el Taller. Medido (RSS máximo, proceso aislado,
  * base de Node ≈ 49 MB):
- *   - diagnóstico: 1353 (106 MB) 535–561 MB, Fundamentos (112 MB) 490 MB → ≤ ~4,8 × el original (DIAGNOSIS_MEMORY_FACTOR 5);
+ *   - diagnóstico: 1353 (106 MB) 535–561 MB, Fundamentos (112 MB) 490 MB → ≤ ~4,8 × el original (B3; con la prueba en seco de B4: DIAGNOSIS_MEMORY_FACTOR 5,5 zip / 7 tar.gz, ver abajo);
  *   - identificación + inventario (lo mismo que una reconstrucción): 295 MB / 195 MB → ≤ ~2,3 × (IDENTIFY_MEMORY_FACTOR 3).
  * Presupuesto TOTAL del Taller en el proceso (env COURSE_WORKSHOP_MEMORY_BUDGET_MB, por defecto 2048): identificaciones
  * (2) y reconstrucción (1) reservan su estimado al empezar; el diagnóstico (carril de 1) arranca SOLO si su estimado
  * entra en lo que queda (si no, espera en cola a que se libere). Con el tope de subida de 200 MB, el peor caso
  * (diagnóstico 1 GB + 2 identificaciones 1,2 GB + reconstrucción 0,6 GB) se acota así: el diagnóstico espera. Las
  * identificaciones no esperan al diagnóstico (comportamiento de B1). Un original cuyo estimado no entra NUNCA en el
- * presupuesto → `failed` WORKSHOP_DIAGNOSIS_TOO_LARGE (guarda defensiva: con 200 MB × 5 < 2 GB no ocurre); el error
+ * presupuesto → `failed` WORKSHOP_DIAGNOSIS_TOO_LARGE (guarda defensiva: con 200 MB × 7 = 1,4 GB < 2 GB no ocurre); el error
  * guarda el presupuesto con que se decidió y se reintenta si el presupuesto actual es mayor.
  */
-export const DIAGNOSIS_MEMORY_FACTOR = 5;
+export const DIAGNOSIS_MEMORY_FACTOR = 5.5;
+/**
+ * r107 B4 fix round 2 (N2): el diagnóstico ahora PRUEBA EN SECO sus arreglos con el motor de parches (B4), que en un
+ * tar.gz vuelve a cargar todas las entradas descomprimidas. Medido por el revisor (RSS máximo): zip v3 111 MB → 556 MB
+ * (5,0×), re-export tar.gz 73 MB → 462 MB (6,3×). Factores con margen: zip 5,5×, tar.gz 7×. Con el tope de subida de
+ * 200 MB, el peor caso es 1,4 GB (tar.gz) < 2 GB del presupuesto por defecto: el tope NO baja y la prueba en seco no se
+ * saltea; con un presupuesto configurado más chico, el original que no entra queda `WORKSHOP_DIAGNOSIS_TOO_LARGE`.
+ */
+export const DIAGNOSIS_MEMORY_FACTOR_TGZ = 7;
+export function diagnosisMemoryFactor(container: string | null | undefined): number {
+  return container === 'tar.gz' ? DIAGNOSIS_MEMORY_FACTOR_TGZ : DIAGNOSIS_MEMORY_FACTOR;
+}
 export const IDENTIFY_MEMORY_FACTOR = 3;
 export const WORKSHOP_MEMORY_BUDGET_DEFAULT_MB = 2048;
 export function workshopMemoryBudgetBytes(env: Record<string, string | undefined> = process.env): number {
@@ -960,10 +971,11 @@ export class CourseWorkshopService {
   /** Reclama (insert o reclamo condicional de la fila existente) y encola en ESTE proceso. */
   private async claimAndEnqueue(row: Row, cur: DiagRow | null): Promise<WorkshopDiagnosisResponse> {
     const size = Number(row.original_size ?? 0);
-    const estimate = size * DIAGNOSIS_MEMORY_FACTOR;
+    const factor = diagnosisMemoryFactor(row.container);
+    const estimate = Math.ceil(size * factor);
     if (estimate > this.memoryBudgetBytes) {
       const error = { code: WORKSHOP_ERRORS.DIAGNOSIS_TOO_LARGE, retryable: false, budgetBytes: this.memoryBudgetBytes,
-        message: `Este paquete pesa ${Math.round(size / 1048576)} MB: el diagnóstico en línea admite hasta ${Math.floor(this.memoryBudgetBytes / DIAGNOSIS_MEMORY_FACTOR / 1048576)} MB (necesita ~${DIAGNOSIS_MEMORY_FACTOR}× su tamaño en memoria). Avísanos para diagnosticarlo aparte.` };
+        message: `Este paquete pesa ${Math.round(size / 1048576)} MB: el diagnóstico en línea admite hasta ${Math.floor(this.memoryBudgetBytes / factor / 1048576)} MB${row.container === 'tar.gz' ? ' en tar.gz' : ''} (necesita ~${String(factor).replace('.', ',')}× su tamaño en memoria). Avísanos para diagnosticarlo aparte.` };
       const [r] = returningRows(await this.q(this.dataSource,
         `insert into public.workshop_diagnoses (session_id, original_sha1, code_version, status, error, finished_at, updated_at)
               values ($1, $2, $3, 'failed', $4::jsonb, now(), now())

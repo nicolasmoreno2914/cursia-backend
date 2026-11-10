@@ -78,6 +78,7 @@ if (MODE === 'bite') {
     { name: 'fix 1 P2-8: quitar enlace sin mirar enlaces anidados', file: 'modules/course-workshop/patch/html-edit.js', from: 'if (no && no.index < cm.index)', to: 'if (false)', expect: /R1 P2-8/ },
     { name: 'fix 1 P2-6: comparación por firma gruesa (sin ocurrencia)', file: 'modules/course-workshop/patch/engine.js', from: "if (!touched)\n        return `id:${f.id}`;", to: 'return findingSignature(f);', expect: /R1 P2-6/ },
     { name: 'fix 1 P2-1: .ARCHIVE_INDEX sin regenerar', file: 'modules/course-workshop/patch/engine.js', from: 'if (await state.finalize())', to: 'if (false)', expect: /R1 P2-1/ },
+    { name: 'fix 2 N1: el enlace muerto se identifica por su fragmento crudo (con style)', file: 'modules/course-workshop/patch/engine.js', from: "if (f.code === 'dead_link')", to: 'if (false)', expect: /R2 N1/ },
     { name: 'remove_activity no sanea los enlaces que la nombran', file: 'modules/course-workshop/patch/op-remove.js', from: 'for (const t of targets) {', to: 'for (const t of []) {', expect: /P7/ },
   ];
   let bad = 0;
@@ -880,6 +881,17 @@ async function ciSuite(fx) {
     const bad = await zipToTarGz(V1, { index: true, extra: { [`activities/label_904/${'x'.repeat(120)}.txt`]: Buffer.from('no entra') } });
     await applyFail(bad, [{ op: 'remove_activity', moduleId: 912 }], 'unsupported', 'nombre que no entra', /demasiado largo/);
   });
+
+  await check('R2 N1 el MISMO botón muerto con otra presentación no es un hallazgo nuevo: colores del style (brand_replace) y texto de la etiqueta (edit_html); un cambio real de botón sigue fallando', async () => {
+    const BTN = '<a href="#" style="background:#1C2833;color:#ffffff;padding:10px 18px;border-radius:10px;display:inline-block;text-decoration:none;font-weight:700;font-family:Arial,sans-serif">📝 Descargar materiales</a>';
+    const b = await zipEdit(V1, (z) => setIntro(z, 'label_901', `<p style="color:#1C2833">Bienvenidos al curso.</p><p>${BTN}</p>`));
+    assert((await diagnose(b)).findings.some((x) => x.code === 'dead_link'), 'fixture con botón muerto');
+    const r1 = await applyOk(b, [{ op: 'brand_replace', colors: { '#1C2833': '#123456' } }], 'colores de un botón muerto');
+    assert(!r1.res.diagnosis.resolved.some((x) => /dead_link/.test(x.signature)) && !r1.res.diagnosis.introduced.length, 'el botón sigue siendo el mismo defecto (ni resuelto ni nuevo)');
+    const r2 = await applyOk(b, [{ op: 'edit_html', target: { moduleId: 901, field: 'intro' }, change: { kind: 'replace', html: `<p style="color:#1C2833">Hola, este es otro texto de bienvenida.</p><p>${BTN}</p>` } }], 'texto de la etiqueta cambiado');
+    assert(!r2.res.diagnosis.resolved.some((x) => /dead_link/.test(x.signature)), 'mismo botón');
+    await applyFail(b, [{ op: 'edit_html', target: { moduleId: 901, field: 'intro' }, change: { kind: 'replace', html: `<p style="color:#1C2833">Bienvenidos al curso.</p><p>${BTN.replace('Descargar materiales', 'Ir al foro')}</p>` } }], 'new_findings', 'un botón muerto por otro');
+  });
 }
 
 // ── --corpus ───────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -927,6 +939,14 @@ async function corpusSuite(manifestPath) {
     }
     console.log(`   ${lines.join('\n   ')}`);
     assert(!bad.length, bad.join('\n'));
+  });
+  // Fix round 2 (N1): el caso del revisor — cambiar un color de marca en un V1 real con botones muertos estilados.
+  const mv = process.env.R107_MATEMATICAS || path.join(os.homedir(), 'Downloads/Matematicas_vfinal.mbz');
+  await check(`P15 corpus: brand_replace #1C2833 → #123456 sobre ${path.basename(mv)} (V1 real con botones «href=#» estilados) → pasa, sin hallazgos nuevos`, async () => {
+    const buf = fs.readFileSync(mv);
+    const { res } = await applyOk(buf, [{ op: 'brand_replace', colors: { '#1C2833': '#123456' } }], 'P15', { filename: path.basename(mv) });
+    assert(!res.diagnosis.introduced.length && !res.diagnosis.resolved.some((x) => /dead_link/.test(x.signature)), `sin nuevos (resueltos: ${res.diagnosis.resolved.map((x) => x.signature).join(' ; ')})`);
+    console.log(`   P15 ${res.operations[0].summary}`);
   });
   const reals = fx.filter((f) => f.source === 'real');
   const table = [];

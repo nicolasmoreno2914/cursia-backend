@@ -6,3 +6,4 @@ export type { BrandImage } from './op-brand';
 export { libroStructure, recomposeLibro } from './op-libro';
 export { PatchState, crc32Of } from './container';
 export { rawIndexMap, xmlEsc } from './html-edit';
+export { prevalidateFixes } from './precheck';
