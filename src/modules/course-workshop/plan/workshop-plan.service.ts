@@ -1148,8 +1148,9 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Mezcla claves en `details` del pedido y quita otras (atómico). */
-  private async patchDetails(requestId: string, set: Record<string, unknown>, drop: string[] = []): Promise<void> {
-    await this.q(this.dataSource, `update public.workshop_requests set details = (coalesce(details, '{}'::jsonb) || $2::jsonb) - $3::text[], updated_at = now() where id = $1`, [requestId, JSON.stringify(set), drop]);
+  private async patchDetails(requestId: string, set: Record<string, unknown>, drop: string[] = [], claim: string | null = null): Promise<void> {
+    // (con `claim`: solo si el pedido sigue con ESE reclamo — un proceso que perdió la espera no toca nada)
+    await this.q(this.dataSource, `update public.workshop_requests set details = (coalesce(details, '{}'::jsonb) || $2::jsonb) - $3::text[], updated_at = now() where id = $1 and ($4::text is null or claim_id = $4::text)`, [requestId, JSON.stringify(set), drop, claim]);
   }
 
   /**
@@ -1524,26 +1525,31 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       if (w.provider === 'videogen') await settleVideogenJob({ ticket, job: polled.job, jobId: w.externalId, boundUsd, providers, charge: gate.charge });
       else await settleGammaGeneration({ ticket, st: polled.st, generationId: w.externalId, boundUsd, pricing: await this.pricing(), charge: gate.charge });
     } catch (err) {
+      // Fix 3: perdió la liquidación (otro proceso ya la liquidó, p. ej. tomó la espera después de nuestro `settling`):
+      // sale SIN ningún efecto — el ganador sigue con su handOff.
+      if (err instanceof RegenError && err.extra?.alreadySettled) return;
       let reason: string;
       let failed = false;
       if (err instanceof WaitTimeout) {
         // Ambiguo SOLO al vencer el plazo total sin estado final: no se reenvía; queda para conciliar.
         const e = await ticket.failed(err, 'ambiguous');
+        if (e.extra?.alreadySettled) return;
         reason = `No se generó: ${e.message}`;
-        await this.patchDetails(requestId, { ...ambiguous(), regenPaid: { ...paid, [w.provider]: null } }, ['regenPending']);
+        await this.patchDetails(requestId, { ...ambiguous(), regenPaid: { ...paid, [w.provider]: null } }, ['regenPending'], claim);
       } else if (err instanceof RegenError && err.code === 'over_bound') {
         reason = err.message;
         failed = true;
-        await this.patchDetails(requestId, { regenPaid: { ...paid, [w.provider]: { ...(paid as any)[w.provider], charged: true } }, lastError: { code: PLAN_ERRORS.PROVIDER_OVER_BOUND, message: err.message, retryable: false } }, ['regenPending']);
+        await this.patchDetails(requestId, { regenPaid: { ...paid, [w.provider]: { ...(paid as any)[w.provider], charged: true } }, lastError: { code: PLAN_ERRORS.PROVIDER_OVER_BOUND, message: err.message, retryable: false } }, ['regenPending'], claim);
       } else if (err instanceof RegenError) {
         // Terminó mal (render fallido = ambiguo; Gamma fallida = cobrada y sin resultado): nunca se reenvía solo.
         reason = `No se generó: ${err.message}`;
-        await this.patchDetails(requestId, { ...(err.code === 'call_ambiguous' ? ambiguous() : {}), regenPaid: { ...paid, [w.provider]: null } }, ['regenPending']);
+        await this.patchDetails(requestId, { ...(err.code === 'call_ambiguous' ? ambiguous() : {}), regenPaid: { ...paid, [w.provider]: null } }, ['regenPending'], claim);
       } else {
         throw err;
       }
-      await this.setRequest(requestId, { status: failed ? 'failed' : 'awaiting_generation', reason });
-      await this.maybeCloseApproval(w.approvalId, 'failed', reason);
+      // Defensa extra: solo con el reclamo propio (si otro proceso tomó la espera, esto no toca nada).
+      const mine = await this.setRequest(requestId, { status: failed ? 'failed' : 'awaiting_generation', reason, claim });
+      if (mine) await this.maybeCloseApproval(w.approvalId, 'failed', reason);
       return;
     }
     await handOff();
@@ -1581,15 +1587,15 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     await this.q(this.dataSource, `update public.workshop_intakes set status = 'failed', error = $2::jsonb, updated_at = now() where id = $1`, [id, JSON.stringify({ code, message, retryable, ...extra })]);
   }
 
-  private async setRequest(id: string, v: { status: RequestStatus; operation?: string | null; target?: unknown; raw_target?: unknown; details?: unknown; questions?: unknown; reason?: string | null; instruction?: string; estimate?: unknown; addSpent?: string; addCalls?: number }): Promise<RequestRow> {
+  private async setRequest(id: string, v: { status: RequestStatus; operation?: string | null; target?: unknown; raw_target?: unknown; details?: unknown; questions?: unknown; reason?: string | null; instruction?: string; estimate?: unknown; addSpent?: string; addCalls?: number; claim?: string | null }): Promise<RequestRow> {
     const [r] = returningRows(await this.q(this.dataSource,
       `update public.workshop_requests set status = $2, operation = coalesce($3, operation), target = coalesce($4::jsonb, target), raw_target = coalesce($5::jsonb, raw_target),
               details = coalesce($6::jsonb, details), questions = coalesce($7::jsonb, questions), reason = $8, instruction = coalesce($9, instruction),
               estimate = coalesce($12::jsonb, estimate), spent_usd = spent_usd + $10, ai_calls = ai_calls + $11, updated_at = now()
-        where id = $1 returning *`,
+        where id = $1 and ($13::text is null or claim_id = $13::text) returning *`,
       [id, v.status, v.operation ?? null, v.target === undefined || v.target === null ? null : JSON.stringify(v.target), v.raw_target === undefined || v.raw_target === null ? null : JSON.stringify(v.raw_target),
         v.details === undefined ? null : JSON.stringify(v.details), v.questions === undefined ? null : JSON.stringify(v.questions), v.reason ?? null, v.instruction ?? null, v.addSpent ?? '0', v.addCalls ?? 0,
-        v.estimate === undefined ? null : JSON.stringify(v.estimate)]));
+        v.estimate === undefined ? null : JSON.stringify(v.estimate), v.claim ?? null]));
     return r as RequestRow;
   }
 

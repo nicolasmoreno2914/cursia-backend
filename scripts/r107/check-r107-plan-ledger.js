@@ -33,6 +33,7 @@
 //   L17 espera retomada tras matar el proceso → el MISMO id externo, 1 solo envío
 //   fix 2: L18 aprobación mixta: la cota del render en espera queda comprometida → el contenido corta antes de enviarse (N1)
 //   · L19 dos procesos liquidan la misma espera → uno solo la toma, un cargo, una subida, un resultado; `sent → settling` (N2)
+//   · L21 (fix 3) A gana `settling` → B lo retoma y liquida → A pierde settleCall: A sale SIN efectos, ítem listo
 //   · L20 retoma fallida sin cobro / job aceptado sin espera → conciliar → re-aprobar → produce; sin conciliar, falla cerrado (N3)
 //
 // Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js [--bite]
@@ -66,6 +67,7 @@ if (process.argv.includes('--bite')) {
   const bites = [
     { name: 'sin `if (!d.allow)` en regenGateFor', anchor: 'regenGateFor(s, approval, simulated)', from: 'if (!d.allow)', to: 'if (false)', only: 'L14' },
     { name: 'la IA de B5 sin las cotas en vuelo (solo lo gastado)', anchor: 'invokerFor(s, approval, pricing, meta)', from: '(cur.spent_usd, cur.calls)', to: '(cur.spent_usd, {})', only: 'L18' },
+    { name: 'sin la salida temprana del perdedor de la liquidación', anchor: 'async runRegenWait(', from: 'err.extra?.alreadySettled)', to: 'false)', only: 'L21' },
     { name: 'sin la condición del reclamo de la espera', anchor: 'async runRegenWait(', from: "and claim_id is not distinct from $3::text returning *", to: 'returning *', only: 'L19' },
   ];
   let code = 0;
@@ -783,6 +785,48 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       await P2.approveGeneration({ id: U }, sid, pl2.planId, opts2); await P2.whenIdle();
       rq = await reqRow(P2, it2.id);
       eq([rq.status, simB.calls.videogen.filter((c) => c.op === 'create').length - creates0], ['resolved', 1], 'conciliado not_charged → reenvía y produce');
+    });
+
+    await check('L21 (B10 fix 3) A gana `settling` → B retoma la espera y también lo gana (liquida) → A pierde settleCall: A sale SIN ningún efecto, el ítem queda listo con el render reusado, sin regenAmbiguous, un solo cargo', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '10.00', reason: 'QA r107 B10 L21' });
+      const q = 'Rehace el video del capítulo 1 (L21).';
+      const simAOpts = { simulated: false, videogenPendingPolls: 1e9, pollTimeoutMs: 60000, videogenJobId: 'vg_sim_l21' };
+      const simA = SIMLIB.simProviders(distRoot, simAOpts);
+      let reached; let release;
+      const hit = new Promise((r) => { reached = r; });
+      const gateA = new Promise((r) => { release = r; });
+      const realCost = simA.videogen.cost.bind(simA.videogen);
+      simA.videogen.cost = async (id) => { reached(); await gateA; return realCost(id); }; // A queda detenido DESPUÉS de ganar `settling`
+      const A = procB(simA, q);
+      await approveIntake(A, q);
+      const pl = await A.getPlan({ id: U }, sid);
+      const it = pl.items.filter((i) => i.operation === 'regenerate_video' && i.stage === 'estimate' && i.requestStatus === 'awaiting_generation' && i.quote === q).pop();
+      const cap = Math.ceil(Math.max(Number(it.plannedCall.expectedUsd) * 1.5, Number(it.plannedCall.regen.totalBoundUsd)) * 100) / 100;
+      const g = await A.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it.plannedCall.expectedUsd), capUsd: cap });
+      const w = await until(async () => (await reqRow(A, it.id)).details.regenPending, 'la espera de A');
+      simAOpts.videogenPendingPolls = 0;
+      await hit;
+      eq((await A.approvalOf(g.approval.id)).calls[w.callId].status, 'settling', 'A ganó `settling`');
+      const simB = SIMLIB.simProviders(distRoot, { simulated: false, videogenJobId: 'vg_sim_l21' });
+      const B = procB(simB, q);
+      const reqId = (await reqRow(B, it.id)).id;
+      await B.settleWaitForTests(sid, reqId); // B toma la espera (reclamo de A) y retoma su `settling`
+      await B.whenIdle();
+      eq((await reqRow(B, it.id)).status, 'resolved', 'B liquidó y terminó el ítem');
+      const effects = [];
+      for (const m of ['patchDetails', 'setRequest', 'maybeCloseApproval']) { const o = A[m].bind(A); A[m] = async (...x) => { effects.push(m); return o(...x); }; }
+      release();
+      await A.whenIdle();
+      eq(effects, [], 'A (perdedor de settleCall) sale sin ningún efecto');
+      const rq = await reqRow(B, it.id);
+      eq([rq.status, rq.details.regenAmbiguous ?? null, rq.details.regenPending ?? null, rq.details.regenPaid.videogen && rq.details.regenPaid.videogen.charged], ['resolved', null, null, true], 'listo, sin regenAmbiguous, pago reusado');
+      eq(simA.calls.videogen.filter((c) => c.op === 'create').length + simB.calls.videogen.filter((c) => c.op === 'create').length, 1, 'el render se reusó (un solo envío)');
+      const ap = await B.approvalOf(g.approval.id);
+      eq([ap.status, Object.values(ap.calls).filter((c) => c.kind === 'videogen:render').map((c) => c.status)], ['done', ['charged']], 'aprobación cerrada, render liquidado una vez');
+      near(ap.spent_usd, Object.values(ap.calls).filter((c) => c.status === 'charged').reduce((a, c) => a + Number(c.costUsd), 0), 'un solo cargo por llamada en spent_usd');
+      const rows = await ds.query(`select count(*)::int n from public.generation_cost_events where provider = 'videogen' and metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [g.approval.id]);
+      eq(rows[0].n, 1, 'un solo cargo de Videogen en el ledger');
+      eq((await A.getPlan({ id: U }, sid)).items.find((i) => i.id === it.id).stage, 'ready', 'ítem listo');
     });
 
   } finally {
