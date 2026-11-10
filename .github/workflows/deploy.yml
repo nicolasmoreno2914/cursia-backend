@@ -248,6 +248,11 @@ jobs:
       - name: Check r107 Taller de cursos — diagnóstico técnico (puro, sintéticos)
         run: node scripts/r107/check-r107-diagnosis.js --ci
 
+      # r107 B4: motor de parches determinista (Fase 2: edit_html, edit_libro_section, exam_question_*, brand_replace,
+      # remove_activity). --ci = sintéticos v3 + V1 mínimo + dañados generados en el momento (sin red, sin IA, USD 0).
+      - name: Check r107 Taller de cursos — motor de parches (puro, sintéticos)
+        run: node scripts/r107/check-r107-patch.js --ci
+
       # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
       - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
         env:
