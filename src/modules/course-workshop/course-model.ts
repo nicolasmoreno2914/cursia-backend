@@ -996,6 +996,29 @@ function libroFormat(files: WorkshopFile[]): { format: 'html' | 'pdf' | 'other' 
   return { format: /\.html?$/i.test(f.filename) ? 'html' : /\.pdf$/i.test(f.filename) ? 'pdf' : 'other', filename: f.filename };
 }
 
+/**
+ * Contexto con el que se resuelven los tokens de un paquete (ids de actividades, secciones, curso, contextos, instancias y
+ * capítulos de book). r107 B4: exportado para que el motor de parches valide los tokens del HTML NUEVO con la misma regla.
+ */
+export function tokenContextOf(raw: RawCourse): TokenContext {
+  const modnameByMid = new Map<number, string>();
+  for (const a of raw.activities) if (!modnameByMid.has(a.moduleId)) modnameByMid.set(a.moduleId, a.modname);
+  const bookChapters = new Map<number, Set<number>>();
+  for (const a of raw.activities) {
+    if (a.modname !== 'book') continue;
+    bookChapters.set(a.moduleId, new Set(a.html.map((h) => /^chapter:(\d+)$/.exec(h.field)?.[1]).filter((v): v is string => !!v).map(Number)));
+  }
+  return {
+    modnameByMid,
+    sectionIds: new Set(raw.sections.map((s) => s.id)),
+    sectionNumbers: new Set(raw.sections.map((s) => s.number).filter((n): n is number => n !== null)),
+    courseIds: new Set([raw.originalCourseId, raw.courseXmlId].filter((v): v is number => v !== null)),
+    contextIds: new Set([...raw.activities.map((a) => a.contextId), raw.originalCourseContextId].filter((v): v is number => v !== null)),
+    instances: new Map(raw.activities.filter((a) => a.instanceId !== null).map((a) => [`${a.modname}:${a.instanceId}`, a.moduleId] as [string, number])),
+    bookChapters,
+  };
+}
+
 export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): WorkshopCourse {
   const issues = raw.issues.slice();
   // Orden: secciones por número (y por orden del manifiesto), actividades por su <sequence>; luego las que no están en
@@ -1027,22 +1050,7 @@ export function buildWorkshopCourse(raw: RawCourse, adapter: FamilyAdapter): Wor
     ordered.push({ a, s, pos: null });
   }
 
-  const modnameByMid = new Map<number, string>();
-  for (const a of raw.activities) if (!modnameByMid.has(a.moduleId)) modnameByMid.set(a.moduleId, a.modname);
-  const bookChapters = new Map<number, Set<number>>();
-  for (const a of raw.activities) {
-    if (a.modname !== 'book') continue;
-    bookChapters.set(a.moduleId, new Set(a.html.map((h) => /^chapter:(\d+)$/.exec(h.field)?.[1]).filter((v): v is string => !!v).map(Number)));
-  }
-  const tokenCtx: TokenContext = {
-    modnameByMid,
-    sectionIds: new Set(raw.sections.map((s) => s.id)),
-    sectionNumbers: new Set(raw.sections.map((s) => s.number).filter((n): n is number => n !== null)),
-    courseIds: new Set([raw.originalCourseId, raw.courseXmlId].filter((v): v is number => v !== null)),
-    contextIds: new Set([...raw.activities.map((a) => a.contextId), raw.originalCourseContextId].filter((v): v is number => v !== null)),
-    instances: new Map(raw.activities.filter((a) => a.instanceId !== null).map((a) => [`${a.modname}:${a.instanceId}`, a.moduleId] as [string, number])),
-    bookChapters,
-  };
+  const tokenCtx = tokenContextOf(raw);
 
   // Clasificación (pasada 1) — y el mapa uuid del capítulo → número de las actividades que dicen las dos cosas.
   const classified = ordered.map(({ a, s, pos }) => {
