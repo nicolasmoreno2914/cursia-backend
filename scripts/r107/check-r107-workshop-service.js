@@ -99,6 +99,7 @@
 //   W79 la revisión se corta en el tope · W80 reserva fallida / ambigua / no enviada · W81 «Arreglar esto» de un hallazgo Q
 //   W82 preguntas puntuales (evidencia sin IA, citas verificadas, cita inventada, sin evidencia, hostil, historial)
 //   W83 compuertas y rutas · W84 reclamo + latido entre procesos (diagnóstico, revisión con IA, pregunta)
+//   W85 (ronda) un error antes del try interno de la revisión / la respuesta cierra y suelta la aprobación
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -2584,6 +2585,38 @@ function rawZip(entries) {
       h = (await quality.listQuestions(OWNER, sid)).questions.find((x) => x.id === q.id);
       eq([h.status, h.error.code], ['failed', 'WORKSHOP_QUALITY_INTERRUPTED'], 'pregunta fallida, visible');
       eq((await ds.query(`select status from public.workshop_ai_approvals where id = $1`, [c.approval.id]))[0].status, 'failed', 'aprobación sin llamadas → cerrada y liberada');
+    });
+
+    await check('W85 (B8 ronda, P2-1) un error ANTES del try interno de la revisión o de la respuesta (base caída al leer la sesión) → la aprobación se CIERRA y se suelta (sin llamadas → liberada), los capítulos / la pregunta quedan fallidos con motivo; nada queda latiendo', async () => {
+      const sid = await diagnosed('b8-error-temprano.mbz', QV1);
+      await quality.startQuality(OWNER, sid, {}); await qidle();
+      const g = await quality.getQuality(OWNER, sid);
+      ledger.settled = [];
+      const real = svc.planSessionById.bind(svc);
+      let boom = 0;
+      svc.planSessionById = async (id) => { if (boom > 0) { boom--; throw Object.assign(new Error('base caída (simulada)'), { code: '57P01' }); } return real(id); };
+      let a;
+      try { boom = 1; a = await confirmAll(sid, g); await qidle(); } finally { svc.planSessionById = real; }
+      const [ap] = await ds.query(`select status, claim_id from public.workshop_ai_approvals where id = $1`, [a.approval.id]);
+      eq(ap.status, 'failed', 'aprobación cerrada');
+      assert(ledger.settled.some((x) => x.key === `workshop:approval:${a.approval.id}`), 'reserva liberada (no hubo llamadas)');
+      const g2 = await quality.getQuality(OWNER, sid);
+      eq(g2.ai.chapters.map((c) => c.status), ['failed', 'failed'], 'capítulos fallidos');
+      assert(/error interno/.test(g2.ai.chapters[0].reason), g2.ai.chapters[0].reason);
+      eq(g2.ai.reviewing, false, 'nada en curso');
+      // Pregunta: lo mismo.
+      const q = await quality.ask(OWNER, sid, { text: '¿El video del capítulo 1 dice bien la velocidad máxima en zona escolar?' }); await qidle();
+      const h = (await quality.listQuestions(OWNER, sid)).questions.find((x) => x.id === q.id);
+      let c;
+      svc.planSessionById = async (id) => { if (boom > 0) { boom--; throw new Error('base caída (simulada)'); } return real(id); };
+      try { boom = 1; c = await quality.ask(OWNER, sid, { questionId: q.id, confirmEstimateUsd: Number(h.estimate.expectedUsd), capUsd: Number(h.estimate.proposedCapUsd) }); await qidle(); } finally { svc.planSessionById = real; }
+      const h2 = (await quality.listQuestions(OWNER, sid)).questions.find((x) => x.id === q.id);
+      eq([h2.status, h2.error.code], ['failed', 'WORKSHOP_QUESTION_FAILED'], 'pregunta fallida, visible');
+      eq((await ds.query(`select status from public.workshop_ai_approvals where id = $1`, [c.approval.id]))[0].status, 'failed', 'su aprobación cerrada');
+      // Ninguna fila queda «viva» para los barridos: B5 la daría por abandonada (no la late nadie).
+      await ds.query(`update public.workshop_ai_approvals set status = 'running', updated_at = now() - interval '1 second' where id = $1`, [c.approval.id]);
+      await plan.sweep();
+      eq((await ds.query(`select status from public.workshop_ai_approvals where id = $1`, [c.approval.id]))[0].status, 'failed', 'no quedó tomada por este proceso');
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

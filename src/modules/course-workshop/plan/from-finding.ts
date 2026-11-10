@@ -16,7 +16,10 @@ const isLater = (op: string) => (LATER_OPERATIONS as readonly string[]).includes
 
 export function requestFromFinding(f: Finding, course: WorkshopCourse): InterpretedRequest {
   const fx = f.suggestedFix;
-  const quote = f.title;
+  // r107 B8 (revisión P2-2): la sugerencia de una revisión de IA es texto NO verificado: viaja solo dentro de la cita del
+  // pedido (que el prompt de contenido de B5 pone como dato no confiable), nunca como la instrucción.
+  const aiSug = typeof (fx?.params as any)?.aiSuggestion === 'string' && (fx!.params as any).aiSuggestion.trim() ? String((fx!.params as any).aiSuggestion).trim().slice(0, 600) : null;
+  const quote = aiSug ? `${f.title} — sugerencia de la IA (no verificada): «${aiSug}»` : f.title;
   const blank = (over: Partial<InterpretedRequest>): InterpretedRequest => ({
     quote, instruction: `Arreglar: ${f.title}`, operation: null, status: 'unavailable', target: null, rawTarget: null, details: { findingId: f.id }, questions: [], reason: null, ...over,
   });

@@ -22,7 +22,7 @@ export const QUALITY_CHECK_TITLES: Readonly<Record<QualityCheckId, string>> = Ob
 });
 
 /** Versión del ARMADO del diagnóstico de calidad (subirla en cada cambio de una regla o de un prompt). */
-export const QUALITY_CODE_VERSION = 'b8-r0';
+export const QUALITY_CODE_VERSION = 'b8-r2';
 export const QUALITY_SCHEMA = 1;
 
 /** Una cita que sostiene un hallazgo: la actividad y el fragmento LITERAL (tal como está en la evidencia). */
@@ -43,6 +43,9 @@ export type QualityFinding = Omit<Finding, 'check'> & {
   origin: 'quality';
   source: 'deterministic' | 'ai';
   quotes: QualityQuote[];
+  /** Solo hallazgos de IA (b8-r2): el título viene prefijado «La IA señala: …» y la sugerencia NO está verificada. */
+  aiText?: true;
+  aiSuggestion?: string | null;
 };
 
 /** Rol de un texto del curso para la calidad (qué es, para el docente y para elegir el arreglo). */

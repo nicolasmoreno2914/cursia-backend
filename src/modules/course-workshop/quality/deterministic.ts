@@ -44,6 +44,8 @@ export interface QualityFindingInput {
   suggestedFix?: SuggestedFix | null;
   source: 'deterministic' | 'ai';
   key?: string;
+  /** Solo IA: la sugerencia del modelo (texto NO verificado, se muestra como tal). */
+  aiSuggestion?: string | null;
 }
 
 /** Hallazgo de calidad con id estable `Q03.exam_length_bias.<12 hex>` (mismo paquete → mismo id). */
@@ -66,6 +68,7 @@ export function makeQualityFinding(i: QualityFindingInput): QualityFinding {
     origin: 'quality',
     source: i.source,
     quotes: i.quotes.map((x) => ({ ...x, text: x.text.length > 300 ? `${x.text.slice(0, 299)}…` : x.text })),
+    ...(i.source === 'ai' ? { aiText: true, aiSuggestion: i.aiSuggestion ?? null } : {}),
   };
 }
 
@@ -114,6 +117,12 @@ const EN_WORDS = new Set(['the', 'and', 'of', 'to', 'is', 'are', 'with', 'for', 
   'were', 'if', 'when', 'what', 'how', 'all', 'more', 'into', 'about', 'between', 'each', 'its', 'than', 'then', 'there', 'do', 'does', 'any']);
 const ES_WORDS = new Set(['de', 'la', 'el', 'que', 'y', 'en', 'los', 'las', 'del', 'se', 'por', 'con', 'para', 'una', 'un', 'es', 'al', 'lo', 'como',
   'más', 'mas', 'su', 'sus', 'son', 'está', 'esta', 'este', 'o', 'si', 'le', 'tu', 'tus', 'puedes', 'debes', 'pero', 'cuando', 'muy']);
+/**
+ * b8-r2 (censo real): palabras del inglés que NO aparecen en glosarios ni en pseudocódigo. «D2C (Direct to Consumer)»,
+ * «as-built», «asistencia < 75% OR promedio…» no son texto en inglés: hacen falta al menos 2 de estas.
+ */
+const EN_PROSE = new Set(['the', 'is', 'are', 'this', 'that', 'you', 'your', 'will', 'with', 'for', 'can', 'should', 'must', 'have', 'has', 'it', 'its',
+  'we', 'our', 'they', 'their', 'be', 'was', 'were', 'what', 'how', 'which', 'these', 'those', 'when', 'there', 'then', 'than', 'do', 'does', 'not', 'if']);
 /** Bibliografía, enlaces y citas: el inglés ahí es legítimo (títulos de obras). */
 const REFERENCE_LIKE = /\(\s*(?:1[5-9]|20)\d{2}[a-z]?\s*\)|\bdoi\b|https?:|www\.|\bet al\b|\bISBN\b|\bpp?\.\s*\d/i;
 
@@ -122,11 +131,12 @@ export function englishSentences(text: string): string[] {
   const out: string[] = [];
   for (const s of String(text).split(/(?<=[.!?;:])\s+|\n+/)) {
     if (REFERENCE_LIKE.test(s)) continue;
-    const words = (s.toLowerCase().match(/[a-záéíóúñü']+/g) ?? []);
+    const words = (s.match(/[A-Za-zÁÉÍÓÚÑÜáéíóúñü']+/g) ?? []).filter((w) => !(w.length > 1 && w === w.toUpperCase())).map((w) => w.toLowerCase());
     if (words.length < 6) continue;
     const en = words.filter((w) => EN_WORDS.has(w)).length;
     const es = words.filter((w) => ES_WORDS.has(w)).length;
-    if (en >= 3 && en / words.length >= 0.2 && es <= Math.max(1, Math.floor(words.length * 0.08))) out.push(s.trim());
+    const prose = words.filter((w) => EN_PROSE.has(w)).length;
+    if (en >= 3 && prose >= 2 && en / words.length >= 0.2 && es <= Math.max(1, Math.floor(words.length * 0.08))) out.push(s.trim());
   }
   return out;
 }
@@ -146,19 +156,32 @@ function q01(ctx: DiagnosisContext, docs: QualityDoc[]): QualityFinding[] {
         suggestedFix: fixForDoc(ctx, d, `Traducir al español latinoamericano neutro (con tuteo) el texto que está en inglés («${excerptOf(en[0], 120)}») y dejar el resto igual.`),
       }));
     }
-    const hits = lqaMarkdownFindings(d.text, 6) as Array<{ code: string; term: string; region: string; hint: string | null; text: string }>;
+    // b8-r2 (censo real + revisión P1-1): la tabla de clíticos de language-qa confunde plurales comunes con voseo + clítico
+    // («fuentes documentales» ≈ «documentá les», «trabajadores informales», «bases relacionales»: 199 de 229 avisos en 102
+    // paquetes). Regla: se acusa (aviso) SOLO el voseo inequívoco — una forma con tilde («podés», «hablá») o «vos»; un
+    // clítico sin tilde («relacionalos») es solo `info` (no se distingue de una tilde faltante del tuteo) y un plural en
+    // -ales / -eles / -iles / -ables / -ibles sin tilde nunca se acusa. La tabla es del generador (paridad con el frontend):
+    // no se toca acá.
+    const hits = (lqaMarkdownFindings(d.text, 6) as Array<{ code: string; term: string; region: string; hint: string | null; text: string }>)
+      .filter((h) => !(h.code === 'VOSEO' && !/[áéíóú]/i.test(h.term) && /(?:[aei]les|[ai]bles)$/i.test(h.term)));
     const byCode = new Map<string, typeof hits>();
     for (const h of hits) byCode.set(h.code, [...(byCode.get(h.code) ?? []), h]);
     for (const [code, hs] of byCode) {
       const terms = [...new Set(hs.map((h) => h.term))].slice(0, 3);
       const what = code === 'VOSEO' ? `usa voseo (${terms.map((t) => `«${t}»`).join(', ')})` : code === 'VOSOTROS' ? `usa español de España (${terms.map((t) => `«${t}»`).join(', ')})` : `usa regionalismos (${terms.map((t) => `«${t}»`).join(', ')})`;
       const fixes = hs.map((h) => `«${h.term}» → ${h.hint ?? 'término neutro'}`).slice(0, 4).join('; ');
+      const unequivocal = (h: (typeof hs)[number]) => h.term.toLowerCase() === 'vos' || /[áéíóú]/i.test(h.term);
+      const voseo = code === 'VOSEO';
+      const strong = !voseo || hs.some(unequivocal);
       out.push(makeQualityFinding({
-        check: 'Q01', code: code.toLowerCase(), severity: 'warning', scope, source: 'deterministic', questionId: d.questionId, key: d.key,
-        title: `${cap(whereOf(d))} ${what}: el curso va en español latinoamericano neutro, con tuteo.`,
-        detail: `${d.key}: language-qa ${code} — ${fixes}`,
+        check: 'Q01', code: code.toLowerCase(), severity: strong ? 'warning' : 'info', scope, source: 'deterministic', questionId: d.questionId, key: d.key,
+        title: voseo
+          ? `${cap(whereOf(d))} ${what}${strong ? '' : ' (podría ser solo una tilde que falta)'}: el curso va en español latinoamericano neutro, con tuteo. Revisa el texto y decide.`
+          : `${cap(whereOf(d))} ${what}: el curso va en español latinoamericano neutro, con tuteo.`,
+        detail: `${d.key}: language-qa ${code} — ${fixes}${voseo ? ' (sin arreglo automático: la corrección propuesta por la tabla puede romper una palabra correcta)' : ''}`,
         quotes: [quoteOf(d, hs[0].text)],
-        suggestedFix: fixForDoc(ctx, d, `Cambiar a español latinoamericano neutro con tuteo: ${fixes}. El resto queda igual.`),
+        // Voseo: NUNCA un arreglo que escriba la forma «corregida» (el docente decide).
+        suggestedFix: voseo ? null : fixForDoc(ctx, d, `Cambiar a español latinoamericano neutro con tuteo: ${fixes}. El resto queda igual.`),
       }));
     }
   }
@@ -279,7 +302,7 @@ const stem5 = (w: string) => (w.length > 5 ? w.slice(0, 5) : w);
 
 export interface QuantityMention {
   doc: QualityDoc; cls: string; value: number; unit: string; raw: string; sentence: string; anchors: string[];
-  /** Las 2 palabras de contenido más cercanas ANTES de la cifra (de qué es el dato) y las 2 de después. */
+  /** Las 3 palabras de contenido más cercanas ANTES de la cifra (de qué es el dato) y las 2 de después. */
   before: string[]; after: string[];
 }
 
@@ -291,13 +314,25 @@ function parseNum(s: string): number {
 /** Palabras de contenido (raíz de 5 letras) de un texto plegado, sin cifras ni unidades. */
 const stemsOf = (s: string): string[] => contentWords(s).filter((w) => !UNIT_WORDS.has(w) && !/^\d/.test(w) && w !== 'aprox' && w !== 'aproximadamente').map(stem5);
 
-function mentionOf(d: QualityDoc, line: string, f: string, idx: number, raw: string, cls: string, value: number, unit: string): QuantityMention | null {
-  // Duraciones o cifras aproximadas («~105 min», «aprox. 60 %») y encabezados de ubicación («Capítulo 2 de 9») son
-  // datos de la estructura del curso, no del contenido: cambian de un capítulo a otro a propósito.
+/**
+ * b8-r2 (revisión P1-2): cifras que NO son datos del contenido y cambian de un capítulo / caso a otro a propósito:
+ * tiempo de estudio y duraciones de la estructura («Tiempo estimado de estudio: 45 minutos», «Duración estimada del
+ * capítulo», «Este capítulo dura 90 minutos», «Capítulo 2 de 9», «~105 min»), pesos de rúbricas («Comunicación · 20 %»,
+ * «criterio», «ponderación»), edades de personas («una niña de 15 años», «paciente de 8 años») y cualquier cifra dentro
+ * de un caso, ejemplo o escenario narrado.
+ */
+export const STRUCTURAL_LINE_RE = /tiempo\s+(?:estimad[oa]|de\s+(?:estudio|lectura|dedicaci[oó]n))|duraci[oó]n|\bdura(?:r[aá])?\s+(?:unos?\s+|aproximadamente\s+)?\d|\btoma(?:r[aá])?\s+(?:unos?\s+|aproximadamente\s+)?\d+\s*(?:min|hora)|(?:minutos|horas)\s+de\s+(?:estudio|lectura|dedicaci[oó]n|trabajo)|cap[ií]tulo\s+\d+\s+de\s+\d+|^\s*(?:m[oó]dulo|unidad)\s+\d+\b|r[uú]brica|criterio|ponderaci[oó]n|\bpeso\b|\bpuntos?\b|\bnota\b|calificaci[oó]n/i;
+export const PERSON_AGE_RE = /\b(?:niñ[oa]s?|beb[eé]s?|paciente|adolescentes?|j[oó]ven(?:es)?|mujer(?:es)?|hombres?|señor[a]?|adult[oa]s?|estudiantes?|v[ií]ctimas?|usuari[oa]s?|personas?|edad|años de edad)\b/i;
+export const NARRATIVE_RE = /^\s*(?:caso|ejemplo|escenario|situaci[oó]n|historia|imagina|supongamos|pensemos)\b|\b(?:caso\s+(?:pr[aá]ctico|real|cl[ií]nico|de\s+estudio|colombia)|por\s+ejemplo|ejemplo\s*:|escenario\s*\d*\s*:|imagina\s+que|supongamos\s+que)|\b(?:llega|acude|consulta|refiere|ingresa)\b[^.]*\bhace\s+\S+\s+(?:horas?|d[ií]as?|semanas?|meses)/i;
+
+function mentionOf(d: QualityDoc, line: string, f: string, idx: number, raw: string, cls: string, value: number, unit: string, narrative = false): QuantityMention | null {
+  // Cifras aproximadas («~105 min», «aprox. 60 %»), de estructura, de rúbrica, edades y de casos / ejemplos: no se comparan.
   const pre = f.slice(Math.max(0, idx - 12), idx);
   if (/[~≈]\s*$|aprox\.?\s*$|aproximadamente\s*$|alrededor de\s*$/.test(pre)) return null;
-  if (/cap[ií]tulo\s+\d+\s+de\s+\d+/i.test(line) || /^\s*(?:m[oó]dulo|unidad)\s+\d+\b/i.test(line)) return null;
-  const before = stemsOf(f.slice(0, idx)).slice(-2);
+  if (narrative || NARRATIVE_RE.test(line) || STRUCTURAL_LINE_RE.test(line)) return null;
+  if (/\banos?\b/.test(foldTxt(raw)) && PERSON_AGE_RE.test(line)) return null;
+  if (cls === 'percent' && /[·(]\s*$/.test(f.slice(Math.max(0, idx - 4), idx))) return null; // «Comunicación · 20 %» (peso)
+  const before = stemsOf(f.slice(0, idx)).slice(-3);
   const after = stemsOf(f.slice(idx + raw.length)).slice(0, 2);
   const ws = stemsOf(f);
   const anchors = new Set<string>();
@@ -309,8 +344,12 @@ function mentionOf(d: QualityDoc, line: string, f: string, idx: number, raw: str
 /** Menciones de una magnitud con unidad: UNA por oración y clase (si una oración trae varias, ya está matizada). */
 export function quantityMentions(d: QualityDoc): QuantityMention[] {
   const out: QuantityMention[] = [];
+  // Un caso / ejemplo narrado sigue hasta 4 líneas después de su encabezado («Caso Colombia: …», «Ejemplo: …»).
+  let narrativeLeft = 0;
   for (const line of d.text.split(/(?<=[.!?;])\s+|\n+/)) {
     const f = foldTxt(line);
+    const narrative = narrativeLeft > 0;
+    if (NARRATIVE_RE.test(line)) narrativeLeft = 4; else if (narrativeLeft > 0) narrativeLeft--;
     QTY_RE.lastIndex = 0;
     const found: Array<{ cls: string; value: number; unit: string; raw: string; idx: number }> = [];
     let m: RegExpExecArray | null;
@@ -324,14 +363,14 @@ export function quantityMentions(d: QualityDoc): QuantityMention[] {
     for (const cls of new Set(found.map((x) => x.cls))) {
       const xs = found.filter((x) => x.cls === cls);
       if (xs.length !== 1) continue;
-      const mm = mentionOf(d, line, f, xs[0].idx, xs[0].raw, cls, xs[0].value, xs[0].unit);
+      const mm = mentionOf(d, line, f, xs[0].idx, xs[0].raw, cls, xs[0].value, xs[0].unit, narrative);
       if (mm) out.push(mm);
     }
     // Plazos: la extracción de E3 (`windowMentions`, valores en horas) tal cual; el emparejamiento es el de abajo.
     for (const w of windowMentions(line, { scope: d.key, section: d.key })) {
       const idx = f.indexOf(w.raw);
       if (idx < 0) continue;
-      const mm = mentionOf(d, line, f, idx, w.raw, 'time', w.maxHours, 'h');
+      const mm = mentionOf(d, line, f, idx, w.raw, 'time', w.maxHours, 'h', narrative);
       if (mm) out.push(mm);
     }
   }
@@ -339,16 +378,17 @@ export function quantityMentions(d: QualityDoc): QuantityMention[] {
 }
 
 /**
- * ¿Hablan del MISMO dato? La cifra va con las mismas palabras: las 2 más cercanas antes de ella iguales (o, si antes no
- * hay 2, las 2 de después), y al menos 2 pares de palabras de la oración en común. «Comunicación · 20 %» y «Análisis del
- * caso · 40 %» (dos criterios de una rúbrica) NO son el mismo dato; «la velocidad máxima en zona escolar es 30 km/h» y
- * «… zona escolar es de 50 km/h», sí.
+ * ¿Hablan del MISMO dato? La cifra va con las mismas palabras A LOS DOS LADOS: las 3 de contenido más cercanas antes de
+ * ella iguales (al menos 2; b8-r1: «durante los primeros 15 minutos» de la presión ≠ del goteo) Y las 2 de después iguales
+ * (también vacías), con al menos 2 pares de palabras de la oración en
+ * común. «Comunicación · 20 %» y «Análisis del caso · 40 %» (dos criterios de una rúbrica) NO son el mismo dato; tampoco
+ * «según la Cámara de Comercio, el 67 % de los clientes…» y «… el 73 % de los servicios…» (b8-r1: la fuente igual antes
+ * de la cifra no basta, lo que se mide va después). «la velocidad máxima en zona escolar es 30 km/h» y «… es de 50 km/h», sí.
  */
 export function sameQuantity(a: QuantityMention, b: QuantityMention): boolean {
   if (a.cls !== b.cls || a.value === b.value) return false;
-  const eqArr = (x: string[], y: string[]) => x.length === 2 && y.length === 2 && x[0] === y[0] && x[1] === y[1];
-  const subject = a.before.length >= 2 && b.before.length >= 2 ? eqArr(a.before, b.before) : eqArr(a.after, b.after);
-  if (!subject) return false;
+  const eqArr = (x: string[], y: string[]) => x.length === y.length && x.every((w, i) => w === y[i]);
+  if (a.before.length < 2 || !eqArr(a.before, b.before) || !eqArr(a.after, b.after)) return false;
   return a.anchors.filter((x) => b.anchors.includes(x)).length >= 2;
 }
 
@@ -379,12 +419,15 @@ function numericConflicts(ctx: DiagnosisContext, docs: QualityDoc[]): QualityFin
           title: `En el capítulo ${a.doc.chapterNumber}, ${whereOf(target.doc)} dice ${fmtVal(target)} y ${whereOf(ref.doc)} dice ${fmtVal(ref)} para lo mismo: revisa cuál es el correcto.`,
           detail: `${target.doc.key} «${excerptOf(target.raw, 40)}» ≠ ${ref.doc.key} «${excerptOf(ref.raw, 40)}» (${target.cls}; palabras en común: ${shared.slice(0, 3).join(', ')})`,
           quotes: [quoteOf(target.doc, target.sentence), quoteOf(ref.doc, ref.sentence)],
-          suggestedFix: fixForDoc(ctx, target.doc, `Revisar el dato «${target.raw}»: ${ref.doc.what} del mismo capítulo dice «${ref.raw}» («${excerptOf(ref.sentence, 140)}»). Dejarlo igual al dato correcto sin cambiar el resto.`),
+          // b8-r2 (P1-2): nunca se «arregla» un lado solo: el docente decide cuál es el correcto (y lo pide en «Pedir arreglos»).
+          suggestedFix: null,
         }));
       } else {
         const [first, second] = (order.get(a.doc.key) ?? 0) <= (order.get(b.doc.key) ?? 0) ? [a, b] : [b, a];
         out.push(makeQualityFinding({
-          check: 'Q04', code: first.cls === 'time' ? 'cross_chapter_time_conflict' : 'cross_chapter_data_conflict', severity: 'warning', scope: scopeOfDoc(ctx, second.doc), source: 'deterministic', questionId: second.doc.questionId, key: pairKey,
+          // b8-r2 (P1-2, decisión del controlador): `info` hasta volver a medirlo en cursos reales (el censo daba sobre todo
+          // estadísticas distintas con la misma fuente, que no son contradicciones).
+          check: 'Q04', code: first.cls === 'time' ? 'cross_chapter_time_conflict' : 'cross_chapter_data_conflict', severity: 'info', scope: scopeOfDoc(ctx, second.doc), source: 'deterministic', questionId: second.doc.questionId, key: pairKey,
           title: `El mismo dato no coincide entre capítulos: ${whereOf(first.doc)} dice ${fmtVal(first)} y ${whereOf(second.doc)} dice ${fmtVal(second)}. Revisa cuál es el correcto.`,
           detail: `${first.doc.key} «${excerptOf(first.raw, 40)}» vs ${second.doc.key} «${excerptOf(second.raw, 40)}» (${first.cls}${first.cls === 'time' ? ', plazos en horas por windowMentions (E3)' : ''}; palabras en común: ${shared.slice(0, 3).join(', ')}). Sin arreglo automático: solo el docente sabe cuál es el correcto (pídelo en «Pedir arreglos» con el dato bueno).`,
           quotes: [quoteOf(second.doc, second.sentence), quoteOf(first.doc, first.sentence)],

@@ -506,7 +506,27 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
    * Revisión APROBADA: capítulo por capítulo, en orden. Antes de cada llamada, la guarda del tope de B5 (invokerFor); si
    * no entra, se corta limpio: lo revisado queda, lo que faltó vuelve a «sin revisar» con el motivo.
    */
+  /**
+   * b8-r2 (revisión P2-1): pase lo que pase dentro (también un error de base ANTES del try interno), la aprobación nunca
+   * queda retenida y latiendo: se cierra por el camino de B5 (`closeApproval`: ambigua solo si una llamada se envió; no
+   * hace nada si ya estaba cerrada), se suelta el reclamo y los capítulos en curso quedan `failed` con el motivo.
+   */
   private async runReview(job: Extract<Job, { kind: 'review' }>, claimId: string): Promise<void> {
+    try {
+      await this.runReviewInner(job, claimId);
+    } catch (err) {
+      this.logger.error(`taller calidad: revisión ${job.runId} falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    } finally {
+      const msg = 'La revisión se interrumpió por un error interno; vuelve a aprobarla.';
+      await this.updateChapters(job.runId, claimId, (ch) => { let n = 0; for (const c of job.chapters) if (IN_FLIGHT.has(ch[String(c)]?.status)) { ch[String(c)] = { ...ch[String(c)], status: 'failed', reason: msg }; n++; } return n > 0; }, true)
+        .catch((e) => this.logger.warn(`taller calidad: no se pudo marcar los capítulos: ${e instanceof Error ? e.message : String(e)}`));
+      await this.plan.closeApproval(job.approvalId, 'failed', msg).catch((e) => this.logger.error(`FINOPS_RESERVATION_NOT_SETTLED: aprobación ${job.approvalId}: ${e instanceof Error ? e.message : String(e)}`));
+      this.plan.releaseApproval(job.approvalId, claimId);
+      this.activeIds.delete(`ai:${job.runId}`);
+    }
+  }
+
+  private async runReviewInner(job: Extract<Job, { kind: 'review' }>, claimId: string): Promise<void> {
     const [run] = await this.q<RunRow[]>(this.dataSource, `select * from public.workshop_quality_runs where id = $1`, [job.runId]);
     const done = async (status: 'done' | 'stopped' | 'failed', reason: string | null) => {
       await this.plan.closeApproval(job.approvalId, status, reason);
@@ -618,7 +638,22 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** b8-r2 (revisión P2-1): igual que la revisión — la aprobación siempre se cierra y se suelta, la pregunta nunca queda colgada. */
   private async runAnswer(job: Extract<Job, { kind: 'answer' }>, claimId: string): Promise<void> {
+    try {
+      await this.runAnswerInner(job, claimId);
+    } catch (err) {
+      this.logger.error(`taller calidad: pregunta ${job.questionId} falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    } finally {
+      const msg = 'La pregunta se interrumpió por un error interno; vuelve a hacerla.';
+      await this.q(this.dataSource, `update public.workshop_questions set status = 'failed', error = $3::jsonb, updated_at = now() where id = $1 and claim_id = $2 and status = 'answering'`,
+        [job.questionId, claimId, JSON.stringify({ code: QUALITY_ERRORS.QUESTION_FAILED, message: msg, retryable: true })]).catch(() => undefined);
+      await this.plan.closeApproval(job.approvalId, 'failed', msg).catch((e) => this.logger.error(`FINOPS_RESERVATION_NOT_SETTLED: aprobación ${job.approvalId}: ${e instanceof Error ? e.message : String(e)}`));
+      this.plan.releaseApproval(job.approvalId, claimId);
+    }
+  }
+
+  private async runAnswerInner(job: Extract<Job, { kind: 'answer' }>, claimId: string): Promise<void> {
     const CLAIMED = `id = $1 and claim_id = $2 and status = 'answering'`;
     const [row] = await this.q<QuestionRow[]>(this.dataSource, `select * from public.workshop_questions where ${CLAIMED}`, [job.questionId, claimId]);
     const release = () => this.plan.releaseApproval(job.approvalId, claimId);

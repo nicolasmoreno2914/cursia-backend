@@ -151,6 +151,9 @@ export function qualityTool(): WorkshopTool {
 
 // ─── Verificación de la salida ─────────────────────────────────────────────
 
+const CHECK_ES: Record<string, string> = { Q01: 'idioma u ortografía', Q02: 'coherencia dentro del capítulo', Q03: 'pregunta adivinable o ambigua', Q05: 'cobertura del examen' };
+const withAiSuggestion = (fx: ReturnType<typeof fixForDoc>, suggestion: string) => (fx && suggestion ? { ...fx, params: { ...fx.params, aiSuggestion: suggestion } } : fx);
+
 export interface ReviewOutcome {
   ok: boolean;
   /** Problemas de FORMA (esquema): reintento. */
@@ -199,9 +202,16 @@ export function parseReview(ctx: DiagnosisContext, docs: QualityDoc[], p: Chapte
       if (!od || od.id === pd.id || !literalIn(od.text, oq)) { rejected.push({ reason: 'Q02 sin el otro dato citado literalmente', check, evidenceId: evId }); continue; }
       other = { pd: od, quote: oq };
     }
-    const title = typeof r.title === 'string' ? r.title.replace(/\s+/g, ' ').trim().slice(0, QUALITY_LIMITS.titleMax) : '';
+    // b8-r2 (revisión P2-2): el título y la sugerencia son TEXTO DE LA IA, no verificado (solo la cita lo es): se
+    // neutralizan, se acotan y se muestran como tal; nunca entran como instrucción confiable de un arreglo.
+    const title = typeof r.title === 'string' ? neutralize(r.title).replace(/\s+/g, ' ').trim().slice(0, QUALITY_LIMITS.titleMax) : '';
     if (title.length < 5) { rejected.push({ reason: 'sin título para el docente', check, evidenceId: evId }); continue; }
-    const suggestion = typeof r.suggestion === 'string' ? r.suggestion.replace(/\s+/g, ' ').trim().slice(0, QUALITY_LIMITS.suggestionMax) : '';
+    let suggestion = typeof r.suggestion === 'string' ? neutralize(r.suggestion).replace(/\s+/g, ' ').trim().slice(0, QUALITY_LIMITS.suggestionMax) : '';
+    // Ortografía: la sugerencia tiene que nombrar alguna palabra de la cita (si no, no se muestra).
+    if (code === 'spelling' && suggestion) {
+      const words = (quote.toLowerCase().match(/[a-záéíóúñü]{3,}/g) ?? []);
+      if (!words.some((w) => suggestion.toLowerCase().includes(w))) suggestion = '';
+    }
     const d = docByKey.get(pd.key);
     if (!d) { rejected.push({ reason: 'bloque sin texto del curso', check, evidenceId: evId }); continue; }
     const od = other ? docByKey.get(other.pd.key) ?? null : null;
@@ -209,14 +219,17 @@ export function parseReview(ctx: DiagnosisContext, docs: QualityDoc[], p: Chapte
     if (seen.has(k)) continue;
     seen.add(k);
     const severity = r.severity === 'info' ? 'info' : 'warning';
-    const instruction = `${suggestion || title} (fragmento: «${excerptOf(quote, 140)}»). Cambiar solo eso y dejar el resto igual.`;
+    // Instrucción del arreglo armada por el SERVIDOR (lo verificado: qué check y qué fragmento); lo que dijo la IA va aparte
+    // (`aiSuggestion`) y «Arreglar esto» lo pasa solo como contexto no confiable (from-finding).
+    const instruction = `Revisar y corregir el problema de ${CHECK_ES[check] ?? 'calidad'} que señaló la revisión en el fragmento verificado «${excerptOf(quote, 140)}». Cambiar solo eso y dejar el resto igual.`;
     accepted.push(makeQualityFinding({
       check: check as QualityCheckId, code, severity, scope: scopeOfDoc(ctx, d), source: 'ai', questionId: d.questionId, key: `${pd.key}|${normalizeQuote(quote)}`,
-      title, detail: `revisión de IA del capítulo ${p.chapterNumber} (${p.sha256.slice(0, 12)}): ${whereOf(d)} · «${excerptOf(quote, 120)}»${suggestion ? ` · sugerencia: ${excerptOf(suggestion, 200)}` : ''}${od && other ? ` · contra ${whereOf(od)}: «${excerptOf(other.quote, 120)}»` : ''}`,
+      title: `La IA señala: ${title}`, detail: `revisión de IA del capítulo ${p.chapterNumber} (${p.sha256.slice(0, 12)}): ${whereOf(d)} · «${excerptOf(quote, 120)}»${suggestion ? ` · sugerencia: ${excerptOf(suggestion, 200)}` : ''}${od && other ? ` · contra ${whereOf(od)}: «${excerptOf(other.quote, 120)}»` : ''}`,
       quotes: [quoteOf(d, quote, pd.id), ...(od && other ? [quoteOf(od, other.quote, other.pd.id)] : [])],
+      aiSuggestion: suggestion || null,
       suggestedFix: check === 'Q05'
-        ? (d.role === 'exam' ? { operation: 'exam_question_add', params: { quizModuleId: d.moduleId, instruction: `Escribir una pregunta de opción múltiple sobre lo central del capítulo ${p.chapterNumber}${p.chapterTitle ? ` («${p.chapterTitle}»)` : ''}: ${suggestion || title}` } } : null)
-        : fixForDoc(ctx, d, instruction),
+        ? (d.role === 'exam' ? { operation: 'exam_question_add', params: { quizModuleId: d.moduleId, instruction: `Escribir una pregunta de opción múltiple sobre lo central del capítulo ${p.chapterNumber}${p.chapterTitle ? ` («${p.chapterTitle}»)` : ''}.`, ...(suggestion ? { aiSuggestion: suggestion } : {}) } } : null)
+        : withAiSuggestion(fixForDoc(ctx, d, instruction), suggestion),
     }));
   }
   return { ok: true, problems, accepted, rejected };
