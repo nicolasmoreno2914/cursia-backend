@@ -1302,7 +1302,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
         if (!(await this.settleCall(approval.id, done, m.costUsd, true))) throw new RegenError('internal', `La llamada ${rec.id} ya estaba liquidada: no se cobra dos veces.`, { alreadySettled: true });
         spentHere += Number(m.costUsd);
         if (over) {
-          const msg = `${PROVIDER_OVER_BOUND}: ${spec.provider} cobró USD ${Number(m.costUsd).toFixed(4)}, más que la cota de la llamada (USD ${Number(spec.boundUsd).toFixed(4)}). Quedó registrado lo real y se cortaron las llamadas que faltaban de esta aprobación.`;
+          const msg = `${PROVIDER_OVER_BOUND}: ${spec.provider} cobró USD ${Number(m.costUsd).toFixed(2)}, más que la cota de la llamada (USD ${Number(spec.boundUsd).toFixed(2)}). Quedó registrado lo real y se cortaron las llamadas que faltaban de esta aprobación.`;
           await this.q(this.dataSource, `update public.workshop_ai_approvals set stop_reason = $2, updated_at = now() where id = $1`, [approval.id, msg]);
           this.logger.error(`WORKSHOP_PROVIDER_OVER_BOUND: aprobación ${approval.id} ${spec.provider}:${spec.kind} medido ${m.costUsd} > cota ${spec.boundUsd}`);
           throw new RegenError('over_bound', msg, { code: PROVIDER_OVER_BOUND, provider: spec.provider, costUsd: m.costUsd, boundUsd: spec.boundUsd });
