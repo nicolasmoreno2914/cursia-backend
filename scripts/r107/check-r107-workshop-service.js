@@ -89,6 +89,7 @@
 //   barrido de B5 sin abrir la sesión · W62 + P2-5 descarga genérica de archivos del Taller bloqueada
 //   Fix round 2: W70 N1 cola de memoria FIFO (el grande no se queda sin turno) · W71 N1 espera máxima · W57/W66 prueba
 //   en seco vencida por huella de contenido · W72 GET /sessions («Mis sesiones») · W73 confirmar un candidato
+//   Fix round 3: W74 confirmar un candidato falla cerrado · W75 espera de memoria vencida en la reconstrucción → visible
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -2259,6 +2260,40 @@ function rawZip(entries) {
       await rejects(svc.confirmCandidate(OWNER, b6.sid, Number(own.id)), 409, 'WORKSHOP_PLAN_APPLIED', 'plan aplicado: ya no se cambia');
     });
 
+
+    await check('W74 (fix 3) confirmar un candidato falla CERRADO: un error de la base al mirar el plan (que no sea «falta la tabla») corta la confirmación sin cambiar nada; «falta la tabla» (antes de B5) sí deja confirmar', async () => {
+      const res = await newIdentified('b6-candidato-cerrado.mbz');
+      const sid = res.session.id;
+      await ds.query(`update public.workshop_sessions set identified_course_id = null, identification = jsonb_set(identification, '{result,candidates}', $2::jsonb) where id = $1`,
+        [sid, JSON.stringify([{ courseId: Number(own.id), title: 'Curso propio', score: 0.7, confidence: 'medium', reasons: [] }])]);
+      const faulty = (code) => new Proxy(ds, { get(t, k) { if (k === 'query') return async (q, a) => { if (/from public\.workshop_plans where session_id = \$1 and original_sha1 = \$2 and status in/.test(q)) throw Object.assign(new Error('falla simulada'), { code }); return t.query(q, a); }; const v = t[k]; return typeof v === 'function' ? v.bind(t) : v; } });
+      const bad = new SVC.CourseWorkshopService(faulty('57014'), storage, permissions);
+      let err = null; try { await bad.confirmCandidate(OWNER, sid, Number(own.id)); } catch (e) { err = e; }
+      assert(err && err.code === '57014', `debió fallar: ${err && err.message}`);
+      eq((await ds.query(`select identified_course_id from public.workshop_sessions where id = $1`, [sid]))[0].identified_course_id, null, 'no cambió nada');
+      const pre = new SVC.CourseWorkshopService(faulty('42P01'), storage, permissions);
+      eq((await pre.confirmCandidate(OWNER, sid, Number(own.id))).identifiedCourseId, Number(own.id), 'sin la tabla de planes: confirma');
+      await Promise.all([...pre.inFlight.values()]);
+    });
+
+    await check('W75 (fix 3) reconstrucción del inventario cuya espera por memoria vence → el inventario dice YA `failed` reintentable WORKSHOP_MEMORY_WAIT_TIMEOUT con cuándo se reintenta (no «building» hasta que venza el reclamo); pasado ese momento se rearma', async () => {
+      const res = await newIdentified('b6-inv-espera.mbz');
+      const sid = res.session.id;
+      await ds.query(`update public.workshop_sessions set inventory = null, identification = identification - 'inventory' where id = $1`, [sid]);
+      const R = new SVC.CourseWorkshopService(ds, storage, permissions);
+      R.memoryMaxWaitMs = 80;
+      const hold = await R.acquireMemory('ocupado', R.memoryBudgetBytes);
+      eq((await R.getInventory(OWNER, sid)).status, 'building', 'empieza');
+      await Promise.all([...R.inFlight.values()]);
+      const g = await R.getInventory(OWNER, sid);
+      eq([g.status, g.error && g.error.code, g.error && g.error.retryable, !!g.retryAt], ['failed', 'WORKSHOP_MEMORY_WAIT_TIMEOUT', true, true], 'visible enseguida, reintentable');
+      assert(/vuelve a intentarlo/.test(g.error.message), g.error.message);
+      hold();
+      await ds.query(`update public.workshop_sessions set identification = jsonb_set(identification, '{inventory,nextAttemptAt}', to_jsonb((now() - interval '1 second')::text)) where id = $1`, [sid]);
+      eq((await R.getInventory(OWNER, sid)).status, 'building', 'pasado el momento, se reintenta');
+      await Promise.all([...R.inFlight.values()]);
+      eq((await R.getInventory(OWNER, sid)).status, 'ready', 'rearmado');
+    });
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {
       const g = new GUARD.CourseWorkshopFlagGuard();
       const ctx = (uid) => ({ switchToHttp: () => ({ getRequest: () => ({ method: 'POST', originalUrl: '/api/v1/course-workshop/sessions', user: { id: uid } }) }) });

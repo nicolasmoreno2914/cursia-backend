@@ -560,7 +560,15 @@ export class CourseWorkshopService {
     if (!Number.isSafeInteger(courseId) || !cand) throw new BadRequestException({ code: 'WORKSHOP_CANDIDATE_INVALID', message: 'Ese curso no está entre los candidatos que encontró la identificación.' });
     const [c] = await this.q<any[]>(this.dataSource, `select id from public.courses where id = $1 and (case when $2::text is not null then institution_id::text = $2::text else owner_id::text = $3::text end)`, [courseId, row.institution_id ?? null, row.owner_id]);
     if (!c) throw new BadRequestException({ code: 'WORKSHOP_CANDIDATE_INVALID', message: 'Ese curso ya no está en el alcance de esta sesión.' });
-    const [busy] = await this.q<any[]>(this.dataSource, `select status from public.workshop_plans where session_id = $1 and original_sha1 = $2 and status in ('applying', 'applied')`, [row.id, row.original_sha1]).catch(() => [] as any[]);
+    // Fix round 3: falla CERRADO — solo «la tabla no existe» (antes de la migración de B5) cuenta como «sin plan»; cualquier
+    // otro error de la base corta la confirmación.
+    let busy: { status: string } | undefined;
+    try {
+      [busy] = await this.dataSource.query(`select status from public.workshop_plans where session_id = $1 and original_sha1 = $2 and status in ('applying', 'applied')`, [row.id, row.original_sha1]);
+    } catch (err) {
+      if ((err as { code?: string })?.code !== '42P01') throw err;
+      busy = undefined;
+    }
     if (busy) throw new ConflictException({ code: 'WORKSHOP_PLAN_APPLIED', message: 'El plan de esta sesión ya se aplicó (o se está aplicando): el curso ya no se cambia.', status: busy.status });
     const result = { ...(res as IdentificationResult), courseId, needsConfirmation: false, notes: [...(res?.notes ?? []), `Curso confirmado por el docente: «${cand.title}».`] };
     const ident = { ...(row.identification ?? {}), result, confirmedBy: { userId: actor.id, at: this.now().toISOString(), courseId }, inventory: { builtAt: null, reason: 'candidate_confirmed' } };
@@ -1034,7 +1042,11 @@ export class CourseWorkshopService {
       return { ...base, status: 'failed', inventory: null, error: err ?? { code: WORKSHOP_ERRORS.INVENTORY_FAILED, message: `No se pudo armar el inventario después de ${INVENTORY_REBUILD_MAX_ATTEMPTS} intentos; avísanos.`, retryable: false } };
     }
     const retryAt = sameVersion && typeof info?.nextAttemptAt === 'string' ? info.nextAttemptAt : null;
-    if (retryAt && new Date(retryAt).getTime() > this.now().getTime()) return { ...base, status: 'building', inventory: null, error: err, retryAt };
+    if (retryAt && new Date(retryAt).getTime() > this.now().getTime()) {
+      // Fix round 3: la espera por memoria venció → `failed` reintentable con el motivo y cuándo se vuelve a intentar.
+      const waitTimeout = err?.code === WORKSHOP_ERRORS.MEMORY_WAIT_TIMEOUT;
+      return { ...base, status: waitTimeout ? 'failed' : 'building', inventory: null, error: err, retryAt };
+    }
     await this.startInventoryRebuild(row);
     return { ...base, status: 'building', inventory: null, error: err, retryAt };
   }
@@ -1078,7 +1090,19 @@ export class CourseWorkshopService {
     if (!claimed.length) { release(); return; }
     const p = this.withMemory(`rebuild:${row.id}`, Number(row.original_size ?? 0) * IDENTIFY_MEMORY_FACTOR, () => this.rebuildInventory(row.id),
       () => this.q(this.dataSource, `update public.workshop_sessions set identification = jsonb_set(identification, '{inventory,rebuildClaimAt}', to_jsonb($2::text)) where id = $1 and inventory is null`, [row.id, this.now().toISOString()]).then(() => undefined))
-      .catch((e) => this.logger.error(`workshop ${row.id}: la reconstrucción del inventario terminó con error: ${e instanceof Error ? e.message : String(e)}`))
+      .catch(async (e) => {
+        // Fix round 3: la espera por memoria venció → se ve YA en el estado del inventario (motivo, reintentable, cuándo).
+        if (e instanceof MemoryWaitTimeoutError) {
+          const retryAt = new Date(this.now().getTime() + INVENTORY_REBUILD_BACKOFF_MS).toISOString();
+          await this.q(this.dataSource,
+            `update public.workshop_sessions set identification = jsonb_set(identification, '{inventory}',
+                (coalesce(identification->'inventory', '{}'::jsonb) - 'rebuildClaimAt') || jsonb_build_object('error', $2::jsonb, 'nextAttemptAt', $3::text, 'builtAt', $4::text))
+              where id = $1 and inventory is null`,
+            [row.id, JSON.stringify({ code: e.code, message: e.message, retryable: true }), retryAt, this.now().toISOString()]).catch(() => {});
+          return;
+        }
+        this.logger.error(`workshop ${row.id}: la reconstrucción del inventario terminó con error: ${e instanceof Error ? e.message : String(e)}`);
+      })
       .finally(() => { release(); this.inFlight.delete(key); });
     this.inFlight.set(key, p);
   }
