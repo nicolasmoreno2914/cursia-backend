@@ -1045,6 +1045,23 @@ function rawZip(entries) {
       eq(await cnt(), f0, 'hallazgos intactos');
     });
 
+    await check('W37 (B4 fix 2, N2) factor de memoria del diagnóstico por contenedor: zip 5,5×, tar.gz 7× (incluye la prueba en seco)', async () => {
+      eq([SVC.diagnosisMemoryFactor('zip'), SVC.diagnosisMemoryFactor('tar.gz'), SVC.diagnosisMemoryFactor(null)], [5.5, 7, 5.5], 'factores');
+      assert(200 * 1024 * 1024 * SVC.diagnosisMemoryFactor('tar.gz') < SVC.workshopMemoryBudgetBytes({}), 'un tar.gz de 200 MB entra en el presupuesto por defecto');
+      const saved = svc.memoryBudgetBytes;
+      try {
+        const t = await newIdentified('b4-tgz.mbz');
+        await ds.query(`update public.workshop_sessions set container = 'tar.gz' where id = $1`, [t.session.id]);
+        svc.memoryBudgetBytes = MBZ.length * 6; // zip (5,5×) entra, tar.gz (7×) no
+        const a = await svc.startDiagnosis(OWNER, t.session.id);
+        eq([a.status, a.error && a.error.code], ['failed', 'WORKSHOP_DIAGNOSIS_TOO_LARGE'], 'tar.gz: 7× no entra');
+        assert(/tar\.gz/.test(a.error.message) && /7×/.test(a.error.message), `motivo: ${a.error.message}`);
+        const z = await newIdentified('b4-zip.mbz');
+        eq((await svc.startDiagnosis(OWNER, z.session.id)).status, 'queued', 'zip: 5,5× entra');
+        await settleD(z.session.id);
+      } finally { svc.memoryBudgetBytes = saved; }
+    });
+
     await check('W36 N2 presupuesto del proceso: reserva viva sin lugar → el diagnóstico espera sin tomar el carril; TOO_LARGE se reintenta con más presupuesto', async () => {
       const saved = svc.memoryBudgetBytes;
       try {

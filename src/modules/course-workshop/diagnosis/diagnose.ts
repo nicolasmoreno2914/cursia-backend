@@ -14,13 +14,14 @@
  * Determinista: mismo paquete → mismo informe byte a byte (sin fechas: `diagnosedAt` lo pone el servicio aparte).
  */
 import { stableStringify } from '../course-model';
+import { prevalidateFixes } from '../patch/precheck';
 import { DiagnosisContext, DiagnosisInput, buildDiagnosisContext } from './context';
 import { CHECK_FAMILY_APPLICABILITY, TECHNICAL_CHECKS } from './checks';
 import { foldValidator, validatorItems } from './check-v3';
 import { CHECK_IDS, CheckId, CheckStatus, Finding, SEVERITY_RANK, Severity } from './finding';
 
 /** Versión del ARMADO del diagnóstico: subirla en cada cambio de un check (un diagnóstico guardado con otra se rehace). */
-export const DIAGNOSIS_CODE_VERSION = 'b3-r3';
+export const DIAGNOSIS_CODE_VERSION = 'b4-r1';
 export const DIAGNOSIS_SCHEMA = 1;
 
 export type Light = 'red' | 'yellow' | 'green';
@@ -114,8 +115,17 @@ export function diagnoseContext(ctx: DiagnosisContext): DiagnosisReport {
 }
 
 /** Lee el paquete y lo diagnostica. Nunca lanza por el contenido del paquete (sí por un error del lector al abrirlo). */
-export async function runTechnicalDiagnosis(input: DiagnosisInput): Promise<DiagnosisReport> {
-  return diagnoseContext(await buildDiagnosisContext(input));
+export async function runTechnicalDiagnosis(input: DiagnosisInput, opts: { prevalidateFixes?: boolean } = {}): Promise<DiagnosisReport> {
+  const ctx = await buildDiagnosisContext(input);
+  const report = diagnoseContext(ctx);
+  // r107 B4 fix round 1: cada arreglo sugerido de la Fase 2 se prueba en seco con el motor de parches sobre este mismo
+  // paquete; si no aplica, se ofrece otro (edit_html) o ninguno, con el motivo. El motor, que diagnostica antes y
+  // después de aplicar un plan, no lo necesita (`prevalidateFixes: false`).
+  if (opts.prevalidateFixes !== false) {
+    await prevalidateFixes(report.findings, { pkg: input.pkg, packageBytes: input.packageBytes, family: ctx.family, course: ctx.course, raw: ctx.raw });
+    return JSON.parse(stableStringify(report)) as DiagnosisReport;
+  }
+  return report;
 }
 
 export type { Severity };

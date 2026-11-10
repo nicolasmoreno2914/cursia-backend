@@ -92,6 +92,19 @@ export interface Finding {
   evidence: FindingEvidence;
   suggestedFix: SuggestedFix | null;
   corroboratedBy: Corroboration[];
+  /**
+   * r107 B4 fix round 1: el arreglo sugerido se PRUEBA con el motor de parches sobre este mismo paquete (sin contenido
+   * nuevo: lo estructural). `ok` = aplica; `fallback` = el sugerido no aplica y se ofrece otro (`suggestedFix` ya es el
+   * nuevo, `original` el que no aplicaba); `unavailable` = ninguno aplica (`suggestedFix` null, `reason` dice por qué);
+   * `not_checked` = operación de otra fase (regenerar), que el motor de la Fase 2 no puede probar.
+   */
+  fixPrecheck: FixPrecheck | null;
+}
+
+export interface FixPrecheck {
+  status: 'ok' | 'fallback' | 'unavailable' | 'not_checked';
+  reason: string | null;
+  original: SuggestedFix | null;
 }
 
 /** Estado de un check en un diagnóstico: corrió, no aplica a este paquete (con el motivo) o queda para otro momento. */
@@ -151,5 +164,6 @@ export function makeFinding(i: FindingInput): Finding {
     evidence,
     suggestedFix: i.suggestedFix ?? null,
     corroboratedBy: [],
+    fixPrecheck: null,
   };
 }

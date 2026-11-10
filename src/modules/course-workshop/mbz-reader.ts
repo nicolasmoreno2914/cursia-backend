@@ -172,6 +172,10 @@ interface ZipEntryInternal extends MbzEntry {
   /** Rango de los datos comprimidos [dataStart, dataEnd) (fix P2-5: detección de entradas superpuestas). */
   dataStart: number;
   dataEnd: number;
+  /** r107 B4: banderas, hora y fecha DOS del directorio central (el motor de parches las conserva al reescribir). */
+  flags: number;
+  modTime: number;
+  modDate: number;
 }
 
 const SIG_EOCD = 0x06054b50;
@@ -228,6 +232,8 @@ function parseZip(buf: Buffer, limits: MbzReaderLimits): ZipEntryInternal[] {
     if (p + 46 > buf.length || buf.readUInt32LE(p) !== SIG_CENTRAL) throw corrupt(`entrada ${i + 1} del directorio central`);
     const flags = buf.readUInt16LE(p + 8);
     const method = buf.readUInt16LE(p + 10);
+    const modTime = buf.readUInt16LE(p + 12);
+    const modDate = buf.readUInt16LE(p + 14);
     const crc = buf.readUInt32LE(p + 16);
     let compressedSize = buf.readUInt32LE(p + 20);
     let size = buf.readUInt32LE(p + 24);
@@ -278,7 +284,7 @@ function parseZip(buf: Buffer, limits: MbzReaderLimits): ZipEntryInternal[] {
     const dataStart = localHeaderOffset + 30 + buf.readUInt16LE(localHeaderOffset + 26) + buf.readUInt16LE(localHeaderOffset + 28);
     const dataEnd = dataStart + compressedSize;
     if (dataEnd > cdOffset) throw corrupt(`datos de ${n.name.slice(0, 80)} fuera de su lugar`);
-    out.push({ name: n.name, size, compressedSize, method, crc32: crc, localHeaderOffset, dataStart, dataEnd });
+    out.push({ name: n.name, size, compressedSize, method, crc32: crc, localHeaderOffset, dataStart, dataEnd, flags, modTime, modDate });
   }
   // Fix P2-5: dos entradas que comparten bytes comprimidos (bomba «superpuesta», Fifield 2019) → el paquete entero fuera.
   const byStart = [...out].sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
@@ -656,6 +662,30 @@ async function openMbzInner(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): P
       return b ? b.toString('utf8') : null;
     },
   };
+}
+
+/**
+ * r107 B4 · motor de parches: entradas de un ZIP con la ubicación de sus datos COMPRIMIDOS (para copiarlos tal cual al
+ * reescribir el paquete: una entrada que el motor no toca conserva sus bytes comprimidos). Mismas validaciones que
+ * `openMbz` (nombres, bombas, superposición); el orden es el del directorio central.
+ */
+export interface ZipRawEntry {
+  name: string;
+  method: number;
+  crc32: number;
+  size: number;
+  compressedSize: number;
+  dataStart: number;
+  dataEnd: number;
+  flags: number;
+  modTime: number;
+  modDate: number;
+}
+export function zipRawEntries(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): ZipRawEntry[] {
+  return parseZip(buf, resolveLimits(limitsIn)).map((e) => ({
+    name: e.name, method: e.method, crc32: e.crc32, size: e.size, compressedSize: e.compressedSize as number,
+    dataStart: e.dataStart, dataEnd: e.dataEnd, flags: e.flags, modTime: e.modTime, modDate: e.modDate,
+  }));
 }
 
 export function isMbzReaderError(e: unknown): e is MbzReaderError {

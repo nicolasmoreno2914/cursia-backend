@@ -69,7 +69,7 @@ export function validatorItems(ctx: DiagnosisContext): ValidatorItem[] {
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k)!.push(i);
   }
-  [...groups.values()].map((g) => ({ ...g[0], message: g.map((x) => x.message).join(' · ') })).forEach((i, n) => {
+  [...groups.values()].map((g) => ({ ...g[0], message: g.map((x) => x.message).join(' · ') })).forEach((i) => {
     let activity: WorkshopActivity | null = null;
     let fileId: number | null = null;
     const fm = /^file (\d+)$/.exec(i.where);
@@ -85,7 +85,9 @@ export function validatorItems(ctx: DiagnosisContext): ValidatorItem[] {
       title: `${TITLES[i.code] ?? 'El paquete no cumple una regla del builder.'}${activity ? ` («${humanName(activity)}»)` : ''}`,
       detail: `mbz-validator-v3${withFacts ? '' : ' (sin expectativas)'} ${i.code} @ ${i.where}: ${i.message}`,
       evidence: { entry: activity ? `${activity.dir}/${activity.modname}.xml` : i.where, excerpt: i.message },
-      key: `${n}|${i.where}|${i.message}`,
+      // r107 B4 fix round 1: sin el ordinal del ítem (un ítem nuevo en otro lugar del paquete corría los ids de todos
+      // los siguientes): código + ubicación ya son únicos por grupo.
+      key: `${i.where}|${i.message}`,
     });
     out.push({ finding, issue: i, activity, related, fileId });
   });
@@ -117,7 +119,7 @@ export function relatedModuleIds(i: MbzV3Issue): number[] {
  */
 export const VALIDATOR_FAMILY: Readonly<Record<string, readonly string[]>> = Object.freeze({
   FILES_INTEGRITY: ['T02.blob_missing', 'T02.blob_altered', 'T02.filesize_mismatch', 'T02.bad_contenthash', 'T02.undeclared_blobs', 'T02.malformed_blob_path', 'T01.listed_missing_folder'],
-  TOKEN_INVALID: ['T04.token_orphan', 'T04.token_wrong_type', 'T04.token_malformed', 'T04.token_external', 'T04.anchor_orphan', 'T04.dead_link'],
+  TOKEN_INVALID: ['T04.token_orphan', 'T04.token_wrong_type', 'T04.token_malformed', 'T04.token_external', 'T04.anchor_orphan', 'T04.dead_link', 'T04.token_unverifiable'],
   STRUCTURE: ['T01.listed_missing_folder', 'T01.xml_unreadable', 'T01.section_missing', 'T01.not_in_sequence', 'T01.sequence_unknown_module', 'T03.moduleid_mismatch', 'T03.duplicate_moduleid', 'T03.duplicate_contextid'],
   LIBRO: ['T07.libro_pdf_truncated', 'T07.libro_truncated', 'T07.libro_missing_chapters', 'T02.blob_missing', 'T02.blob_altered'],
   LIBRO_HTML: ['T07.libro_book_empty_chapter'],
