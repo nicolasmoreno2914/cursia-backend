@@ -56,6 +56,8 @@ export interface QualityFindingV2 {
   kind: QualityFindingKind;
   /** false = la regla no pudo medirse (NOT MEASURED); nunca cuenta como aprobado. Ausente = medido. */
   measured?: false;
+  /** r63 (V1): hallazgo proyectado en modo observación (nunca BLOCKER/MAJOR; ver `package-observation.ts`). */
+  observation?: { rulesVersion: string; source: string; originalSeverity: QualitySeverityV2 };
 }
 
 /**

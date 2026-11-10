@@ -16,6 +16,7 @@
  */
 import { QUALITY_FINDING_FORMAT_VERSION, QUALITY_SEVERITIES, QualityFindingV2, QualitySeverityV2, findingsFromHoursReport, findingsFromMbzIssues, findingsFromPackageWarnings, sortFindings } from './quality-finding';
 import { COURSE_QUALITY_CHECKS_VERSION, QualityCheckInput, QualityCourseChapter, runCourseQualityChecks } from './course-quality-checks';
+import { QualityObservationMeta, isObservationFinding } from './package-observation';
 
 export const COURSE_QUALITY_REPORT_VERSION = 1 as const;
 /** Tope de hallazgos en el resumen persistido (job / metadata); el informe completo cuenta todos. */
@@ -42,12 +43,26 @@ export interface CourseQualityReport {
   findings: QualityFindingV2[];
   /** Hallazgos omitidos del resumen por el tope (solo en el resumen persistido). */
   truncated?: number;
+  /**
+   * r63 (V1): hallazgos proyectados en MODO OBSERVACIÓN (batería Q1–Q9, alineación, C1–C7). Van al final de `findings`
+   * (marcados con `observation`) y se cuentan SOLO acá: los contadores, `blocksDelivery`, `requiresHumanResolution`,
+   * `needsHumanReview` y `notMeasured` de arriba no los incluyen. Ausente = informe de antes de r63 (nunca se recalcula).
+   */
+  observation?: QualityObservationMeta & { counts: Record<QualitySeverityV2, number>; notMeasured: string[] };
 }
 
-export function assembleCourseQualityReport(findings: QualityFindingV2[]): CourseQualityReport {
-  const sorted = dedupe(sortFindings(findings));
-  const counts = Object.fromEntries(QUALITY_SEVERITIES.map((s) => [s, 0])) as Record<QualitySeverityV2, number>;
-  for (const f of sorted) counts[f.severity]++;
+export function assembleCourseQualityReport(findings: QualityFindingV2[], observationMeta?: QualityObservationMeta | null): CourseQualityReport {
+  // r63 (V1): los de observación se ordenan y cuentan aparte, DESPUÉS de los de siempre (el tope del resumen prioriza
+  // los de siempre, con sus BLOCKER/MAJOR primero; los de observación nunca son BLOCKER ni MAJOR).
+  const sorted = dedupe(sortFindings(findings.filter((f) => !isObservationFinding(f))));
+  const observed = observationMeta ? dedupe(sortFindings(findings.filter(isObservationFinding))) : [];
+  const countOf = (xs: QualityFindingV2[]) => {
+    const c = Object.fromEntries(QUALITY_SEVERITIES.map((s) => [s, 0])) as Record<QualitySeverityV2, number>;
+    for (const f of xs) c[f.severity]++;
+    return c;
+  };
+  const notMeasuredOf = (xs: QualityFindingV2[]) => [...new Set(xs.filter((f) => f.measured === false).map((f) => f.code))].sort();
+  const counts = countOf(sorted);
   return {
     reportVersion: COURSE_QUALITY_REPORT_VERSION,
     formatVersion: QUALITY_FINDING_FORMAT_VERSION,
@@ -56,9 +71,10 @@ export function assembleCourseQualityReport(findings: QualityFindingV2[]): Cours
     blocksDelivery: counts.BLOCKER > 0,
     requiresHumanResolution: counts.MAJOR > 0,
     needsHumanReview: sorted.filter((f) => f.kind === 'needs_human_review').length,
-    notMeasured: [...new Set(sorted.filter((f) => f.measured === false).map((f) => f.code))].sort(),
+    notMeasured: notMeasuredOf(sorted),
     deliveryRule: QUALITY_DELIVERY_RULE,
-    findings: sorted,
+    findings: [...sorted, ...observed],
+    ...(observationMeta ? { observation: { ...observationMeta, counts: countOf(observed), notMeasured: notMeasuredOf(observed) } } : {}),
   };
 }
 
@@ -107,6 +123,11 @@ export interface PackageQualityInput {
   builderVersion?: string;
   /** Hallazgos ya proyectados de otros productores (batería, diseño, alineación, rechazos). */
   extraFindings?: QualityFindingV2[] | null;
+  /**
+   * r63 (V1): metadata del modo observación (`buildPackageObservationFindings().meta`). Con ella, los `extraFindings`
+   * marcados con `observation` se cuentan aparte (ver `CourseQualityReport.observation`); sin ella, se ignoran.
+   */
+  observationMeta?: QualityObservationMeta | null;
 }
 
 export function qualityCheckInputFromPackage(p: PackageQualityInput): QualityCheckInput {
@@ -156,5 +177,5 @@ export function buildPackageQualityReport(p: PackageQualityInput): CourseQuality
     ...runCourseQualityChecks(qualityCheckInputFromPackage(p)),
     ...(p.extraFindings ?? []),
   ];
-  return assembleCourseQualityReport(findings);
+  return assembleCourseQualityReport(findings, p.observationMeta ?? null);
 }
