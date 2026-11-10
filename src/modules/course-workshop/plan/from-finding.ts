@@ -27,7 +27,7 @@ export function requestFromFinding(f: Finding, course: WorkshopCourse): Interpre
   const op = fx.operation as RequestOperation;
   const fallbackNote = f.fixPrecheck?.status === 'fallback' && f.fixPrecheck.reason ? ` (${f.fixPrecheck.reason})` : '';
   const viaResolve = (raw: Partial<RawAiRequest>): InterpretedRequest => {
-    const r = resolveRequest({ quote, operation: op as RawAiRequest['operation'], instruction: raw.instruction ?? `Arreglar: ${f.title}`, target: raw.target ?? null, colors: [], chapters: null, reason: null, questions: [] }, course);
+    const r = resolveRequest({ quote, operation: op as RawAiRequest['operation'], instruction: raw.instruction ?? `Arreglar: ${f.title}`, target: raw.target ?? null, colors: [], chapters: null, reason: null, questions: [] }, course, { trustedTarget: true, trustedChange: true });
     return { ...r, details: { ...r.details, findingId: f.id } };
   };
 

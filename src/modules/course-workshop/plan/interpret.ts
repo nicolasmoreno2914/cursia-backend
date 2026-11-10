@@ -36,11 +36,14 @@ export interface RawAiRequest {
   chapters: number | null;
   reason: string | null;
   questions: Array<{ text: string; options: Array<{ id: string; label: string; target: RawTarget | null }> }>;
+  /** Fix round 1 (P2-3): fragmentos LITERALES del pedido que justifican el destino y el cambio. */
+  targetEvidence?: string | null;
+  changeEvidence?: string | null;
 }
 export interface RawTarget { moduleId?: number; field?: string; chapterNumber?: number; chapters?: number[]; questionId?: number; quizModuleId?: number; moduleNumber?: number }
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
-const REQ_KEYS = new Set(['quote', 'operation', 'instruction', 'target', 'colors', 'chapters', 'reason', 'questions']);
+const REQ_KEYS = new Set(['quote', 'operation', 'instruction', 'target', 'colors', 'chapters', 'reason', 'questions', 'targetEvidence', 'changeEvidence']);
 const TARGET_KEYS = new Set(['moduleId', 'field', 'chapterNumber', 'chapters', 'questionId', 'quizModuleId', 'moduleNumber']);
 const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
 
@@ -73,7 +76,7 @@ const str = (v: unknown, max: number): string | null => (typeof v === 'string' &
  * Esquema estricto de la salida de la herramienta. `requestText` = el pedido del docente (las citas tienen que estar).
  * `single`: re-interpretación de un pedido (exactamente uno).
  */
-export function parseInterpretation(raw: unknown, requestText: string, opts: { single?: boolean } = {}): RawAiRequest[] {
+export function parseInterpretation(raw: unknown, requestText: string, opts: { single?: boolean; evidenceText?: string } = {}): RawAiRequest[] {
   const problems: string[] = [];
   if (!isObj(raw)) throw new InterpretationOutputError(['la salida no es un objeto']);
   for (const k of Object.keys(raw)) if (k !== 'requests') problems.push(`clave desconocida «${k}»`);
@@ -82,6 +85,7 @@ export function parseInterpretation(raw: unknown, requestText: string, opts: { s
   if (list.length > PLAN_LIMITS.requestsPerIntake) problems.push(`demasiados pedidos (${list.length}; máximo ${PLAN_LIMITS.requestsPerIntake})`);
   if (opts.single && list.length !== 1) problems.push(`se esperaba exactamente un pedido (llegaron ${list.length})`);
   const text = normalizeQuote(requestText);
+  const evText = normalizeQuote(opts.evidenceText ?? requestText);
   const out: RawAiRequest[] = [];
   list.forEach((r, i) => {
     const where = `pedido ${i + 1}`;
@@ -130,9 +134,19 @@ export function parseInterpretation(raw: unknown, requestText: string, opts: { s
         questions.push({ text: qt, options: opts2 });
       });
     }
+    // Evidencia (P2-3): opcional en el esquema (si falta, el servidor PREGUNTA), pero si viene tiene que ser literal.
+    const evid = (k: 'targetEvidence' | 'changeEvidence'): string | null => {
+      if (r[k] === undefined || r[k] === null) return null;
+      const v = str(r[k], 400);
+      if (!v) { problems.push(`${where}: ${k} inválido`); return null; }
+      if (!evText.includes(normalizeQuote(v))) { problems.push(`${where}: «${k}» no es un fragmento literal del pedido`); return null; }
+      return v;
+    };
+    const targetEvidence = evid('targetEvidence');
+    const changeEvidence = evid('changeEvidence');
     if (op === 'necesita_respuesta' && !questions.length && !reason) problems.push(`${where}: necesita_respuesta sin preguntas`);
     if (op === 'fuera_de_alcance' && !reason) problems.push(`${where}: fuera_de_alcance sin motivo`);
-    out.push({ quote: quote ?? '', operation: op as RawAiRequest['operation'], instruction: instruction ?? '', target, colors, chapters, reason, questions });
+    out.push({ quote: quote ?? '', operation: op as RawAiRequest['operation'], instruction: instruction ?? '', target, colors, chapters, reason, questions, targetEvidence, changeEvidence });
   });
   if (problems.length) throw new InterpretationOutputError(problems);
   return out;
@@ -164,8 +178,15 @@ function examsOf(course: WorkshopCourse): WorkshopActivity[] {
 function examOption(a: WorkshopActivity) { return { label: `${a.title}`, resolves: { quizModuleId: a.moduleId } }; }
 function textOption(a: WorkshopActivity) { return { label: activityLabel(a), resolves: { moduleId: a.moduleId } }; }
 
+export interface ResolveOptions {
+  /** El destino lo eligió el docente (respuesta a una pregunta del servidor) o un hallazgo / aviso: no pide evidencia. */
+  trustedTarget?: boolean;
+  /** El cambio lo escribió el docente o viene de un hallazgo: no pide evidencia. */
+  trustedChange?: boolean;
+}
+
 /** Resuelve UN pedido de la IA contra el inventario. Nunca lanza. */
-export function resolveRequest(r: RawAiRequest, course: WorkshopCourse): InterpretedRequest {
+export function resolveRequest(r: RawAiRequest, course: WorkshopCourse, opts: ResolveOptions = {}): InterpretedRequest {
   const op = r.operation;
   if (op === 'fuera_de_alcance') return { ...base(r, null), status: 'out_of_scope', reason: r.reason ?? 'No es un cambio que el Taller haga.' };
   if (op === 'necesita_respuesta') {
@@ -181,16 +202,27 @@ export function resolveRequest(r: RawAiRequest, course: WorkshopCourse): Interpr
   const needs = (q: ClarifyQuestion, reason: string): InterpretedRequest => ({ ...out, status: 'needs_answer', questions: [q], reason });
   const missingIdReason = 'No encontré esa actividad en este curso.';
 
-  if (NEEDS_INSTRUCTION.has(operation) && plainText(r.instruction, 40).length < 8) {
-    // Se resuelve el destino igual (si se puede) para preguntar solo lo que falta.
-    const pre = resolveTarget(operation, t, r, course);
-    const q = instructionQuestion('¿Qué cambio concreto quieres hacer? (por ejemplo: «cambiar el año 1990 por 1992»)');
-    return { ...out, status: 'needs_answer', target: 'target' in pre ? pre.target : null, details: 'target' in pre ? pre.details ?? {} : {}, questions: [q], reason: 'El pedido no dice qué cambiar exactamente.' };
-  }
   const res = resolveTarget(operation, t, r, course);
-  if ('question' in res) return needs(res.question, res.reason ?? missingIdReason);
   if ('unavailable' in res) return { ...out, status: 'unavailable', reason: res.unavailable };
-  return { ...out, status: isLater(operation) ? 'phase_later' : 'resolved', target: res.target, details: res.details ?? {} };
+  const qs: ClarifyQuestion[] = [];
+  const reasons: string[] = [];
+  if ('question' in res) { qs.push(res.question); reasons.push(res.reason ?? missingIdReason); }
+  // D6 en el servidor (fix round 1, P2-3): el destino que eligió la IA tiene que estar JUSTIFICADO por el texto del
+  // docente (evidencia literal que nombra la actividad); si no, se pregunta con las candidatas.
+  else if (!opts.trustedTarget) {
+    const why = targetUnjustified(res.target, r.targetEvidence ?? null, course, operation);
+    if (why) { qs.push(targetQuestion(why.question, why.options)); reasons.push(why.reason); }
+  }
+  // El cambio: instrucción concreta Y evidencia literal concreta en el pedido («mejora el capítulo 3» no lo es).
+  if (NEEDS_INSTRUCTION.has(operation) && !opts.trustedChange) {
+    const vague = plainText(r.instruction, 40).length < 8 ? 'El pedido no dice qué cambiar exactamente.' : changeVague(r.changeEvidence ?? null);
+    if (vague) { qs.push(instructionQuestion('¿Qué cambio concreto quieres hacer? (por ejemplo: «cambiar el año 1990 por 1992»)')); reasons.push(vague); }
+  }
+  if (qs.length) {
+    const keep = 'target' in res && !qs.some((q) => q.purpose === 'target') ? res.target : null;
+    return { ...out, status: 'needs_answer', target: keep, details: keep && 'target' in res ? res.details ?? {} : {}, questions: qs.slice(0, PLAN_LIMITS.questionsMax), reason: reasons.join(' ') };
+  }
+  return { ...out, status: isLater(operation) ? 'phase_later' : 'resolved', target: (res as { target: ResolvedTarget }).target, details: (res as { details?: RequestDetails }).details ?? {} };
 }
 
 type TargetResult = { target: ResolvedTarget; details?: RequestDetails } | { question: ClarifyQuestion; reason?: string } | { unavailable: string };
@@ -331,6 +363,106 @@ function allRoleOptions(course: WorkshopCourse, role: 'game' | 'video' | 'presen
   return course.chapters.flatMap((c) => chapterRoleActivities(course, c.number, role)).map(textOption);
 }
 
+
+// ─── D6: evidencia del destino y del cambio (fix round 1, P2-3) ─────────────
+
+const fold = (x: string) => String(x).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+/** Palabras que no identifican una actividad ni un cambio (genéricas del curso, artículos, verbos de acción). */
+const GENERIC = new Set(['capitulo', 'modulo', 'unidad', 'curso', 'actividad', 'actividades', 'texto', 'contenido', 'parte', 'seccion', 'leccion', 'tema', 'cosa', 'cosas', 'todo', 'todos', 'toda', 'todas', 'algo',
+  'para', 'porque', 'sobre', 'entre', 'desde', 'hasta', 'como', 'esta', 'este', 'esto', 'estos', 'estas', 'donde', 'cuando', 'tambien', 'luego', 'despues', 'antes', 'aqui', 'alli', 'mucho', 'poco', 'mas', 'menos', 'favor',
+  'interactivo', 'interactiva', 'presentacion', 'video', 'juego', 'examen', 'pregunta', 'libro', 'guia']);
+const ACTION = new Set(['cambia', 'cambiar', 'cambien', 'quita', 'quitar', 'saca', 'sacar', 'agrega', 'agregar', 'anade', 'anadir', 'pon', 'poner', 'haz', 'hacer', 'corrige', 'corregir', 'reemplaza', 'reemplazar', 'escribe', 'escribir', 'rehace', 'rehacer', 'elimina', 'eliminar', 'borra', 'borrar']);
+/** Verbos que no dicen QUÉ cambiar («mejora el capítulo 3»). */
+const VAGUE = new Set(['mejora', 'mejorar', 'mejoren', 'arregla', 'arreglar', 'revisa', 'revisar', 'optimiza', 'optimizar', 'pule', 'pulir', 'perfecciona', 'perfeccionar', 'ajusta', 'ajustar', 'actualiza', 'actualizar', 'renueva', 'renovar']);
+const words = (x: string) => fold(x).match(/[a-zñ]{4,}/g) ?? [];
+/** Quita las referencias de ubicación («capítulo 3», «módulo 2», «pregunta 4»): no son el dato del cambio. */
+const stripRefs = (x: string) => fold(x).replace(/\b(capitulo|cap|modulo|unidad|pregunta|seccion|leccion)\.?\s*\d+/g, ' ');
+
+/**
+ * Regla del CAMBIO concreto: la evidencia literal existe y trae un dato citado («…» / "…"), un número que no sea una
+ * referencia de ubicación, ≥ 2 palabras de contenido, o 1 palabra de contenido con un verbo que no sea vago
+ * («corrige la ortografía» sí; «mejora la redacción» o «mejora el capítulo 3» no). null = concreto.
+ */
+export function changeVague(evidence: string | null): string | null {
+  if (!evidence) return 'El pedido no muestra qué cambiar (la interpretación no citó el cambio en el texto del docente).';
+  if (/[«"“].{1,}?[»"”]/.test(evidence)) return null;
+  const s = stripRefs(evidence);
+  if (/\d/.test(s)) return null;
+  const ws = words(s);
+  const content = ws.filter((w) => !GENERIC.has(w) && !ACTION.has(w) && !VAGUE.has(w));
+  const vagueVerb = ws.some((w) => VAGUE.has(w));
+  if (content.length >= 2 || (content.length === 1 && !vagueVerb)) return null;
+  return `«${evidence.slice(0, 80)}» no dice qué cambiar exactamente.`;
+}
+
+const ROLE_WORDS: Record<string, string[]> = {
+  video: ['video'], game: ['juego', 'scorm', 'practica'], presentation: ['presentacion', 'gamma', 'diapositiva'], cta: ['boton'],
+  welcome: ['bienvenida'], closing: ['cierre'], libro: ['libro'], audiobook: ['audiolibro'], welcome_audio: ['audio'], forum: ['foro'],
+};
+
+/**
+ * Regla del DESTINO justificado: la evidencia literal nombra la actividad — por una palabra de su título (o del
+ * enunciado de la pregunta), o por su rol / clase cuando es la ÚNICA de ese rol en su capítulo (si la evidencia nombra
+ * el capítulo) o en el curso, o es la única actividad de texto del capítulo que nombra. null = justificado.
+ */
+function targetUnjustified(t: ResolvedTarget, evidence: string | null, course: WorkshopCourse, op: RequestOperation): { question: string; options: Array<{ label: string; resolves: ClarifyOption['resolves'] }>; reason: string } | null {
+  if (t.kind === 'course' || t.kind === 'module') return null; // colores / agregar: no hay actividad que elegir
+  const ev = fold(evidence ?? '');
+  const evWords = new Set(words(ev).filter((w) => !GENERIC.has(w) && !ACTION.has(w) && !VAGUE.has(w)));
+  const chapterNamed = (n: number | null) => n !== null && new RegExp(`\\b(capitulo|cap)\\.?\\s*${n}\\b`).test(ev);
+  const cleanT = (title: string) => fold(title).replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const evClean = cleanT(ev);
+  // El título COMPLETO citado, o una palabra propia (no genérica) de él.
+  const titleHit = (title: string) => (cleanT(title).length >= 6 && evClean.includes(cleanT(title))) || words(title).some((w) => !GENERIC.has(w) && evWords.has(w));
+  const optionsFor = (): Array<{ label: string; resolves: ClarifyOption['resolves'] }> => {
+    if (t.kind === 'question') {
+      const quiz = activityOf(course, t.quizModuleId);
+      return (quiz?.exam?.questions ?? []).filter((q) => q.qtype === 'multichoice' || q.qtype === 'truefalse').map((q) => ({ label: short(plainText(q.html, 140), 140), resolves: { quizModuleId: t.quizModuleId, questionId: q.id } }));
+    }
+    const a = 'moduleId' in t && t.moduleId !== null ? activityOf(course, t.moduleId) : null;
+    if (!a) return [];
+    const ch = a.placement.scope === 'chapter' ? a.placement.chapterNumber : null;
+    const same = course.activities.filter((x) => !x.missingFolder && (ch !== null ? x.placement.scope === 'chapter' && x.placement.chapterNumber === ch : x.placement.scope !== 'chapter') && (x.role ?? x.kind) === (a.role ?? a.kind));
+    const pool = op === 'edit_html' && ch !== null ? chapterTextCandidates(course, ch) : same;
+    return (pool.length ? pool : [a]).map((x) => textOption(x));
+  };
+  const ask = (reason: string) => ({ question: '¿A qué actividad te refieres exactamente?', options: optionsFor(), reason });
+  if (!evidence) return ask('La interpretación eligió una actividad sin citar dónde la nombra el pedido: no se elige por el docente.');
+  if (t.kind === 'question') {
+    const quiz = activityOf(course, t.quizModuleId);
+    const q = quiz?.exam?.questions.find((x) => x.id === t.questionId);
+    const stem = q ? words(plainText(q.html, 400)).filter((w) => !GENERIC.has(w)) : [];
+    if (stem.some((w) => evWords.has(w))) return null;
+    if ((quiz?.exam?.questions.length ?? 0) === 1) return null;
+    return ask(`«${short(evidence, 60)}» no nombra esa pregunta del examen.`);
+  }
+  if (t.kind === 'exam') {
+    const quiz = activityOf(course, t.quizModuleId);
+    const exams = course.activities.filter((a) => a.modname === 'quiz' && a.exam);
+    if (exams.length === 1 || (quiz && titleHit(quiz.title))) return null;
+    const unit = quiz?.exam?.unit ?? null;
+    if (unit !== null && new RegExp(`\\b(unidad|modulo)\\s*${unit}\\b`).test(ev) && /examen|evaluacion/.test(ev)) return null;
+    if (quiz?.exam?.final && /final/.test(ev)) return null;
+    return ask(`«${short(evidence, 60)}» no dice a qué examen.`);
+  }
+  if (t.kind === 'libro') {
+    if (!/libro/.test(ev)) return ask(`«${short(evidence, 60)}» no nombra el Libro Guía.`);
+    if (t.recompose || t.chapters.every((n) => chapterNamed(n))) return null;
+    return ask(`«${short(evidence, 60)}» no dice qué capítulo del Libro.`);
+  }
+  const a = t.moduleId !== null ? activityOf(course, t.moduleId) : null;
+  if (!a) return null;
+  if (titleHit(a.title)) return null;
+  const ch = a.placement.scope === 'chapter' ? a.placement.chapterNumber : null;
+  const roleKey = String(a.role ?? a.kind);
+  const roleNamed = (ROLE_WORDS[roleKey] ?? []).some((w) => ev.includes(w));
+  const scope = course.activities.filter((x) => !x.missingFolder && (ch !== null ? x.placement.scope === 'chapter' && x.placement.chapterNumber === ch : true));
+  const uniqueRole = scope.filter((x) => String(x.role ?? x.kind) === roleKey).length === 1;
+  if (roleNamed && uniqueRole && (ch === null || chapterNamed(ch) || course.activities.filter((x) => String(x.role ?? x.kind) === roleKey).length === 1)) return null;
+  if (op === 'edit_html' && ch !== null && chapterNamed(ch) && chapterTextCandidates(course, ch).length === 1) return null;
+  return ask(`«${short(evidence, 60)}» no nombra con certeza «${short(a.title, 60)}».`);
+}
+
 // ─── Respuestas ─────────────────────────────────────────────────────────────
 
 export class AnswerError extends Error {
@@ -382,7 +514,8 @@ export function answerRequest(req: InterpretedRequest, answers: ClarifyAnswer[],
   // Destino resuelto con el que ya se había resuelto (solo faltaba la instrucción).
   if (req.target && !qa.some((x) => x.q.purpose === 'target')) rawTarget = { ...rawTargetOf(req.target), ...rawTarget };
   const raw: RawAiRequest = { quote: req.quote, operation: req.operation as RawAiRequest['operation'], instruction, target: rawTarget, colors: req.details.colors ?? [], chapters: req.details.chapters ?? null, reason: null, questions: [] };
-  const next = resolveRequest(raw, course);
+  // El docente eligió el destino o escribió el cambio (o ya estaban justificados: si no, habría otra pregunta pendiente).
+  const next = resolveRequest(raw, course, { trustedTarget: true, trustedChange: true });
   return { resolved: { ...next, details: { ...req.details, ...next.details } } };
 }
 

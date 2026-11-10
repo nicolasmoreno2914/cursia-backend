@@ -23,6 +23,7 @@ import { usageModelPriorsV1 } from '../../finops/usage-model';
 import { addDec, cmpDec, normalizeDecimal } from '../../finops/decimal';
 import { parseSafetyCapFactor, readSafetyCapFactor, safetyCapOf } from '../../finops/safety-cap';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
+import { workshopModel } from './ai';
 import type { WorkshopCourse } from '../course-model';
 import type { WorkshopAiUsage } from './ai';
 import type { RequestDetails, RequestOperation } from './types';
@@ -51,13 +52,42 @@ export function aiCallItems(kind: AiCallKind, size: { promptChars: number; outpu
   }
 }
 
-function run(items: EstimateItem[], pricing: DryRunPricing): EstimateResult {
-  return estimateCost({ items, catalog: pricing.catalog, usageModel: usageModelPriorsV1(), retryPolicy: pricing.retryPolicy, pricingAsOf: pricing.asOf ?? null });
+function run(items: EstimateItem[], pricing: DryRunPricing, model: string | null = null): EstimateResult {
+  const um = usageModelPriorsV1();
+  // Fix round 1 (P2-1): las llamadas del Taller se valúan con el modelo REAL que usa (WORKSHOP_AI_MODEL), no con el del
+  // usage model del generador. Un modelo sin precio en el catálogo hace fallar el estimado (falla cerrado).
+  if (model) for (const op of Object.values(um.operations)) if (op.provider === 'anthropic') op.product = model;
+  return estimateCost({ items, catalog: pricing.catalog, usageModel: um, retryPolicy: pricing.retryPolicy, pricingAsOf: pricing.asOf ?? null });
 }
 
-/** Estimado de una llamada del Taller (antes de hacerla: lo usa la compuerta de saldo, D9). */
-export function estimateAiCall(kind: AiCallKind, size: { promptChars: number; outputChars?: number; chapters?: number }, pricing: DryRunPricing): EstimateResult {
-  return run(aiCallItems(kind, size), pricing);
+/**
+ * Precios + el MODELO que usa el Taller (fix round 1, P2-1). `model` ausente = `workshopModel()` (lo fija Cursia por
+ * configuración del servidor, nunca el docente).
+ */
+export type WorkshopPricing = DryRunPricing & { model?: string | null };
+export const modelOf = (pricing: WorkshopPricing): string => (pricing.model ?? null) || workshopModel();
+
+export class ModelUnpricedError extends Error {
+  readonly code = 'WORKSHOP_MODEL_UNPRICED';
+  constructor(readonly model: string) {
+    super(`El modelo de IA configurado para el Taller («${model}») no tiene precio en el catálogo de FinOps: no se puede estimar ni acotar el gasto, así que no se llama a la IA.`);
+  }
+}
+
+/** Falla cerrado si el modelo del Taller no tiene precio de entrada y salida en el catálogo. */
+export function assertModelPriced(pricing: WorkshopPricing): string {
+  const model = modelOf(pricing);
+  try {
+    priceUsage({ input_tokens: 1, output_tokens: 1, cache_write_tokens: 1 }, pricing.catalog, { provider: 'anthropic', service: 'messages', product: model, asOf: pricing.asOf ?? null } as any);
+  } catch {
+    throw new ModelUnpricedError(model);
+  }
+  return model;
+}
+
+/** Estimado de una llamada del Taller (antes de hacerla: lo usa la compuerta de saldo, D9), con el modelo real. */
+export function estimateAiCall(kind: AiCallKind, size: { promptChars: number; outputChars?: number; chapters?: number }, pricing: WorkshopPricing): EstimateResult {
+  return run(aiCallItems(kind, size), pricing, assertModelPriced(pricing));
 }
 
 /** Items de un capítulo completo del generador (agregar capítulo / módulo). */
@@ -89,7 +119,10 @@ export function estimateLater(op: RequestOperation, details: RequestDetails, cou
 
 export const memOf = (e: EstimateResult): MinExpMax => ({ min: e.totals.min, expected: e.totals.expected, max: e.totals.max });
 
-/** USD de una respuesta MEDIDA (uso real del proveedor × catálogo). Uso desconocido → 0 (y el ledger lo marca). */
+/**
+ * USD de una respuesta MEDIDA (uso real del proveedor × catálogo) con el modelo que respondió. Fix round 1 (P2-1): sin
+ * precio para ese modelo → ModelUnpricedError (nunca se valúa con otro modelo más barato).
+ */
 export function priceMeasured(usage: WorkshopAiUsage | null, model: string, pricing: DryRunPricing): string {
   if (!usage) return normalizeDecimal(0);
   const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
@@ -97,9 +130,7 @@ export function priceMeasured(usage: WorkshopAiUsage | null, model: string, pric
   try {
     return priceUsage(meters, pricing.catalog, { provider: 'anthropic', service: 'messages', product: model, asOf: pricing.asOf ?? null } as any).amount;
   } catch {
-    // Modelo sin precio en el catálogo: se valúa con el modelo de referencia del usage model (lado seguro: el ledger
-    // registra el real con su propia regla `pending_zero`).
-    return priceUsage(meters, pricing.catalog, { provider: 'anthropic', service: 'messages', product: 'claude-sonnet-4-6', asOf: pricing.asOf ?? null } as any).amount;
+    throw new ModelUnpricedError(model);
   }
 }
 

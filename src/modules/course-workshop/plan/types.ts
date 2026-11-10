@@ -173,10 +173,12 @@ export interface PlanItemView {
   cost: PlanItemCost;
   misalignment: MisalignmentWarning[];
   dryRun: PlanItemDryRun | null;
+  /** Fix round 1 (P2-4): riesgo alto → B6 exige confirmarlo uno por uno al aplicar. */
+  requiresItemConfirm: boolean;
   /** false = etapa de ESTIMADO: todavía sin contenido generado (sin antes/después); se genera al aprobarlo con tope. */
   generated: boolean;
   /** La llamada de IA que generaría el contenido (estimado + cota), mientras no se generó. */
-  plannedCall?: { kind: string; promptChars: number; maxTokens: number; size: { promptChars: number; outputChars?: number; chapters?: number }; expectedUsd: string; boundUsd: string } | null;
+  plannedCall?: { model?: string; kind: string; promptChars: number; maxTokens: number; size: { promptChars: number; outputChars?: number; chapters?: number }; expectedUsd: string; boundUsd: string } | null;
 }
 
 export type Phase2Op = EditHtmlOp | EditLibroSectionOp | ExamQuestionReplaceOp | ExamQuestionAddOp | ExamQuestionRemoveOp | BrandReplaceOp | RemoveActivityOp;

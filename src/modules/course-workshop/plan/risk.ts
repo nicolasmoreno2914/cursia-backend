@@ -57,3 +57,31 @@ export function riskOf(input: { operation: RequestOperation; target: ResolvedTar
   const level = reasons.reduce<RiskLevel>((m, [l]) => (RANK[l] > RANK[m] ? l : m), 'bajo');
   return { level, reasons: reasons.map(([, r]) => r) };
 }
+
+// ─── Fix round 1 (P2-4): guarda de cambios masivos / de riesgo alto ─────────
+
+/** Más de este número de ítems de riesgo alto en un plan → aviso del plan. */
+export const HIGH_RISK_PLAN_THRESHOLD = 5;
+/** Más de este número de `remove_activity` salidos de UNA misma entrada → aviso de cambio masivo. */
+export const BULK_REMOVALS_PER_INTAKE = 3;
+
+/** Todo ítem de riesgo ALTO exige que el docente lo confirme uno por uno al aplicar (B6). */
+export const requiresItemConfirm = (risk: PlanRisk): boolean => risk.level === 'alto';
+
+export interface PlanWarning { code: 'REMOVALS' | 'BULK_REMOVALS' | 'MANY_HIGH_RISK'; message: string; count: number; itemIds: string[] }
+
+/** Avisos del PLAN (no de un ítem): quitar actividades, cambios masivos desde una misma entrada, muchos de riesgo alto. */
+export function planWarnings(items: Array<{ id: string; operation: string; risk: PlanRisk; intakeId: string | null; live: boolean }>): PlanWarning[] {
+  const live = items.filter((i) => i.live);
+  const out: PlanWarning[] = [];
+  const removes = live.filter((i) => i.operation === 'remove_activity');
+  if (removes.length) out.push({ code: 'REMOVALS', count: removes.length, itemIds: removes.map((i) => i.id), message: `El plan QUITA ${removes.length} actividad(es) del curso: cada una se confirma por separado al aplicar.` });
+  const byIntake = new Map<string, string[]>();
+  for (const r of removes) if (r.intakeId) byIntake.set(r.intakeId, [...(byIntake.get(r.intakeId) ?? []), r.id]);
+  for (const [, ids] of byIntake) {
+    if (ids.length > BULK_REMOVALS_PER_INTAKE) out.push({ code: 'BULK_REMOVALS', count: ids.length, itemIds: ids, message: `Un mismo pedido quita ${ids.length} actividades: revisa que de verdad lo quieras (un documento puede pedir de más).` });
+  }
+  const high = live.filter((i) => i.risk.level === 'alto');
+  if (high.length > HIGH_RISK_PLAN_THRESHOLD) out.push({ code: 'MANY_HIGH_RISK', count: high.length, itemIds: high.map((i) => i.id), message: `El plan tiene ${high.length} cambios de riesgo alto: revísalos uno por uno.` });
+  return out;
+}

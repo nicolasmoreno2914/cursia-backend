@@ -20,9 +20,11 @@ import {
   AiCall, AiInvoke, AiUnavailableError, BuildCtx, PlannedCall, PreparedItem, answerAndResolve, callBoundUsd, capDecision, combinedDryRun, estimateContent, estimateInterpretation,
   estimateItemView, estimateReinterpretation, interpretText, openBuildCtx, prepareItem, proposedCapOf,
 } from './builder';
-import { planTotals, priceMeasured } from './cost';
+import { ModelUnpricedError, WorkshopPricing, assertModelPriced, modelOf, planTotals, priceMeasured } from './cost';
+import { ApprovalCall, callErrorOutcome, closeReservation } from './approval-ledger';
 import { requestFromFinding } from './from-finding';
 import { AnswerError, checkAnswers, resolveRequest } from './interpret';
+import { planWarnings } from './risk';
 import {
   ClarifyAnswer, DOCUMENT_EXTENSIONS, InterpretedRequest, IntakeSource, LATER_OPERATIONS, MisalignmentWarning, PLAN_CODE_VERSION, PLAN_LIMITS, PlanItemView, RequestStatus,
 } from './types';
@@ -70,6 +72,8 @@ export const PLAN_ERRORS = Object.freeze({
   RESERVATION_FAILED: 'WORKSHOP_RESERVATION_FAILED',
   FINOPS_UNAVAILABLE: 'WORKSHOP_FINOPS_UNAVAILABLE',
   ITEMS_INVALID: 'WORKSHOP_GENERATE_ITEMS_INVALID',
+  MODEL_UNPRICED: 'WORKSHOP_MODEL_UNPRICED',
+  CALL_AMBIGUOUS: 'WORKSHOP_AI_CALL_AMBIGUOUS',
   ROUNDS_EXHAUSTED: 'WORKSHOP_REQUEST_ROUNDS_EXHAUSTED',
   DIAGNOSIS_NOT_READY: 'WORKSHOP_DIAGNOSIS_NOT_READY',
   FINDING_NOT_FOUND: 'WORKSHOP_FINDING_NOT_FOUND',
@@ -91,7 +95,7 @@ const sha1 = (s: string) => createHash('sha1').update(s).digest('hex');
 interface IntakeRow { id: string; session_id: string; original_sha1: string; created_by: string; source: IntakeSource; status: string; filename: string | null; media_type: string | null; storage_path: string | null; declared_bytes: string | null; text: string | null; error: any; notes: any; estimate: any; approval_id: string | null; spent_usd: string; ai_calls: number; claim_id: string | null; created_at: Date; updated_at: Date }
 interface RequestRow { id: string; session_id: string; intake_id: string; ordinal: number; finding_id: string | null; quote: string; instruction: string; operation: string | null; status: RequestStatus; target: any; raw_target: any; details: any; questions: any; answers: any; rounds: number; reason: string | null; estimate: any; spent_usd: string; ai_calls: number; claim_id: string | null; created_at: Date; updated_at: Date }
 interface ItemRow { id: string; plan_id: string; request_id: string; status: 'proposed' | 'removed'; stage: 'estimate' | 'ready'; operation: string; available: boolean; params: any; view: PlanItemView; risk_level: string; spent_usd: string; apply_expected_usd: string; created_at: Date; updated_at: Date }
-interface ApprovalRow { id: string; session_id: string; created_by: string; kind: 'interpret' | 'reinterpret' | 'generate'; intake_id: string | null; request_id: string | null; item_ids: string[]; estimate: any; cap_usd: string; spent_usd: string; ai_calls: number; reservation_key: string | null; status: string; stop_reason: string | null; created_at: Date; updated_at: Date }
+interface ApprovalRow { id: string; session_id: string; created_by: string; kind: 'interpret' | 'reinterpret' | 'generate'; intake_id: string | null; request_id: string | null; item_ids: string[]; estimate: any; cap_usd: string; spent_usd: string; ai_calls: number; reservation_key: string | null; calls: Record<string, ApprovalCall>; status: string; stop_reason: string | null; created_at: Date; updated_at: Date }
 
 /** Estimado de una aprobación (lo que el docente ve y confirma). */
 export interface ApprovalEstimate { calls: PlannedCall[]; expectedUsd: string; boundUsd: string; proposedCapUsd: string; note: string }
@@ -134,6 +138,21 @@ export class WorkshopPlanService {
   private readonly client: WorkshopAiClient & { simulated?: boolean };
   /** Precios del estimator (catálogo de la base o el seed). Reemplazable en pruebas. */
   pricingLoader: () => Promise<DryRunPricing> = () => loadDryRunPricing(this.dataSource);
+
+  /**
+   * Fix round 1 (P2-1): precios + el modelo REAL del Taller (`WORKSHOP_AI_MODEL`, fijado por Cursia). Si el catálogo no
+   * tiene precio para ese modelo, falla cerrado: 503 WORKSHOP_MODEL_UNPRICED y no se estima, reserva ni llama.
+   */
+  private async pricing(): Promise<WorkshopPricing> {
+    const p: WorkshopPricing = { ...(await this.pricingLoader()), model: workshopModel() };
+    try {
+      assertModelPriced(p);
+    } catch (e) {
+      if (e instanceof ModelUnpricedError) throw new ServiceUnavailableException({ code: PLAN_ERRORS.MODEL_UNPRICED, message: e.message, model: e.model });
+      throw e;
+    }
+    return p;
+  }
   /** Trabajos de este proceso (las pruebas los esperan). */
   readonly inFlight = new Map<string, Promise<void>>();
   /** Llamadas efectivas al cliente de IA de este proceso (las pruebas lo leen). */
@@ -241,14 +260,18 @@ export class WorkshopPlanService {
    * atribuir, kill switch) la aprobación queda `failed` con el motivo y se lanza el error: nada se encola ni se llama.
    */
   private async openApproval(s: WorkshopPlanSession, actor: WorkshopActor, a: { kind: ApprovalRow['kind']; intakeId?: string | null; requestId?: string | null; itemIds?: string[]; estimate: ApprovalEstimate; capUsd: string }): Promise<ApprovalRow> {
+    await this.pricing(); // fix round 1 (P2-1): modelo sin precio → 503, no se reserva
     await this.preflight(actor.id, a.capUsd);
     if (!this.ledger) throw new ServiceUnavailableException({ code: PLAN_ERRORS.FINOPS_UNAVAILABLE, message: 'No se puede reservar el tope (FinOps no está disponible en este proceso): no se llamó a la IA.' });
     const [row] = await this.q<ApprovalRow[]>(this.dataSource,
       `insert into public.workshop_ai_approvals (session_id, created_by, kind, intake_id, request_id, item_ids, estimate, cap_usd, status)
             values ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, 'reserved') returning *`,
       [s.id, actor.id, a.kind, a.intakeId ?? null, a.requestId ?? null, JSON.stringify(a.itemIds ?? []), JSON.stringify(a.estimate), a.capUsd]);
+    // Fix round 1 (P2-2): con el cliente SIMULADO (pruebas) no se reserva en el ledger: una reserva MOCK no se puede
+    // liquidar (no es un costo medible) y quedaría pendiente para siempre. El tope se sigue haciendo cumplir acá.
+    if (this.client.simulated === true) return row;
     const courseId = actor.id.toLowerCase() === s.ownerId.toLowerCase() ? s.identifiedCourseId : null;
-    const input = approvalReservationInput({ approvalId: row.id, payer: actor.id, courseId, capUsd: a.capUsd, kind: a.kind, simulated: this.client.simulated === true });
+    const input = approvalReservationInput({ approvalId: row.id, payer: actor.id, courseId, capUsd: a.capUsd, kind: a.kind, simulated: false });
     try {
       await this.ledger.recordCharge(input);
     } catch (err) {
@@ -264,15 +287,32 @@ export class WorkshopPlanService {
     return r as ApprovalRow;
   }
 
-  /** Cierra la aprobación y LIBERA la reserva (lo gastado de verdad ya quedó como cargos por llamada). */
+  /**
+   * Cierra la aprobación. Fix round 1 (P1-1): la reserva se libera SOLO si todas las llamadas enviadas tienen su cargo
+   * registrado o un rechazo documentado sin cobro; si alguna quedó en vuelo / ambigua / sin su cargo, la reserva queda
+   * PENDIENTE para conciliar y la aprobación pasa a `ambiguous` con el motivo visible (closeReservation).
+   */
   private async closeApproval(id: string, status: 'done' | 'stopped' | 'failed', reason: string | null): Promise<void> {
     const [a] = returningRows(await this.q(this.dataSource, `update public.workshop_ai_approvals set status = $2, stop_reason = coalesce($3, stop_reason), updated_at = now() where id = $1 and status in ('reserved', 'running') returning *`, [id, status, reason])) as ApprovalRow[];
-    if (!a?.reservation_key || !this.ledger) return;
+    if (!a) return;
+    let out;
     try {
-      await this.ledger.settleReservation(a.reservation_key, null, `workshop_approval_${status}`, { recordedBy: 'course-workshop' });
+      out = await closeReservation(this.ledger, { reservationKey: a.reservation_key, calls: a.calls ?? {} }, `workshop_approval_${status}`);
     } catch (err) {
       this.logger.error(`FINOPS_RESERVATION_NOT_SETTLED: aprobación ${id} (${a.reservation_key}): ${err instanceof Error ? err.message : String(err)}`);
+      await this.q(this.dataSource, `update public.workshop_ai_approvals set status = 'ambiguous', stop_reason = $2, updated_at = now() where id = $1`, [id, 'No se pudo liberar la reserva del tope: queda pendiente para conciliar.']);
+      return;
     }
+    if (out.unresolved.length) {
+      this.logger.warn(`FINOPS_RESERVATION_AMBIGUOUS: aprobación ${id} (${a.reservation_key ?? 'sin reserva'}): ${out.unresolved.map((c) => `${c.id}:${c.status}`).join(', ')}`);
+      await this.q(this.dataSource, `update public.workshop_ai_approvals set status = 'ambiguous', calls = $2::jsonb, stop_reason = $3, updated_at = now() where id = $1`, [id, JSON.stringify(out.calls), [reason, out.reason].filter(Boolean).join(' · ')]);
+    } else {
+      await this.q(this.dataSource, `update public.workshop_ai_approvals set calls = $2::jsonb, updated_at = now() where id = $1`, [id, JSON.stringify(out.calls)]);
+    }
+  }
+
+  private async setCall(approvalId: string, c: ApprovalCall): Promise<void> {
+    await this.q(this.dataSource, `update public.workshop_ai_approvals set calls = calls || jsonb_build_object($2::text, $3::jsonb), updated_at = now() where id = $1`, [approvalId, c.id, JSON.stringify(c)]);
   }
 
   private async approvalOf(id: string): Promise<ApprovalRow | null> {
@@ -299,21 +339,48 @@ export class WorkshopPlanService {
       } catch {
         throw new AiUnavailableError(PLAN_ERRORS.AI_UNAVAILABLE, 'El servicio de IA no está disponible en este momento: no se llamó a la IA.');
       }
+      let bound: string;
+      try {
+        bound = callBoundUsd(call.size.promptChars, call.maxTokens, pricing);
+      } catch (e) {
+        if (e instanceof ModelUnpricedError) throw new AiUnavailableError(PLAN_ERRORS.MODEL_UNPRICED, e.message);
+        throw e;
+      }
+      // Fix round 1 (P1-1): la llamada queda registrada como ENVIADA antes de enviarla (si el proceso se cae, queda así
+      // y la reserva no se libera).
+      const rec: ApprovalCall = { id: randomUUID(), kind: call.kind, attempt: call.attempt, boundUsd: bound, status: 'sent', at: new Date().toISOString() };
+      await this.setCall(approval.id, rec);
       let result: WorkshopAiResult;
       try {
-        result = await this.client.call({ purpose: call.purpose, model: workshopModel(), system: call.system, user: call.user, tool: call.tool, maxTokens: call.maxTokens, timeoutMs: WORKSHOP_AI_TIMEOUT_MS });
+        result = await this.client.call({ purpose: call.purpose, model: modelOf(pricing), system: call.system, user: call.user, tool: call.tool, maxTokens: call.maxTokens, timeoutMs: WORKSHOP_AI_TIMEOUT_MS });
       } catch (err) {
-        this.logger.error(`taller plan: la IA falló (${err instanceof Error ? err.message : String(err)})`);
-        throw new AiUnavailableError(PLAN_ERRORS.AI_UNAVAILABLE, 'El servicio de IA no respondió; vuelve a intentarlo en unos minutos.');
+        const o = callErrorOutcome(err);
+        this.logger.error(`taller plan: la IA falló (${o.status}, estado ${o.providerStatus ?? '—'}: ${err instanceof Error ? err.message : String(err)})`);
+        await this.setCall(approval.id, { ...rec, status: o.status, providerStatus: o.providerStatus, error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
+        if (o.status === 'ambiguous') {
+          // Pudo cobrarse: cuenta la cota entera como gastada (la guarda del tope no deja seguir a ciegas).
+          await this.q(this.dataSource, `update public.workshop_ai_approvals set spent_usd = spent_usd + $2, updated_at = now() where id = $1`, [approval.id, bound]);
+          throw new AiUnavailableError(PLAN_ERRORS.CALL_AMBIGUOUS, 'La IA no respondió y no se sabe si la llamada se cobró: la reserva del tope queda pendiente hasta conciliarla. Vuelve a intentarlo más tarde.');
+        }
+        throw new AiUnavailableError(PLAN_ERRORS.AI_UNAVAILABLE, 'El servicio de IA rechazó la llamada sin cobrarla; vuelve a intentarlo en unos minutos.');
       }
       this.aiCalls++;
-      const costUsd = priceMeasured(result.usage, result.model, pricing);
-      await this.q(this.dataSource, `update public.workshop_ai_approvals set spent_usd = spent_usd + $2, ai_calls = ai_calls + 1, updated_at = now() where id = $1`, [approval.id, costUsd]);
-      const input = workshopChargeInput({ payer, courseId, result, purpose: call.purpose, metadata: { ...meta, approvalId: approval.id, sessionId: s.id, callKind: call.kind, attempt: call.attempt, planCodeVersion: PLAN_CODE_VERSION } });
-      if (!this.ledger || !input) this.logger.error(`FINOPS_NOT_RECORDED: taller ${call.kind} (${result.messageId ?? 'sin id'}) — ${!this.ledger ? 'sin FinOps en este proceso' : 'faltan owner/id/usage'}`);
-      else {
-        try { await this.ledger.recordCharge(input); } catch (err) { this.logger.error(`FINOPS_NOT_RECORDED: taller ${call.kind} (${result.messageId}): ${err instanceof Error ? err.message : String(err)}`); }
+      let costUsd: string;
+      try {
+        costUsd = priceMeasured(result.usage, result.model, pricing);
+      } catch {
+        // Respondió un modelo sin precio: se cuenta la cota (lado seguro); el ledger lo registra `pending_zero`.
+        costUsd = bound;
       }
+      await this.q(this.dataSource, `update public.workshop_ai_approvals set spent_usd = spent_usd + $2, ai_calls = ai_calls + 1, updated_at = now() where id = $1`, [approval.id, costUsd]);
+      const input = workshopChargeInput({ payer, courseId, result, purpose: call.purpose, metadata: { ...meta, approvalId: approval.id, callId: rec.id, sessionId: s.id, callKind: call.kind, attempt: call.attempt, planCodeVersion: PLAN_CODE_VERSION } });
+      let recorded = false;
+      let recErr: string | null = null;
+      if (this.ledger && input) {
+        try { await this.ledger.recordCharge(input); recorded = true; } catch (err) { recErr = err instanceof Error ? err.message.slice(0, 300) : String(err); }
+      } else recErr = !this.ledger ? 'sin FinOps en este proceso' : 'faltan owner/id/usage';
+      if (!recorded) this.logger.error(`FINOPS_NOT_RECORDED: taller ${call.kind} (${result.messageId ?? 'sin id'}): ${recErr}`);
+      await this.setCall(approval.id, { ...rec, status: recorded ? 'charged' : 'charge_unrecorded', messageId: result.messageId, costUsd, error: recErr, charge: recorded ? null : input });
       return { result, costUsd };
     };
   }
@@ -339,7 +406,7 @@ export class WorkshopPlanService {
     const text = typeof rawText === 'string' ? rawText.replace(/\r\n/g, '\n').trim() : '';
     if (!text) throw new BadRequestException({ code: PLAN_ERRORS.TEXT_EMPTY, message: 'Escribe qué quieres cambiar del curso.' });
     if (text.length > PLAN_LIMITS.textMaxChars) throw new BadRequestException({ code: PLAN_ERRORS.TEXT_TOO_LONG, message: `El pedido es demasiado largo (máximo ${PLAN_LIMITS.textMaxChars} caracteres): envía solo los cambios.` });
-    const estimate = this.estimateOf([estimateInterpretation({ course: await this.courseForEstimate(s.id), pricing: await this.pricingLoader() }, text)], 'Interpretar el pedido (1 llamada; un reintento por validación entra en el margen). La IA no corre hasta que lo apruebes.');
+    const estimate = this.estimateOf([estimateInterpretation({ course: await this.courseForEstimate(s.id), pricing: await this.pricing() }, text)], 'Interpretar el pedido (1 llamada; un reintento por validación entra en el margen). La IA no corre hasta que lo apruebes.');
     const [row] = await this.q<IntakeRow[]>(this.dataSource,
       `insert into public.workshop_intakes (session_id, original_sha1, created_by, source, status, text, text_sha1, estimate) values ($1, $2, $3, 'text', 'awaiting_confirmation', $4, $5, $6::jsonb) returning *`,
       [s.id, s.originalSha1, actor.id, text, sha1(text), JSON.stringify(estimate)]);
@@ -437,7 +504,7 @@ export class WorkshopPlanService {
       return this.requestView(r);
     }
     const course = await this.courseForEstimate(s.id);
-    const estimate = this.estimateOf([estimateReinterpretation({ course, pricing: await this.pricingLoader() }, this.interpretedOf(row), qa.reduce((n, x) => n + x.question.length + x.answer.length, 0))], 'Re-interpretar este pedido con tus respuestas (1 llamada). La IA no corre hasta que lo apruebes.');
+    const estimate = this.estimateOf([estimateReinterpretation({ course, pricing: await this.pricing() }, this.interpretedOf(row), qa.reduce((n, x) => n + x.question.length + x.answer.length, 0))], 'Re-interpretar este pedido con tus respuestas (1 llamada). La IA no corre hasta que lo apruebes.');
     const [r] = returningRows(await this.q(this.dataSource,
       `update public.workshop_requests set status = 'awaiting_confirmation', estimate = $4::jsonb, answers = answers || $2::jsonb, details = details || jsonb_build_object('pendingAnswers', $3::jsonb), updated_at = now() where id = $1 and status = 'needs_answer' returning *`,
       [row.id, log, JSON.stringify(answers), JSON.stringify(estimate)]));
@@ -579,7 +646,7 @@ export class WorkshopPlanService {
       let ctx: BuildCtx;
       try {
         const original = await this.workshop.loadVerifiedOriginal(s.id);
-        ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricingLoader(), baseline: await this.baselineOf(s) });
+        ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
       } catch (err) {
         const body = (err as { getResponse?: () => any })?.getResponse?.();
         const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
@@ -642,7 +709,7 @@ export class WorkshopPlanService {
     if (text.length > PLAN_LIMITS.documentTextMaxChars) { await this.failIntake(row.id, PLAN_ERRORS.TEXT_TOO_LONG, `El documento tiene ${text.length.toLocaleString('es')} caracteres de texto; el máximo es ${PLAN_LIMITS.documentTextMaxChars.toLocaleString('es')}. Envía solo los cambios.`, false); return; }
     const inv = await this.workshop.persistedInventory(s.id);
     if (!inv) { await this.failIntake(row.id, PLAN_ERRORS.INVENTORY_NOT_READY, 'El inventario del paquete todavía no está listo: vuelve a subir el documento en unos segundos.', true); return; }
-    const estimate = this.estimateOf([estimateInterpretation({ course: inv, pricing: await this.pricingLoader() }, text)], 'Interpretar el documento (1 llamada; un reintento por validación entra en el margen). La IA no corre hasta que lo apruebes.');
+    const estimate = this.estimateOf([estimateInterpretation({ course: inv, pricing: await this.pricing() }, text)], 'Interpretar el documento (1 llamada; un reintento por validación entra en el margen). La IA no corre hasta que lo apruebes.');
     await this.q(this.dataSource, `update public.workshop_intakes set status = 'awaiting_confirmation', text = $2, text_sha1 = $3, media_type = $4, notes = $5::jsonb, estimate = $6::jsonb, updated_at = now() where id = $1 and status = 'extracting'`,
       [row.id, text, sha1(text), mediaType, JSON.stringify(notes), JSON.stringify(estimate)]);
   }
@@ -724,7 +791,7 @@ export class WorkshopPlanService {
       if (!f) { await this.setRequest(row.id, { status: 'failed', reason: 'El hallazgo ya no está en el diagnóstico de este paquete.' }); return; }
       req = requestFromFinding(f, ctx.course);
     } else if (!alreadyResolved && intake?.source === 'misalignment' && row.target === null) {
-      const r = resolveRequest({ quote: row.quote, operation: row.operation as any, instruction: row.instruction, target: row.raw_target ?? {}, colors: [], chapters: null, reason: null, questions: [] }, ctx.course);
+      const r = resolveRequest({ quote: row.quote, operation: row.operation as any, instruction: row.instruction, target: row.raw_target ?? {}, colors: [], chapters: null, reason: null, questions: [] }, ctx.course, { trustedTarget: true, trustedChange: true });
       req = { ...r, details: { ...(row.details ?? {}), ...r.details } };
     } else if (!alreadyResolved && Array.isArray(row.details?.pendingAnswers) && row.questions?.length) {
       // Respuestas a preguntas del SERVIDOR: se resuelve sin IA.
@@ -818,11 +885,12 @@ export class WorkshopPlanService {
     const planId = await this.planIdOf(s);
     // Un ítem que el docente QUITÓ sigue quitado cuando se genera su contenido.
     await this.q(this.dataSource,
-      `insert into public.workshop_plan_items (plan_id, request_id, status, stage, operation, available, params, view, risk_level, spent_usd, apply_expected_usd)
-            values ($1, $2, 'proposed', $10, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)
+      `insert into public.workshop_plan_items (plan_id, request_id, status, stage, operation, available, params, view, risk_level, spent_usd, apply_expected_usd, requires_item_confirm)
+            values ($1, $2, 'proposed', $10, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $11)
        on conflict (request_id) do update set plan_id = excluded.plan_id, stage = excluded.stage, operation = excluded.operation, available = excluded.available, params = excluded.params,
-            view = excluded.view, risk_level = excluded.risk_level, spent_usd = excluded.spent_usd, apply_expected_usd = excluded.apply_expected_usd, updated_at = now()`,
-      [planId, requestId, view.operation, view.available, JSON.stringify(view.params), JSON.stringify(view), view.risk.level, view.cost.spentUsd, view.cost.apply.expected, stage]);
+            view = excluded.view, risk_level = excluded.risk_level, spent_usd = excluded.spent_usd, apply_expected_usd = excluded.apply_expected_usd,
+            requires_item_confirm = excluded.requires_item_confirm, updated_at = now()`,
+      [planId, requestId, view.operation, view.available, JSON.stringify(view.params), JSON.stringify(view), view.risk.level, view.cost.spentUsd, view.cost.apply.expected, stage, view.requiresItemConfirm === true]);
   }
 
   /** Prueba en seco del plan COMBINADO (ítems propuestos, generados y disponibles, en orden de creación). */
@@ -872,7 +940,7 @@ export class WorkshopPlanService {
         where session_id = $1 and status = 'preparing' and updated_at < now() - ($3::int * interval '1 millisecond') and not (id = any($4::uuid[]))`,
       [sessionId, 'La preparación se interrumpió; vuelve a pedir el cambio.', PLAN_STALE_MS, active]);
     const stale = await this.q<ApprovalRow[]>(this.dataSource, `select id from public.workshop_ai_approvals where session_id = $1 and status in ('reserved', 'running') and updated_at < now() - ($2::int * interval '1 millisecond') and not (id = any($3::uuid[]))`, [sessionId, PLAN_STALE_MS, active]);
-    for (const a of stale) await this.closeApproval(a.id, 'failed', 'Se interrumpió (reinicio del servidor): la reserva se liberó.');
+    for (const a of stale) await this.closeApproval(a.id, 'failed', 'Se interrumpió (reinicio del servidor).');
   }
 
   // ── lecturas ──
@@ -918,7 +986,8 @@ export class WorkshopPlanService {
   approvalView(a: ApprovalRow) {
     return {
       id: a.id, kind: a.kind, intakeId: a.intake_id, requestId: a.request_id, itemIds: a.item_ids ?? [], estimate: a.estimate, capUsd: usd(a.cap_usd), spentUsd: usd(a.spent_usd),
-      aiCalls: Number(a.ai_calls ?? 0), status: a.status, stopReason: a.stop_reason, reserved: !!a.reservation_key, createdAt: iso(a.created_at), updatedAt: iso(a.updated_at),
+      aiCalls: Number(a.ai_calls ?? 0), status: a.status, stopReason: a.stop_reason, reserved: !!a.reservation_key,
+      calls: Object.values(a.calls ?? {}).map((c) => ({ id: c.id, kind: c.kind, status: c.status, boundUsd: c.boundUsd, costUsd: c.costUsd ?? null, providerStatus: c.providerStatus ?? null })), createdAt: iso(a.created_at), updatedAt: iso(a.updated_at),
     };
   }
 
@@ -931,7 +1000,7 @@ export class WorkshopPlanService {
     const live = (i: ItemRow) => i.status === 'proposed' && byReq.get(i.request_id)?.status !== 'withdrawn';
     const itemViews = items.filter((i) => byReq.has(i.request_id)).map((i) => {
       const r = byReq.get(i.request_id)!;
-      return { id: i.id, requestId: i.request_id, findingId: r.finding_id, quote: r.quote, instruction: r.instruction, status: live(i) ? 'proposed' : 'removed', stage: i.stage, requestStatus: r.status, reason: r.reason, ...i.view };
+      return { id: i.id, requestId: i.request_id, findingId: r.finding_id, quote: r.quote, instruction: r.instruction, status: live(i) ? 'proposed' : 'removed', stage: i.stage, requiresItemConfirm: (i as any).requires_item_confirm === true, requestStatus: r.status, reason: r.reason, ...i.view };
     });
     const ready = items.filter((i) => live(i) && i.stage === 'ready');
     const totals = planTotals({
@@ -942,9 +1011,12 @@ export class WorkshopPlanService {
     const toGenerate = items.filter((i) => live(i) && i.stage === 'estimate' && byReq.get(i.request_id)?.status === 'awaiting_generation');
     const generation = toGenerate.length ? { itemIds: toGenerate.map((i) => i.id), ...this.estimateOf(toGenerate.map((i) => i.view.plannedCall as PlannedCall), `Generar el contenido (antes/después) de ${toGenerate.length} ítem(s): la IA corre solo cuando apruebes el tope.`) } : null;
     const withItem = new Set(items.map((i) => i.request_id));
+    const warnings = planWarnings(items.filter((i) => byReq.has(i.request_id)).map((i) => ({ id: i.id, operation: i.operation, risk: i.view.risk, intakeId: byReq.get(i.request_id)!.intake_id, live: live(i) })));
     return {
       sessionId: s.id, planId: plan?.id ?? null, status: 'draft' as const, originalSha1: s.originalSha1, planCodeVersion: PLAN_CODE_VERSION,
       items: itemViews,
+      /** Fix round 1 (P2-4): avisos del plan (quitar actividades, cambios masivos, muchos de riesgo alto). */
+      warnings,
       /** Lo que falta aprobar para generar el contenido de los ítems en etapa de estimado (estimado + tope propuesto). */
       generation,
       pending: requests.filter((r) => ['needs_answer', 'awaiting_confirmation', 'preparing'].includes(r.status)).map((r) => this.requestView(r)),

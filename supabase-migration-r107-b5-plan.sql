@@ -18,7 +18,8 @@
 --   workshop_ai_approvals  APROBACIÓN de gasto de IA (D8/D9: ninguna llamada a la IA sin ella): qué se aprueba
 --                        (interpretar una entrada / re-interpretar un pedido / generar el contenido de ítems), el
 --                        estimado mostrado, el TOPE aprobado (reservado de una vez en el ledger de FinOps: reservation_key),
---                        lo gastado y el estado (reserved → running → done | stopped (tope alcanzado) | failed).
+--                        lo gastado, cada llamada con su estado, y el estado (reserved → running → done | stopped (tope
+--                        alcanzado) | failed | ambiguous (una llamada con resultado desconocido: la reserva queda pendiente)).
 --
 -- Tablas NUEVAS; ninguna existente cambia (FK a workshop_sessions ON DELETE CASCADE). Aditiva e idempotente. RLS
 -- encendido y sin privilegios para anon/authenticated: solo el backend (service role). Mismo patrón que B1–B3.
@@ -108,6 +109,8 @@ create table if not exists public.workshop_plan_items (
   params         jsonb null,
   view           jsonb not null,
   risk_level     text not null check (risk_level in ('bajo', 'medio', 'alto')),
+  -- Fix round 1 (P2-4): riesgo alto → B6 exige confirmar este ítem por separado al aplicar.
+  requires_item_confirm boolean not null default false,
   spent_usd      numeric(14, 6) not null default 0,
   apply_expected_usd numeric(14, 6) not null default 0,
   created_at     timestamptz not null default now(),
@@ -129,7 +132,11 @@ create table if not exists public.workshop_ai_approvals (
   spent_usd        numeric(14, 6) not null default 0,
   ai_calls         integer not null default 0,
   reservation_key  text null,
-  status           text not null default 'reserved' check (status in ('reserved', 'running', 'done', 'stopped', 'failed')),
+  -- Fix round 1 (P1-1): cada llamada con su estado (sent → charged | not_charged | ambiguous | charge_unrecorded). La
+  -- reserva se libera SOLO si ninguna quedó con resultado desconocido o sin su cargo en el ledger; si no, la aprobación
+  -- queda `ambiguous` y la reserva PENDIENTE para conciliar (nunca gasto real sin registrar).
+  calls            jsonb not null default '{}'::jsonb,
+  status           text not null default 'reserved' check (status in ('reserved', 'running', 'done', 'stopped', 'failed', 'ambiguous')),
   stop_reason      text null,
   created_at       timestamptz not null default now(),
   updated_at       timestamptz not null default now()

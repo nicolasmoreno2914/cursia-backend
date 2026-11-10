@@ -21,7 +21,7 @@ import { xmlUnescape } from '../../visual-design/preview-extract';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import type { WorkshopAiResult, WorkshopTool } from './ai';
 import { WORKSHOP_INTERPRET_MAX_TOKENS, WORKSHOP_QUESTION_MAX_TOKENS, htmlMaxTokens, libroMaxTokens } from './ai';
-import { AiCallKind, ZERO_MEM, estimateAiCall, estimateLater, memOf, priceMeasured, sumUsd } from './cost';
+import { AiCallKind, WorkshopPricing, ZERO_MEM, estimateAiCall, estimateLater, memOf, modelOf, priceMeasured, sumUsd } from './cost';
 import { llmCallUpperBoundUsage } from '../../finops/llm-usage-ingest';
 import { decideRunSpend } from '../../finops/run-spend-guard';
 import { parseSafetyCapFactor, readSafetyCapFactor, safetyCapOf } from '../../finops/safety-cap';
@@ -31,7 +31,7 @@ import { SearchDoc, misalignmentWarnings, searchDocs } from './misalignment';
 import {
   CONTENT_SYSTEM, INTERPRET_SYSTEM, htmlTool, htmlUser, interpretTool, interpretUser, libroTool, libroUser, questionTool, questionUser, reinterpretUser,
 } from './prompts';
-import { riskOf } from './risk';
+import { requiresItemConfirm, riskOf } from './risk';
 import { activityLabel, activityOf, chapterPlainText, inventorySummary } from './summary';
 import { ClarifyAnswer, InterpretedRequest, MisalignmentWarning, PLAN_LIMITS, PlanItemView, RequestOperation } from './types';
 
@@ -66,13 +66,13 @@ export interface BuildCtx {
   course: WorkshopCourse;
   family: WorkshopFamily;
   builderLine: string;
-  pricing: DryRunPricing;
+  pricing: WorkshopPricing;
   baseline: { originalSha1: string; report: DiagnosisReport } | null;
   docs: SearchDoc[] | null;
   originalSha1: string;
 }
 
-export async function openBuildCtx(original: Buffer, opts: { filename?: string | null; originalSha1: string; pricing: DryRunPricing; baseline?: { originalSha1: string; report: DiagnosisReport } | null }): Promise<BuildCtx> {
+export async function openBuildCtx(original: Buffer, opts: { filename?: string | null; originalSha1: string; pricing: WorkshopPricing; baseline?: { originalSha1: string; report: DiagnosisReport } | null }): Promise<BuildCtx> {
   const pkg = await openMbz(original);
   const facts = await readPackageFacts(pkg, opts.filename ?? null);
   const family = familyOf(facts);
@@ -112,7 +112,7 @@ export interface InterpretOutcome {
   calls: number;
 }
 
-async function interpretLoop(ctx: BuildCtx, ai: AiInvoke, make: (retry: string[] | null) => string, quoteSource: string, single: boolean): Promise<InterpretOutcome> {
+async function interpretLoop(ctx: BuildCtx, ai: AiInvoke, make: (retry: string[] | null) => string, quoteSource: string, single: boolean, evidenceText?: string): Promise<InterpretOutcome> {
   let spent = '0';
   let calls = 0;
   let problems: string[] = [];
@@ -126,7 +126,7 @@ async function interpretLoop(ctx: BuildCtx, ai: AiInvoke, make: (retry: string[]
       continue;
     }
     try {
-      const raw = parseInterpretation(result.input, quoteSource, { single });
+      const raw = parseInterpretation(result.input, quoteSource, { single, evidenceText });
       return { ok: true, requests: raw.map((r) => resolveRequest(r, ctx.course)), reason: null, problems: [], spentUsd: spent, calls };
     } catch (e) {
       if (!(e instanceof InterpretationOutputError)) throw e;
@@ -150,7 +150,9 @@ export async function answerAndResolve(ctx: BuildCtx, req: InterpretedRequest, a
   if ('resolved' in a) return { ok: true, requests: [a.resolved], reason: null, problems: [], spentUsd: '0', calls: 0 };
   const inventory = inventorySummary(ctx.course);
   const previous = { operation: req.operation, instruction: req.instruction, target: req.rawTarget, questions: req.questions.map((q) => q.text) };
-  const out = await interpretLoop(ctx, ai, (retry) => reinterpretUser({ quote: req.quote, previous, qa: a.reinterpret, inventory }) + retryNote(retry), req.quote, true);
+  // La evidencia del destino / cambio puede venir de las RESPUESTAS del docente (fix round 1, P2-3).
+  const evidenceText = [req.quote, ...a.reinterpret.map((x) => x.answer)].join('\n');
+  const out = await interpretLoop(ctx, ai, (retry) => reinterpretUser({ quote: req.quote, previous, qa: a.reinterpret, inventory }) + retryNote(retry), req.quote, true, evidenceText);
   if (out.ok) out.requests = out.requests.map((r) => ({ ...r, details: { ...req.details, ...r.details } }));
   return out;
 }
@@ -204,8 +206,9 @@ export async function prepareItem(ctx: BuildCtx, req: InterpretedRequest, ai: Ai
       changes: [], files: [], entries: { added: [], removed: [], modified: [] },
       risk: riskOf({ operation: req.operation, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding }),
       cost: { spentUsd: '0', apply: memOf(est), contentEstimate: null, basis: `estimator ${est.estimatorVersion} · ${est.usageModelVersion} · ${ctx.pricing.source}: lo que costaría rehacerlo` },
-      misalignment: [], dryRun: null, generated: true,
+      misalignment: [], dryRun: null, generated: true, requiresItemConfirm: false,
     };
+    view.requiresItemConfirm = requiresItemConfirm(view.risk);
     return { status: 'phase_later', reason: 'Disponible en una fase posterior del Taller.', view, spentUsd: '0', calls: 0 };
   }
   if (req.status !== 'resolved' || !req.operation || !req.target) return { status: req.status === 'needs_answer' ? 'failed' : (req.status as PreparedItem['status']), reason: req.reason, view: null, spentUsd: '0', calls: 0 };
@@ -249,7 +252,9 @@ export async function prepareItem(ctx: BuildCtx, req: InterpretedRequest, ai: Ai
       misalignment: warnings,
       dryRun: { ok: true, failure: null, resolved: res.diagnosis?.resolved.length ?? 0, removed: res.diagnosis?.removed.length ?? 0, engineVersion: PATCH_ENGINE_VERSION },
       generated: true,
+      requiresItemConfirm: false,
     };
+    view.requiresItemConfirm = requiresItemConfirm(view.risk);
     return { status: 'resolved', reason: null, view, spentUsd: spent, calls };
   }
   return { status: 'failed', reason: `La IA no produjo un contenido válido tras el reintento (${(lastFailure?.message ?? problems.join('; ')).slice(0, 400)}). No se agregó al plan.`, view: null, spentUsd: spent, calls };
@@ -426,12 +431,12 @@ async function warningsFor(ctx: BuildCtx, req: InterpretedRequest, cand: Candida
 // ─── Estimado ANTES de gastar (ronda de decisiones: la IA solo corre con una aprobación y su tope) ─────────────
 
 /** Una llamada planeada: su estimado (estimator) y su COTA (entrada completa + max_tokens de salida, como el proxy). */
-export interface PlannedCall { kind: AiCallKind; promptChars: number; maxTokens: number; size: AiCall['size']; expectedUsd: string; boundUsd: string }
+export interface PlannedCall { model: string; kind: AiCallKind; promptChars: number; maxTokens: number; size: AiCall['size']; expectedUsd: string; boundUsd: string }
 
 class EstimateOnly extends Error { constructor(readonly call: AiCall) { super('estimate-only'); } }
 
-export function plannedCallOf(call: Pick<AiCall, 'kind' | 'size' | 'maxTokens'>, pricing: DryRunPricing): PlannedCall {
-  return { kind: call.kind, promptChars: call.size.promptChars, maxTokens: call.maxTokens, size: call.size, expectedUsd: estimateAiCall(call.kind, call.size, pricing).totals.expected, boundUsd: callBoundUsd(call.size.promptChars, call.maxTokens, pricing) };
+export function plannedCallOf(call: Pick<AiCall, 'kind' | 'size' | 'maxTokens'>, pricing: WorkshopPricing): PlannedCall {
+  return { model: modelOf(pricing), kind: call.kind, promptChars: call.size.promptChars, maxTokens: call.maxTokens, size: call.size, expectedUsd: estimateAiCall(call.kind, call.size, pricing).totals.expected, boundUsd: callBoundUsd(call.size.promptChars, call.maxTokens, pricing) };
 }
 
 /** Lo que costaría interpretar este texto (la primera llamada; el reintento por validación lo cubre el margen). */
@@ -464,20 +469,22 @@ export { needsContent };
 /** Vista del ítem en etapa de ESTIMADO: sin contenido generado, con lo que costaría generarlo (D8). */
 export function estimateItemView(ctx: Pick<BuildCtx, 'pricing'>, req: InterpretedRequest, call: PlannedCall, opts: { fromFinding?: boolean } = {}): PlanItemView {
   const est = memOf(estimateAiCall(call.kind, call.size, ctx.pricing));
+  const risk = riskOf({ operation: req.operation!, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding });
   return {
-    operation: req.operation!, params: null, available: true,
+    operation: req.operation!, params: null, available: true, requiresItemConfirm: requiresItemConfirm(risk),
     summary: `${summaryOf(req)} — el contenido nuevo se genera cuando apruebes su costo.`,
     changes: [], files: [], entries: { added: [], removed: [], modified: [] },
-    risk: riskOf({ operation: req.operation!, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding }),
+    risk,
     cost: { spentUsd: '0', apply: ZERO_MEM, contentEstimate: est, basis: 'estimado ANTES de generar (estimator de FinOps); la IA corre solo con tu aprobación y su tope' },
     misalignment: [], dryRun: null, generated: false, plannedCall: call,
   };
 }
 
 /** Cota USD de una llamada: entrada completa como escritura de caché (lo más caro) + max_tokens de salida. */
-export function callBoundUsd(promptChars: number, maxTokens: number, pricing: DryRunPricing): string {
+export function callBoundUsd(promptChars: number, maxTokens: number, pricing: WorkshopPricing): string {
   const u = llmCallUpperBoundUsage(promptChars, maxTokens);
-  return priceMeasured({ cache_creation_input_tokens: u.cache_write_tokens, output_tokens: u.output_tokens }, 'claude-sonnet-4-6', pricing);
+  // Fix round 1 (P2-1): con el modelo REAL del Taller; sin precio → ModelUnpricedError (no se llama).
+  return priceMeasured({ cache_creation_input_tokens: u.cache_write_tokens, output_tokens: u.output_tokens }, modelOf(pricing), pricing);
 }
 
 /**
@@ -497,7 +504,7 @@ export function proposedCapOf(calls: PlannedCall[], capFactor?: number): { expec
  * Guarda del tope aprobado ANTES de cada llamada (regla 1 de run-spend-guard: gastado + cota de esta llamada ≤
  * autorizado). Lo que no entra NO se llama: se corta limpio con el motivo visible.
  */
-export function capDecision(spentUsd: string, call: Pick<AiCall, 'size' | 'maxTokens'>, capUsd: string, pricing: DryRunPricing) {
+export function capDecision(spentUsd: string, call: Pick<AiCall, 'size' | 'maxTokens'>, capUsd: string, pricing: WorkshopPricing) {
   const bound = Number(callBoundUsd(call.size.promptChars, call.maxTokens, pricing));
   return decideRunSpend({ authorizedBudget: Number(capUsd), runSpent: Number(spentUsd), nextCost: bound, itemSpent: null, itemExpected: null, itemEstimatedMax: null, runExpected: null, progressExpected: null });
 }
