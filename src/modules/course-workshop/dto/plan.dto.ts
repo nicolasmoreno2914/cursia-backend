@@ -104,3 +104,11 @@ export class ApplyPlanDto {
   @Type(() => ApprovedItemDto)
   confirm?: ApprovedItemDto[];
 }
+
+/** r107 B6 · `POST …/sessions/:id/identification/confirm`: el candidato que el docente confirma como su curso. */
+export class ConfirmCandidateDto {
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  courseId: number;
+}

@@ -502,6 +502,76 @@ export class CourseWorkshopService {
     };
   }
 
+  /**
+   * r107 B6 (fix round 2, para B7 «Mis sesiones»): sesiones que el actor puede ver, de la más nueva a la más vieja,
+   * paginadas por cursor. Alcance = el de `loadForActor`: las propias; con RBAC en enforce, las de las instituciones
+   * donde tiene `courses.view`; SuperAdmin, todas. Sin el inventario (jsonb grande). Cada una con el título del curso
+   * identificado (si sigue en el alcance de la sesión) y un resumen de su última versión.
+   */
+  async listSessions(actor: WorkshopActor, q: { limit?: unknown; cursor?: unknown } = {}): Promise<{ sessions: Array<WorkshopSessionRecord & { identifiedCourseTitle: string | null; parentVersionId: string | null; latestVersion: unknown }>; nextCursor: string | null }> {
+    const limit = Math.min(Math.max(Number.parseInt(String(q.limit ?? '20'), 10) || 20, 1), 100);
+    let cur: { at: string; id: string } | null = null;
+    if (typeof q.cursor === 'string' && q.cursor) {
+      const [at, cid] = Buffer.from(q.cursor, 'base64url').toString('utf8').split('|');
+      if (!at || !Number.isFinite(Date.parse(at)) || !isUuid(cid ?? '')) throw new BadRequestException({ code: 'WORKSHOP_CURSOR_INVALID', message: 'El cursor de la lista no es válido.' });
+      cur = { at, id: cid.toLowerCase() };
+    }
+    const sa = this.superAdmin(actor);
+    let insts: string[] = [];
+    if (!sa && rbacMode() === 'enforce' && this.permissions) {
+      const ms = (await this.permissions.membershipsOf(actor.id)).filter((m) => m.status === 'active');
+      for (const m of ms) {
+        const d = await this.permissions.can({ id: actor.id, email: actor.email ?? null }, 'courses.view', m.institutionId, { concreteResource: true });
+        if (d.allowed) insts.push(String(m.institutionId).toLowerCase());
+      }
+    }
+    const rows = await this.q<any[]>(this.dataSource,
+      `select ${SESSION_COLS.split(',').map((c) => `s.${c.trim()}`).join(', ')}, s.parent_version_id::text as parent_version_id, s.created_at::text as created_key,
+              (select c.title from public.courses c where c.id = s.identified_course_id
+                 and (case when s.institution_id is not null then c.institution_id::text = s.institution_id::text else c.owner_id::text = s.owner_id::text end)) as course_title,
+              (select jsonb_build_object('id', v.id, 'number', v.number, 'status', v.status, 'restoreCheck', v.restore_check, 'createdAt', v.created_at, 'finishedAt', v.finished_at)
+                 from public.workshop_versions v where v.session_id = s.id order by v.created_at desc, v.id desc limit 1) as latest_version
+         from public.workshop_sessions s
+        where ($1::boolean or s.owner_id::text = $2::text or (s.institution_id is not null and s.institution_id::text = any($3::text[])))
+          and ($4::timestamptz is null or (s.created_at, s.id) < ($4::timestamptz, $5::uuid))
+        order by s.created_at desc, s.id desc limit $6`,
+      [sa, actor.id.toLowerCase(), insts, cur?.at ?? null, cur?.id ?? null, limit + 1]);
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    return {
+      sessions: page.map((r) => ({ ...this.toRecord(r as Row), identifiedCourseTitle: r.course_title ?? null, parentVersionId: r.parent_version_id ?? null, latestVersion: r.latest_version ?? null })),
+      // Cursor con la marca de tiempo COMPLETA (microsegundos): con milisegundos se saltearía o repetiría una fila.
+      nextCursor: rows.length > limit && last ? Buffer.from(`${last.created_key}|${last.id}`, 'utf8').toString('base64url') : null,
+    };
+  }
+
+  /**
+   * r107 B6 (fix round 2): el docente CONFIRMA cuál de los candidatos que propuso la identificación es su curso. Solo un
+   * candidato que el servidor produjo (`identification.result.candidates`) y que sigue en el alcance de la sesión; la
+   * fuente se vuelve a enganchar (el inventario se rearma). No si el plan ya se está aplicando o se aplicó.
+   */
+  async confirmCandidate(actor: WorkshopActor, id: string, courseIdRaw: unknown): Promise<WorkshopSessionRecord> {
+    let row = await this.loadForActor(actor, id, 'courses.edit');
+    row = await this.expireIfStale(row);
+    if (row.status !== 'identified' || !row.original_sha1) throw new ConflictException({ code: WORKSHOP_ERRORS.NOT_IDENTIFIED, message: 'Se puede confirmar el curso cuando termina la identificación.', status: row.status });
+    const courseId = Number(courseIdRaw);
+    const res = row.identification?.result as IdentificationResult | undefined;
+    const cand = (res?.candidates ?? []).find((c) => c.courseId === courseId);
+    if (!Number.isSafeInteger(courseId) || !cand) throw new BadRequestException({ code: 'WORKSHOP_CANDIDATE_INVALID', message: 'Ese curso no está entre los candidatos que encontró la identificación.' });
+    const [c] = await this.q<any[]>(this.dataSource, `select id from public.courses where id = $1 and (case when $2::text is not null then institution_id::text = $2::text else owner_id::text = $3::text end)`, [courseId, row.institution_id ?? null, row.owner_id]);
+    if (!c) throw new BadRequestException({ code: 'WORKSHOP_CANDIDATE_INVALID', message: 'Ese curso ya no está en el alcance de esta sesión.' });
+    const [busy] = await this.q<any[]>(this.dataSource, `select status from public.workshop_plans where session_id = $1 and original_sha1 = $2 and status in ('applying', 'applied')`, [row.id, row.original_sha1]).catch(() => [] as any[]);
+    if (busy) throw new ConflictException({ code: 'WORKSHOP_PLAN_APPLIED', message: 'El plan de esta sesión ya se aplicó (o se está aplicando): el curso ya no se cambia.', status: busy.status });
+    const result = { ...(res as IdentificationResult), courseId, needsConfirmation: false, notes: [...(res?.notes ?? []), `Curso confirmado por el docente: «${cand.title}».`] };
+    const ident = { ...(row.identification ?? {}), result, confirmedBy: { userId: actor.id, at: this.now().toISOString(), courseId }, inventory: { builtAt: null, reason: 'candidate_confirmed' } };
+    const [r] = returningRows(await this.q(this.dataSource,
+      `update public.workshop_sessions set identified_course_id = $2, identification = $3::jsonb, inventory = null, updated_at = now() where id = $1 and status = 'identified' and original_sha1 = $4 returning ${SESSION_COLS}`,
+      [row.id, courseId, JSON.stringify(ident), row.original_sha1])) as Row[];
+    if (!r) throw new ConflictException({ code: WORKSHOP_ERRORS.NOT_IDENTIFIED, message: 'La sesión cambió mientras confirmabas: vuelve a intentarlo.' });
+    await this.startInventoryRebuild(r); // la fuente del curso confirmado se engancha al rearmar el inventario
+    return this.toRecord(r);
+  }
+
   async get(actor: WorkshopActor, id: string): Promise<WorkshopSessionRecord> {
     let row = await this.loadForActor(actor, id, 'courses.view');
     row = await this.expireIfStale(row);

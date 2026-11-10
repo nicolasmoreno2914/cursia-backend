@@ -22,6 +22,8 @@
 //   A11 el informe recorta un antes/después enorme con aviso (el paquete lleva el texto completo); mismo plan → mismos bytes
 //   A13 (fix 1, P2-2) huella del contenido revisado: cambia con los parámetros o el antes/después; la del plan, con el
 //       orden y cada ítem; approvalMismatch detecta cambiados / faltantes / sobrantes / huella del plan
+//   A14 (fix 2, B7) filtro global de errores: los 4xx del Taller pasan SUS detalles (ids, bloqueos, estimado…) con su
+//       forma; nada para otros códigos ni para 5xx; claves que parecen secretas fuera; tamaño acotado
 //   A12 Libro v3 (PDF): con la entrada del builder SIN cambios se reproduce byte a byte el PDF del original; con el markdown
 //       nuevo del capítulo → PDF nuevo (lo arma el builder, no la IA) → el motor lo reemplaza en el original (blob +
 //       files.xml) y la versión pasa la compuerta y el validador; fuente que no reproduce / capítulo desconocido / sin
@@ -264,6 +266,23 @@ const sha = (alg, b) => crypto.createHash(alg).update(b).digest('hex');
     eq(A.approvalMismatch(cur, { planHash: ph, items, confirm: [] }), { changed: [], missing: [], extra: [], planHashOk: true }, 'igual');
     eq(A.approvalMismatch(cur, { planHash: ph, items: [{ ...items[0], contentHash: 'd'.repeat(64) }, { id: 'e5e5e5e5-5555-4555-8555-555555555555', contentHash: h }], confirm: [] }), { changed: [cur[0].id], missing: [cur[1].id], extra: ['e5e5e5e5-5555-4555-8555-555555555555'], planHashOk: true }, 'cambiado / faltante / sobrante');
     eq(A.approvalMismatch(cur, { planHash: 'f'.repeat(64), items, confirm: [] }).planHashOk, false, 'huella del plan');
+  });
+
+  await check('A14 (fix 2, B7) AllExceptionsFilter: un 409 del Taller llega con sus detalles (changedItemIds, blocking, failedItemId, estimate, version…); otro código o un 5xx no; secretos y formas inválidas fuera', async () => {
+    const FL = L('common/filters/http-exception.filter.js');
+    const { ConflictException, BadRequestException, InternalServerErrorException } = require('@nestjs/common');
+    const run = (exc) => { let out = null; const res = { status() { return this; }, json(b) { out = b; } }; new FL.AllExceptionsFilter().catch(exc, { switchToHttp: () => ({ getResponse: () => res, getRequest: () => ({ url: '/x', method: 'POST' }) }) }); return out; };
+    const id1 = '11111111-2222-4333-8444-555555555555';
+    const b = run(new ConflictException({ code: 'WORKSHOP_APPLY_PLAN_CHANGED', message: 'cambió', changedItemIds: [id1], missingItemIds: ['no-uuid'], planHash: 'a'.repeat(64), items: [{ id: id1, contentHash: 'b'.repeat(64), apiKey: 'sk-secreto' }], blocking: [{ itemId: id1, reason: 'sin generar' }], estimate: { expectedUsd: '0.10', proposedCapUsd: '0.15' }, failedItemId: id1, version: { id: id1, status: 'failed', signedUrl: 'https://x' }, internal: { password: 'x' }, stack: 'Error at…' }));
+    eq([b.code, b.error, b.changedItemIds, b.planHash, b.failedItemId, b.estimate.expectedUsd, b.blocking[0].reason], ['WORKSHOP_APPLY_PLAN_CHANGED', 'cambió', [id1], 'a'.repeat(64), id1, '0.10', 'sin generar'], 'detalles del Taller');
+    eq([b.missingItemIds, b.items[0].apiKey, b.version.signedUrl, b.internal, b.stack], [undefined, undefined, undefined, undefined, undefined], 'forma inválida, secretos y claves no listadas: fuera');
+    const o = run(new ConflictException({ code: 'OTRA_COSA', message: 'x', changedItemIds: [id1], blocking: [1], estimate: { a: 1 } }));
+    eq([o.changedItemIds, o.blocking, o.estimate], [undefined, undefined, undefined], 'otro código: nada nuevo');
+    const f = run(new InternalServerErrorException({ code: 'WORKSHOP_APPLY_FAILED', message: 'x', blocking: [{ a: 1 }] }));
+    eq(f.blocking, undefined, '5xx: nada');
+    const big = run(new BadRequestException({ code: 'WORKSHOP_X', message: 'x', items: Array.from({ length: 200 }, () => ({ t: 'y'.repeat(4000) })) }));
+    eq(big.items, undefined, 'más de 64 KB: fuera');
+    eq(FL.workshopErrorDetails({ code: 'WORKSHOP_A', status: 'applying' }), { status: 'applying' }, 'texto corto');
   });
 
   console.log(`\n${fail ? '❌' : '✅'} check-r107-apply --ci: ${ok}/${ok + fail}`);

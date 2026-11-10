@@ -65,6 +65,14 @@ export class AllExceptionsFilter implements ExceptionFilter {
       }
     }
 
+    // r107 B6 (fix round 2): detalles del Taller de cursos que el navegador necesita para explicar un 4xx (qué ítems
+    // cambiaron, qué falta confirmar, qué bloquea, el estimado vigente…). SOLO para errores con código del Taller
+    // (`WORKSHOP_*` / `COURSE_WORKSHOP_*`, que arma solo el Taller), SOLO 4xx y SOLO estas claves, cada una con su forma:
+    // ids → lista de uuids; textos acotados; objetos/listas → JSON acotado (64 KB) y sin claves que parezcan secretas.
+    if (message && typeof message === 'object' && status >= 400 && status < 500) {
+      Object.assign(errorResponse, workshopErrorDetails(message as Record<string, unknown>));
+    }
+
     if (status >= 500) {
       this.logger.error(
         `${request.method} ${request.url} → ${status}`,
@@ -74,4 +82,47 @@ export class AllExceptionsFilter implements ExceptionFilter {
 
     response.status(status).json(errorResponse);
   }
+}
+
+/** r107 B6: claves del cuerpo de los 4xx del Taller que pasan al navegador, con su forma. */
+export const WORKSHOP_ERROR_DETAIL_KEYS: Readonly<Record<string, 'ids' | 'id' | 'text' | 'hash' | 'json'>> = Object.freeze({
+  status: 'text', ledgerCode: 'text', model: 'text', approvalId: 'id', failedItemId: 'id', planHash: 'hash',
+  changedItemIds: 'ids', missingItemIds: 'ids', extraItemIds: 'ids', unknownItemIds: 'ids',
+  blocking: 'json', later: 'json', items: 'json', warnings: 'json', failure: 'json', estimate: 'json', version: 'json',
+});
+const WORKSHOP_CODE_RE = /^(COURSE_)?WORKSHOP_[A-Z0-9_]{1,80}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SECRET_KEY_RE = /pass(word)?|secret|token|api[-_]?key|authorization|service[-_]?role|credential|cookie|jwt|signed|url/i;
+const WORKSHOP_DETAIL_MAX_BYTES = 64 * 1024;
+
+function scrubDetail(v: unknown, depth = 0): unknown {
+  if (v === null || typeof v === 'number' || typeof v === 'boolean') return v;
+  if (typeof v === 'string') return v.length > 4000 ? `${v.slice(0, 4000)}…` : v;
+  if (depth > 6) return null;
+  if (Array.isArray(v)) return v.slice(0, 200).map((x) => scrubDetail(x, depth + 1));
+  if (typeof v === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) if (!SECRET_KEY_RE.test(k)) out[k] = scrubDetail(x, depth + 1);
+    return out;
+  }
+  return null;
+}
+
+/** Puro: los detalles permitidos de un cuerpo de error del Taller ({} si el código no es del Taller). */
+export function workshopErrorDetails(body: Record<string, unknown>): Record<string, unknown> {
+  if (typeof body.code !== 'string' || !WORKSHOP_CODE_RE.test(body.code)) return {};
+  const out: Record<string, unknown> = {};
+  for (const [k, kind] of Object.entries(WORKSHOP_ERROR_DETAIL_KEYS)) {
+    const v = body[k];
+    if (v === undefined || v === null) continue;
+    if (kind === 'ids') { if (Array.isArray(v) && v.length <= 200 && v.every((x) => typeof x === 'string' && UUID_RE.test(x))) out[k] = v; }
+    else if (kind === 'id') { if (typeof v === 'string' && UUID_RE.test(v)) out[k] = v; }
+    else if (kind === 'hash') { if (typeof v === 'string' && /^[0-9a-f]{64}$/.test(v)) out[k] = v; }
+    else if (kind === 'text') { if (typeof v === 'string' && v.length <= 120) out[k] = v; }
+    else {
+      const x = scrubDetail(v);
+      if (x !== null && JSON.stringify(x).length <= WORKSHOP_DETAIL_MAX_BYTES) out[k] = x;
+    }
+  }
+  return out;
 }

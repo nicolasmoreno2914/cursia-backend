@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
@@ -7,7 +7,7 @@ import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 import { CourseWorkshopFlagGuard } from './course-workshop-flag.guard';
 import { CourseWorkshopService, WorkshopActor } from './course-workshop.service';
 import { CreateWorkshopSessionDto } from './dto/create-workshop-session.dto';
-import { AnswerRequestDto, ApplyPlanDto, ConfirmSpendDto, CreateDocumentRequestDto, CreateTextRequestDto, GenerateItemsDto } from './dto/plan.dto';
+import { AnswerRequestDto, ApplyPlanDto, ConfirmCandidateDto, ConfirmSpendDto, CreateDocumentRequestDto, CreateTextRequestDto, GenerateItemsDto } from './dto/plan.dto';
 import { WorkshopPlanService } from './plan/workshop-plan.service';
 import { WorkshopApplyService } from './apply/workshop-apply.service';
 
@@ -36,6 +36,21 @@ export class CourseWorkshopController {
   @HttpCode(HttpStatus.ACCEPTED)
   uploaded(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.workshop.markUploaded(actorOf(user), id);
+  }
+
+  // r107 B6 · GET /api/v1/course-workshop/sessions?limit=&cursor= → { sessions (nuevas primero: estado, curso identificado,
+  // última versión), nextCursor }. Alcance: las propias; en enforce, las de sus instituciones con courses.view; SA todas.
+  @Get('sessions')
+  list(@Query('limit') limit: string | undefined, @Query('cursor') cursor: string | undefined, @CurrentUser() user: AuthUser) {
+    return this.workshop.listSessions(actorOf(user), { limit, cursor });
+  }
+
+  // r107 B6 · POST /api/v1/course-workshop/sessions/:id/identification/confirm { courseId } → sesión con el curso confirmado
+  // (solo un candidato que propuso la identificación y que sigue en el alcance; el inventario se rearma con su fuente)
+  @Post('sessions/:id/identification/confirm')
+  @HttpCode(HttpStatus.OK)
+  confirmCandidate(@Param('id') id: string, @Body() body: ConfirmCandidateDto, @CurrentUser() user: AuthUser) {
+    return this.workshop.confirmCandidate(actorOf(user), id, body.courseId);
   }
 
   // GET /api/v1/course-workshop/sessions/:id → sesión (estado, familia, curso identificado, método y confianza)

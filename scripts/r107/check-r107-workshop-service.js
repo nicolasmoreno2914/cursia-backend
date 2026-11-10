@@ -88,7 +88,7 @@
 //   subir → objeto borrado · W68 P2-4 presupuesto de memoria compartido (identificación + diagnóstico + aplicar) · W69 P2-1
 //   barrido de B5 sin abrir la sesión · W62 + P2-5 descarga genérica de archivos del Taller bloqueada
 //   Fix round 2: W70 N1 cola de memoria FIFO (el grande no se queda sin turno) · W71 N1 espera máxima · W57/W66 prueba
-//   en seco vencida por huella de contenido
+//   en seco vencida por huella de contenido · W72 GET /sessions («Mis sesiones») · W73 confirmar un candidato
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -1996,6 +1996,7 @@ function rawZip(entries) {
       eq([SVC.workshopMemoryMaxWaitMs({}), SVC.workshopMemoryMaxWaitMs({ COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN: '5' }), SVC.workshopMemoryMaxWaitMs({ COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN: 'x' })], [30 * 60000, 5 * 60000, 30 * 60000], 'plazo por env (30 min por defecto)');
     });
 
+
     await check('W69 (fix 1, P2-1) BARRIDO de B5 sin abrir la sesión: una aprobación `running` de un proceso muerto (llamada en vuelo) pasa a `ambiguous` con la reserva PENDIENTE (visible para la conciliación); una entrada colgada de otro arranque se marca interrumpida; lo que late no se toca', async () => {
       const res = await newIdentified('b6-barrido-b5.mbz');
       const sid = res.session.id;
@@ -2202,6 +2203,61 @@ function rawZip(entries) {
         fs.writeFileSync(path.join(dir, 'versions.json'), JSON.stringify({ builtAt: new Date().toISOString(), versions: out }, null, 2));
       });
     }
+
+    await check('W72 (fix 2, B7) GET /course-workshop/sessions: las propias de la más nueva a la más vieja, paginadas por cursor, con estado, curso identificado y última versión; ajeno no ve nada; SuperAdmin todas; miembro solo con RBAC enforce y solo las de su institución; cursor inválido → 400', async () => {
+      const all = [];
+      let cursor = null;
+      for (let i = 0; i < 50; i++) { const pg = await svc.listSessions(OWNER, { limit: 7, cursor }); all.push(...pg.sessions); cursor = pg.nextCursor; if (!cursor) break; }
+      const [n] = await ds.query(`select count(*)::int n from public.workshop_sessions where owner_id = $1`, [OWNER.id]);
+      eq([all.length, new Set(all.map((x) => x.id)).size], [n.n, n.n], 'todas las propias, sin repetir, en páginas');
+      const dbOrder = (await ds.query(`select id from public.workshop_sessions where owner_id = $1 order by created_at desc, id desc`, [OWNER.id])).map((x) => x.id);
+      eq(all.map((x) => x.id), dbOrder, 'de la más nueva a la más vieja (con páginas de 7, sin saltos ni repetidas)');
+      const s1 = all.find((x) => x.id === b6.sid);
+      eq([s1.status, s1.identifiedCourseTitle, s1.latestVersion && s1.latestVersion.number, s1.latestVersion && s1.latestVersion.status, s1.latestVersion && s1.latestVersion.restoreCheck], ['identified', 'Curso propio', 1, 'ready', 'not_available'], 'curso identificado + última versión');
+      eq(all.find((x) => x.id === b6.child.sid).parentVersionId, b6.version.id, 'la hija (W60) dice de qué versión viene');
+      assert(!('inventory' in s1) || s1.inventory === null || typeof s1.inventory === 'object', 'sin el inventario completo');
+      const oth = (await svc.listSessions(OTHER, { limit: 100 })).sessions;
+      assert(oth.every((x) => !all.some((y) => y.id === x.id)), 'ajeno: ninguna de las del dueño (solo las suyas)');
+      const [no] = await ds.query(`select count(*)::int n from public.workshop_sessions where owner_id = $1`, [OTHER.id]);
+      eq(oth.length, no.n, 'las suyas');
+      assert((await svc.listSessions(ADMIN, { limit: 100 })).sessions.length >= Math.min(n.n, 100), 'SuperAdmin: todas');
+      process.env.CURSIA_RBAC_MODE = 'enforce';
+      let instS;
+      try {
+        instS = (await svc.createSession(OWNER, { filename: 'b6-inst.mbz', sizeBytes: MBZ.length }, INST)).session;
+        const mem = (await svc.listSessions(MEMBER, { limit: 100 })).sessions;
+        assert(mem.some((x) => x.id === instS.id) && mem.every((x) => x.institutionId === INST || x.ownerIdIsActor), 'miembro: la de su institución');
+        assert(!mem.some((x) => all.some((y) => y.id === x.id && y.institutionId !== INST)), 'miembro: ninguna personal del dueño');
+      } finally { delete process.env.CURSIA_RBAC_MODE; }
+      const memOff = (await svc.listSessions(MEMBER, { limit: 100 })).sessions;
+      assert(!memOff.some((x) => x.id === instS.id), 'sin enforce: el miembro no ve la de la institución');
+      const [nm] = await ds.query(`select count(*)::int n from public.workshop_sessions where owner_id = $1`, [MEMBER.id]);
+      eq(memOff.length, nm.n, 'sin enforce: solo las suyas');
+      await rejects(svc.listSessions(OWNER, { cursor: 'basura' }), 400, 'WORKSHOP_CURSOR_INVALID', 'cursor');
+      const CTRLW = D('modules/course-workshop/course-workshop.controller.js');
+      const routes = Object.getOwnPropertyNames(CTRLW.CourseWorkshopController.prototype);
+      assert(routes.includes('list') && routes.includes('confirmCandidate'), 'rutas en el controlador');
+    });
+
+    await check('W73 (fix 2, B7) confirmar un CANDIDATO de la identificación: solo uno que el servidor propuso y que sigue en el alcance; ajeno 404; fuera de la lista / de otra cuenta → 400; confirmado → curso de la sesión + el inventario se rearma con su fuente; plan aplicado → 409', async () => {
+      const res = await newIdentified('b6-candidato.mbz');
+      const sid = res.session.id;
+      await ds.query(`update public.workshop_sessions set identified_course_id = null,
+          identification = jsonb_set(jsonb_set(identification, '{result,courseId}', 'null'::jsonb), '{result,candidates}', $2::jsonb) where id = $1`,
+        [sid, JSON.stringify([{ courseId: Number(own.id), title: 'Curso propio', score: 0.7, confidence: 'medium', reasons: ['título'] }, { courseId: Number(foreign.id), title: 'otro', score: 0.6, confidence: 'low', reasons: ['x'] }])]);
+      await rejects(svc.confirmCandidate(OTHER, sid, Number(own.id)), 404, null, 'ajeno');
+      await rejects(svc.confirmCandidate(OWNER, sid, 999999), 400, 'WORKSHOP_CANDIDATE_INVALID', 'no es candidato');
+      await rejects(svc.confirmCandidate(OWNER, sid, Number(foreign.id)), 400, 'WORKSHOP_CANDIDATE_INVALID', 'candidato fuera del alcance (otra cuenta)');
+      const r = await svc.confirmCandidate(OWNER, sid, Number(own.id));
+      eq([r.identifiedCourseId, r.identification.needsConfirmation], [Number(own.id), false], 'confirmado');
+      assert(r.identification.notes.some((x) => /confirmado por el docente/.test(x)), 'lo dice');
+      await settle(`inventory:${sid}`);
+      const inv = await svc.getInventory(OWNER, sid);
+      eq([inv.status, inv.inventory && inv.inventory.sourceLookup && inv.inventory.sourceLookup.courseId], ['ready', Number(own.id)], 'inventario rearmado con la fuente del curso');
+      await rejects(svc.confirmCandidate(OWNER, b6.sid, Number(own.id)), 400, 'WORKSHOP_CANDIDATE_INVALID', 'sesión sin ese candidato');
+      await ds.query(`update public.workshop_sessions set identification = jsonb_set(identification, '{result,candidates}', $2::jsonb) where id = $1`, [b6.sid, JSON.stringify([{ courseId: Number(own.id), title: 'Curso propio', score: 1, confidence: 'high', reasons: [] }])]);
+      await rejects(svc.confirmCandidate(OWNER, b6.sid, Number(own.id)), 409, 'WORKSHOP_PLAN_APPLIED', 'plan aplicado: ya no se cambia');
+    });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {
       const g = new GUARD.CourseWorkshopFlagGuard();
