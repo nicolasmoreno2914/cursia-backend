@@ -1,4 +1,5 @@
-import { BadRequestException, ConflictException, Inject, Injectable, Logger, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Inject, Injectable, Logger, NotFoundException, OnModuleDestroy, OnModuleInit, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { isCourseWorkshopEnabled } from '../../features/course-workshop-flag';
 import { createHash, randomUUID } from 'crypto';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../../common/db/returning-rows';
@@ -11,7 +12,7 @@ import { loadDryRunPricing } from '../../finops/dry-run-pricing';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import { readDocument, DocumentReadError } from '../../academic-context';
 import { isUuid } from '../../authz/schema-probe';
-import { CourseWorkshopService, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
+import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
 import { DIAGNOSIS_CODE_VERSION, DiagnosisReport } from '../diagnosis/diagnose';
 import type { Finding } from '../diagnosis/finding';
 import type { WorkshopCourse } from '../course-model';
@@ -25,6 +26,7 @@ import { ApprovalCall, callErrorOutcome, closeReservation } from './approval-led
 import { requestFromFinding } from './from-finding';
 import { AnswerError, checkAnswers, resolveRequest } from './interpret';
 import { planWarnings } from './risk';
+import { itemContentHash, planContentHash, selectApplyItems } from '../apply/apply-core';
 import {
   ClarifyAnswer, DOCUMENT_EXTENSIONS, InterpretedRequest, IntakeSource, LATER_OPERATIONS, MisalignmentWarning, PLAN_CODE_VERSION, PLAN_LIMITS, PlanItemView, RequestStatus,
 } from './types';
@@ -81,10 +83,21 @@ export const PLAN_ERRORS = Object.freeze({
   PREPARE_FAILED: 'WORKSHOP_PLAN_ITEM_FAILED',
   AI_UNAVAILABLE: 'WORKSHOP_AI_UNAVAILABLE',
   USER_BUDGET_INSUFFICIENT: 'USER_BUDGET_INSUFFICIENT',
+  PLAN_APPLYING: 'WORKSHOP_PLAN_APPLYING',
+  PLAN_APPLIED: 'WORKSHOP_PLAN_APPLIED',
 });
 
-/** Una entrada / pedido en curso más viejo que esto, sin trabajo vivo en este proceso, se da por interrumpido. */
+/**
+ * Una entrada / pedido / aprobación en curso SIN reclamo (filas anteriores a B6) más vieja que esto se da por interrumpida.
+ * r107 B6 (requisito de B5): con reclamo `<arranque>.<uuid>` + latido, una fila de OTRO arranque se da por interrumpida
+ * recién cuando deja de latir PLAN_HEARTBEAT_STALE_MS (3 latidos); la de ESTE arranque, cuando ya no la tiene ningún
+ * trabajo vivo. Así un trabajo largo de otro proceso nunca se corta a los 15 min, y uno muerto se ve en ~30 s.
+ */
 export const PLAN_STALE_MS = 15 * 60_000;
+export const PLAN_HEARTBEAT_MS = 10_000;
+export const PLAN_HEARTBEAT_STALE_MS = 3 * PLAN_HEARTBEAT_MS;
+/** Fix round 1 (P2-1): barrido de B5 en cada proceso de la API con el flag encendido. */
+export const PLAN_SWEEP_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 2 * 60_000;
 
 type Q = { query: (sql: string, params?: unknown[]) => Promise<any> };
@@ -133,7 +146,7 @@ export function approvalReservationInput(a: { approvalId: string; payer: string;
 }
 
 @Injectable()
-export class WorkshopPlanService {
+export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WorkshopPlanService.name);
   private readonly client: WorkshopAiClient & { simulated?: boolean };
   /** Precios del estimator (catálogo de la base o el seed). Reemplazable en pruebas. */
@@ -157,10 +170,13 @@ export class WorkshopPlanService {
   readonly inFlight = new Map<string, Promise<void>>();
   /** Llamadas efectivas al cliente de IA de este proceso (las pruebas lo leen). */
   aiCalls = 0;
-  private readonly queue: Array<{ job: Job; done: () => void }> = [];
+  private readonly queue: Array<{ job: Job; done: () => void; stamped: Promise<void>; claimId: string }> = [];
   private laneBusy = false;
   /** Entradas / pedidos / aprobaciones con trabajo en cola o corriendo en ESTE proceso. */
   private readonly activeIds = new Set<string>();
+  /** r107 B6: reclamos de este proceso que se laten (trabajos en cola o corriendo). */
+  private readonly beating = new Set<string>();
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly dataSource: DataSource,
@@ -195,20 +211,72 @@ export class WorkshopPlanService {
     const key = `${job.kind}:${id ?? job.sessionId}:${randomUUID()}`;
     if (id) this.activeIds.add(id);
     if ('approvalId' in job) this.activeIds.add(job.approvalId);
+    // r107 B6: reclamo entre procesos (como el diagnóstico de B3): las filas del trabajo llevan `<arranque>.<uuid>` y este
+    // proceso las late mientras el trabajo está en cola o corriendo.
+    const claimId = `${this.workshop.bootId}.${randomUUID()}`;
+    this.beat(claimId, true);
+    const stamped = this.stamp(job, claimId).catch((err) => this.logger.warn(`taller plan: no se pudo marcar el reclamo (${err instanceof Error ? err.message : String(err)})`));
     let done!: () => void;
-    const p = new Promise<void>((r) => { done = r; }).finally(() => { this.inFlight.delete(key); if (id) this.activeIds.delete(id); if ('approvalId' in job) this.activeIds.delete(job.approvalId); });
+    const p = new Promise<void>((r) => { done = r; }).finally(() => { this.inFlight.delete(key); if (id) this.activeIds.delete(id); if ('approvalId' in job) this.activeIds.delete(job.approvalId); this.beat(claimId, false); });
     this.inFlight.set(key, p);
-    this.queue.push({ job, done });
+    this.queue.push({ job, done, stamped, claimId });
     this.pump();
   }
 
+  /** Marca con el reclamo las filas EN CURSO del trabajo (entrada, pedido, aprobación y los pedidos de una generación). */
+  private async stamp(job: Job, claimId: string): Promise<void> {
+    if ('intakeId' in job) await this.q(this.dataSource, `update public.workshop_intakes set claim_id = $2, updated_at = now() where id = $1 and status in ('queued', 'interpreting', 'extracting')`, [job.intakeId, claimId]);
+    if ('requestId' in job) await this.q(this.dataSource, `update public.workshop_requests set claim_id = $2, updated_at = now() where id = $1 and status = 'preparing'`, [job.requestId, claimId]);
+    if ('approvalId' in job) {
+      await this.q(this.dataSource, `update public.workshop_ai_approvals set claim_id = $2, updated_at = now() where id = $1 and status in ('reserved', 'running')`, [job.approvalId, claimId]);
+      if (job.kind === 'generate') {
+        await this.q(this.dataSource, `update public.workshop_requests r set claim_id = $2, updated_at = now() from public.workshop_ai_approvals a, public.workshop_plan_items i
+            where a.id = $1 and i.id::text in (select jsonb_array_elements_text(a.item_ids)) and r.id = i.request_id and r.status = 'preparing'`, [job.approvalId, claimId]);
+      }
+    }
+  }
+
+  private beat(claimId: string, on: boolean): void {
+    if (on) this.beating.add(claimId); else this.beating.delete(claimId);
+    if (this.beating.size && !this.heartbeatTimer) {
+      this.heartbeatTimer = setInterval(() => { void this.heartbeat(); }, PLAN_HEARTBEAT_MS);
+      this.heartbeatTimer.unref?.();
+    } else if (!this.beating.size && this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /** Latido (r107 B6): refresca `updated_at` de las filas en curso que este proceso tiene reclamadas. */
+  async heartbeat(): Promise<void> {
+    if (!this.beating.size) return;
+    const claims = [...this.beating];
+    try {
+      await this.q(this.dataSource, `update public.workshop_intakes set updated_at = now() where claim_id = any($1::text[]) and status in ('queued', 'interpreting', 'extracting')`, [claims]);
+      await this.q(this.dataSource, `update public.workshop_requests set updated_at = now() where claim_id = any($1::text[]) and status = 'preparing'`, [claims]);
+      await this.q(this.dataSource, `update public.workshop_ai_approvals set updated_at = now() where claim_id = any($1::text[]) and status in ('reserved', 'running')`, [claims]);
+    } catch (err) {
+      this.logger.warn(`taller plan: latido falló: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** SOLO pruebas: simula que este proceso murió (deja de latir y de tomar trabajo). */
+  simulateDeathForTests(): void {
+    this.beating.clear();
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    this.queue.length = 0;
+    this.dead = true;
+  }
+  private dead = false;
+
   /** Carril de 1 por proceso (cada trabajo tiene el original en memoria y corre pruebas en seco del motor). */
   private pump(): void {
-    if (this.laneBusy) return;
+    if (this.laneBusy || this.dead) return;
     const next = this.queue.shift();
     if (!next) return;
     this.laneBusy = true;
-    this.runJob(next.job)
+    next.stamped.then(() => this.runJob(next.job, next.claimId))
       .catch((err) => this.logger.error(`taller plan: trabajo ${next.job.kind} terminó con error: ${err instanceof Error ? err.stack ?? err.message : String(err)}`))
       .finally(() => { this.laneBusy = false; next.done(); this.pump(); });
   }
@@ -404,6 +472,7 @@ export class WorkshopPlanService {
 
   async createTextIntake(actor: WorkshopActor, sessionId: string, rawText: unknown) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const text = typeof rawText === 'string' ? rawText.replace(/\r\n/g, '\n').trim() : '';
     if (!text) throw new BadRequestException({ code: PLAN_ERRORS.TEXT_EMPTY, message: 'Escribe qué quieres cambiar del curso.' });
     if (text.length > PLAN_LIMITS.textMaxChars) throw new BadRequestException({ code: PLAN_ERRORS.TEXT_TOO_LONG, message: `El pedido es demasiado largo (máximo ${PLAN_LIMITS.textMaxChars} caracteres): envía solo los cambios.` });
@@ -417,6 +486,7 @@ export class WorkshopPlanService {
   /** (a) Aprobar el costo de interpretar una entrada → reserva del tope → recién ahí corre la IA. */
   async confirmInterpretation(actor: WorkshopActor, sessionId: string, intakeId: string, input: { confirmEstimateUsd: unknown; capUsd: unknown }) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const row = await this.intakeOf(s.id, intakeId);
     if (row.status !== 'awaiting_confirmation' || !row.estimate) throw new ConflictException({ code: PLAN_ERRORS.NOT_AWAITING_CONFIRMATION, message: 'Esta entrada no está esperando que apruebes su costo.', status: row.status });
     const cap = this.validateConfirmation(row.estimate, input);
@@ -429,6 +499,7 @@ export class WorkshopPlanService {
 
   async createDocumentIntake(actor: WorkshopActor, sessionId: string, input: { filename: unknown; sizeBytes: unknown }) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const base = typeof input.filename === 'string' ? (input.filename.split(/[\\/]/).pop() ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 255) : '';
     const ext = (/\.[a-z0-9]+$/i.exec(base)?.[0] ?? '').toLowerCase();
     if (!base || !(DOCUMENT_EXTENSIONS as readonly string[]).includes(ext)) throw new BadRequestException({ code: PLAN_ERRORS.DOCUMENT_INVALID, message: 'Sube un documento .docx, .pdf, .txt o .md con los cambios.' });
@@ -454,6 +525,7 @@ export class WorkshopPlanService {
   /** Cierra la subida: se extrae el texto (sin IA) y la entrada queda esperando que se apruebe su interpretación. */
   async markDocumentUploaded(actor: WorkshopActor, sessionId: string, intakeId: string) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const row = await this.intakeOf(s.id, intakeId);
     if (row.source !== 'document') throw new BadRequestException({ code: PLAN_ERRORS.DOCUMENT_INVALID, message: 'Esta entrada no es un documento.' });
     if (row.status !== 'awaiting_upload') return this.intakeView(row);
@@ -484,6 +556,7 @@ export class WorkshopPlanService {
    */
   async answer(actor: WorkshopActor, sessionId: string, requestId: string, answers: ClarifyAnswer[]) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const row = await this.requestOf(s.id, requestId);
     if (row.status !== 'needs_answer') throw new ConflictException({ code: PLAN_ERRORS.NOT_WAITING, message: 'Este pedido no está esperando respuestas.' });
     if (row.rounds >= PLAN_LIMITS.roundsMax) throw new ConflictException({ code: PLAN_ERRORS.ROUNDS_EXHAUSTED, message: 'Este pedido ya tuvo demasiadas rondas de preguntas: retíralo y escríbelo de nuevo con más detalle.' });
@@ -516,6 +589,7 @@ export class WorkshopPlanService {
   /** Aprobar el costo de re-interpretar un pedido con sus respuestas. */
   async confirmReinterpretation(actor: WorkshopActor, sessionId: string, requestId: string, input: { confirmEstimateUsd: unknown; capUsd: unknown }) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const row = await this.requestOf(s.id, requestId);
     if (row.status !== 'awaiting_confirmation' || !row.estimate) throw new ConflictException({ code: PLAN_ERRORS.NOT_AWAITING_CONFIRMATION, message: 'Este pedido no está esperando que apruebes su costo.', status: row.status });
     const cap = this.validateConfirmation(row.estimate, input);
@@ -528,6 +602,7 @@ export class WorkshopPlanService {
 
   async withdraw(actor: WorkshopActor, sessionId: string, requestId: string) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const row = await this.requestOf(s.id, requestId);
     const [r] = returningRows(await this.q(this.dataSource, `update public.workshop_requests set status = 'withdrawn', updated_at = now() where id = $1 returning *`, [row.id]));
     await this.q(this.dataSource, `update public.workshop_plan_items set status = 'removed', updated_at = now() where request_id = $1`, [row.id]);
@@ -549,6 +624,7 @@ export class WorkshopPlanService {
    */
   async approveGeneration(actor: WorkshopActor, sessionId: string, planId: string, input: { itemIds: unknown; capUsd: unknown; confirmEstimateUsd: unknown }) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     if (!isUuid(planId)) throw new NotFoundException('Plan no encontrado');
     const [plan] = await this.q<any[]>(this.dataSource, `select id from public.workshop_plans where id = $1 and session_id = $2 and original_sha1 = $3`, [planId.toLowerCase(), s.id, s.originalSha1]);
     if (!plan) throw new NotFoundException('Plan no encontrado');
@@ -573,6 +649,7 @@ export class WorkshopPlanService {
 
   async setItemStatus(actor: WorkshopActor, sessionId: string, itemId: string, status: 'proposed' | 'removed') {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const item = await this.itemOf(s, itemId);
     if (status === 'proposed') {
       const [req] = await this.q<RequestRow[]>(this.dataSource, `select status from public.workshop_requests where id = $1`, [item.request_id]);
@@ -586,6 +663,7 @@ export class WorkshopPlanService {
   /** Aviso de desalineación → pedido APARTE (D7). Idempotente por (ítem, aviso). Queda en etapa de estimado si necesita IA. */
   async addWarning(actor: WorkshopActor, sessionId: string, itemId: string, warningId: string) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     const item = await this.itemOf(s, itemId);
     const w = (item.view.misalignment ?? []).find((x: MisalignmentWarning) => x.id === warningId);
     if (!w || !w.suggestedOperation || !w.activity) throw new BadRequestException({ code: PLAN_ERRORS.WARNING_NOT_ADDABLE, message: 'Este aviso no se puede agregar como pedido (no hay una operación del Taller que lo arregle).' });
@@ -607,6 +685,7 @@ export class WorkshopPlanService {
   /** «Arreglar esto» desde un hallazgo del diagnóstico listo de ESTE original. Idempotente por hallazgo; sin IA de interpretación. */
   async fixFinding(actor: WorkshopActor, sessionId: string, findingId: string) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
+    await this.assertPlanEditable(s);
     if (typeof findingId !== 'string' || !/^T\d{2}\.[a-z0-9_]+\.[0-9a-f]{12}$/.test(findingId)) throw new NotFoundException({ code: PLAN_ERRORS.FINDING_NOT_FOUND, message: 'Hallazgo no encontrado.' });
     const [d] = await this.q<any[]>(this.dataSource, `select id, status from public.workshop_diagnoses where session_id = $1 and original_sha1 = $2 and code_version = $3`, [s.id, s.originalSha1, DIAGNOSIS_CODE_VERSION]);
     if (!d || d.status !== 'ready') throw new ConflictException({ code: PLAN_ERRORS.DIAGNOSIS_NOT_READY, message: 'Primero hay que diagnosticar el paquete (o esperar a que termine el diagnóstico).' });
@@ -630,7 +709,7 @@ export class WorkshopPlanService {
 
   // ── trabajo en segundo plano ──
 
-  private async runJob(job: Job): Promise<void> {
+  private async runJob(job: Job, claimId: string = `${this.workshop.bootId}.${randomUUID()}`): Promise<void> {
     const s = await this.workshop.planSessionById(job.sessionId);
     if (!s || s.status !== 'identified' || !s.originalSha1) {
       await this.failJob(job, WORKSHOP_ERRORS.ORIGINAL_CHANGED, 'El original de la sesión ya no está disponible.', false);
@@ -638,36 +717,42 @@ export class WorkshopPlanService {
     }
     if (job.kind === 'extract') { await this.runExtract(s, job.intakeId); return; }
     if (job.kind === 'interpret') {
-      const [claimed] = returningRows(await this.q(this.dataSource, `update public.workshop_intakes set status = 'interpreting', claim_id = $2, updated_at = now() where id = $1 and status = 'queued' returning *`, [job.intakeId, randomUUID()]));
+      const [claimed] = returningRows(await this.q(this.dataSource, `update public.workshop_intakes set status = 'interpreting', claim_id = $2, updated_at = now() where id = $1 and status = 'queued' returning *`, [job.intakeId, claimId]));
       if (!claimed) { await this.closeApproval(job.approvalId, 'failed', 'La entrada ya no estaba en cola.'); return; }
     }
     if ('approvalId' in job) await this.q(this.dataSource, `update public.workshop_ai_approvals set status = 'running', updated_at = now() where id = $1 and status = 'reserved'`, [job.approvalId]);
     const bytes = Number(s.originalSize ?? 0) * diagnosisMemoryFactor(s.container);
-    await this.workshop.withMemory(`plan:${job.sessionId}`, bytes, async () => {
-      let ctx: BuildCtx;
-      try {
-        const original = await this.workshop.loadVerifiedOriginal(s.id);
-        ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
-      } catch (err) {
-        const body = (err as { getResponse?: () => any })?.getResponse?.();
-        const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
-        await this.failJob(job, code, String(body?.message ?? 'No se pudo abrir el original de la sesión; vuelve a intentarlo.'), code !== WORKSHOP_ERRORS.ORIGINAL_CHANGED && code !== WORKSHOP_ERRORS.ORIGINAL_MISSING);
-        return;
-      }
-      try {
-        if (job.kind === 'interpret') await this.runInterpret(s, ctx, job.intakeId, job.approvalId);
-        else if (job.kind === 'reinterpret') await this.runReinterpret(s, ctx, job.requestId, job.approvalId);
-        else if (job.kind === 'stage') await this.runStage(s, ctx, job.requestId);
-        else if (job.kind === 'generate') await this.runGenerate(s, ctx, job.approvalId);
-      } catch (err) {
-        if (err instanceof AiUnavailableError) await this.failJob(job, err.code, err.message, true, err.extra);
-        else {
-          this.logger.error(`taller plan ${s.id}: ${job.kind} falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-          await this.failJob(job, PLAN_ERRORS.PREPARE_FAILED, 'No se pudo procesar el pedido; vuelve a intentarlo. Si se repite, avísanos.', true);
+    try {
+      await this.workshop.withMemory(`plan:${job.sessionId}`, bytes, async () => {
+        let ctx: BuildCtx;
+        try {
+          const original = await this.workshop.loadVerifiedOriginal(s.id);
+          ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
+        } catch (err) {
+          const body = (err as { getResponse?: () => any })?.getResponse?.();
+          const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
+          await this.failJob(job, code, String(body?.message ?? 'No se pudo abrir el original de la sesión; vuelve a intentarlo.'), code !== WORKSHOP_ERRORS.ORIGINAL_CHANGED && code !== WORKSHOP_ERRORS.ORIGINAL_MISSING);
+          return;
         }
-      }
-      await this.refreshCombined(s, ctx).catch((err) => this.logger.error(`taller plan ${s.id}: prueba en seco combinada: ${err instanceof Error ? err.message : String(err)}`));
-    });
+        try {
+          if (job.kind === 'interpret') await this.runInterpret(s, ctx, job.intakeId, job.approvalId);
+          else if (job.kind === 'reinterpret') await this.runReinterpret(s, ctx, job.requestId, job.approvalId);
+          else if (job.kind === 'stage') await this.runStage(s, ctx, job.requestId);
+          else if (job.kind === 'generate') await this.runGenerate(s, ctx, job.approvalId);
+        } catch (err) {
+          if (err instanceof AiUnavailableError) await this.failJob(job, err.code, err.message, true, err.extra);
+          else {
+            this.logger.error(`taller plan ${s.id}: ${job.kind} falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+            await this.failJob(job, PLAN_ERRORS.PREPARE_FAILED, 'No se pudo procesar el pedido; vuelve a intentarlo. Si se repite, avísanos.', true);
+          }
+        }
+        await this.refreshCombined(s, ctx).catch((err) => this.logger.error(`taller plan ${s.id}: prueba en seco combinada: ${err instanceof Error ? err.message : String(err)}`));
+      });
+    } catch (err) {
+      // r107 B6 fix round 2 (N1): la espera por memoria venció → falla visible y reintentable (nunca espera para siempre).
+      if (err instanceof MemoryWaitTimeoutError) { await this.failJob(job, err.code, err.message, true); return; }
+      throw err;
+    }
   }
 
   private async failJob(job: Job, code: string, message: string, retryable: boolean, extra: Record<string, unknown> = {}): Promise<void> {
@@ -883,6 +968,11 @@ export class WorkshopPlanService {
   }
 
   private async upsertItem(s: WorkshopPlanSession, requestId: string, view: PlanItemView, stage: 'estimate' | 'ready'): Promise<void> {
+    // r107 B6: un plan que ya se está aplicando (o se aplicó) no cambia: lo que se aplica quedó congelado en la versión.
+    if (!(await this.planEditableNow(s))) {
+      await this.setRequest(requestId, { status: 'failed', reason: 'El plan ya se estaba aplicando (o ya se aplicó) cuando este pedido terminó de prepararse: no entra. Para seguir arreglando, abre una sesión desde la versión.' });
+      return;
+    }
     const planId = await this.planIdOf(s);
     // Un ítem que el docente QUITÓ sigue quitado cuando se genera su contenido.
     await this.q(this.dataSource,
@@ -896,12 +986,15 @@ export class WorkshopPlanService {
 
   /** Prueba en seco del plan COMBINADO (ítems propuestos, generados y disponibles, en orden de creación). */
   private async refreshCombined(s: WorkshopPlanSession, ctx: BuildCtx): Promise<void> {
+    if (!(await this.planEditableNow(s))) return; // r107 B6: la prueba en seco de un plan aplicado / aplicándose queda como estaba
     const planId = await this.planIdOf(s);
     const items = await this.q<ItemRow[]>(this.dataSource, `select i.* from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
         where i.plan_id = $1 and i.status = 'proposed' and i.stage = 'ready' and i.available and r.status = 'resolved' order by i.created_at, i.id`, [planId]);
     const c = await combinedDryRun(ctx, items.map((i) => i.params));
     await this.q(this.dataSource, `update public.workshop_plans set combined = $2::jsonb, updated_at = now() where id = $1`,
-      [planId, JSON.stringify({ ...c, itemIds: items.map((i) => i.id), failedItemId: c.failure && c.failure.opIndex !== null ? items[c.failure.opIndex]?.id ?? null : null, at: new Date().toISOString() })]);
+      [planId, JSON.stringify({ ...c, itemIds: items.map((i) => i.id),
+        // r107 B6 fix round 2 (nota): huella del contenido de cada ítem probado (aplicar compara contra la del ítem actual).
+        itemHashes: items.map((i) => itemContentHash({ operation: i.operation, stage: i.stage, params: i.params ?? null, view: i.view ?? null })), failedItemId: c.failure && c.failure.opIndex !== null ? items[c.failure.opIndex]?.id ?? null : null, at: new Date().toISOString() })]);
   }
 
   private async baselineOf(s: WorkshopPlanSession): Promise<{ originalSha1: string; report: DiagnosisReport } | null> {
@@ -929,19 +1022,77 @@ export class WorkshopPlanService {
   }
 
   /**
-   * Trabajo colgado sin nada vivo en este proceso (reinicio) → fallido reintentable, visible; la aprobación se cierra y
-   * su reserva se libera. Requisito para B6: claim + latido entre procesos como el diagnóstico de B3.
+   * Trabajo colgado sin nada vivo (reinicio, OOM, otro proceso caído) → fallido reintentable, visible; la aprobación se
+   * cierra y su reserva se libera SOLO si ninguna llamada pudo cobrarse (closeApproval). r107 B6: con reclamo + latido
+   * entre procesos (ver PLAN_HEARTBEAT_STALE_MS); las filas sin reclamo (anteriores a B6) siguen el plazo de 15 min.
    */
-  private async expireStale(sessionId: string): Promise<void> {
+  private async expireStale(sessionId: string | null): Promise<void> {
     const active = [...this.activeIds];
-    await this.q(this.dataSource, `update public.workshop_intakes set status = 'failed', error = $2::jsonb, updated_at = now()
-        where session_id = $1 and status in ('queued', 'interpreting', 'extracting') and updated_at < now() - ($3::int * interval '1 millisecond') and not (id = any($4::uuid[]))`,
-      [sessionId, JSON.stringify({ code: PLAN_ERRORS.INTERRUPTED, message: 'La interpretación se interrumpió; vuelve a enviar el pedido.', retryable: true }), PLAN_STALE_MS, active]);
-    await this.q(this.dataSource, `update public.workshop_requests set status = 'failed', reason = $2, updated_at = now()
-        where session_id = $1 and status = 'preparing' and updated_at < now() - ($3::int * interval '1 millisecond') and not (id = any($4::uuid[]))`,
-      [sessionId, 'La preparación se interrumpió; vuelve a pedir el cambio.', PLAN_STALE_MS, active]);
-    const stale = await this.q<ApprovalRow[]>(this.dataSource, `select id from public.workshop_ai_approvals where session_id = $1 and status in ('reserved', 'running') and updated_at < now() - ($2::int * interval '1 millisecond') and not (id = any($3::uuid[]))`, [sessionId, PLAN_STALE_MS, active]);
+    const beating = [...this.beating];
+    const ABANDONED = `not (id = any($4::uuid[])) and case
+        when claim_id is null then updated_at < now() - ($3::int * interval '1 millisecond')
+        when split_part(claim_id, '.', 1) = $5::text then not (claim_id = any($6::text[]))
+        else updated_at < now() - ($7::int * interval '1 millisecond') end`;
+    const P = (extra: unknown[]) => [...extra, PLAN_STALE_MS, active, this.workshop.bootId, beating, PLAN_HEARTBEAT_STALE_MS];
+    await this.q(this.dataSource, `update public.workshop_intakes set status = 'failed', error = $2::jsonb, claim_id = null, updated_at = now()
+        where ($1::uuid is null or session_id = $1::uuid) and status in ('queued', 'interpreting', 'extracting') and ${ABANDONED}`,
+      P([sessionId, JSON.stringify({ code: PLAN_ERRORS.INTERRUPTED, message: 'La interpretación se interrumpió; vuelve a enviar el pedido.', retryable: true })]));
+    await this.q(this.dataSource, `update public.workshop_requests set status = 'failed', reason = $2, claim_id = null, updated_at = now()
+        where ($1::uuid is null or session_id = $1::uuid) and status = 'preparing' and ${ABANDONED}`,
+      P([sessionId, 'La preparación se interrumpió; vuelve a pedir el cambio.']));
+    const stale = await this.q<ApprovalRow[]>(this.dataSource, `select id from public.workshop_ai_approvals where ($1::uuid is null or session_id = $1::uuid) and $2::text is null and status in ('reserved', 'running') and ${ABANDONED}`,
+      [sessionId, null, PLAN_STALE_MS, active, this.workshop.bootId, beating, PLAN_HEARTBEAT_STALE_MS]);
     for (const a of stale) await this.closeApproval(a.id, 'failed', 'Se interrumpió (reinicio del servidor).');
+  }
+
+  /**
+   * r107 B6 fix round 1 (P2-1): BARRIDO periódico (como el de las versiones): sin que nadie abra la sesión, lo que quedó
+   * de un proceso muerto (reclamo sin latido) se cierra — una aprobación con una llamada en vuelo pasa a `ambiguous` (su
+   * reserva sigue PENDIENTE) y aparece en el listado de conciliación del admin.
+   */
+  async sweep(): Promise<void> {
+    if (this.dead) return;
+    await this.expireStale(null);
+  }
+
+  onModuleInit(): void {
+    let on = false;
+    try { on = isCourseWorkshopEnabled(); } catch { on = false; }
+    if (!on) return;
+    this.sweepTimer = setInterval(() => { void this.sweep().catch((e) => this.logger.warn(`taller plan: barrido falló: ${e instanceof Error ? e.message : String(e)}`)); }, PLAN_SWEEP_MS);
+    this.sweepTimer.unref?.();
+  }
+
+  onModuleDestroy(): void {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.sweepTimer = null;
+    this.heartbeatTimer = null;
+  }
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * r107 B6: el plan se edita solo mientras es borrador (o después de una aplicación fallida, que lo vuelve a borrador).
+   * Aplicándose → 409; aplicado → 409 (para seguir arreglando se abre una sesión desde su versión).
+   */
+  private async assertPlanEditable(s: WorkshopPlanSession): Promise<void> {
+    let st: string | null = null;
+    try {
+      const [p] = await this.dataSource.query(`select status from public.workshop_plans where session_id = $1 and original_sha1 = $2`, [s.id, s.originalSha1]);
+      st = p?.status ?? null;
+    } catch (err) {
+      if ((err as { code?: string })?.code === '42P01') return; // sin la tabla: lo dirá la consulta siguiente (503)
+      throw err;
+    }
+    if (st === 'applying') throw new ConflictException({ code: PLAN_ERRORS.PLAN_APPLYING, message: 'El plan se está aplicando: espera a que termine para cambiarlo.' });
+    if (st === 'applied') throw new ConflictException({ code: PLAN_ERRORS.PLAN_APPLIED, message: 'Este plan ya se aplicó y su versión está guardada. Para seguir arreglando, abre una sesión desde esa versión.' });
+    if (st === 'failed') await this.dataSource.query(`update public.workshop_plans set status = 'draft', updated_at = now() where session_id = $1 and original_sha1 = $2 and status = 'failed'`, [s.id, s.originalSha1]);
+  }
+
+  /** Para el trabajo en segundo plano: ¿todavía se le pueden agregar / cambiar ítems al plan? */
+  private async planEditableNow(s: WorkshopPlanSession): Promise<boolean> {
+    const [p] = await this.q<any[]>(this.dataSource, `select status from public.workshop_plans where session_id = $1 and original_sha1 = $2`, [s.id, s.originalSha1]);
+    return !p || p.status === 'draft' || p.status === 'failed';
   }
 
   // ── lecturas ──
@@ -1001,8 +1152,26 @@ export class WorkshopPlanService {
     const live = (i: ItemRow) => i.status === 'proposed' && byReq.get(i.request_id)?.status !== 'withdrawn';
     const itemViews = items.filter((i) => byReq.has(i.request_id)).map((i) => {
       const r = byReq.get(i.request_id)!;
-      return { id: i.id, requestId: i.request_id, findingId: r.finding_id, quote: r.quote, instruction: r.instruction, status: live(i) ? 'proposed' : 'removed', stage: i.stage, requiresItemConfirm: (i as any).requires_item_confirm === true, requestStatus: r.status, reason: r.reason, ...i.view };
+      return { id: i.id, requestId: i.request_id, findingId: r.finding_id, quote: r.quote, instruction: r.instruction, status: live(i) ? 'proposed' : 'removed', stage: i.stage, requiresItemConfirm: (i as any).requires_item_confirm === true, requestStatus: r.status, reason: r.reason, ...i.view,
+        // r107 B6 fix round 1 (P2-2): huella del contenido que el docente revisa (aplicar la exige).
+        contentHash: itemContentHash({ operation: i.operation, stage: i.stage, params: i.params ?? null, view: i.view ?? null }) };
     });
+    // Lo que el docente aprueba al aplicar (B6): los ítems que entran con su huella, la huella del plan y los que piden
+    // confirmación uno por uno. El POST …/apply manda exactamente esto de vuelta.
+    const sel = selectApplyItems(items.filter((i) => byReq.has(i.request_id)).map((i) => {
+      const r = byReq.get(i.request_id)!;
+      return { id: i.id, requestId: i.request_id, operation: i.operation, status: live(i) ? 'proposed' as const : 'removed' as const, requestStatus: r.status, stage: i.stage, available: i.available, params: i.params ?? null,
+        requiresItemConfirm: (i as any).requires_item_confirm === true, summary: i.view?.summary ?? i.operation, quote: r.quote, riskLevel: i.risk_level,
+        contentHash: itemContentHash({ operation: i.operation, stage: i.stage, params: i.params ?? null, view: i.view ?? null }) };
+    }));
+    const applyItems = sel.apply.map((i) => ({ id: i.id, contentHash: i.contentHash as string }));
+    const applyBlock = {
+      planHash: applyItems.length ? planContentHash(applyItems) : null,
+      items: applyItems,
+      confirmRequired: sel.apply.filter((i) => i.requiresItemConfirm).map((i) => ({ id: i.id, contentHash: i.contentHash as string, summary: i.summary })),
+      blocking: sel.blocking,
+      later: sel.later.map((i) => i.id),
+    };
     const ready = items.filter((i) => live(i) && i.stage === 'ready');
     const totals = planTotals({
       spent: [...intakes.map((x) => usd(x.spent_usd)), ...requests.map((x) => usd(x.spent_usd))],
@@ -1014,8 +1183,11 @@ export class WorkshopPlanService {
     const withItem = new Set(items.map((i) => i.request_id));
     const warnings = planWarnings(items.filter((i) => byReq.has(i.request_id)).map((i) => ({ id: i.id, operation: i.operation, risk: i.view.risk, intakeId: byReq.get(i.request_id)!.intake_id, live: live(i) })));
     return {
-      sessionId: s.id, planId: plan?.id ?? null, status: 'draft' as const, originalSha1: s.originalSha1, planCodeVersion: PLAN_CODE_VERSION,
+      sessionId: s.id, planId: plan?.id ?? null, status: (plan?.status ?? 'draft') as 'draft' | 'applying' | 'applied' | 'failed', appliedVersionId: plan?.applied_version_id ?? null,
+      originalSha1: s.originalSha1, planCodeVersion: PLAN_CODE_VERSION,
       items: itemViews,
+      /** r107 B6 (fix round 1, P2-2): lo que se envía a POST …/plans/:planId/apply (huellas del contenido revisado). */
+      apply: applyBlock,
       /** Fix round 1 (P2-4): avisos del plan (quitar actividades, cambios masivos, muchos de riesgo alto). */
       warnings,
       /** Lo que falta aprobar para generar el contenido de los ítems en etapa de estimado (estimado + tope propuesto). */

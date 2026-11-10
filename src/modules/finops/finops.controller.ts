@@ -12,17 +12,19 @@ import {
   ParseIntPipe,
   Post,
   Query,
+  Optional,
   Res,
   UnprocessableEntityException,
   UseGuards,
 } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import type { Response } from 'express';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
 import { GammaPriceError } from './pricing-catalog-db';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import type { AuthUser } from '../../auth/auth.types';
-import { FinopsLedgerService, TTS_RESERVATION_KEY_RE } from './finops-ledger.service';
+import { FinopsLedgerService, TTS_RESERVATION_KEY_RE, WORKSHOP_APPROVAL_RESERVATION_KEY_RE } from './finops-ledger.service';
 import { FinopsBudgetService } from './finops-budget.service';
 import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsError } from './errors';
@@ -317,6 +319,7 @@ export class FinopsAdminController {
   constructor(
     private readonly ledger: FinopsLedgerService,
     private readonly budget: FinopsBudgetService,
+    @Optional() private readonly moduleRef?: ModuleRef,
   ) {}
 
   // POST /api/v1/finops/courses/:courseId/authorizations (RF-b)
@@ -566,6 +569,71 @@ export class FinopsAdminController {
       if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
       throw finopsErrorToHttp(err);
     }
+  }
+
+  // GET /api/v1/finops/workshop-reservations?courseId= — r107 B6: reservas del TOPE de aprobaciones de IA del Taller de cursos
+  // que quedaron PENDIENTES (alguna llamada con resultado desconocido). Cuentan contra el saldo del usuario mientras tanto.
+  @Get('workshop-reservations')
+  async workshopReservations(@Query('courseId') courseId?: string) {
+    const f: { courseId?: number } = {};
+    if (courseId !== undefined) {
+      if (!/^\d{1,12}$/.test(courseId)) throw new BadRequestException('courseId inválido');
+      f.courseId = Number(courseId);
+    }
+    try {
+      return { reservations: await this.ledger.pendingWorkshopApprovalReservations(f) };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // POST /api/v1/finops/workshop-reservations/reconcile {reservationKey, outcome: 'charged_partial'|'not_charged', reason, amount?, evidence?}
+  // r107 B6: decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. `charged_partial` = lo que Anthropic confirma que
+  // cobró por la(s) llamada(s) ambigua(s) (monto real + evidencia); `not_charged` = no cobró (se libera). `charged` (la
+  // reserva ENTERA) no se acepta: el tope incluye las llamadas que ya tienen su cargo real registrado (contaría doble).
+  // Repetir la misma decisión = no-op. Queda auditada (admin_audit_log) y anotada en la aprobación.
+  @Post('workshop-reservations/reconcile')
+  @HttpCode(HttpStatus.OK)
+  async reconcileWorkshopReservation(@Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
+    const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    for (const k of Object.keys(b)) if (!['reservationKey', 'outcome', 'reason', 'amount', 'evidence'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+    if (typeof b.reservationKey !== 'string' || !WORKSHOP_APPROVAL_RESERVATION_KEY_RE.test(b.reservationKey)) throw new BadRequestException('reservationKey inválida');
+    const d = parseDecisionOrBadRequest(b, ['reservationKey']);
+    if (d.outcome === 'charged') throw new BadRequestException('outcome charged no se acepta en el Taller: usa charged_partial con el monto real que confirma Anthropic, o not_charged');
+    const decidedBy = String(user?.id || '');
+    if (!decidedBy) throw new BadRequestException('usuario sin id');
+    try {
+      const state = await this.ledger.workshopApprovalReservationState(b.reservationKey);
+      if (state === 'not_workshop') throw new BadRequestException('no es una reserva de una aprobación del Taller');
+      if (state === 'approval_running') throw new ConflictException('la aprobación sigue en curso: puede liquidarse sola; conciliar cuando termine');
+      const out = await applyReconcileDecision(this.ledger, b.reservationKey, d, decidedBy, { workshopApproval: true });
+      await this.ledger.noteWorkshopApprovalReconciled(b.reservationKey, {
+        outcome: d.outcome, amount: d.amount ?? null, countedAmount: (out.countedAmount as string | undefined) ?? (d.outcome === 'not_charged' ? '0' : null), reason: d.reason, decidedBy, evidence: d.evidence ?? null,
+      });
+      await this.auditWorkshopReconcile(user, b.reservationKey, d, out);
+      return out;
+    } catch (err) {
+      if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  /** Auditoría (append-only, r75) de la conciliación del Taller. Sin el servicio de auditoría en el proceso, queda en el log. */
+  private async auditWorkshopReconcile(user: AuthUser, key: string, d: ReconcileDecision, out: Record<string, unknown>): Promise<void> {
+    let audit: { record: (e: Record<string, unknown>) => Promise<number> } | null = null;
+    try {
+      const { AuditLogService } = await import('../access/audit-log.service');
+      audit = this.moduleRef?.get(AuditLogService, { strict: false }) ?? null;
+    } catch {
+      audit = null;
+    }
+    const entry = {
+      actorId: String(user.id), actorEmail: user.email ?? null, actorIsSuperAdmin: true, action: 'finops.reconcile_workshop_approval', targetType: 'workshop_ai_approval',
+      targetId: key.slice('workshop:approval:'.length), before: { reservationKey: key, status: 'pending' },
+      after: { outcome: d.outcome, amount: d.amount ?? null, reason: d.reason, evidence: d.evidence ?? null, reconciled: out.reconciled ?? null, alreadySettled: out.alreadySettled ?? null, countedAmount: out.countedAmount ?? null },
+    };
+    if (!audit) { console.warn(`FINOPS_AUDIT_UNAVAILABLE: ${JSON.stringify(entry)}`); return; }
+    await audit.record(entry);
   }
 
   // POST /api/v1/finops/llm-proxy-reservations/:callId/reconcile {outcome: 'charged'|'not_charged'|'charged_partial', reason, amount?, evidence?}

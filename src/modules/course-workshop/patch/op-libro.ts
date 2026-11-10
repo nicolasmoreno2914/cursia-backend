@@ -246,6 +246,18 @@ export async function applyEditLibroSection(ctx: OpContext, op: EditLibroSection
   const main = a.files.filter((x) => x.filearea === 'content' && x.filename !== '.');
   const lf = main.find((x) => /\.html?$/i.test(x.filename)) ?? main.find((x) => /\.pdf$/i.test(x.filename)) ?? main[0];
   if (!lf) throw new PatchError('target_not_found', `${a.dir} no trae archivo del Libro.`);
+  if ((/\.pdf$/i.test(lf.filename) || lf.mimetype === 'application/pdf') && op.pdf) {
+    // r107 B6 · Libro v3: reemplazo del PDF por el que armó el builder (nunca un PDF escrito por la IA).
+    const pdf = Buffer.from(String(op.pdf.base64 ?? ''), 'base64');
+    if (pdf.length < 8 || pdf.subarray(0, 5).toString('latin1') !== '%PDF-' || !/%%EOF\s*$/.test(pdf.subarray(-32).toString('latin1'))) throw new PatchError('invalid_content', 'El Libro nuevo no es un PDF completo.');
+    if (op.pdf.previousSha1 !== lf.contenthash) throw new PatchError('stale_target', 'El PDF del Libro del paquete no es el que se usó para regenerarlo.');
+    if (!lf.blobPresent || !ctx.state.has(blobPath(lf.contenthash))) throw new PatchError('target_not_found', 'El archivo del Libro no viene en el paquete (blob faltante).');
+    const nh = await replaceBlob(ctx, lf.contenthash, pdf, 'application/pdf');
+    const nums = op.chapters.map((c) => c.number).join(', ');
+    ctx.report.fields.push({ entry: blobPath(nh), field: `file:${lf.filename}`, moduleId: a.moduleId, sectionId: null, before: `[PDF ${lf.contenthash}]`, after: `[PDF ${nh}, ${pdf.length} bytes, capítulo(s) ${nums}]`, beforeRawSha1: lf.contenthash, afterRawSha1: nh });
+    finish(ctx, a, { notes: [`PDF del Libro regenerado con el builder v3 (capítulo(s) ${nums})`], misalignment: ['El Libro en línea (mod_book) de esos capítulos no cambia con el PDF: si también hay que corregirlo, pídelo aparte (edit_html).'] });
+    return;
+  }
   if (/\.pdf$/i.test(lf.filename) || lf.mimetype === 'application/pdf') {
     throw new PatchError('unavailable', 'El Libro Guía es un PDF (builder v3): regenerarlo exige la fuente por capítulo (markdown, portada, módulos), que no viene en el paquete ni en el inventario. No disponible en esta fase: nunca un PDF a medias.');
   }

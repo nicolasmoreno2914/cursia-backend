@@ -68,7 +68,26 @@ export const WORKSHOP_ERRORS = Object.freeze({
   DIAGNOSIS_FAILED: 'WORKSHOP_DIAGNOSIS_FAILED',
   DIAGNOSIS_INTERRUPTED: 'WORKSHOP_DIAGNOSIS_INTERRUPTED',
   DIAGNOSIS_TOO_LARGE: 'WORKSHOP_DIAGNOSIS_TOO_LARGE',
+  MEMORY_WAIT_TIMEOUT: 'WORKSHOP_MEMORY_WAIT_TIMEOUT',
 });
+
+/** r107 B6 fix round 2 (N1): una reserva en la cola de memoria. */
+interface MemoryWaiter { ticket: number; key: string; bytes: number; grant: () => void; tick: ReturnType<typeof setInterval> | null; deadline: ReturnType<typeof setTimeout> | null; enqueuedAt: number }
+
+/** La espera por memoria venció (fix round 2, N1): motivo visible, reintentable. */
+export class MemoryWaitTimeoutError extends Error {
+  readonly code = WORKSHOP_ERRORS.MEMORY_WAIT_TIMEOUT;
+  constructor(readonly waitedMs: number, readonly bytes: number, readonly budgetBytes: number) {
+    super(`El servidor estuvo ocupado con otros trabajos del Taller durante ${Math.round(waitedMs / 60000)} min y este no llegó a empezar (necesita ~${Math.round(bytes / 1048576)} MB de ${Math.round(budgetBytes / 1048576)} MB). No se hizo nada: vuelve a intentarlo.`);
+    this.name = 'MemoryWaitTimeoutError';
+  }
+}
+export const WORKSHOP_MEMORY_MAX_WAIT_DEFAULT_MIN = 30;
+export function workshopMemoryMaxWaitMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = (env.COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN ?? '').trim();
+  const min = raw === '' ? WORKSHOP_MEMORY_MAX_WAIT_DEFAULT_MIN : Number(raw);
+  return Number.isFinite(min) && min >= 1 ? Math.floor(min * 60_000) : WORKSHOP_MEMORY_MAX_WAIT_DEFAULT_MIN * 60_000;
+}
 
 /**
  * r107 B3 fix round 2 (N1): cada diagnóstico `queued` / `running` lleva en `claim_id` el ARRANQUE del proceso dueño
@@ -105,6 +124,8 @@ export function diagnosisMemoryFactor(container: string | null | undefined): num
   return container === 'tar.gz' ? DIAGNOSIS_MEMORY_FACTOR_TGZ : DIAGNOSIS_MEMORY_FACTOR;
 }
 export const IDENTIFY_MEMORY_FACTOR = 3;
+/** Latido de quien espera lugar en el presupuesto de memoria (fix round 1 de B6, P2-4). */
+export const MEMORY_WAIT_TICK_MS = 10_000;
 export const WORKSHOP_MEMORY_BUDGET_DEFAULT_MB = 2048;
 export function workshopMemoryBudgetBytes(env: Record<string, string | undefined> = process.env): number {
   const raw = (env.COURSE_WORKSHOP_MEMORY_BUDGET_MB ?? '').trim();
@@ -481,6 +502,84 @@ export class CourseWorkshopService {
     };
   }
 
+  /**
+   * r107 B6 (fix round 2, para B7 «Mis sesiones»): sesiones que el actor puede ver, de la más nueva a la más vieja,
+   * paginadas por cursor. Alcance = el de `loadForActor`: las propias; con RBAC en enforce, las de las instituciones
+   * donde tiene `courses.view`; SuperAdmin, todas. Sin el inventario (jsonb grande). Cada una con el título del curso
+   * identificado (si sigue en el alcance de la sesión) y un resumen de su última versión.
+   */
+  async listSessions(actor: WorkshopActor, q: { limit?: unknown; cursor?: unknown } = {}): Promise<{ sessions: Array<WorkshopSessionRecord & { identifiedCourseTitle: string | null; parentVersionId: string | null; latestVersion: unknown }>; nextCursor: string | null }> {
+    const limit = Math.min(Math.max(Number.parseInt(String(q.limit ?? '20'), 10) || 20, 1), 100);
+    let cur: { at: string; id: string } | null = null;
+    if (typeof q.cursor === 'string' && q.cursor) {
+      const [at, cid] = Buffer.from(q.cursor, 'base64url').toString('utf8').split('|');
+      if (!at || !Number.isFinite(Date.parse(at)) || !isUuid(cid ?? '')) throw new BadRequestException({ code: 'WORKSHOP_CURSOR_INVALID', message: 'El cursor de la lista no es válido.' });
+      cur = { at, id: cid.toLowerCase() };
+    }
+    const sa = this.superAdmin(actor);
+    let insts: string[] = [];
+    if (!sa && rbacMode() === 'enforce' && this.permissions) {
+      const ms = (await this.permissions.membershipsOf(actor.id)).filter((m) => m.status === 'active');
+      for (const m of ms) {
+        const d = await this.permissions.can({ id: actor.id, email: actor.email ?? null }, 'courses.view', m.institutionId, { concreteResource: true });
+        if (d.allowed) insts.push(String(m.institutionId).toLowerCase());
+      }
+    }
+    const rows = await this.q<any[]>(this.dataSource,
+      `select ${SESSION_COLS.split(',').map((c) => `s.${c.trim()}`).join(', ')}, s.parent_version_id::text as parent_version_id, s.created_at::text as created_key,
+              (select c.title from public.courses c where c.id = s.identified_course_id
+                 and (case when s.institution_id is not null then c.institution_id::text = s.institution_id::text else c.owner_id::text = s.owner_id::text end)) as course_title,
+              (select jsonb_build_object('id', v.id, 'number', v.number, 'status', v.status, 'restoreCheck', v.restore_check, 'createdAt', v.created_at, 'finishedAt', v.finished_at)
+                 from public.workshop_versions v where v.session_id = s.id order by v.created_at desc, v.id desc limit 1) as latest_version
+         from public.workshop_sessions s
+        where ($1::boolean or s.owner_id::text = $2::text or (s.institution_id is not null and s.institution_id::text = any($3::text[])))
+          and ($4::timestamptz is null or (s.created_at, s.id) < ($4::timestamptz, $5::uuid))
+        order by s.created_at desc, s.id desc limit $6`,
+      [sa, actor.id.toLowerCase(), insts, cur?.at ?? null, cur?.id ?? null, limit + 1]);
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    return {
+      sessions: page.map((r) => ({ ...this.toRecord(r as Row), identifiedCourseTitle: r.course_title ?? null, parentVersionId: r.parent_version_id ?? null, latestVersion: r.latest_version ?? null })),
+      // Cursor con la marca de tiempo COMPLETA (microsegundos): con milisegundos se saltearía o repetiría una fila.
+      nextCursor: rows.length > limit && last ? Buffer.from(`${last.created_key}|${last.id}`, 'utf8').toString('base64url') : null,
+    };
+  }
+
+  /**
+   * r107 B6 (fix round 2): el docente CONFIRMA cuál de los candidatos que propuso la identificación es su curso. Solo un
+   * candidato que el servidor produjo (`identification.result.candidates`) y que sigue en el alcance de la sesión; la
+   * fuente se vuelve a enganchar (el inventario se rearma). No si el plan ya se está aplicando o se aplicó.
+   */
+  async confirmCandidate(actor: WorkshopActor, id: string, courseIdRaw: unknown): Promise<WorkshopSessionRecord> {
+    let row = await this.loadForActor(actor, id, 'courses.edit');
+    row = await this.expireIfStale(row);
+    if (row.status !== 'identified' || !row.original_sha1) throw new ConflictException({ code: WORKSHOP_ERRORS.NOT_IDENTIFIED, message: 'Se puede confirmar el curso cuando termina la identificación.', status: row.status });
+    const courseId = Number(courseIdRaw);
+    const res = row.identification?.result as IdentificationResult | undefined;
+    const cand = (res?.candidates ?? []).find((c) => c.courseId === courseId);
+    if (!Number.isSafeInteger(courseId) || !cand) throw new BadRequestException({ code: 'WORKSHOP_CANDIDATE_INVALID', message: 'Ese curso no está entre los candidatos que encontró la identificación.' });
+    const [c] = await this.q<any[]>(this.dataSource, `select id from public.courses where id = $1 and (case when $2::text is not null then institution_id::text = $2::text else owner_id::text = $3::text end)`, [courseId, row.institution_id ?? null, row.owner_id]);
+    if (!c) throw new BadRequestException({ code: 'WORKSHOP_CANDIDATE_INVALID', message: 'Ese curso ya no está en el alcance de esta sesión.' });
+    // Fix round 3: falla CERRADO — solo «la tabla no existe» (antes de la migración de B5) cuenta como «sin plan»; cualquier
+    // otro error de la base corta la confirmación.
+    let busy: { status: string } | undefined;
+    try {
+      [busy] = await this.dataSource.query(`select status from public.workshop_plans where session_id = $1 and original_sha1 = $2 and status in ('applying', 'applied')`, [row.id, row.original_sha1]);
+    } catch (err) {
+      if ((err as { code?: string })?.code !== '42P01') throw err;
+      busy = undefined;
+    }
+    if (busy) throw new ConflictException({ code: 'WORKSHOP_PLAN_APPLIED', message: 'El plan de esta sesión ya se aplicó (o se está aplicando): el curso ya no se cambia.', status: busy.status });
+    const result = { ...(res as IdentificationResult), courseId, needsConfirmation: false, notes: [...(res?.notes ?? []), `Curso confirmado por el docente: «${cand.title}».`] };
+    const ident = { ...(row.identification ?? {}), result, confirmedBy: { userId: actor.id, at: this.now().toISOString(), courseId }, inventory: { builtAt: null, reason: 'candidate_confirmed' } };
+    const [r] = returningRows(await this.q(this.dataSource,
+      `update public.workshop_sessions set identified_course_id = $2, identification = $3::jsonb, inventory = null, updated_at = now() where id = $1 and status = 'identified' and original_sha1 = $4 returning ${SESSION_COLS}`,
+      [row.id, courseId, JSON.stringify(ident), row.original_sha1])) as Row[];
+    if (!r) throw new ConflictException({ code: WORKSHOP_ERRORS.NOT_IDENTIFIED, message: 'La sesión cambió mientras confirmabas: vuelve a intentarlo.' });
+    await this.startInventoryRebuild(r); // la fuente del curso confirmado se engancha al rearmar el inventario
+    return this.toRecord(r);
+  }
+
   async get(actor: WorkshopActor, id: string): Promise<WorkshopSessionRecord> {
     let row = await this.loadForActor(actor, id, 'courses.view');
     row = await this.expireIfStale(row);
@@ -521,14 +620,94 @@ export class CourseWorkshopService {
     // Sin await (202). Nunca una promesa rechazada sin dueño (tumbaría el proceso): si hasta el registro del fallo
     // falla (base caída), queda `identifying` y IDENTIFY_STALE_MS la libera al leerla.
     // Fix round 2 (N2): la identificación reserva su estimado de memoria (el diagnóstico solo arranca si entra).
-    const p = this.withSlot(() => this.withMemory(`identify:${row.id}`, bytes * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row.id, claimId)))
-      .catch((err) => this.logger.error(`workshop ${row.id}: la identificación terminó con error: ${err instanceof Error ? err.message : String(err)}`))
+    const p = this.withSlot(() => this.withMemory(`identify:${row.id}`, bytes * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row.id, claimId), () => this.touchIdentifying(row.id, claimId)))
+      .catch((err) => this.identificationEnded(row.id, claimId, err))
       .finally(() => this.inFlight.delete(row.id));
     this.inFlight.set(row.id, p);
     return this.toRecord(claimed[0]);
   }
 
+  /**
+   * r107 B6 · encadenar arreglos (ruling del controlador): una sesión HIJA cuyo original es una versión `ready`. Reusa
+   * B1–B5 tal cual: misma ingesta (pero sin subir nada: el objeto ya es el paquete de la versión, en la carpeta del
+   * dueño), la identificación verifica que los bytes sean EXACTAMENTE los de la versión y hereda el curso identificado;
+   * inventario, diagnóstico y plan corren igual que en cualquier sesión. Mismo dueño e institución que la de origen
+   * (el alcance no cambia). Idempotente: una hija por versión (índice único); abrirla otra vez devuelve la misma.
+   * Quien llama ya verificó las compuertas sobre la sesión de origen y que la versión esté lista.
+   */
+  async openChildSession(actor: WorkshopActor, v: {
+    parentSessionId: string; ownerId: string; institutionId: string | null; versionId: string; versionNumber: number; storagePath: string;
+    filename: string; sha1: string; sha256: string; size: number; inheritCourseId: number | null;
+  }): Promise<{ session: WorkshopSessionRecord; created: boolean }> {
+    const existing = async () => {
+      const [r] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS} from public.workshop_sessions where parent_version_id = $1`, [v.versionId]);
+      return r ?? null;
+    };
+    let row = await existing();
+    if (row) return { session: this.toRecord(await this.expireIfStale(row)), created: false };
+    const identification = {
+      upload: {
+        filename: v.filename, declaredBytes: v.size, createdBy: actor.id, fromVersionId: v.versionId, fromVersionNumber: v.versionNumber,
+        fromSessionId: v.parentSessionId, inheritCourseId: v.inheritCourseId, expect: { sha1: v.sha1, sha256: v.sha256, size: v.size },
+      },
+    };
+    try {
+      [row] = await this.q<Row[]>(this.dataSource,
+        `insert into public.workshop_sessions (owner_id, institution_id, status, storage_path, identification, parent_version_id)
+         values ($1, $2, 'uploaded', $3, $4::jsonb, $5) returning ${SESSION_COLS}`,
+        [v.ownerId, v.institutionId, v.storagePath, JSON.stringify(identification), v.versionId]);
+    } catch (err) {
+      if ((err as { code?: string })?.code === '23505') {
+        const again = await existing();
+        if (again) return { session: this.toRecord(again), created: false };
+      }
+      throw err;
+    }
+    const claimId = randomUUID();
+    const [claimed] = returningRows(await this.q(this.dataSource,
+      `update public.workshop_sessions
+          set status = 'identifying', error = null, updated_at = now(),
+              identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{claim}', jsonb_build_object('id', $2::text, 'at', now(), 'headBytes', $3::bigint))
+        where id = $1 and status = 'uploaded' returning *`,
+      [row.id, claimId, v.size]));
+    if (!claimed) return { session: this.toRecord(row), created: true };
+    const p = this.withSlot(() => this.withMemory(`identify:${row!.id}`, v.size * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row!.id, claimId), () => this.touchIdentifying(row!.id, claimId)))
+      .catch((err) => this.identificationEnded(row!.id, claimId, err))
+      .finally(() => this.inFlight.delete(row!.id));
+    this.inFlight.set(row.id, p);
+    return { session: this.toRecord(claimed), created: true };
+  }
+
+  /** r107 B6: la versión de origen de una sesión (null = sesión de un .mbz subido). Columna de B6: se lee aparte. */
+  async parentVersionOf(sessionId: string): Promise<string | null> {
+    const [r] = await this.q<any[]>(this.dataSource, `select parent_version_id::text as v from public.workshop_sessions where id = $1`, [sessionId]);
+    return r?.v ?? null;
+  }
+
+  /** r107 B6: la misma sesión con sus compuertas (para el Taller de versiones), sin exigir que esté identificada. */
+  async sessionForActor(actor: WorkshopActor, id: string, permission: Permission): Promise<WorkshopPlanSession & { record: WorkshopSessionRecord }> {
+    let row = await this.loadForActor(actor, id, permission);
+    row = await this.expireIfStale(row);
+    return { ...this.planSessionOf(row), record: this.toRecord(row) };
+  }
+
   // ── identificación ──
+
+  /** Una identificación terminó con error: si fue la espera por memoria (fix round 2, N1), queda `failed` reintentable con el motivo. */
+  private async identificationEnded(id: string, claimId: string, err: unknown): Promise<void> {
+    if (err instanceof MemoryWaitTimeoutError) {
+      await this.q(this.dataSource,
+        `update public.workshop_sessions set status = 'failed', error = $3::jsonb, updated_at = now() where id = $1 and status = 'identifying' and identification->'claim'->>'id' = $2`,
+        [id, claimId, JSON.stringify({ code: err.code, message: err.message, retryable: true })]).catch(() => {});
+      return;
+    }
+    this.logger.error(`workshop ${id}: la identificación terminó con error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  /** Latido de una identificación que espera memoria (fix round 1, P2-4): sigue viva para los demás procesos. */
+  private async touchIdentifying(id: string, claimId: string): Promise<void> {
+    await this.q(this.dataSource, `update public.workshop_sessions set updated_at = now() where id = $1 and status = 'identifying' and identification->'claim'->>'id' = $2`, [id, claimId]);
+  }
 
   /** Identificaciones corriendo ahora en este proceso (las pruebas lo leen). */
   get runningCount(): number {
@@ -586,6 +765,13 @@ export class CourseWorkshopService {
     }
     const { buf, sha1, sha256 } = dl;
     const size = buf.length;
+    // r107 B6: una sesión HIJA se abre sobre una versión ya verificada: sus bytes tienen que ser EXACTAMENTE los de esa
+    // versión (si el objeto cambió en Storage, no se usa: terminal, como un original cambiado).
+    const expect = row.identification?.upload?.expect;
+    if (expect && (expect.sha1 !== sha1 || expect.sha256 !== sha256 || Number(expect.size) !== size)) {
+      await fail(WORKSHOP_ERRORS.ORIGINAL_CHANGED, 'La versión de origen cambió en el almacenamiento después de verificarla (ya no tiene la misma huella): por seguridad no se usa.', false, { sha1, size });
+      return;
+    }
     // Se verifica lo DESCARGADO, no el HEAD: si el objeto cambió entre el HEAD y la descarga, se pide reintentar (el
     // reintento vuelve a hacer HEAD y a hashear lo que llegue).
     if (Number.isFinite(headBytes) && headBytes !== size) {
@@ -615,7 +801,16 @@ export class CourseWorkshopService {
       const { catalog, truncated } = await this.loadCatalog(scope, {
         sha256, courseIds: [facts.cursiaMeta?.courseId ?? null, facts.v3NameCourseId].filter((x): x is number => typeof x === 'number'), title: facts.title,
       });
-      const result = identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope, catalog, catalogTruncated: truncated });
+      let result = identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope, catalog, catalogTruncated: truncated });
+      // r107 B6: la sesión hija HEREDA el curso identificado de su sesión de origen (la versión es un arreglo de ESE curso;
+      // su huella nueva no está en el catálogo). Solo si sigue en el alcance (loadSources lo vuelve a verificar).
+      const inherited = row.identification?.upload?.inheritCourseId;
+      if (inherited !== undefined && row.identification?.upload?.fromVersionId) {
+        result = {
+          ...result, courseId: typeof inherited === 'number' ? inherited : null, needsConfirmation: false,
+          notes: [...result.notes, `Sesión abierta desde la versión ${String(row.identification.upload.fromVersionNumber ?? '')} de otra sesión: hereda su curso identificado.`],
+        };
+      }
       // B2: inventario con los MISMOS bytes recién hasheados (son los que quedan como original: verificado por
       // construcción). Una falla del inventario no tumba la identificación, pero queda visible (identification.inventory).
       const inv = await this.composeInventory(pkg, { family: result.family, builderLine: result.builder.line, builderVersion: result.builder.version }, result.courseId, scope);
@@ -847,7 +1042,11 @@ export class CourseWorkshopService {
       return { ...base, status: 'failed', inventory: null, error: err ?? { code: WORKSHOP_ERRORS.INVENTORY_FAILED, message: `No se pudo armar el inventario después de ${INVENTORY_REBUILD_MAX_ATTEMPTS} intentos; avísanos.`, retryable: false } };
     }
     const retryAt = sameVersion && typeof info?.nextAttemptAt === 'string' ? info.nextAttemptAt : null;
-    if (retryAt && new Date(retryAt).getTime() > this.now().getTime()) return { ...base, status: 'building', inventory: null, error: err, retryAt };
+    if (retryAt && new Date(retryAt).getTime() > this.now().getTime()) {
+      // Fix round 3: la espera por memoria venció → `failed` reintentable con el motivo y cuándo se vuelve a intentar.
+      const waitTimeout = err?.code === WORKSHOP_ERRORS.MEMORY_WAIT_TIMEOUT;
+      return { ...base, status: waitTimeout ? 'failed' : 'building', inventory: null, error: err, retryAt };
+    }
     await this.startInventoryRebuild(row);
     return { ...base, status: 'building', inventory: null, error: err, retryAt };
   }
@@ -889,8 +1088,21 @@ export class CourseWorkshopService {
       throw e;
     }
     if (!claimed.length) { release(); return; }
-    const p = this.withMemory(`rebuild:${row.id}`, Number(row.original_size ?? 0) * IDENTIFY_MEMORY_FACTOR, () => this.rebuildInventory(row.id))
-      .catch((e) => this.logger.error(`workshop ${row.id}: la reconstrucción del inventario terminó con error: ${e instanceof Error ? e.message : String(e)}`))
+    const p = this.withMemory(`rebuild:${row.id}`, Number(row.original_size ?? 0) * IDENTIFY_MEMORY_FACTOR, () => this.rebuildInventory(row.id),
+      () => this.q(this.dataSource, `update public.workshop_sessions set identification = jsonb_set(identification, '{inventory,rebuildClaimAt}', to_jsonb($2::text)) where id = $1 and inventory is null`, [row.id, this.now().toISOString()]).then(() => undefined))
+      .catch(async (e) => {
+        // Fix round 3: la espera por memoria venció → se ve YA en el estado del inventario (motivo, reintentable, cuándo).
+        if (e instanceof MemoryWaitTimeoutError) {
+          const retryAt = new Date(this.now().getTime() + INVENTORY_REBUILD_BACKOFF_MS).toISOString();
+          await this.q(this.dataSource,
+            `update public.workshop_sessions set identification = jsonb_set(identification, '{inventory}',
+                (coalesce(identification->'inventory', '{}'::jsonb) - 'rebuildClaimAt') || jsonb_build_object('error', $2::jsonb, 'nextAttemptAt', $3::text, 'builtAt', $4::text))
+              where id = $1 and inventory is null`,
+            [row.id, JSON.stringify({ code: e.code, message: e.message, retryable: true }), retryAt, this.now().toISOString()]).catch(() => {});
+          return;
+        }
+        this.logger.error(`workshop ${row.id}: la reconstrucción del inventario terminó con error: ${e instanceof Error ? e.message : String(e)}`);
+      })
       .finally(() => { release(); this.inFlight.delete(key); });
     this.inFlight.set(key, p);
   }
@@ -940,15 +1152,107 @@ export class CourseWorkshopService {
 
   // ── diagnóstico técnico (B3) ──
 
-  /** Fix round 2 (N2): reserva `bytes` mientras corre `fn`; al soltar, el diagnóstico en cola puede arrancar. */
-  async withMemory<T>(key: string, bytes: number, fn: () => Promise<T>): Promise<T> {
-    this.memoryReservations.set(key, Math.max(0, bytes));
+  /**
+   * r107 B6 fix round 1 (P2-4): UN presupuesto de memoria por proceso para TODO el trabajo pesado del Taller
+   * (identificación, reconstrucción del inventario, diagnóstico, trabajos del plan, aplicar). Cada uno reserva su
+   * factor × tamaño del original y ESPERA hasta que entre (o hasta que no haya nada reservado: un trabajo solo siempre
+   * puede correr; el que nunca entra lo rechaza antes quien llama). Nada arranca por encima del presupuesto.
+   * `withMemory` (B3) ahora también espera: es `acquireMemory` + soltar al terminar.
+   */
+  async withMemory<T>(key: string, bytes: number, fn: () => Promise<T>, onWaitTick?: () => Promise<void> | void): Promise<T> {
+    const release = await this.acquireMemory(key, bytes, onWaitTick);
     try {
       return await fn();
     } finally {
-      this.memoryReservations.delete(key);
-      this.pumpDiagnosis();
+      release();
     }
+  }
+
+  /**
+   * Reserva que ESPERA lugar. Fix round 2 (N1): cola FIFO con boletos — se atiende ESTRICTAMENTE en orden de llegada:
+   * mientras haya alguien esperando, un pedido nuevo NO entra aunque quepa (no se adelanta a uno más grande que todavía
+   * no entra); al soltarse memoria se atiende desde la cabeza mientras quepa. Uno más grande que todo el presupuesto
+   * solo arranca cuando no hay nada reservado (le llega su turno en la cabeza). Mientras espera, `onWaitTick` corre cada
+   * MEMORY_WAIT_TICK_MS (latido); pasado `memoryMaxWaitMs` falla con MemoryWaitTimeoutError (motivo visible, reintentable),
+   * nunca espera para siempre. Devuelve la función que la suelta.
+   */
+  async acquireMemory(key: string, bytes: number, onWaitTick?: () => Promise<void> | void): Promise<() => void> {
+    const need = Math.max(0, bytes);
+    const release = () => {
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        this.memoryReservations.delete(key);
+        this.memoryReleased();
+      };
+    };
+    if (!this.memoryQueue.length && this.memoryFits(need)) {
+      this.reserveNow(key, need);
+      return release();
+    }
+    await new Promise<void>((resolve, reject) => this.enqueueMemory({ key, bytes: need, grant: resolve, timeout: reject, onWaitTick }));
+    return release();
+  }
+
+  /** Entra ya (sin mirar la cola): nada reservado, o cabe en lo que queda. */
+  private memoryFits(bytes: number): boolean {
+    return this.reservedMemoryBytes === 0 || this.reservedMemoryBytes + bytes <= this.memoryBudgetBytes;
+  }
+
+  /** Pone un pedido al final de la cola (con su latido y su plazo máximo). `grant` corre con la reserva YA hecha. */
+  private enqueueMemory(w: { key: string; bytes: number; grant: () => void; timeout: (e: Error) => void; onWaitTick?: () => Promise<void> | void }): void {
+    const entry: MemoryWaiter = { ticket: ++this.memoryTicket, key: w.key, bytes: w.bytes, grant: w.grant, tick: null, deadline: null, enqueuedAt: Date.now() };
+    if (w.onWaitTick) { const f = w.onWaitTick; entry.tick = setInterval(() => { void Promise.resolve(f()).catch(() => {}); }, MEMORY_WAIT_TICK_MS); entry.tick.unref?.(); }
+    const maxWait = this.memoryMaxWaitMs;
+    entry.deadline = setTimeout(() => {
+      const idx = this.memoryQueue.indexOf(entry);
+      if (idx < 0) return;
+      this.memoryQueue.splice(idx, 1);
+      if (entry.tick) clearInterval(entry.tick);
+      this.memoryTimeouts++;
+      w.timeout(new MemoryWaitTimeoutError(maxWait, w.bytes, this.memoryBudgetBytes));
+      this.drainMemoryQueue(); // el que salió podía estar en la cabeza: los de atrás pueden entrar
+    }, maxWait);
+    entry.deadline.unref?.();
+    this.memoryQueue.push(entry);
+    this.drainMemoryQueue();
+  }
+
+  /** Atiende desde la cabeza mientras quepa (FIFO estricto: si la cabeza no entra, nadie de atrás pasa). */
+  private drainMemoryQueue(): void {
+    while (this.memoryQueue.length && this.memoryFits(this.memoryQueue[0].bytes)) {
+      const h = this.memoryQueue.shift()!;
+      if (h.tick) clearInterval(h.tick);
+      if (h.deadline) clearTimeout(h.deadline);
+      this.reserveNow(h.key, h.bytes);
+      this.memoryGrantOrder.push(h.key);
+      if (this.memoryGrantOrder.length > 200) this.memoryGrantOrder.shift();
+      h.grant();
+    }
+  }
+  private readonly memoryQueue: MemoryWaiter[] = [];
+  private memoryTicket = 0;
+  /** Espera máxima por memoria (env COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN, por defecto 30 min; las pruebas lo cambian). */
+  memoryMaxWaitMs = workshopMemoryMaxWaitMs();
+  /** Orden en que se otorgaron las reservas que esperaron (pruebas). */
+  readonly memoryGrantOrder: string[] = [];
+  /** Esperas que vencieron (pruebas). */
+  memoryTimeouts = 0;
+  /** Reserva síncrona + el pico observado (las pruebas lo leen). */
+  private reserveNow(key: string, bytes: number): void {
+    this.memoryReservations.set(key, bytes);
+    this.peakReservedBytes = Math.max(this.peakReservedBytes, this.reservedMemoryBytes);
+  }
+  /** Pico de memoria reservada en este proceso (pruebas). */
+  peakReservedBytes = 0;
+  /** Trabajos esperando lugar en el presupuesto (pruebas). */
+  get memoryWaiting(): number {
+    return this.memoryQueue.length;
+  }
+  /** Al soltarse memoria: se atiende la cola en orden. */
+  private memoryReleased(): void {
+    this.drainMemoryQueue();
   }
   /** Bytes reservados ahora en este proceso (las pruebas lo leen). */
   get reservedMemoryBytes(): number {
@@ -1062,29 +1366,48 @@ export class CourseWorkshopService {
    * estimado de memoria entra en el presupuesto del proceso (N2); si no, espera a que se suelte una reserva.
    */
   private pumpDiagnosis(): void {
-    if (this.dead || this.diagnosisLane !== null) return;
+    if (this.dead || this.diagnosisLane !== null || this.diagnosisMemoryPending) return;
     const job = this.diagnosisQueue[0];
     if (!job) return;
-    if (this.reservedMemoryBytes > 0 && this.reservedMemoryBytes + job.bytes > this.memoryBudgetBytes) return;
     this.diagnosisQueue.shift();
-    this.diagnosisLane = job.diagnosisId;
-    this.memoryReservations.set(`diagnosis:${job.diagnosisId}`, job.bytes);
-    (async () => {
-      // P2-7: `running` recién ahora; el latido sigue mientras corre.
-      const started = returningRows(await this.q(this.dataSource,
-        `update public.workshop_diagnoses set status = 'running', started_at = now(), updated_at = now()
-          where id = $1 and claim_id = $2 and status = 'queued' returning id`, [job.diagnosisId, job.claimId]));
-      if (started.length) await this.runDiagnosis(job.diagnosisId, job.claimId);
-    })()
-      .catch((err) => this.logger.error(`workshop diagnóstico ${job.diagnosisId}: terminó con error: ${err instanceof Error ? err.message : String(err)}`))
-      .finally(() => {
-        this.memoryReservations.delete(`diagnosis:${job.diagnosisId}`);
-        this.diagnosisLane = null;
-        this.beat(job.claimId, false);
-        job.done();
-        this.pumpDiagnosis();
-      });
+    // Fix round 2 (N1): el diagnóstico pide su memoria en la MISMA cola FIFO que los demás; mientras espera NO toma el
+    // carril (sigue `queued`, con su latido). Uno solo pendiente a la vez (el carril es de 1).
+    const start = () => {
+      this.diagnosisMemoryPending = false;
+      this.diagnosisLane = job.diagnosisId;
+      (async () => {
+        // P2-7: `running` recién ahora; el latido sigue mientras corre.
+        const started = returningRows(await this.q(this.dataSource,
+          `update public.workshop_diagnoses set status = 'running', started_at = now(), updated_at = now()
+            where id = $1 and claim_id = $2 and status = 'queued' returning id`, [job.diagnosisId, job.claimId]));
+        if (started.length) await this.runDiagnosis(job.diagnosisId, job.claimId);
+      })()
+        .catch((err) => this.logger.error(`workshop diagnóstico ${job.diagnosisId}: terminó con error: ${err instanceof Error ? err.message : String(err)}`))
+        .finally(() => {
+          this.diagnosisLane = null;
+          this.beat(job.claimId, false);
+          job.done();
+          this.memoryReservations.delete(`diagnosis:${job.diagnosisId}`);
+          this.memoryReleased();
+          this.pumpDiagnosis();
+        });
+    };
+    const key = `diagnosis:${job.diagnosisId}`;
+    if (!this.memoryQueue.length && this.memoryFits(job.bytes)) { this.reserveNow(key, job.bytes); start(); return; }
+    this.diagnosisMemoryPending = true;
+    this.enqueueMemory({
+      key, bytes: job.bytes, grant: start,
+      timeout: (e) => {
+        this.diagnosisMemoryPending = false;
+        void this.q(this.dataSource,
+          `update public.workshop_diagnoses set status = 'failed', error = $3::jsonb, finished_at = now(), updated_at = now() where id = $1 and claim_id = $2 and status = 'queued'`,
+          [job.diagnosisId, job.claimId, JSON.stringify({ code: WORKSHOP_ERRORS.MEMORY_WAIT_TIMEOUT, message: e.message, retryable: true })])
+          .catch(() => {})
+          .finally(() => { this.beat(job.claimId, false); job.done(); this.pumpDiagnosis(); });
+      },
+    });
   }
+  private diagnosisMemoryPending = false;
 
   /**
    * GET …/sessions/:id/diagnosis — mismas compuertas que GET …/:id (`courses.view`). N1: si el diagnóstico pedido quedó

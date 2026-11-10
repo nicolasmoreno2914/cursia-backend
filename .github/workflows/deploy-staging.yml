@@ -256,6 +256,11 @@ jobs:
       - name: Check r107 Taller de cursos — pedidos, preguntas y plan (IA simulada)
         run: node scripts/r107/check-r107-plan.js --ci
 
+      # r107 B6: aplicar un plan aprobado (núcleo puro: motor B4 + compuerta antes/después + validador, informe de cambios,
+      # confirmaciones de riesgo alto, cadena de versiones, restoreCheck, factor de memoria). La parte con base corre local (PG16).
+      - name: Check r107 Taller de cursos — aplicar + versiones (puro)
+        run: node scripts/r107/check-r107-apply.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -907,6 +912,12 @@ jobs:
                # idempotente; requiere [5i].
                echo "━━━ [5l] r107 B5: Taller de cursos (pedidos y plan) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r107-b5-plan.js
+
+               # r107 B6: aplicar + versiones (workshop_versions, tabla NUEVA con RLS + sin anon/authenticated; sesiones hijas
+               # y estados nuevos de plan / aprobación en tablas del Taller). Staging-only (EXCLUDED del plan de producción).
+               # Aditiva e idempotente; requiere [5i] y [5l].
+               echo "━━━ [5m] r107 B6: Taller de cursos (aplicar + versiones) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r107-b6-apply.js
 
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod

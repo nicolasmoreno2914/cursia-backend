@@ -12,6 +12,11 @@
 //   L4  un cargo que no se pudo registrar se reintenta al cerrar (idempotente por el id del mensaje) → registrado y liberada
 //   L5  una reserva con el tope por encima del disponible restante → USER_BUDGET_EXHAUSTED (el ledger hace cumplir el saldo)
 //   L6  (fix round 2, N1) una llamada `not_sent` libera la reserva; junto a una ambigua, sigue pendiente
+//   r107 B6 (con las migraciones r107 B1–B6 aplicadas con sus scripts sobre el mismo esquema):
+//   L7  openApproval de PUNTA A PUNTA (WorkshopPlanService real, sesión real): reserva real → llamada → cargo → liberada
+//   L8  conciliación admin de una aprobación `ambiguous`: listado, `charged_partial` con monto real + evidencia, aprobación
+//       `reconciled`, auditoría (admin_audit_log), no-op al repetir, 409 a otra decisión, `charged` entero → 400
+//   L9  `not_charged` libera; una aprobación en curso no figura ni se concilia; solo SuperAdmin
 //
 // Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js
 'use strict';
@@ -185,6 +190,130 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq(await errCode(reserve('l5', (av + 0.05).toFixed(6))), 'USER_BUDGET_EXHAUSTED', 'rechazado por el ledger');
       eq(await errCode(plan.preflight(U, (av + 0.05).toFixed(6))), 'USER_BUDGET_INSUFFICIENT', 'y por la compuerta del Taller');
       eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    // ── r107 B6: openApproval de punta a punta con el ledger REAL + las migraciones r107 sobre el esquema de staging ──
+    for (const s of ['scripts/migrate-r107-workshop-sessions.js', 'scripts/migrate-r107-b2-inventory.js', 'scripts/migrate-r107-b3-diagnosis.js', 'scripts/migrate-r107-b5-plan.js', 'scripts/migrate-r107-b6-apply.js']) {
+      const res = runScript(s, localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(res.code === 0, `${s}: exit ${res.code}\n${res.out.slice(-1500)}`);
+    }
+    const SVC = L('modules/course-workshop/course-workshop.service.js');
+    const ART = L('modules/artifacts/artifacts.service.js');
+    const DRY = L('modules/pedagogy/dry-run.js');
+    const { FinopsAdminController } = L('modules/finops/finops.controller.js');
+    const S = require(path.join(REPO, 'scripts/lib/commercial-simulation'));
+    const COURSES = require(path.join(REPO, 'scripts/fixtures/commercial-simulation/courses.json')).courses;
+    global.fetch = realFetch;
+    const MBZ = (await S.simulateCourse(distRoot, COURSES.find((c) => c.id === '1x1-sin-examenes'))).built.mbz;
+    global.fetch = async (u, o) => { const s = String(u); if (/^http:\/\/127\.0\.0\.1:\d+/.test(s)) return realFetch(u, o); throw new Error(`NETWORK FORBIDDEN in check: ${s}`); };
+    const objects = new Map();
+    const storage = {
+      async createSignedUploadUrl(ownerId, bucket, p) { ART.assertWritableStoragePath(ownerId, bucket, p); return { method: 'backend', url: `http://storage.local/${p}`, token: 't' }; },
+      async headStorageObjectBytes(bucket, p) { return objects.has(p) ? objects.get(p).length : null; },
+      async downloadStorageObjectCapped(bucket, p, opts) {
+        if (!objects.has(p)) throw new ART.StorageHttpError(404, 'not_found', p);
+        const b = objects.get(p);
+        const body = new ReadableStream({ start(c) { c.enqueue(new Uint8Array(b)); c.close(); } });
+        return ART.readBodyCapped(new Response(body), opts.maxBytes, () => {}, opts.onChunk, { sizeHint: opts.sizeHint });
+      },
+    };
+    const svc = new SVC.CourseWorkshopService(ds, storage, null);
+    const sess = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l7.mbz', sizeBytes: MBZ.length });
+    objects.set(sess.upload.storagePath, MBZ);
+    await svc.markUploaded({ id: U }, sess.session.id);
+    await Promise.all([...svc.inFlight.values()]);
+    const sid = sess.session.id;
+    eq((await svc.get({ id: U }, sid)).status, 'identified', 'sesión identificada (con las migraciones r107 sobre el esquema de staging)');
+    const mkClient = (mode) => ({
+      simulated: false, calls: 0,
+      async call(req) {
+        this.calls++;
+        if (mode === 'timeout') throw Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' });
+        return { input: { requests: [{ quote: 'Agrega una línea a la bienvenida.', operation: 'edit_html', instruction: 'Agregar una línea al final de la bienvenida.', target: { moduleId: 1000 }, targetEvidence: 'Agrega una línea a la bienvenida.', changeEvidence: 'Agrega una línea a la bienvenida.' }] },
+          stopReason: 'tool_use', model: req.model, messageId: `msg_l7_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false };
+      },
+    });
+    const planFor = (client) => { const p = new PLS.WorkshopPlanService(ds, storage, svc, ledger, budget, client); p.pricingLoader = async () => DRY.seedPricing(); return p; };
+    const approveIntake = async (p, text) => {
+      const a = await p.createTextIntake({ id: U }, sid, text);
+      const c = await p.confirmInterpretation({ id: U }, sid, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p.whenIdle();
+      return { a, c, ap: (await p.listRequests({ id: U }, sid)).approvals.find((x) => x.id === c.approval.id) };
+    };
+
+    await check('L7 (B6) openApproval de PUNTA A PUNTA contra el ledger REAL con las migraciones r107 (enforce): estimado → aprobar → reserva `pending` del tope en el ledger → la llamada → cargo real con approvalId → reserva LIBERADA; disponible = antes − cargo', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '2.00', reason: 'QA r107 B6' });
+      const before = await available();
+      const client = mkClient('ok');
+      const p = planFor(client);
+      const a = await p.createTextIntake({ id: U }, sid, 'Agrega una línea a la bienvenida.');
+      eq(client.calls, 0, 'sin aprobar no se llama');
+      const c = await p.confirmInterpretation({ id: U }, sid, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      const key = `workshop:approval:${c.approval.id}`;
+      eq([c.approval.reserved, (await pending(key)).measurement_status], [true, 'pending'], 'reserva REAL pendiente antes de llamar');
+      near(await available(), before - Number(a.estimate.proposedCapUsd), 'el tope reservado descuenta del disponible');
+      await p.whenIdle();
+      const ap = (await p.listRequests({ id: U }, sid)).approvals.find((x) => x.id === c.approval.id);
+      eq([ap.status, ap.aiCalls, ap.calls.map((x) => x.status), client.calls], ['done', 1, ['charged'], 1], 'aprobación cerrada, llamada cobrada');
+      const [ch] = await ds.query(`select amount::text a, operation, owner_id from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [c.approval.id]);
+      assert(ch && Number(ch.a) > 0 && /^llm\.workshop_interpret/.test(ch.operation), `cargo real: ${JSON.stringify(ch)}`);
+      const pd = await pending(key);
+      assert(pd.adj >= 1, 'la reserva tiene su liquidación');
+      near(await net(key), 0, 'reserva liberada (neto 0)');
+      near(await available(), before - Number(ch.a), 'disponible = antes − cargo real');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    const ctl = new FinopsAdminController(ledger, budget, { get: () => audit });
+    const saUser = { id: SA, email: SA_EMAIL };
+    let amb1 = null; let amb2 = null;
+
+    await check('L8 (B6) conciliación: una aprobación del Taller con una llamada AMBIGUA aparece en el listado admin de reservas pendientes (con sus llamadas); `charged` entero → 400; `charged_partial` con el monto real + evidencia → cuenta eso, aprobación `reconciled`, AUDITADA; repetir = no-op; otra decisión → 409', async () => {
+      const p = planFor(mkClient('timeout'));
+      const r1 = await approveIntake(p, 'Agrega una línea a la bienvenida.');
+      eq([r1.ap.status, r1.ap.calls.map((x) => x.status)], ['ambiguous', ['ambiguous']], 'ambigua');
+      amb1 = `workshop:approval:${r1.c.approval.id}`;
+      near(await net(amb1), Number(r1.a.estimate.proposedCapUsd), 'el tope entero sigue retenido');
+      const r2 = await approveIntake(p, 'Agrega una línea a la bienvenida.');
+      amb2 = `workshop:approval:${r2.c.approval.id}`;
+      const list = (await ctl.workshopReservations()).reservations;
+      const row = list.find((x) => x.reservationKey === amb1);
+      assert(row && row.approvalStatus === 'ambiguous' && row.sessionId === sid && row.kind === 'interpret' && row.calls.length === 1 && row.calls[0].status === 'ambiguous', `en el listado: ${JSON.stringify(row)}`);
+      assert(list.some((x) => x.reservationKey === amb2), 'las dos');
+      const badReq = async (b) => { try { await ctl.reconcileWorkshopReservation(b, saUser); return null; } catch (e) { return e.getStatus ? e.getStatus() : e.message; } };
+      eq(await badReq({ reservationKey: amb1, outcome: 'charged', reason: 'x' }), 400, 'charged entero no');
+      eq(await badReq({ reservationKey: 'workshop:approval:nope', outcome: 'not_charged', reason: 'x' }), 400, 'clave inválida');
+      eq(await badReq({ reservationKey: `workshop:approval:${crypto.randomUUID()}`, outcome: 'not_charged', reason: 'x' }), 400, 'no es una reserva del Taller');
+      const ev = { source: 'provider_console', referenceIds: ['req_l8_1'], observedAmount: '0.0123' };
+      const out = await ctl.reconcileWorkshopReservation({ reservationKey: amb1, outcome: 'charged_partial', amount: '0.0123', reason: 'Anthropic confirma el cobro de la llamada (consola)', evidence: ev }, saUser);
+      eq([out.outcome, out.reconciled, out.countedAmount], ['charged_partial', true, '0.0123000000'], 'conciliada con el monto real');
+      near(await net(amb1), 0.0123, 'cuenta SOLO lo cobrado');
+      const [w] = await ds.query(`select status, reconciliation from public.workshop_ai_approvals where id = $1`, [r1.c.approval.id]);
+      eq([w.status, w.reconciliation.outcome, w.reconciliation.decidedBy, w.reconciliation.amount], ['reconciled', 'charged_partial', SA, '0.0123000000'], 'anotada en la aprobación');
+      const [au] = await ds.query(`select actor_id::text a, action, target_type, target_id, after from public.admin_audit_log where action = 'finops.reconcile_workshop_approval' and target_id = $1`, [r1.c.approval.id]);
+      assert(au && au.a === SA && au.target_type === 'workshop_ai_approval' && au.after.outcome === 'charged_partial', `auditada: ${JSON.stringify(au)}`);
+      const again = await ctl.reconcileWorkshopReservation({ reservationKey: amb1, outcome: 'charged_partial', amount: '0.0123', reason: 'repetida', evidence: ev }, saUser);
+      eq([again.alreadySettled, again.reconciled], [true, false], 'repetir = no-op');
+      eq(await badReq({ reservationKey: amb1, outcome: 'not_charged', reason: 'cambio de opinión' }), 409, 'otra decisión sobre una ya cerrada → 409');
+      assert(!(await ctl.workshopReservations()).reservations.some((x) => x.reservationKey === amb1), 'ya no figura como pendiente');
+    });
+
+    await check('L9 (B6) `not_charged` (Anthropic no cobró) → reserva LIBERADA a 0 con motivo, auditada; una aprobación todavía EN CURSO no figura ni se concilia (409); solo SuperAdmin (guard de la clase)', async () => {
+      const before = await available();
+      const out = await ctl.reconcileWorkshopReservation({ reservationKey: amb2, outcome: 'not_charged', reason: 'La consola de Anthropic no muestra la llamada' }, saUser);
+      eq([out.outcome, out.reconciled], ['not_charged', true], 'liberada');
+      near(await net(amb2), 0, 'neto 0');
+      assert(await available() > before, 'el saldo retenido vuelve');
+      // Una aprobación `running` (con su reserva pendiente) no se concilia: puede liquidarse sola.
+      const [run] = await ds.query(`insert into public.workshop_ai_approvals (session_id, created_by, kind, estimate, cap_usd, status) values ($1, $2, 'interpret', '{}'::jsonb, 0.05, 'running') returning id`, [sid, U]);
+      await reserve(run.id, '0.050000');
+      const key = `workshop:approval:${run.id}`;
+      assert(!(await ctl.workshopReservations()).reservations.some((x) => x.reservationKey === key), 'en curso: no figura');
+      let st = null; try { await ctl.reconcileWorkshopReservation({ reservationKey: key, outcome: 'not_charged', reason: 'x' }, saUser); } catch (e) { st = e.getStatus(); }
+      eq(st, 409, 'en curso → 409');
+      const { SuperAdminGuard } = L('auth/super-admin.guard.js');
+      const guards = Reflect.getMetadata('__guards__', FinopsAdminController) || [];
+      assert(guards.includes(SuperAdminGuard), 'el controlador exige SuperAdmin');
     });
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
