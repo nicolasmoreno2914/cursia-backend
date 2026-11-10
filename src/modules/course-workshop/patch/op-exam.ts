@@ -198,6 +198,22 @@ async function loadQuiz(ctx: OpContext, a: WorkshopActivity): Promise<QuizXml> {
   return parseQuiz(entry, await ctx.state.readText(entry));
 }
 
+/**
+ * Fix round 1 (P2-3): un paquete con datos de usuarios (respaldo «con usuarios») o con intentos / notas del examen no se
+ * toca: renumerar o quitar ranuras, o cambiar una pregunta, dejaría intentos apuntando a lo que ya no existe.
+ */
+export async function examUserDataProblem(ctx: Pick<OpContext, 'state'>, quizDir: string): Promise<string | null> {
+  const mb = ctx.state.has('moodle_backup.xml') ? await ctx.state.readText('moodle_backup.xml') : '';
+  if (/<setting>\s*<level>root<\/level>\s*<name>users<\/name>\s*<value>1<\/value>/.test(mb)) return 'el paquete es un respaldo CON usuarios: exporta el curso sin datos de usuarios para editar sus exámenes.';
+  const qx = ctx.state.has(`${quizDir}/quiz.xml`) ? await ctx.state.readText(`${quizDir}/quiz.xml`) : '';
+  if (/<attempt id="\d+"|<grade id="\d+"|<question_usage id="\d+"/.test(qx)) return 'el examen trae intentos o notas de estudiantes: exporta el curso sin datos de usuarios para editar sus preguntas.';
+  return null;
+}
+async function assertNoUserData(ctx: OpContext, a: WorkshopActivity): Promise<void> {
+  const why = await examUserDataProblem(ctx, a.dir);
+  if (why) throw new PatchError('unsupported', `No se editan las preguntas de «${a.title || a.dir}»: ${why}`);
+}
+
 /** Ranuras FIJAS de todos los quiz del paquete que usan una entrada / pregunta (fuera del quiz dado). */
 async function otherUses(ctx: OpContext, skip: number, entryId: number | null, questionId: number): Promise<string[]> {
   const out: string[] = [];
@@ -215,6 +231,7 @@ function misalignExplanations(ctx: OpContext, a: WorkshopActivity): void {
 
 export async function applyExamReplace(ctx: OpContext, op: ExamQuestionReplaceOp): Promise<void> {
   const a = quizOf(ctx, op.quizModuleId);
+  await assertNoUserData(ctx, a);
   const wq = a.exam!.questions.find((q) => q.id === op.questionId);
   if (!wq) throw new PatchError('target_not_found', `La pregunta ${op.questionId} no es de ${a.dir} (o no es la versión que usa su ranura).`);
   validateQuestion(ctx, op.question, `${a.title || a.dir}`);
@@ -242,6 +259,9 @@ export async function applyExamReplace(ctx: OpContext, op: ExamQuestionReplaceOp
   xml = xml.slice(0, s + open.length) + body + xml.slice(e);
   ctx.state.write('questions.xml', xml);
   noteModified(ctx, 'questions.xml');
+  // Respuestas que ya no existen (menos opciones que antes): sus archivos fuera (P2-7).
+  const kept = op.question.qtype === 'truefalse' ? 2 : op.question.answers.length;
+  await dropQuestionFiles(ctx, { questionIds: [], answerIds: oldAnswerIds.slice(kept) });
   ctx.report.fields.push({ entry: 'questions.xml', field: `question:${wq.id}`, moduleId: a.moduleId, sectionId: null, questionId: wq.id, before: describe(wq.html, wq.answers.map((x) => ({ html: x.html, fraction: x.fraction ?? 0 }))), after: describeNew(op.question), beforeRawSha1: sha1Of(oldBody), afterRawSha1: sha1Of(body) });
   Object.assign(ctx.report.idsAssigned, ids.assigned);
   const others = await otherUses(ctx, a.moduleId, wq.bankEntryId, wq.id);
@@ -259,6 +279,7 @@ const tsOf = (xml: string) => /<timecreated>(\d+)<\/timecreated>/.exec(xml)?.[1]
 
 export async function applyExamAdd(ctx: OpContext, op: ExamQuestionAddOp): Promise<void> {
   const a = quizOf(ctx, op.quizModuleId);
+  await assertNoUserData(ctx, a);
   validateQuestion(ctx, op.question, `${a.title || a.dir}`);
   const quiz = await loadQuiz(ctx, a);
   let xml = await ctx.state.readText('questions.xml');
@@ -370,6 +391,7 @@ export async function applyExamAdd(ctx: OpContext, op: ExamQuestionAddOp): Promi
 
 export async function applyExamRemove(ctx: OpContext, op: ExamQuestionRemoveOp): Promise<void> {
   const a = quizOf(ctx, op.quizModuleId);
+  await assertNoUserData(ctx, a);
   const wq = a.exam!.questions.find((q) => q.id === op.questionId);
   if (!wq) throw new PatchError('target_not_found', `La pregunta ${op.questionId} no es de ${a.dir}.`);
   const quiz = await loadQuiz(ctx, a);
@@ -421,11 +443,13 @@ export async function applyExamRemove(ctx: OpContext, op: ExamQuestionRemoveOp):
     // Se lleva también el salto de línea + sangría anteriores (bloque limpio).
     const ls = xml.lastIndexOf('\n', s);
     const cut = ls >= 0 && /^\s*$/.test(xml.slice(ls, s)) ? ls : s;
-    const removedIds = [wq.id, ...wq.otherVersions];
+    const seg = xml.slice(s, e);
+    const removedIds = [...seg.matchAll(/<question id="(\d+)">/g)].map((m) => Number(m[1]));
+    const answerIds = [...seg.matchAll(/<answer id="(\d+)">/g)].map((m) => Number(m[1]));
     xml = xml.slice(0, cut) + xml.slice(e);
     ctx.state.write('questions.xml', xml);
     noteModified(ctx, 'questions.xml');
-    await dropQuestionFiles(ctx, removedIds);
+    await dropQuestionFiles(ctx, { questionIds: removedIds, answerIds });
     ctx.report.notes.push(`la pregunta ${wq.id} sale del banco${wq.otherVersions.length ? ` (con sus versiones ${wq.otherVersions.join(', ')})` : ''}`);
   } else {
     ctx.report.notes.push(`la pregunta ${wq.id} queda en el banco: la usa también ${others.join(', ')}`);
@@ -436,12 +460,22 @@ export async function applyExamRemove(ctx: OpContext, op: ExamQuestionRemoveOp):
   ctx.report.summary = `${a.title || a.dir}: pregunta ${wq.id} quitada`;
 }
 
-/** Archivos de files.xml de preguntas quitadas (component question, itemid = pregunta) y sus blobs huérfanos. */
-async function dropQuestionFiles(ctx: OpContext, qids: number[]): Promise<void> {
-  if (!ctx.state.has('files.xml')) return;
+/**
+ * Archivos de files.xml (component `question`) de lo que se quita, y sus blobs si quedan huérfanos (un blob que otra
+ * entrada usa se conserva). Fix round 1 (P2-7): las áreas de la PREGUNTA (questiontext, generalfeedback, *feedback,
+ * hint) usan el id de la pregunta como itemid; las de las RESPUESTAS (answer, answerfeedback), el id de la respuesta.
+ */
+async function dropQuestionFiles(ctx: OpContext, ids: { questionIds: number[]; answerIds: number[] }): Promise<number> {
+  if (!ctx.state.has('files.xml')) return 0;
   let xml = await ctx.state.readText('files.xml');
-  const victims = [...xml.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].filter((m) => /<component>question<\/component>/.test(m[2]) && qids.includes(Number(/<itemid>(\d+)<\/itemid>/.exec(m[2])?.[1] ?? -1)));
-  if (!victims.length) return;
+  const ANSWER_AREAS = new Set(['answer', 'answerfeedback']);
+  const victims = [...xml.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].filter((m) => {
+    if (!/<component>question<\/component>/.test(m[2])) return false;
+    const area = /<filearea>([^<]*)<\/filearea>/.exec(m[2])?.[1] ?? '';
+    const item = Number(/<itemid>(\d+)<\/itemid>/.exec(m[2])?.[1] ?? -1);
+    return ANSWER_AREAS.has(area) ? ids.answerIds.includes(item) : ids.questionIds.includes(item);
+  });
+  if (!victims.length) return 0;
   const hashes = new Set<string>();
   for (const m of victims.reverse()) {
     hashes.add(/<contenthash>([0-9a-f]{40})<\/contenthash>/.exec(m[2])?.[1] ?? '');
@@ -453,4 +487,6 @@ async function dropQuestionFiles(ctx: OpContext, qids: number[]): Promise<void> 
   for (const h of hashes) {
     if (h && !xml.includes(`<contenthash>${h}</contenthash>`) && ctx.state.has(blobPath(h))) { ctx.state.remove(blobPath(h)); ctx.report.entriesRemoved.push(blobPath(h)); }
   }
+  ctx.report.notes.push(`files.xml: ${victims.length} archivo(s) de preguntas / respuestas quitadas`);
+  return victims.length;
 }

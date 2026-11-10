@@ -74,6 +74,10 @@ if (MODE === 'bite') {
     { name: 'sin validación de tokens del HTML nuevo', file: 'modules/course-workshop/patch/html-edit.js', from: 'if (bad.length) {', to: 'if (false) {', expect: /P2/ },
     { name: 'sin la regla «ningún hallazgo nuevo»', file: 'modules/course-workshop/patch/engine.js', from: 'if (delta.introduced.length) {', to: 'if (false) {', expect: /P10/ },
     { name: 'ranuras aleatorias: solo el filtercondition de Moodle 4.1 (no el de 4.3+)', file: 'modules/course-workshop/patch/op-exam.js', from: 'const cat = j.filter?.category;', to: 'const cat = undefined;', expect: /P5/ },
+    { name: 'fix 1 P1-1: tokens del HTML nuevo con la validación vieja (deja pasar tipos inventados)', file: 'modules/course-workshop/patch/html-edit.js', from: 'const bad = strictTokenProblems(fragment, v.tokenCtx);', to: 'const bad = badTokens(fragment, v.tokenCtx).map((t) => t.token);', expect: /R1 P1-1/ },
+    { name: 'fix 1 P2-8: quitar enlace sin mirar enlaces anidados', file: 'modules/course-workshop/patch/html-edit.js', from: 'if (no && no.index < cm.index)', to: 'if (false)', expect: /R1 P2-8/ },
+    { name: 'fix 1 P2-6: comparación por firma gruesa (sin ocurrencia)', file: 'modules/course-workshop/patch/engine.js', from: "if (!touched)\n        return `id:${f.id}`;", to: 'return findingSignature(f);', expect: /R1 P2-6/ },
+    { name: 'fix 1 P2-1: .ARCHIVE_INDEX sin regenerar', file: 'modules/course-workshop/patch/engine.js', from: 'if (await state.finalize())', to: 'if (false)', expect: /R1 P2-1/ },
     { name: 'remove_activity no sanea los enlaces que la nombran', file: 'modules/course-workshop/patch/op-remove.js', from: 'for (const t of targets) {', to: 'for (const t of []) {', expect: /P7/ },
   ];
   let bad = 0;
@@ -175,13 +179,34 @@ function makePng(r, g, b) {
   const row = Buffer.from([0, r, g, b, r, g, b]);
   return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(Buffer.concat([row, row]))), chunk('IEND', Buffer.alloc(0))]);
 }
-/** tar.gz de un zip (writer propio, independiente del motor). */
-async function zipToTarGz(buf) {
+/** tar.gz de un zip (writer propio, independiente del motor). `index`: con un .ARCHIVE_INDEX (viejo, como Moodle). */
+async function zipToTarGz(buf, opts = {}) {
   const { map } = await entriesOf(buf);
+  const all = new Map(map);
+  for (const [k, v] of Object.entries(opts.extra || {})) all.set(k, v);
   const blocks = [];
-  for (const [name, data] of map) {
+  const ents = [...all];
+  if (opts.index) ents.unshift(['.ARCHIVE_INDEX', Buffer.from(`Moodle archive file index. Count: ${all.size}\n` + [...all].map(([n, d]) => `${n}\tf\t${d.length}\t?\n`).join(''))]);
+  const hdr = (name, prefix, size, type) => {
     const h = Buffer.alloc(512);
-    h.write(name, 0, 100, 'utf8'); h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+    h.write(name, 0, 100, 'utf8'); h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116); if (prefix) h.write(prefix, 345, 155, 'utf8');
+    h.write(size.toString(8).padStart(11, '0') + '\0', 124); h.write('00000000000\0', 136); h.write('        ', 148); h.write(type, 156); h.write('ustar\0', 257); h.write('00', 263);
+    let s = 0; for (let i = 0; i < 512; i++) s += h[i];
+    h.write(s.toString(8).padStart(6, '0') + '\0 ', 148);
+    return h;
+  };
+  for (const [name0, data] of ents) {
+    let name = name0; let prefix = '';
+    if (Buffer.byteLength(name) > 100) { const i = name.lastIndexOf('/', name.length - 2); prefix = name.slice(0, i); name = name.slice(i + 1); }
+    if (Buffer.byteLength(name) > 100) {
+      // Un segmento de más de 100 bytes: solo se puede expresar con PAX (lo que el motor NUNCA escribe).
+      const body = ` path=${name0}\n`; let len = body.length + 2; while (String(len).length + body.length !== len) len = String(len).length + body.length;
+      const rec = Buffer.from(`${len}${body}`);
+      blocks.push(hdr('PaxHeader/x', '', rec.length, 'x'), rec, Buffer.alloc((512 - (rec.length % 512)) % 512));
+      name = 'pax-largo'; prefix = '';
+    }
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100, 'utf8'); h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116); if (prefix) h.write(prefix, 345, 155, 'utf8');
     h.write(data.length.toString(8).padStart(11, '0') + '\0', 124); h.write('00000000000\0', 136); h.write('        ', 148); h.write('0', 156); h.write('ustar\0', 257); h.write('00', 263);
     let s = 0; for (let i = 0; i < 512; i++) s += h[i];
     h.write(s.toString(8).padStart(6, '0') + '\0 ', 148);
@@ -189,6 +214,22 @@ async function zipToTarGz(buf) {
   }
   blocks.push(Buffer.alloc(1024));
   return zlib.gzipSync(Buffer.concat(blocks));
+}
+
+/** Cabeceras de un tar (sin descomprimir nada más): tipo, nombre, prefix, ruta y datos. */
+function tarHeaders(tar) {
+  const out = [];
+  let off = 0;
+  const str = (b, o, l) => { const s = b.subarray(o, o + l); const z = s.indexOf(0); return (z < 0 ? s : s.subarray(0, z)).toString('utf8'); };
+  while (off + 512 <= tar.length) {
+    const h = tar.subarray(off, off + 512);
+    if (h.every((x) => x === 0)) break;
+    const size = parseInt(str(h, 124, 12) || '0', 8);
+    const name = str(h, 0, 100); const prefix = str(h, 345, 155);
+    out.push({ type: String.fromCharCode(h[156] || 48), name, prefix, path: prefix ? `${prefix}/${name}` : name, size, data: tar.subarray(off + 512, off + 512 + size) });
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return out;
 }
 
 // ── Invariantes (P3) ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -380,7 +421,11 @@ async function fixSeeded(id, dmg, base, expected) {
   const ops = await resolveFix(seeded, dmg, base);
   const { res } = await applyOk(dmg, ops, id);
   const sig = SIG(seeded);
-  assert(res.diagnosis.resolved.some((x) => x.signature === sig), `${id}: el diagnóstico posterior no da por resuelto ${sig} (resueltos: ${res.diagnosis.resolved.map((x) => x.signature).join(' ; ')})`);
+  // Fix round 1 (P2-6): si el arreglo quitó la actividad, el hallazgo figura como «quitado», no como «resuelto».
+  const removedAct = ops.some((o) => o.op === 'remove_activity');
+  const list = removedAct ? res.diagnosis.removed : res.diagnosis.resolved;
+  assert(list.some((x) => x.signature === sig), `${id}: el diagnóstico posterior no da por ${removedAct ? 'quitado' : 'resuelto'} ${sig} (${list.map((x) => x.signature).join(' ; ')})`);
+  if (removedAct) assert(!res.diagnosis.resolved.some((x) => x.signature === sig), `${id}: un hallazgo de una actividad quitada no es «resuelto»`);
   return { seeded, ops, res };
 }
 
@@ -705,6 +750,136 @@ async function ciSuite(fx) {
     }
     console.log(`   ${lines.join('\n   ')}`);
   });
+
+  // ── Fix round 1 ─────────────────────────────────────────────────────────────────────────────────────────────────────
+  await check('R1 P1-1 tokens inventados en HTML nuevo (tipo desconocido / sin id) → falla, en campos y en preguntas; WWWROOT sí', async () => {
+    for (const tok of ['$@ACTIVITYVIEWBYID*999@$', '$@MODVIEWBYID*5@$', '$@FOOBAR*77@$', '$@SCORMVIEWBYID@$', '$@BOOKVIEWBYIDCH*1@$']) {
+      await applyFail(V1, [{ op: 'edit_html', target: { moduleId: 901, field: 'intro' }, change: { kind: 'replace', html: `<p><a href="${tok}">x</a></p>` } }], 'invalid_content', `campo ${tok}`, /token inválido/);
+      await applyFail(V1, [{ op: 'edit_html', target: { sectionId: 12 }, change: { kind: 'replace', html: `<p><a href="${tok}">x</a></p>` } }], 'invalid_content', `sección ${tok}`);
+      await applyFail(V1, [{ op: 'exam_question_add', quizModuleId: 930, question: { ...MC('x'), text: `<p>Ver <a href="${tok}">esto</a></p>` } }], 'invalid_content', `pregunta ${tok}`);
+      await applyFail(V1, [{ op: 'edit_html', target: { moduleId: 911, field: 'intro' }, change: { kind: 'token', token: '$@SCORMVIEWBYID*912@$', action: 'retarget', to: tok } }], tok === '$@SCORMVIEWBYID@$' || tok === '$@BOOKVIEWBYIDCH*1@$' ? 'invalid_content' : 'invalid_content', `retarget ${tok}`);
+    }
+    await applyOk(V1, [{ op: 'edit_html', target: { moduleId: 901, field: 'intro' }, change: { kind: 'replace', html: '<p><a href="$@WWWROOT@$/my/">Mi área</a></p>' } }], 'WWWROOT');
+  });
+
+  await check('R1 P2-8 quitar enlace: `</a >`, `</A\n>`, «>» dentro de un atributo → texto conservado; enlace anidado o sin cerrar → falla', async () => {
+    const T = '$@SCORMVIEWBYID*912@$';
+    const cases = [
+      [`<p>Video. <a href="${T}">Practicar</a >. <a href="$@RESOURCEVIEWBYID*903@$">Libro</a></p>`, '<p>Video. Practicar. <a href="$@RESOURCEVIEWBYID*903@$">Libro</a></p>'],
+      [`<p>Video. <A title="a > b" HREF='${T}'>Practicar</A\n>.</p>`, '<p>Video. Practicar.</p>'],
+    ];
+    for (const [html, want] of cases) {
+      const b = await zipEdit(V1, (z) => setIntro(z, 'hvp_911', html));
+      const { inv } = await applyOk(b, [{ op: 'edit_html', target: { moduleId: 911, field: 'intro' }, change: { kind: 'token', token: T, action: 'unlink' } }], `unlink ${html.slice(0, 30)}`);
+      eq(field(inv, 911, 'intro').html, want, 'unlink robusto');
+    }
+    for (const html of [`<p><a href="${T}">Practicar <a href="#x">otro</a></a></p>`, `<p><a href="${T}">Practicar</p>`]) {
+      const b = await zipEdit(V1, (z) => setIntro(z, 'hvp_911', html));
+      await applyFail(b, [{ op: 'edit_html', target: { moduleId: 911, field: 'intro' }, change: { kind: 'token', token: T, action: 'unlink' } }], 'invalid_content', 'anidado / sin cerrar');
+    }
+  });
+
+  await check('R1 P2-5 colores: nunca dentro de <script>, <style> ni comentarios; logo: los SCORM no se tocan y el informe lo dice', async () => {
+    const b = await zipEdit(V1, (z) => setIntro(z, 'label_904', '<p style="color:#B45309">Guía.</p><!-- <div style="color:#B45309"> --><script>var t = \'<div style="color:#B45309">\';</script><p><a href="$@RESOURCEVIEWBYID*903@$">Descargar Libro Guía</a></p>'));
+    const { inv } = await applyOk(b, [{ op: 'brand_replace', colors: { '#B45309': '#0F766E' } }], 'colores con script');
+    eq(field(inv, 904, 'intro').html, '<p style="color:#0F766E">Guía.</p><!-- <div style="color:#B45309"> --><script>var t = \'<div style="color:#B45309">\';</script><p><a href="$@RESOURCEVIEWBYID*903@$">Descargar Libro Guía</a></p>', 'solo el style real');
+    // Logo que solo vive en un SCORM: no se reemplaza → el logo no aparece en otro lado → falla con motivo, y el aviso no miente.
+    const L1 = makePng(9, 9, 9); const L2 = makePng(8, 8, 8);
+    const sc = await zipEdit(V1, async (z) => { const c = (await inventoryOf(V1)).activities.find((a) => a.moduleId === 912).contextId; await addFile(z, { contextId: c, component: 'mod_scorm', filearea: 'content', filename: 'logo.png', data: L1, mimetype: 'image/png', fileId: 95 }); await setIntro(z, 'label_901', `<p>Bienvenidos.</p><img src="data:image/png;base64,${L1.toString('base64')}">`); });
+    const r = await applyOk(sc, [{ op: 'brand_replace', logo: { currentSha1: sha1(L1), image: { base64: L2.toString('base64'), mimetype: 'image/png' } } }], 'logo con SCORM');
+    assert(r.b.map.has(blobPath(sha1(L1))) && !r.res.operations[0].files.length, 'el blob del SCORM sigue con el logo viejo');
+    assert(r.res.operations[0].misalignment.some((m) => /SCORM tienen el logo anterior/.test(m)), `aviso veraz: ${r.res.operations[0].misalignment.join(' | ')}`);
+    const shared = await zipEdit(sc, (z) => addFile(z, { contextId: 104, component: 'mod_label', filearea: 'intro', filename: 'logo.png', data: L1, mimetype: 'image/png', fileId: 96 }));
+    await applyFail(shared, [{ op: 'brand_replace', logo: { currentSha1: sha1(L1), image: { base64: L2.toString('base64'), mimetype: 'image/png' } } }], 'unsupported', 'blob compartido con un SCORM', /SCORM/);
+  });
+
+  await check('R1 P2-3 exámenes: respaldo con usuarios o intentos → no se editan (motivo claro)', async () => {
+    const withUsers = await zipEdit(V1, async (z) => { const mb = await z.file('moodle_backup.xml').async('string'); const i = mb.indexOf('</contents>') + 11; z.file('moodle_backup.xml', mb.slice(0, i) + '<settings><setting><level>root</level><name>users</name><value>1</value></setting></settings>' + mb.slice(i)); });
+    await applyFail(withUsers, [{ op: 'exam_question_remove', quizModuleId: 930, questionId: 5001 }], 'unsupported', 'con usuarios', /sin datos de usuarios/);
+    const attempts = await zipEdit(V1, async (z) => { const p = 'activities/quiz_930/quiz.xml'; const x = await z.file(p).async('string'); z.file(p, x.replace('</quiz>', () => '<attempts><attempt id="1"><userid>5</userid></attempt></attempts></quiz>')); });
+    await applyFail(attempts, [{ op: 'exam_question_replace', quizModuleId: 930, questionId: 5001, question: MC('x') }], 'unsupported', 'con intentos', /intentos/);
+  });
+
+  await check('R1 P2-7 preguntas: los archivos de sus respuestas (itemid = id de la respuesta) se van con ellas; el blob compartido se queda', async () => {
+    const ctxQ = (await inventoryOf(V1)).activities.find((a) => a.moduleId === 930).contextId;
+    const A1 = Buffer.from('respuesta-6001'); const A3 = Buffer.from('respuesta-6003'); const QT = Buffer.from('enunciado-5001');
+    const b = await zipEdit(V1, async (z) => {
+      const add = (fileId, filearea, itemid, data, name) => addFile(z, { contextId: ctxQ, component: 'question', filearea, filename: name, data, mimetype: 'image/png', fileId }).then(async () => { const fx = await z.file('files.xml').async('string'); z.file('files.xml', fx.replace(`<file id="${fileId}"><contenthash>${sha1(data)}</contenthash><contextid>${ctxQ}</contextid><component>question</component><filearea>${filearea}</filearea><itemid>0</itemid>`, () => `<file id="${fileId}"><contenthash>${sha1(data)}</contenthash><contextid>${ctxQ}</contextid><component>question</component><filearea>${filearea}</filearea><itemid>${itemid}</itemid>`)); });
+      await add(81, 'answer', 6001, A1, 'a1.png'); await add(82, 'answerfeedback', 6003, A3, 'a3.png'); await add(83, 'questiontext', 5001, QT, 'q.png');
+      await addFile(z, { contextId: 104, component: 'mod_label', filearea: 'intro', filename: 'copia-a1.png', data: A1, mimetype: 'image/png', fileId: 84 });
+    });
+    const rem = await applyOk(b, [{ op: 'exam_question_remove', quizModuleId: 930, questionId: 5001 }], 'quitar pregunta con archivos');
+    const fx = rem.b.map.get('files.xml').toString('utf8');
+    assert(!/<file id="8[123]">/.test(fx), 'los 3 archivos de la pregunta y sus respuestas fuera');
+    assert(!rem.b.map.has(blobPath(sha1(A3))) && !rem.b.map.has(blobPath(sha1(QT))) && rem.b.map.has(blobPath(sha1(A1))), 'blobs huérfanos fuera, el compartido queda');
+    const rep = await applyOk(b, [{ op: 'exam_question_replace', quizModuleId: 930, questionId: 5001, question: { qtype: 'multichoice', text: '<p>¿2 + 2?</p>', answers: [{ html: 'Cuatro', fraction: 1 }, { html: 'Tres', fraction: 0 }] } }], 'reemplazo con menos opciones');
+    const fx2 = rep.b.map.get('files.xml').toString('utf8');
+    assert(/<file id="81">/.test(fx2) && !/<file id="82">/.test(fx2) && /<file id="83">/.test(fx2), 'solo sale el archivo de la respuesta que ya no existe (6003)');
+  });
+
+  await check('R1 P2-4 Libro V1: capítulo faltante en su módulo (después de la página «Módulo 2»); pie de página conservado; módulo desconocido entre módulos → falla', async () => {
+    const PG = (n) => `<div class="pg-hd"><div class="pg-hd-l">Libro Guía · Curso</div></div>`;
+    const FT = '<div class="pg-ft">Libro Guía · Curso<br><span class="cp">© Material protegido</span></div>';
+    const LIB = '<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>L</title></head><body>'
+      + '<div class="page"><div class="cover">Portada</div></div>'
+      + `<div class="page">${PG()}<h1>Módulo 1 — Bases</h1><p>Intro del módulo 1.</p>${FT}</div>`
+      + `<div class="page">${PG()}<h1>Capítulo 1: Primero</h1><p>Contenido del primero.</p>${FT}</div>`
+      + `<div class="page">${PG()}<h1>Módulo 2 — Avance</h1><p>Intro del módulo 2.</p>${FT}</div>`
+      + `<div class="page">${PG()}<h1>Recursos y Bibliografía</h1><p>Refs.</p>${FT}</div></body></html>`;
+    const base = await zipEdit(V1, async (z) => {
+      await replaceBlobIn(z, 'libro_guia_completo.html', () => LIB);
+      for (const [d, nm] of [['section_12', 'Módulo 1 · Capítulo 1: Primero'], ['section_13', 'Módulo 2 · Capítulo 2: Segundo']]) { const p = `sections/${d}/section.xml`; const x = await z.file(p).async('string'); z.file(p, x.replace(/<name>[^<]*<\/name>/, () => `<name>${nm}</name>`)); }
+    });
+    const inv0 = await inventoryOf(base);
+    eq(inv0.chapters.map((c) => [c.number, c.moduleNumber]), [[1, 1], [2, 2]], 'módulos de los capítulos');
+    const { res, b } = await applyOk(base, [{ op: 'edit_libro_section', moduleId: 903, chapters: [{ number: 2, html: '<p>Contenido del segundo.</p>', title: 'Segundo' }, { number: 1, html: '<p>Primero reescrito.</p>' }] }], 'libro con módulos');
+    const out = b.map.get(blobPath(res.operations[0].files[0].after.contenthash)).toString('utf8');
+    const iM2 = out.indexOf('Módulo 2 — Avance'); const iC2 = out.indexOf('Capítulo 2: Segundo'); const iB = out.indexOf('Recursos y Bibliografía');
+    assert(iM2 > 0 && iC2 > iM2 && iB > iC2, 'Módulo 2 → Capítulo 2 → Bibliografía');
+    assert(out.includes(`<h1>Capítulo 1: Primero</h1><p>Primero reescrito.</p>${FT}</div>`), 'el pie de la página reemplazada se conserva');
+    assert(out.includes(`<div class="page">${PG()}<h1>Capítulo 2: Segundo</h1><p>Contenido del segundo.</p>${FT}</div>`), 'el capítulo agregado lleva encabezado y pie');
+    // Sin módulos en el curso (secciones sin «Módulo M»): entre el cap. 1 y el final hay una página de módulo → falla.
+    const plain = await zipEdit(V1, (z) => replaceBlobIn(z, 'libro_guia_completo.html', () => LIB));
+    await applyFail(plain, [{ op: 'edit_libro_section', moduleId: 903, chapters: [{ number: 2, html: '<p>x</p>', title: 'Segundo' }] }], 'unsupported', 'módulo desconocido', /módulo/);
+  });
+
+  await check('R1 P2-6 hallazgos por ocurrencia: cambiar un enlace muerto por otro en la misma etiqueta → hallazgo nuevo; los de una actividad quitada → «quitados», no «resueltos»', async () => {
+    const two = await zipEdit(V1, (z) => setIntro(z, 'label_901', '<p style="color:#000">Bienvenidos. <a href="#">Ir al módulo</a></p>'));
+    const r = await applyFail(two, [{ op: 'edit_html', target: { moduleId: 901, field: 'intro' }, change: { kind: 'replace', html: '<p style="color:#000">Bienvenidos. <a href="#">Ver el foro</a></p>' } }], 'new_findings', 'cambio de un defecto por otro');
+    assert(r.diagnosis.introduced.some((x) => /dead_link/.test(x.signature)) && r.diagnosis.resolved.some((x) => /dead_link/.test(x.signature)), 'uno resuelto + uno nuevo');
+    const z = await JSZip.loadAsync(AS); const exp = await BC.MUTATIONS['empty-label'](z); const dmg = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const mid = Number(exp.target.split('_')[1]);
+    const ok2 = await applyOk(dmg, [{ op: 'remove_activity', moduleId: mid }], 'quitar etiqueta vacía');
+    assert(ok2.res.diagnosis.removed.some((x) => /empty_activity/.test(x.signature)) && !ok2.res.diagnosis.resolved.some((x) => /empty_activity/.test(x.signature)), 'quitado ≠ resuelto');
+  });
+
+  await check('R1 P2-2 remove_activity: condición de acceso por NOTA, cálculo ##giN## y bloque que la nombra → falla con motivo', async () => {
+    const gi = Number(/<grade_item id="(\d+)"/.exec((await entriesOf(AS)).map.get('activities/h5pactivity_1020/grades.xml').toString('utf8'))[1]);
+    const byGrade = await zipEdit(AS, async (z) => { const p = 'activities/label_1022/module.xml'; const x = await z.file(p).async('string'); z.file(p, x.replace('<availability>$@NULL@$</availability>', () => `<availability>{"op":"&amp;","c":[{"type":"grade","id":${gi},"min":50}],"showc":[true]}</availability>`)); });
+    await applyFail(byGrade, [{ op: 'remove_activity', moduleId: 1020 }], 'invariant', 'por nota', /NOTA/);
+    const calc = await zipEdit(AS, async (z) => { const x = await z.file('gradebook.xml').async('string'); z.file('gradebook.xml', x.replace('</gradebook>', () => `<calc>##gi${gi}##</calc></gradebook>`)); });
+    await applyFail(calc, [{ op: 'remove_activity', moduleId: 1020 }], 'invariant', '##gi##', /##gi/);
+    const blk = await zipEdit(AS, (z) => { z.file('course/blocks/completion_progress_9/block.xml', `<?xml version="1.0" encoding="UTF-8"?><block id="9" contextid="9999" version="1"><blockname>completion_progress</blockname><configdata>${Buffer.from('a:1:{s:15:"selectactivities";a:1:{i:0;s:18:"h5pactivity-1020";}}').toString('base64')}</configdata></block>`); });
+    await applyFail(blk, [{ op: 'remove_activity', moduleId: 1020 }], 'invariant', 'bloque', /bloque/);
+  });
+
+  await check('R1 P2-1 tar.gz como el de Moodle: .ARCHIVE_INDEX regenerado (cuenta y líneas del paquete nuevo), carpetas, nombres largos con prefix (nunca PAX); un nombre que no entra → falla clara', async () => {
+    const tgz = await zipToTarGz(V1, { index: true, extra: { [`activities/label_904/${'d'.repeat(60)}/${'n'.repeat(70)}.txt`]: Buffer.from('largo') } });
+    const { res } = await applyOk(tgz, [{ op: 'remove_activity', moduleId: 912 }], 'tar.gz con índice');
+    const hdrs = tarHeaders(zlib.gunzipSync(res.package));
+    assert(hdrs.every((h) => h.type === '0' || h.type === '5'), `tipos: ${[...new Set(hdrs.map((h) => h.type))].join(',')}`);
+    eq(hdrs[0].path, '.ARCHIVE_INDEX', 'el índice primero');
+    const idx = hdrs[0].data.toString('utf8').split('\n').filter(Boolean);
+    const rest = hdrs.slice(1);
+    eq(idx[0], `Moodle archive file index. Count: ${rest.length}`, 'cuenta');
+    eq(idx.slice(1).map((l) => l.split('\t')[0]), rest.map((h) => h.path), 'una línea por entrada, en orden');
+    assert(!idx.some((l) => l.startsWith('activities/scorm_912/')), 'sin lo quitado');
+    const long = rest.find((h) => h.path.endsWith('.txt'));
+    assert(long && long.prefix && long.name.length <= 100, 'nombre largo partido en prefix + name');
+    assert(res.operations[res.operations.length - 1].entriesModified.includes('.ARCHIVE_INDEX'), 'el informe dice que el índice cambió');
+    const bad = await zipToTarGz(V1, { index: true, extra: { [`activities/label_904/${'x'.repeat(120)}.txt`]: Buffer.from('no entra') } });
+    await applyFail(bad, [{ op: 'remove_activity', moduleId: 912 }], 'unsupported', 'nombre que no entra', /demasiado largo/);
+  });
 }
 
 // ── --corpus ───────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -894,6 +1069,36 @@ async function moodleSuite() {
     assert(!o.cms.some((c) => c.name === rm.title), 'M2: actividad quitada');
     assert(o.cms.some((c) => c.intro && c.intro.includes('#0F766E')), 'M2: color nuevo');
     console.log(`   M2 curso restaurado ${o.courseid}: ${o.cms.length} actividades; Libro ${newHash.slice(0, 10)}…; color ${col} → #0F766E`);
+  });
+  // Fix round 1 (P2-1): un tar.gz REAL (re-export de Moodle del corpus) parcheado → restauración real.
+  const tgzPath = process.env.R107_REEXPORT || path.join(os.homedir(), 'Downloads/copia_de_seguridad-moodle2-course-183-matemáticas_para_grado_11-20260406-2235-nu.mbz');
+  await check(`M3 tar.gz real (${path.basename(tgzPath)}): edit_html + brand_replace + remove_activity → índice regenerado, restaura igual de limpio que el original y muestra los cambios`, async () => {
+    const buf = fs.readFileSync(tgzPath);
+    eq(R.detectContainer(buf), 'tar.gz', 'contenedor');
+    const inv = await inventoryOf(buf, path.basename(tgzPath));
+    const { map } = await entriesOf(buf);
+    const ops = autoOps(inv, (n) => map.get(n)?.toString('utf8') ?? null).filter((o) => ['edit_html', 'brand_replace', 'remove_activity'].includes(o.kind)).map((o) => o.op);
+    assert(ops.length === 3, `operaciones: ${ops.map((o) => o.op).join(', ')}`);
+    const { res } = await applyOk(buf, ops, 'M3', { filename: path.basename(tgzPath) });
+    eq(res.container, 'tar.gz', 'sale tar.gz');
+    assert(res.operations.some((o) => o.entriesModified.includes('.ARCHIVE_INDEX')), 'índice regenerado');
+    const hdrs = tarHeaders(zlib.gunzipSync(res.package));
+    assert(hdrs.every((h) => h.type === '0' || h.type === '5'), 'sin PAX');
+    const o0 = restore(buf, 'r107-patch-reexport-original');
+    const o = restore(res.package, 'r107-patch-reexport');
+    // Igual de limpio que el original (el original es la línea de base de un backup ajeno).
+    // (el log trae fecha e ids del curso nuevo: se comparan sin números; el original ya trae un aviso propio de Moodle).
+    const norm = (v) => JSON.stringify(v ?? null).replace(/\d+/g, 'N');
+    for (const k of ['restoreStatus', 'restoreLogLines', 'restoreDbLogWarnings', 'precheck', 'cli']) eq(norm(o[k]), norm(o0[k]), `M3: ${k} igual al original`);
+    eq(o.restoreStatus, 1000, 'M3: controller');
+    console.log(`   M3 avisos del restore, iguales en original y parcheado: ${JSON.stringify(o0.restoreLogLines)}`);
+    const edited = ops[0];
+    const a = inv.activities.find((x) => x.moduleId === edited.target.moduleId);
+    const rc = o.cms.find((c) => c.name === a.title || (c.intro && c.intro.includes('Nota del Taller')));
+    assert(rc && rc.intro.includes('Nota del Taller: ñandú «$&» O\'Brien'), 'M3: etiqueta editada');
+    const removed = inv.activities.find((x) => x.moduleId === ops[2].moduleId);
+    eq(o.cms.length, o0.cms.length - 1, `M3: una actividad menos (${removed.title})`);
+    console.log(`   M3 curso restaurado ${o.courseid}: ${o.cms.length} actividades (original ${o0.cms.length})`);
   });
 }
 

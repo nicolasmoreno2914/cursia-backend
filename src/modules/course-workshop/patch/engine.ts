@@ -47,28 +47,64 @@ export interface PatchInput {
   baseline?: { originalSha1: string; report: DiagnosisReport } | null;
 }
 
-/** Firma de un hallazgo para comparar antes / después sin depender de desplazamientos ni de hashes de blobs. */
+/** Firma gruesa de un hallazgo (sin posiciones): para mostrar y para agrupar. */
 export function findingSignature(f: Finding): string {
   const file = f.evidence.file ? `${f.evidence.file.component}/${f.evidence.file.filearea}/${f.evidence.file.filename}` : '';
   const where = f.scope.activity ? f.scope.activity.dir : `${f.scope.level}:${f.scope.chapterNumber ?? ''}`;
   return [f.check, f.code, f.severity, where, f.evidence.questionId ?? '', f.evidence.token ?? '', file].join('|');
 }
 
-/** Compara dos diagnósticos (multiconjunto de firmas error/warning). */
-export function diagnosisDelta(before: Finding[], after: Finding[], counts: { before: DiagnosisDelta['before']; after: DiagnosisDelta['after'] }): DiagnosisDelta {
+/** Lo que tocó el plan: entradas (modificadas, agregadas, quitadas), archivos de files.xml cambiados y actividades quitadas. */
+export interface PlanTouch { entries: Set<string>; files: Set<string>; removedDirs: Set<string> }
+export function planTouch(reports: OperationReport[]): PlanTouch {
+  const entries = new Set<string>();
+  const files = new Set<string>();
+  const removedDirs = new Set<string>();
+  for (const r of reports) {
+    for (const e of [...r.entriesModified, ...r.entriesAdded, ...r.entriesRemoved]) entries.add(e);
+    for (const fc of r.files) files.add(`${fc.component}/${fc.filearea}/${fc.filename}`);
+    for (const e of r.entriesRemoved) { const m = /^(activities\/[^/]+)\/(module|[a-z]+)\.xml$/.exec(e); if (m && m[2] === 'module') removedDirs.add(m[1]); }
+  }
+  return { entries, files, removedDirs };
+}
+
+/**
+ * Fix round 1 (P2-6): identidad de UNA ocurrencia. Donde el plan no tocó nada, el id exacto del hallazgo de B3 (incluye
+ * la entrada, el campo y la posición). Donde sí tocó (la entrada, o el archivo del blob), las posiciones cambian
+ * legítimamente: se usa la firma + el fragmento de evidencia (el enlace muerto, la ruta H5P…), así cambiar un defecto
+ * por otro del mismo código en la misma actividad cuenta como uno resuelto y uno NUEVO.
+ */
+export function occurrenceKey(f: Finding, t: PlanTouch): string {
+  const fileKey = f.evidence.file ? `${f.evidence.file.component}/${f.evidence.file.filearea}/${f.evidence.file.filename}` : null;
+  const blob = !!f.evidence.entry && /^files\/[0-9a-f]{2}\/[0-9a-f]{40}$/.test(f.evidence.entry);
+  const touched = (f.evidence.entry && t.entries.has(f.evidence.entry)) || (fileKey && t.files.has(fileKey))
+    || (f.evidence.entry === null && !!f.scope.activity && [...t.entries].some((e) => e.startsWith(`${f.scope.activity!.dir}/`)))
+    || (blob && !!fileKey && t.files.has(fileKey));
+  if (!touched) return `id:${f.id}`;
+  const entry = blob ? `file:${fileKey ?? ''}` : (f.evidence.entry ?? '');
+  return ['occ', findingSignature(f), entry, f.evidence.excerpt ?? ''].join('|');
+}
+
+/** Compara dos diagnósticos por ocurrencia (solo error / warning). */
+export function diagnosisDelta(before: Finding[], after: Finding[], counts: { before: DiagnosisDelta['before']; after: DiagnosisDelta['after'] }, touch: PlanTouch = { entries: new Set(), files: new Set(), removedDirs: new Set() }): DiagnosisDelta {
   const visible = (fs: Finding[]) => fs.filter((x) => x.severity === 'error' || x.severity === 'warning');
-  const bag = (fs: Finding[]) => {
+  const removed: DiagnosisDelta['removed'] = [];
+  const bag = (fs: Finding[], side: 'before' | 'after') => {
     const m = new Map<string, Finding[]>();
-    for (const x of visible(fs)) { const k = findingSignature(x); m.set(k, [...(m.get(k) ?? []), x]); }
+    for (const x of visible(fs)) {
+      if (side === 'before' && x.scope.activity && touch.removedDirs.has(x.scope.activity.dir)) { removed.push({ signature: findingSignature(x), title: x.title, severity: x.severity }); continue; }
+      const k = occurrenceKey(x, touch);
+      m.set(k, [...(m.get(k) ?? []), x]);
+    }
     return m;
   };
-  const b = bag(before);
-  const a = bag(after);
+  const b = bag(before, 'before');
+  const a = bag(after, 'after');
   const resolved: DiagnosisDelta['resolved'] = [];
   const introduced: DiagnosisDelta['introduced'] = [];
-  for (const [k, xs] of b) { const n = (a.get(k) ?? []).length; for (const x of xs.slice(n)) resolved.push({ signature: k, title: x.title, severity: x.severity }); }
-  for (const [k, xs] of a) { const n = (b.get(k) ?? []).length; for (const x of xs.slice(n)) introduced.push({ signature: k, title: x.title, severity: x.severity }); }
-  return { before: counts.before, after: counts.after, resolved, introduced };
+  for (const [k, xs] of b) { const n = (a.get(k) ?? []).length; for (const x of xs.slice(n)) resolved.push({ signature: findingSignature(x), title: x.title, severity: x.severity }); }
+  for (const [k, xs] of a) { const n = (b.get(k) ?? []).length; for (const x of xs.slice(n)) introduced.push({ signature: findingSignature(x), title: x.title, severity: x.severity }); }
+  return { before: counts.before, after: counts.after, resolved, introduced, removed };
 }
 
 function checkInventory(given: WorkshopCourse, actual: WorkshopCourse): string | null {
@@ -132,8 +168,15 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
   }
 
   // Escritura + relectura + lo no tocado idéntico.
+  // tar.gz: `.ARCHIVE_INDEX` regenerado para el conjunto final de entradas (fix round 1, P2-1).
+  if (await state.finalize()) { const last = reports[reports.length - 1]; if (!last.entriesModified.includes('.ARCHIVE_INDEX')) last.entriesModified.push('.ARCHIVE_INDEX'); last.notes.push('tar.gz: .ARCHIVE_INDEX regenerado (lista y cuenta de entradas del paquete nuevo)'); }
   const touched = await state.touched();
-  const { bytes, preserved } = await state.serialize();
+  let bytes: Buffer; let preserved: number;
+  try {
+    ({ bytes, preserved } = await state.serialize());
+  } catch (e) {
+    return fail({ opIndex: null, op: null, code: 'unsupported', message: `No se puede escribir el paquete nuevo: ${e instanceof Error ? e.message : String(e)}` }, pkg.container);
+  }
   if (sha1Of(input.original) !== originalSha1) return fail({ opIndex: null, op: null, code: 'invariant', message: 'El original cambió durante la aplicación (no debería pasar nunca).' }, pkg.container);
   let out: MbzPackage;
   try {
@@ -157,9 +200,9 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
     const bl = input.baseline;
     const before = bl && bl.originalSha1 === originalSha1 && bl.report?.codeVersion === DIAGNOSIS_CODE_VERSION && bl.report.family === family
       ? bl.report
-      : await runTechnicalDiagnosis({ pkg: await openMbz(input.original), packageBytes: input.original, family, builderLine, builderVersion: null });
-    const after = await runTechnicalDiagnosis({ pkg: out, packageBytes: bytes, family, builderLine, builderVersion: null });
-    delta = diagnosisDelta(before.findings, after.findings, { before: before.counts.total, after: after.counts.total });
+      : await runTechnicalDiagnosis({ pkg: await openMbz(input.original), packageBytes: input.original, family, builderLine, builderVersion: null }, { prevalidateFixes: false });
+    const after = await runTechnicalDiagnosis({ pkg: out, packageBytes: bytes, family, builderLine, builderVersion: null }, { prevalidateFixes: false });
+    delta = diagnosisDelta(before.findings, after.findings, { before: before.counts.total, after: after.counts.total }, planTouch(reports));
   } catch (e) {
     return fail({ opIndex: null, op: null, code: 'invariant', message: `El diagnóstico del resultado falló: ${e instanceof Error ? e.message : String(e)}` }, pkg.container);
   }

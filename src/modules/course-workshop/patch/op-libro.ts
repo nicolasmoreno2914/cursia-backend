@@ -65,6 +65,14 @@ export function libroStructure(html: string): { headings: Heading[]; chapters: C
     if (page >= 0) {
       const close = matchingDivClose(html, page);
       if (close >= 0) { bodyEnd = Math.min(bodyEnd, close); complete = true; } else complete = false;
+      // Fix round 1 (P2-4b): el pie de la página (`<div class="pg-ft">…</div>`, último hijo) NO es parte del cuerpo.
+      if (close >= 0 && bodyEnd === close) {
+        const ft = html.lastIndexOf('<div class="pg-ft">', close);
+        if (ft > h.end) {
+          const ftClose = matchingDivClose(html, ft);
+          if (ftClose >= 0 && /^\s*$/.test(html.slice(ftClose + html.slice(ftClose).match(/^<\/div\s*>/i)![0].length, close))) bodyEnd = ft;
+        }
+      }
       blockEnd = close >= 0 ? close + html.slice(close).match(/^<\/div\s*>/i)![0].length : html.length;
     } else {
       blockEnd = bodyEnd;
@@ -84,7 +92,7 @@ function validateChapterHtml(c: LibroChapterInput): void {
 }
 
 /** Documento recompuesto + qué pasó con cada capítulo. */
-export function recomposeLibro(html: string, input: EditLibroSectionOp, titleOf: (n: number) => string | null, courseChapters: number[]): { html: string; notes: string[]; misalignment: string[] } {
+export function recomposeLibro(html: string, input: EditLibroSectionOp, titleOf: (n: number) => string | null, courseChapters: number[], moduleOf: (n: number) => number | null = () => null): { html: string; notes: string[]; misalignment: string[] } {
   const notes: string[] = [];
   const misalignment: string[] = [];
   const byNum = new Map<number, LibroChapterInput>();
@@ -104,7 +112,34 @@ export function recomposeLibro(html: string, input: EditLibroSectionOp, titleOf:
     if (!t) throw new PatchError('invalid_params', `Falta el título del capítulo ${n} (no está en el Libro ni en el inventario).`);
     return `<h${level}>Capítulo ${n}: ${htmlEsc(t)}</h${level}>`;
   };
-  const block = (c: LibroChapterInput) => (wrapped ? `<div class="page">${heading(c.number, c.title)}${c.html}</div>` : `${heading(c.number, c.title)}${c.html}`);
+  // Fix round 1 (P2-4b): un capítulo agregado lleva el encabezado (pg-hd) y el pie (pg-ft) de las páginas de capítulo
+  // del Libro: se copian de la primera página de capítulo completa.
+  const tpl = st.chapters.find((c) => c.wrapped && c.complete);
+  const pgHead = tpl ? html.slice(tpl.blockStart + '<div class="page">'.length, tpl.headStart) : '';
+  const pgFoot = tpl ? html.slice(tpl.bodyEnd, tpl.blockEnd).replace(/<\/div\s*>\s*$/i, '') : '';
+  const block = (c: LibroChapterInput) => (wrapped ? `<div class="page">${pgHead}${heading(c.number, c.title)}${c.html}${pgFoot}</div>` : `${heading(c.number, c.title)}${c.html}`);
+  // Páginas de presentación de módulo («Módulo M …»): un capítulo agregado nunca queda del lado equivocado (P2-4a).
+  const moduleBlocks = st.headings.filter((x) => x.number === null && /^\s*M[óo]dulo\s+(\d+)\b/i.test(x.text)).map((x) => {
+    const page = enclosingPage(html, x.start);
+    const close = page >= 0 ? matchingDivClose(html, page) : -1;
+    const end = close >= 0 ? close + html.slice(close).match(/^<\/div\s*>/i)![0].length : (st.headings.find((y) => y.start > x.start && y.level <= x.level)?.start ?? st.bodyClose);
+    return { module: Number(/M[óo]dulo\s+(\d+)/i.exec(x.text)![1]), start: page >= 0 ? page : x.start, end };
+  });
+  const insertAt = (n: number): number => {
+    const m = moduleOf(n);
+    const prev = [...st.chapters].reverse().find((c) => c.number < n);
+    const next = st.chapters.find((c) => c.number > n);
+    if (m !== null) {
+      if (prev && moduleOf(prev.number) === m) return prev.blockEnd;
+      if (next && moduleOf(next.number) === m) return next.blockStart;
+      const mb = moduleBlocks.find((x) => x.module === m);
+      if (mb) return mb.end;
+    }
+    const from = prev ? prev.blockEnd : 0;
+    const to = next ? next.blockStart : st.bodyClose;
+    if (moduleBlocks.some((x) => x.start >= from && x.start < to)) throw new PatchError('unsupported', `No se sabe de qué módulo es el capítulo ${n} y entre sus vecinos hay una presentación de módulo: no se ubica a ciegas.`);
+    return prev ? prev.blockEnd : next ? next.blockStart : st.bodyClose;
+  };
 
   if (intact) {
     if (!st.chapters.length) throw new PatchError('unsupported', 'El Libro no tiene títulos de capítulo con el formato del builder («Capítulo N: …»): no se puede ubicar cada capítulo con certeza (se editaría a ciegas).');
@@ -120,9 +155,7 @@ export function recomposeLibro(html: string, input: EditLibroSectionOp, titleOf:
     }
     const missing = [...byNum.keys()].filter((n) => !seq.includes(n)).sort((a, b) => a - b);
     for (const n of missing) {
-      const prev = [...st.chapters].reverse().find((c) => c.number < n);
-      const next = st.chapters.find((c) => c.number > n);
-      const at = prev ? prev.blockEnd : next ? next.blockStart : st.bodyClose;
+      const at = insertAt(n);
       edits.push({ start: at, end: at, ins: block(byNum.get(n)!) });
       notes.push(`capítulo ${n}: agregado (faltaba)`);
     }
@@ -195,11 +228,12 @@ export async function applyEditLibroSection(ctx: OpContext, op: EditLibroSection
   }
   const titleOf = (n: number) => ctx.inv.chapters.find((c) => c.number === n)?.title ?? null;
   const courseChapters = ctx.inv.chapters.map((c) => c.number);
+  const moduleOf = (n: number) => ctx.inv.chapters.find((c) => c.number === n)?.moduleNumber ?? null;
   if (a.modname === 'page') {
     const f = a.html.find((h) => h.field === 'content');
     if (!f) throw new PatchError('target_not_found', `${a.dir} no tiene contenido.`);
     const loc = await locateField(ctx.state, f);
-    const res = recomposeLibro(f.html, op, titleOf, courseChapters);
+    const res = recomposeLibro(f.html, op, titleOf, courseChapters, moduleOf);
     check(res.html, courseChapters, op);
     const raw = xmlEsc(res.html);
     writeField(ctx.state, loc, raw);
@@ -220,7 +254,7 @@ export async function applyEditLibroSection(ctx: OpContext, op: EditLibroSection
   const buf = await ctx.state.read(blobPath(lf.contenthash));
   if (sha1Of(buf) !== lf.contenthash) throw new PatchError('stale_target', 'El blob del Libro no coincide con su sha1: no se edita un archivo dañado.');
   const html = buf.toString('utf8');
-  const res = recomposeLibro(html, op, titleOf, courseChapters);
+  const res = recomposeLibro(html, op, titleOf, courseChapters, moduleOf);
   check(res.html, courseChapters, op);
   const out = Buffer.from(res.html, 'utf8');
   await replaceBlob(ctx, lf.contenthash, out);

@@ -13,7 +13,7 @@
  */
 import { xmlEsc } from '../../../package/mbz-common';
 import { xmlUnescape } from '../../visual-design/preview-extract';
-import { TokenContext, WorkshopActivity, WorkshopCourse, WorkshopHtmlField, extractTokens, pluginfileRefs } from '../course-model';
+import { TokenContext, WorkshopActivity, WorkshopCourse, WorkshopHtmlField, extractTokens, pluginfileRefs, tokenKindShape } from '../course-model';
 import { PatchState, sha1Of } from './container';
 import { PatchError } from './types';
 
@@ -84,16 +84,37 @@ export function badTokens(html: string, tokenCtx: TokenContext): Array<{ token: 
 }
 
 /**
+ * Fix round 1 (P1-1): en el HTML NUEVO un token solo pasa si es de un tipo que Moodle conoce y, si su tipo lleva id,
+ * trae los ids que corresponden y apunta a algo que existe en su espacio de ids (estado `ok`). Un tipo inventado
+ * (`$@ACTIVITYVIEWBYID*9@$`, `$@FOOBAR*7@$`), un token sin id (`$@SCORMVIEWBYID@$`) o uno que no se puede verificar →
+ * la operación falla. Sin id solo los tipos que existen así (`WWWROOT`).
+ */
+export function strictTokenProblems(html: string, tokenCtx: TokenContext): string[] {
+  const out: string[] = [];
+  const resolved = new Map(extractTokens(html, { field: 'x', entry: 'x' }, tokenCtx).filter((t) => t.status !== 'malformed').map((t) => [t.token, t]));
+  for (const m of html.matchAll(/\$@([A-Z0-9_]+)((?:\*\d+)*)@(\$)?/g)) {
+    const tok = m[0];
+    if (m[3] === undefined) { out.push(`«${tok}» está mal formado (no cierra en @$)`); continue; }
+    const shape = tokenKindShape(m[1]);
+    const ids = (m[2].match(/\*\d+/g) || []).length;
+    if (shape.shape === 'unknown') { out.push(`«${tok}» no es un tipo de token que Moodle conozca`); continue; }
+    if (shape.shape === 'idless') { if (ids) out.push(`«${tok}» no lleva id`); continue; }
+    if (ids !== shape.ids) { out.push(`«${tok}» necesita ${shape.ids} id(s)`); continue; }
+    const t = resolved.get(tok);
+    const st = t ? t.status : 'unchecked';
+    if (st !== 'ok') out.push(`«${tok}» ${st === 'orphan' ? 'apunta a una actividad que no existe' : st === 'wrong_type' ? 'apunta a una actividad de otro tipo' : st === 'external' ? 'apunta a otro curso' : 'no se puede verificar contra el paquete'}`);
+  }
+  return out;
+}
+
+/**
  * Valida un FRAGMENTO nuevo (lo que la operación escribe). `full` = el campo completo resultante: además se exige que
  * no tenga más tokens inválidos que antes (un reemplazo por rango que corta un token lo rompería).
  */
 export function validateNewHtml(fragment: string, full: string, v: HtmlValidationCtx): void {
-  const bad = badTokens(fragment, v.tokenCtx);
+  const bad = strictTokenProblems(fragment, v.tokenCtx);
   if (bad.length) {
-    const t = bad[0];
-    const why = t.status === 'orphan' ? 'apunta a una actividad que no existe' : t.status === 'wrong_type' ? 'apunta a una actividad de otro tipo'
-      : t.status === 'external' ? 'apunta a otro curso' : 'está mal formado (no cierra en @$)';
-    throw new PatchError('invalid_content', `El HTML nuevo de ${v.where} trae el token «${t.token}», que ${why}: el motor nunca escribe un token inventado.`);
+    throw new PatchError('invalid_content', `El HTML nuevo de ${v.where} trae un token inválido: ${bad[0]}. El motor nunca escribe un token inventado.`);
   }
   const count = (h: string) => badTokens(h, v.tokenCtx).reduce((s, t) => s + t.count, 0);
   if (count(full) > count(v.oldHtml)) throw new PatchError('invalid_content', `El cambio en ${v.where} rompe un token $@…@$ existente.`);
@@ -137,7 +158,6 @@ export function replaceRange(raw: string, rawByteOffset: number, rawBytes: numbe
   return { newRaw, fragment: html, newHtml: xmlUnescape(newRaw), notes: [`rango ${rawByteOffset}+${rawBytes} bytes reemplazado`] };
 }
 
-const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** Ocurrencias (índices en el HTML desescapado) de un token exacto. */
 function tokenPositions(html: string, token: string): number[] {
@@ -165,14 +185,23 @@ export function editToken(raw: string, token: string, action: 'unlink' | 'retarg
     if (!to || !/^\$@[A-Z0-9_]+(\*\d+){0,2}@\$$/.test(to)) throw new PatchError('invalid_params', `El token nuevo «${to ?? ''}» no es un token $@…@$.`);
     for (const p of pos) edits.push({ start: p, end: p + token.length, ins: to });
   } else {
-    const anchors = [...html.matchAll(new RegExp(`<a\\b[^>]*\\bhref\\s*=\\s*(["'])[^"']*${escRe(token)}[^"']*\\1[^>]*>`, 'gi'))];
+    // Fix round 1 (P2-8): etiqueta de apertura con atributos entre comillas (pueden traer «>»), cierre `</a >` /
+    // `</A\n>` incluidos; un `<a` antes del cierre (enlace anidado o sin cerrar) → falla, nunca deja un enlace abierto.
+    const OPEN_A = /<a\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
     const covered = new Set<number>();
-    for (const a of anchors) {
+    for (const a of html.matchAll(OPEN_A)) {
       const s = a.index ?? 0;
-      const close = html.toLowerCase().indexOf('</a>', s + a[0].length);
-      if (close < 0) throw new PatchError('invalid_content', `El enlace con ${token} no cierra (</a>): no se puede quitar sin romper el HTML.`);
-      edits.push({ start: s, end: close + 4, ins: html.slice(s + a[0].length, close) });
-      for (const p of pos) if (p >= s && p < s + a[0].length) covered.add(p);
+      const hrefs = [...a[0].matchAll(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)].map((h) => h[1] ?? h[2] ?? h[3] ?? '');
+      if (!hrefs.some((h) => h.includes(token))) continue;
+      const after = s + a[0].length;
+      const closeRe = /<\/a\s*>/gi; closeRe.lastIndex = after;
+      const cm = closeRe.exec(html);
+      if (!cm) throw new PatchError('invalid_content', `El enlace con ${token} no cierra (</a>): no se puede quitar sin romper el HTML.`);
+      const nextOpen = /<a\b/gi; nextOpen.lastIndex = after;
+      const no = nextOpen.exec(html);
+      if (no && no.index < cm.index) throw new PatchError('invalid_content', `El enlace con ${token} tiene otro enlace adentro o no cierra antes del siguiente: no se quita a ciegas.`);
+      edits.push({ start: s, end: cm.index + cm[0].length, ins: html.slice(after, cm.index) });
+      for (const p of pos) if (p >= s && p < after) covered.add(p);
     }
     const loose = pos.filter((p) => !covered.has(p));
     if (loose.length) throw new PatchError('unsupported', `El token ${token} aparece fuera de un enlace <a href> (p. ej. en un iframe o una imagen): no se puede sanear sin dejar el contenido roto.`);

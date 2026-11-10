@@ -52,6 +52,13 @@ export class PatchState {
 
   get container(): 'zip' | 'tar.gz' { return this.original.container; }
 
+  /** Estado nuevo sobre el MISMO original y su caché de lecturas (pruebas en seco: cada una con su capa propia). */
+  fork(): PatchState {
+    const s = new PatchState(this.original, this.originalBytes);
+    for (const [k, v] of this.cache) s.cache.set(k, v);
+    return s;
+  }
+
   has(name: string): boolean {
     if (this.removed.has(name)) return false;
     return this.changed.has(name) || this.original.has(name);
@@ -186,39 +193,89 @@ export class PatchState {
     return { bytes: Buffer.concat([...parts, cdBuf, eocd]), preserved };
   }
 
+  /** Carpetas implícitas de una lista de archivos, cada una antes de su primer archivo (como lista `tgz_packer`). */
+  private static tarItems(files: string[]): Array<{ path: string; dir: boolean }> {
+    const items: Array<{ path: string; dir: boolean }> = [];
+    const seenDir = new Set<string>();
+    for (const n of files) {
+      const parts = n.split('/');
+      for (let i = 1; i < parts.length; i++) {
+        const d = `${parts.slice(0, i).join('/')}/`;
+        if (!seenDir.has(d)) { seenDir.add(d); items.push({ path: d, dir: true }); }
+      }
+      items.push({ path: n, dir: false });
+    }
+    return items;
+  }
+
+  /**
+   * Antes de escribir (lo llama el motor, así el cambio entra al informe): en un tar.gz que traía `.ARCHIVE_INDEX` se
+   * regenera con el formato de `tgz_packer` para el conjunto de entradas FINAL. Devuelve true si cambió.
+   */
+  async finalize(): Promise<boolean> {
+    const INDEX = '.ARCHIVE_INDEX';
+    if (this.container !== 'tar.gz' || !this.has(INDEX)) return false;
+    const items = PatchState.tarItems(this.names().filter((n) => n !== INDEX));
+    let list = `Moodle archive file index. Count: ${items.length}\n`;
+    for (const it of items) list += `${it.path}\t${it.dir ? 'd' : 'f'}\t${it.dir ? 0 : (await this.read(it.path)).length}\t?\n`;
+    const lb = Buffer.from(list, 'utf8');
+    if ((await this.read(INDEX)).equals(lb)) return false;
+    this.write(INDEX, lb);
+    return true;
+  }
+
+  /**
+   * Fix round 1 (P2-1): tar igual al de Moodle (`tgz_packer`): `.ARCHIVE_INDEX` PRIMERO y REGENERADO (si el original lo
+   * traía) con la cuenta y una línea por carpeta y archivo (el extractor lo usa como lista y para el progreso: uno viejo
+   * da archivos fantasma o un progreso que se pasa del máximo), carpetas como entradas `5`, nombres largos partidos en
+   * `prefix` (≤ 155) + `name` (≤ 100) por una barra — nunca PAX, que el extractor de Moodle no entiende; si un nombre
+   * no entra, la escritura falla.
+   */
   private async serializeTarGz(): Promise<Buffer> {
-    const blocks: Buffer[] = [];
-    const header = (name: string, size: number, type: string): Buffer => {
+    const DEFAULT_TIMESTAMP = 1356998400; // tgz_packer::DEFAULT_TIMESTAMP
+    const INDEX = '.ARCHIVE_INDEX';
+    const split = (path: string): { name: string; prefix: string } => {
+      let name = path;
+      let prefix = '';
+      while (Buffer.byteLength(name, 'utf8') > 100) {
+        const slash = name.indexOf('/');
+        if (slash < 0) throw new Error(`nombre demasiado largo para tar: ${path.slice(0, 120)}`);
+        prefix = prefix ? `${prefix}/${name.slice(0, slash)}` : name.slice(0, slash);
+        name = name.slice(slash + 1);
+        if (Buffer.byteLength(prefix, 'utf8') > 155) throw new Error(`ruta demasiado larga para tar: ${path.slice(0, 120)}`);
+      }
+      return { name, prefix };
+    };
+    const header = (path: string, size: number, dir: boolean): Buffer => {
+      const { name, prefix } = split(path);
       const h = Buffer.alloc(512);
       h.write(name, 0, 100, 'utf8');
-      h.write('0000644\0', 100, 'ascii'); h.write('0000000\0', 108, 'ascii'); h.write('0000000\0', 116, 'ascii');
+      h.write(dir ? '0000755\0' : '0000644\0', 100, 'ascii'); h.write('0000000\0', 108, 'ascii'); h.write('0000000\0', 116, 'ascii');
+      if (size.toString(8).length > 11) throw new Error(`archivo demasiado grande para tar: ${path}`);
       h.write(size.toString(8).padStart(11, '0') + '\0', 124, 'ascii');
-      h.write('00000000000\0', 136, 'ascii');
+      h.write(DEFAULT_TIMESTAMP.toString(8).padStart(11, '0') + '\0', 136, 'ascii');
       h.write('        ', 148, 'ascii');
-      h.write(type, 156, 'ascii');
-      h.write('ustar\0', 257, 'ascii'); h.write('00', 263, 'ascii');
+      h.write(dir ? '5' : '0', 156, 'ascii');
+      h.write('ustar\0' + '00', 257, 'ascii');
+      h.write(prefix, 345, 155, 'utf8');
       let sum = 0;
       for (let i = 0; i < 512; i++) sum += h[i];
       h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 'ascii');
       return h;
     };
     const pad = (n: number) => Buffer.alloc((512 - (n % 512)) % 512);
-    for (const name of this.names()) {
-      const data = await this.read(name);
-      const nb = Buffer.byteLength(name, 'utf8');
-      if (nb > 100) {
-        // PAX: «<largo> path=<nombre>\n», donde el largo se cuenta a sí mismo.
-        const body = ` path=${name}\n`;
-        const base = Buffer.byteLength(body, 'utf8');
-        let len = base + String(base).length;
-        while (base + String(len).length !== len) len = base + String(len).length;
-        const rec = Buffer.from(`${len}${body}`, 'utf8');
-        blocks.push(header(`PaxHeader/${sha1Of(name).slice(0, 16)}`, rec.length, 'x'), rec, pad(rec.length));
-        blocks.push(header(sha1Of(name).slice(0, 40), data.length, '0'));
-      } else {
-        blocks.push(header(name, data.length, '0'));
-      }
-      blocks.push(data, pad(data.length));
+    const files = this.names().filter((n) => n !== INDEX);
+    const items = PatchState.tarItems(files);
+    for (const it of items) split(it.path); // falla ANTES de escribir nada si algún nombre no entra
+    const blocks: Buffer[] = [];
+    if (this.has(INDEX)) {
+      const lb = await this.read(INDEX);
+      blocks.push(header(INDEX, lb.length, false), lb, pad(lb.length));
+    }
+    for (const it of items) {
+      if (it.dir) { blocks.push(header(it.path, 0, true)); continue; }
+      const data = await this.read(it.path);
+      blocks.push(header(it.path, data.length, false), data, pad(data.length));
     }
     blocks.push(Buffer.alloc(1024));
     return zlib.gzipSync(Buffer.concat(blocks), { level: 6 });

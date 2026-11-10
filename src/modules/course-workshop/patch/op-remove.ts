@@ -48,6 +48,29 @@ export async function applyRemoveActivity(ctx: OpContext, op: RemoveActivityOp):
     const av = /<availabilityjson>([\s\S]*?)<\/availabilityjson>/.exec(await state.readText(s.entry))?.[1] ?? '';
     if (new RegExp(`(&quot;|")cm(&quot;|")\\s*:\\s*${a.moduleId}\\b`).test(av)) throw new PatchError('invariant', `La sección «${s.name}» tiene una condición de acceso que depende de «${a.title}».`);
   }
+  // Fix round 1 (P2-2): dependencias por los ÍTEMS DE CALIFICACIÓN de la actividad (su grades.xml): condiciones de acceso
+  // «por nota» (`{"type":"grade","id":<itemid>}`) y cálculos del libro de calificaciones (`##gi<itemid>##`); y bloques
+  // cuya configuración nombra la actividad. No se limpian: la operación falla con el motivo.
+  const gradesEntry = `${a.dir}/grades.xml`;
+  const itemIds = state.has(gradesEntry) ? [...(await state.readText(gradesEntry)).matchAll(/<grade_item id="(\d+)">/g)].map((m) => Number(m[1])) : [];
+  if (itemIds.length) {
+    const gradeCond = new RegExp(`(?:&quot;|")type(?:&quot;|")\\s*:\\s*(?:&quot;|")grade(?:&quot;|")\\s*,\\s*(?:&quot;|")id(?:&quot;|")\\s*:\\s*(${itemIds.join('|')})\\b`);
+    const calc = new RegExp(`##gi(${itemIds.join('|')})##`);
+    for (const n of state.names()) {
+      if (!/\.xml$/.test(n) || n.startsWith(`${a.dir}/`)) continue;
+      if (!/(^|\/)(module|section|grades|gradebook)\.xml$/.test(n)) continue;
+      const x = await state.readText(n);
+      if (gradeCond.test(x)) throw new PatchError('invariant', `${n} tiene una condición de acceso por la NOTA de «${a.title}»: no se puede quitar sin cambiar esa condición.`);
+      if (calc.test(x)) throw new PatchError('invariant', `${n} tiene un cálculo de calificación que usa la nota de «${a.title}» (##gi…##): no se quita.`);
+    }
+  }
+  for (const n of state.names().filter((x) => /(^|\/)blocks\/[^/]+\/block\.xml$/.test(x))) {
+    const cfg = /<configdata>([^<]*)<\/configdata>/.exec(await state.readText(n))?.[1] ?? '';
+    if (!cfg) continue;
+    let dec = '';
+    try { dec = Buffer.from(cfg, 'base64').toString('latin1'); } catch { dec = ''; }
+    if (new RegExp(`"${a.modname}-${a.moduleId}"|s:\\d+:"${a.moduleId}"|i:${a.moduleId};`).test(dec)) throw new PatchError('invariant', `La configuración del bloque ${n.split('/').slice(-2, -1)[0]} nombra a «${a.title}»: no se quita (el bloque quedaría apuntando a una actividad que no existe).`);
+  }
   if (state.has('completion.xml') && new RegExp(`<moduleinstance>${a.moduleId}</moduleinstance>`).test(await state.readText('completion.xml'))) throw new PatchError('invariant', `La finalización del curso depende de «${a.title}»: no se quita.`);
   if (state.has('badges.xml') && new RegExp(`<name>module_${a.moduleId}</name>`).test(await state.readText('badges.xml'))) throw new PatchError('invariant', `Una insignia del curso depende de «${a.title}»: no se quita.`);
 

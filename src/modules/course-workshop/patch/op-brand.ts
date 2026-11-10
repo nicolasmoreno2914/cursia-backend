@@ -66,7 +66,10 @@ function swapDataUris(html: string, currentSha1: string, uri: string): { out: st
 /** Cambia colores solo dentro de `style="…"` / `style='…'` de etiquetas. Devuelve ediciones sobre el HTML desescapado. */
 function colorEdits(html: string, map: Map<string, string>, used: Map<string, number>): Array<{ start: number; end: number; ins: string }> {
   const edits: Array<{ start: number; end: number; ins: string }> = [];
-  for (const t of html.matchAll(/<[a-zA-Z][^<>]*>/g)) {
+  // Fix round 1 (P2-5): el texto de <script>/<style> y los comentarios se tapan (mismo largo) antes de buscar etiquetas:
+  // un `'<div style="color:#…">'` dentro de un script o de un comentario no es un atributo y no se toca.
+  const masked = html.replace(/<!--[\s\S]*?(?:-->|$)|<(script|style)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, (m) => ' '.repeat(m.length));
+  for (const t of masked.matchAll(/<[a-zA-Z][^<>]*>/g)) {
     const tagStart = t.index ?? 0;
     for (const s of t[0].matchAll(/\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) {
       const val = s[1] ?? s[2] ?? '';
@@ -141,8 +144,14 @@ export async function applyBrandReplace(ctx: OpContext, op: BrandReplaceOp): Pro
   // 2. Blobs con los bytes del logo (y data URI dentro del Libro Guía HTML).
   if (op.logo && logoBytes) {
     const blobs = new Map<string, { mimetype: string | null; names: string[] }>();
-    for (const { file } of ctx.raw.allFiles) {
-      if (file.contenthash !== op.logo.currentSha1) continue;
+    // Fix round 1 (P2-5): los SCORM no se tocan (su área content se vuelve a extraer del zip del área package): un blob
+    // del logo que use un SCORM se cuenta y se avisa, no se reemplaza; si el mismo blob lo usa también otra actividad,
+    // no se puede reemplazar solo para ella (es el mismo archivo) → la operación falla con motivo.
+    const scormUse = ctx.raw.allFiles.filter(({ file }) => file.contenthash === op.logo!.currentSha1 && file.component === 'mod_scorm');
+    const otherUse = ctx.raw.allFiles.filter(({ file }) => file.contenthash === op.logo!.currentSha1 && file.component !== 'mod_scorm');
+    if (scormUse.length && otherUse.length) throw new PatchError('unsupported', `El logo actual es el MISMO archivo en un juego SCORM y en ${otherUse.length} lugar(es) más: no se puede cambiar fuera del SCORM sin tocar el SCORM (que no se modifica).`);
+    if (scormUse.length) r.misalignment.push(`${scormUse.length} archivo(s) de juegos SCORM tienen el logo anterior y no se tocan (el SCORM no se modifica).`);
+    for (const { file } of otherUse) {
       const x = blobs.get(file.contenthash) ?? { mimetype: file.mimetype, names: [] };
       x.names.push(file.filename);
       blobs.set(file.contenthash, x);
@@ -169,7 +178,7 @@ export async function applyBrandReplace(ctx: OpContext, op: BrandReplaceOp): Pro
     }
     if (!logoCount) throw new PatchError('target_not_found', `El logo actual (${op.logo.currentSha1.slice(0, 10)}…) no aparece en el paquete: nada que reemplazar.`);
     parts.push(`logo reemplazado en ${logoCount} lugar(es)`);
-    if (ctx.inv.activities.some((a) => a.modname === 'scorm')) r.misalignment.push('Los juegos SCORM no se tocan: si muestran el logo, conservan el anterior.');
+    if (ctx.inv.activities.some((a) => a.modname === 'scorm') && !scormUse.length) r.misalignment.push('Los juegos SCORM no se tocan: si llevan el logo dentro de su paquete, conservan el anterior.');
   }
   const missing = [...colorMap.keys()].filter((k) => !used.get(k));
   if (missing.length) throw new PatchError('target_not_found', `Los colores ${missing.map((k) => `#${k}`).join(', ')} no aparecen en ningún style="" del curso.`);

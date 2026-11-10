@@ -171,6 +171,8 @@ export interface DiagnosisDelta {
   after: { error: number; warning: number; info: number };
   /** Hallazgos error/warning del original que ya no aparecen. */
   resolved: Array<{ signature: string; title: string; severity: string }>;
+  /** Hallazgos error/warning de actividades QUITADAS por el plan (no cuentan como resueltos). */
+  removed: Array<{ signature: string; title: string; severity: string }>;
   /** Hallazgos error/warning que NO estaban en el original (el plan falla si hay alguno). */
   introduced: Array<{ signature: string; title: string; severity: string }>;
 }
