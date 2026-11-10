@@ -31,9 +31,13 @@
 //   L16 esperando al proveedor / ambigua sin conciliar → re-aprobar = 409 WORKSHOP_REGEN_PENDING_PROVIDER (el plan lo dice);
 //       el carril y la memoria se sueltan durante la espera; tras la conciliación del admin, se re-aprueba
 //   L17 espera retomada tras matar el proceso → el MISMO id externo, 1 solo envío
+//   fix 2: L18 aprobación mixta: la cota del render en espera queda comprometida → el contenido corta antes de enviarse (N1)
+//   · L19 dos procesos liquidan la misma espera → uno solo la toma, un cargo, una subida, un resultado; `sent → settling` (N2)
+//   · L20 retoma fallida sin cobro / job aceptado sin espera → conciliar → re-aprobar → produce; sin conciliar, falla cerrado (N3)
 //
 // Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js [--bite]
-//   --bite: copia dist/, quita `if (!d.allow)` de la compuerta real y verifica que L14 FALLA.
+//   --bite: copia dist/ y rompe UNA guarda por vez: `if (!d.allow)` de regenGateFor → L14; las cotas en vuelo de la IA de
+//   B5 → L18; la condición del reclamo de la espera → L19. Cada mutación tiene que hacer fallar su prueba.
 'use strict';
 const fs = require('fs');
 const os = require('os');
@@ -58,29 +62,35 @@ const ONLY = oi > 0 ? process.argv[oi + 1] : null;
 if (process.argv.includes('--bite')) {
   // Mordida (P1-4): sin `if (!d.allow)` la compuerta deja pasar la 2.ª llamada → L14 tiene que fallar.
   const tmp = fs.mkdtempSync(path.join(REPO, '.r107-bite-')); // dentro del repo: resuelve node_modules
-  let code = 1;
+  // Mordidas (P1-4 / fix 2 N2): cada una rompe UNA guarda de la compuerta real y su prueba tiene que fallar.
+  const bites = [
+    { name: 'sin `if (!d.allow)` en regenGateFor', anchor: 'regenGateFor(s, approval, simulated)', from: 'if (!d.allow)', to: 'if (false)', only: 'L14' },
+    { name: 'la IA de B5 sin las cotas en vuelo (solo lo gastado)', anchor: 'invokerFor(s, approval, pricing, meta)', from: '(cur.spent_usd, cur.calls)', to: '(cur.spent_usd, {})', only: 'L18' },
+    { name: 'sin la condición del reclamo de la espera', anchor: 'async runRegenWait(', from: "and claim_id is not distinct from $3::text returning *", to: 'returning *', only: 'L19' },
+  ];
+  let code = 0;
   try {
-    fs.cpSync(distRoot, tmp, { recursive: true });
-    const f = path.join(tmp, 'modules/course-workshop/plan/workshop-plan.service.js');
-    const src = fs.readFileSync(f, 'utf8');
-    // Solo el de la compuerta de la regeneración (`regenGateFor`); el de la IA del Taller (invokerFor, B5) no se toca.
-    const at = src.indexOf('regenGateFor(s, approval, simulated)');
-    const k = at < 0 ? -1 : src.indexOf('if (!d.allow)', at);
-    if (at < 0 || k < 0 || src.indexOf('if (!d.allow)', k + 1) >= 0) console.error('❌ mordida: no encontré un único «if (!d.allow)» dentro de regenGateFor');
-    else {
-      fs.writeFileSync(f, src.slice(0, k) + 'if (false)' + src.slice(k + 'if (!d.allow)'.length));
-      const r = spawnSync(process.execPath, [__filename, '--dist', tmp, '--only', 'L14'], { encoding: 'utf8', env: process.env, maxBuffer: 64 * 1024 * 1024 });
+    for (const m of bites) {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.cpSync(distRoot, tmp, { recursive: true });
+      const f = path.join(tmp, 'modules/course-workshop/plan/workshop-plan.service.js');
+      const src = fs.readFileSync(f, 'utf8');
+      const at = src.indexOf(m.anchor);
+      const k = at < 0 ? -1 : src.indexOf(m.from, at);
+      if (at < 0 || k < 0) { console.error(`❌ mordida «${m.name}»: no encontré la guarda`); code = 1; continue; }
+      fs.writeFileSync(f, src.slice(0, k) + m.to + src.slice(k + m.from.length));
+      const r = spawnSync(process.execPath, [__filename, '--dist', tmp, '--only', m.only], { encoding: 'utf8', env: process.env, maxBuffer: 64 * 1024 * 1024 });
       const out = (r.stdout || '') + (r.stderr || '');
-      const bit = r.status !== 0 && /❌ L14/.test(out);
-      console.log(bit ? '✅ mordida: sin `if (!d.allow)` L14 FALLA (la 2.ª llamada se envía por encima del tope)' : `❌ mordida: la mutación NO hizo fallar L14\n${out.slice(-2000)}`);
-      code = bit ? 0 : 1;
+      const bit = r.status !== 0 && new RegExp(`❌ ${m.only}`).test(out);
+      console.log(bit ? `✅ mordida «${m.name}»: ${m.only} FALLA` : `❌ mordida «${m.name}»: la mutación NO hizo fallar ${m.only}\n${out.slice(-2000)}`);
+      if (!bit) code = 1;
     }
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   process.exit(code);
 }
 
 let passes = 0; let failures = 0;
-async function check(name, fn) { if (ONLY && !name.startsWith(ONLY)) return; try { await fn(); passes++; console.log(`✅ ${name}`); } catch (err) { failures++; console.log(`❌ ${name}\n   ${err && err.stack ? err.stack.split('\n').slice(0, 6).join('\n   ') : err}`); } }
+async function check(name, fn) { if (ONLY && !ONLY.split(',').some((o) => name.startsWith(o))) return; try { await fn(); passes++; console.log(`✅ ${name}`); } catch (err) { failures++; console.log(`❌ ${name}\n   ${err && err.stack ? err.stack.split('\n').slice(0, 6).join('\n   ') : err}`); } }
 const assert = (c, m) => { if (!c) throw new Error(m); };
 const eq = (a, b, m) => { const x = JSON.stringify(a); const y = JSON.stringify(b); if (x !== y) throw new Error(`${m}: esperado ${y}, encontrado ${x}`); };
 const near = (a, b, m) => assert(Math.abs(Number(a) - Number(b)) < 1e-6, `${m}: esperado ${b}, encontrado ${a}`);
@@ -625,6 +635,156 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq((await B.getPlan({ id: U }, sid)).items.find((i) => i.id === it.id).stage, 'ready', 'ítem listo');
       near(await net(`workshop:approval:${g.approval.id}`), 0, 'reserva liberada');
     });
+    // ── r107 B10 fix 2 ──
+    const twoClient = (q1, q2) => ({
+      simulated: false, calls: 0, content: 0,
+      async call(req) {
+        this.calls++;
+        if (req.purpose === 'content') { this.content++; throw new Error('L18: el contenido NO debía enviarse'); }
+        return { input: { requests: [
+          { quote: q1, operation: 'regenerate_video', instruction: q1, target: { moduleId: 1016 }, targetEvidence: q1, changeEvidence: q1 },
+          // La profundización del capítulo (texto largo): su llamada de contenido tiene una cota mayor que el margen de IA del video.
+          { quote: q2, operation: 'edit_html', instruction: 'Agregar un ejemplo al final de la profundización del capítulo 1.', target: { moduleId: 1014 }, targetEvidence: 'la profundización del capítulo 1', changeEvidence: 'Agrega un ejemplo' },
+        ] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b10f2_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false };
+      },
+    });
+    const pendingWait = async (tag, simOpts) => {
+      const q = `Rehace el video del capítulo 1 (${tag}).`;
+      const sim = SIMLIB.simProviders(distRoot, simOpts);
+      const svcA = new SVC.CourseWorkshopService(ds, storage, null);
+      const A = new PLS.WorkshopPlanService(ds, storage, svcA, ledger, budget, regenClient('regenerate_video', 1016, q));
+      A.pricingLoader = async () => DRY.seedPricing();
+      A.regenProviders = () => sim;
+      await approveIntake(A, q);
+      const pl = await A.getPlan({ id: U }, sid);
+      const it = pl.items.filter((i) => i.operation === 'regenerate_video' && i.stage === 'estimate' && i.requestStatus === 'awaiting_generation' && i.quote === q).pop();
+      const cap = Math.ceil(Math.max(Number(it.plannedCall.expectedUsd) * 1.5, Number(it.plannedCall.regen.totalBoundUsd)) * 100) / 100;
+      const g = await A.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it.plannedCall.expectedUsd), capUsd: cap });
+      const w = await until(async () => (await reqRow(A, it.id)).details.regenPending, `la espera ${tag}`);
+      await until(async () => sim.calls.videogen.some((c) => c.op === 'status'), 'A consultando');
+      A.simulateDeathForTests();
+      await A.whenIdle();
+      return { A, sim, it, g, w, pl, cap, q };
+    };
+    const procB = (sim, label) => { const sv = new SVC.CourseWorkshopService(ds, storage, null); const P = new PLS.WorkshopPlanService(ds, storage, sv, ledger, budget, regenClient('regenerate_video', 1016, label)); P.pricingLoader = async () => DRY.seedPricing(); P.regenProviders = () => sim; return P; };
+
+    await check('L18 (B10 fix 2 N1) aprobación MIXTA: la cota del render que espera queda comprometida → el contenido de B5 corta con cap_reached ANTES de enviarse; tope nunca superado', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '10.00', reason: 'QA r107 B10 L18' });
+      const q1 = 'Rehace el video del capítulo 1 (L18).';
+      const q2 = 'Agrega un ejemplo a la profundización del capítulo 1 (L18).';
+      const client = twoClient(q1, q2);
+      const simOpts = { simulated: false, videogenPendingPolls: 1e9, pollTimeoutMs: 60000, videogenJobId: 'vg_sim_l18' };
+      const sim = SIMLIB.simProviders(distRoot, simOpts);
+      const p = planFor(client);
+      p.regenProviders = () => sim;
+      await approveIntake(p, `${q1} ${q2}`);
+      const pl = await p.getPlan({ id: U }, sid);
+      const vid = pl.items.filter((i) => i.quote === q1 && i.requestStatus === 'awaiting_generation').pop();
+      const con = pl.items.filter((i) => i.quote === q2 && i.requestStatus === 'awaiting_generation').pop();
+      assert(vid && con && con.stage === "estimate", `dos ítems: ${JSON.stringify(pl.items.filter((i) => [q1, q2].includes(i.quote)).map((i) => [i.operation, i.stage, i.requestStatus]))} ${JSON.stringify(pl.pending.concat(pl.excluded).map((x) => [x.quote, x.status, x.reason]).filter((x) => x[0] === q2))}`);
+      const tb = Number(vid.plannedCall.regen.totalBoundUsd);
+      const vb = Number(vid.plannedCall.regen.providers.find((l) => l.provider === 'videogen').boundUsd);
+      const cb = Number(con.plannedCall.boundUsd);
+      const exp = Number(vid.plannedCall.expectedUsd) + Number(con.plannedCall.expectedUsd);
+      const cap = Math.max(tb, exp) + (vb + cb - Math.max(tb, exp)) / 2;
+      assert(cap + 1e-9 >= tb && cap + 1e-9 >= exp && cap < vb + cb, `el escenario: Σ cotas video ${tb} ≤ tope ${cap} < render ${vb} + contenido ${cb}`);
+      const g = await p.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [vid.id, con.id], confirmEstimateUsd: Number((Number(vid.plannedCall.expectedUsd) + Number(con.plannedCall.expectedUsd)).toFixed(6)), capUsd: Number(cap.toFixed(6)) });
+      await until(async () => (await reqRow(p, vid.id)).details.regenPending, 'el render esperando');
+      await until(async () => (await reqRow(p, con.id)).status === 'awaiting_generation', 'el contenido cortado');
+      const cr = await reqRow(p, con.id);
+      eq(client.content, 0, 'el contenido NO se envió');
+      assert(/tope/.test(cr.reason), `motivo visible: ${cr.reason}`);
+      const ap = await p.approvalOf(g.approval.id);
+      eq(Object.values(ap.calls).map((c) => [c.kind, c.status]), [['videogen:render', 'sent']], 'solo el render, en vuelo (su cota comprometida)');
+      simOpts.videogenPendingPolls = 0;
+      await p.whenIdle();
+      const ap2 = await p.approvalOf(g.approval.id);
+      assert(Number(ap2.spent_usd) <= Number(ap2.cap_usd) + 1e-9, `gastado ${ap2.spent_usd} ≤ tope ${ap2.cap_usd}`);
+      eq([ap2.status, (await reqRow(p, vid.id)).status], ['stopped', 'resolved'], 'el video terminó; la aprobación queda cortada por el tope del contenido');
+    });
+
+    await check('L19 (B10 fix 2 N2) dos procesos liquidan la MISMA espera: uno solo la toma (el otro no consulta), un solo cargo, una sola subida a YouTube, un solo resultado; `sent → settling` condicional', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '10.00', reason: 'QA r107 B10 L19' });
+      const { it, g, w } = await pendingWait('L19', { simulated: false, videogenPendingPolls: 1e9, pollTimeoutMs: 60000, videogenJobId: 'vg_sim_l19' });
+      const simB = SIMLIB.simProviders(distRoot, { simulated: false, videogenJobId: 'vg_sim_l19' });
+      const simC = SIMLIB.simProviders(distRoot, { simulated: false, videogenJobId: 'vg_sim_l19' });
+      const B = procB(simB, 'b'); const C = procB(simC, 'c');
+      const before = Number((await B.approvalOf(g.approval.id)).spent_usd);
+      const reqId = (await reqRow(B, it.id)).id;
+      const errs = await Promise.all([B.settleWaitForTests(sid, reqId), C.settleWaitForTests(sid, reqId)].map((x) => x.then(() => null, (e) => e)));
+      eq(errs, [null, null], 'ninguno falla');
+      const statusB = simB.calls.videogen.filter((c) => c.op === 'status').length;
+      const statusC = simC.calls.videogen.filter((c) => c.op === 'status').length;
+      eq([statusB > 0, statusC > 0].filter(Boolean).length, 1, `uno solo tomó la espera (consultas B ${statusB}, C ${statusC})`);
+      await B.whenIdle(); await C.whenIdle();
+      const ap = await B.approvalOf(g.approval.id);
+      const vg = Object.values(ap.calls).filter((c) => c.kind === 'videogen:render');
+      eq(vg.map((c) => c.status), ['charged'], 'el render liquidado una vez');
+      near(Number(ap.spent_usd) - before, Object.values(ap.calls).filter((c) => c.status === 'charged').reduce((a, c) => a + Number(c.costUsd), 0), 'un solo cargo en spent_usd por llamada');
+      eq(simB.calls.youtube.length + simC.calls.youtube.length, 1, 'una sola subida a YouTube');
+      const arts = await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_regen_result' and metadata->>'approvalId' = $1`, [g.approval.id]);
+      eq(arts[0].n, 1, 'un solo resultado');
+      const rows = await ds.query(`select count(*)::int n from public.generation_cost_events where provider = 'videogen' and metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [g.approval.id]);
+      eq(rows[0].n, 1, 'un solo cargo de Videogen en el ledger');
+      eq([(await reqRow(B, it.id)).status, ap.status], ['resolved', 'done'], 'ítem listo, aprobación cerrada');
+      assert(w.externalId === 'vg_sim_l19', 'mismo id externo');
+      // La transición `sent → settling` en sí: dos procesos a la vez → la gana UNO.
+      const s = await svc.planSessionById(sid);
+      const ap0 = await B.openApproval(s, { id: U }, { kind: 'generate', estimate: B.estimateOf([], 'L19'), capUsd: '0.100000' });
+      await B.startApproval(ap0.id);
+      const gate = B.regenGateFor(s, await B.approvalOf(ap0.id), false);
+      const t = await gate.begin({ provider: 'gamma', kind: 'generate', boundUsd: '0.050000', attempt: 1 });
+      const wins = await Promise.all([B.claimSettle(ap0.id, t.id, 'claim-b', null), C.claimSettle(ap0.id, t.id, 'claim-c', null)]);
+      eq(wins.filter(Boolean).length, 1, 'una sola gana `settling`');
+      await t.charged({ costUsd: '0.040000', charge: null });
+      let again = null; try { await t.charged({ costUsd: '0.040000', charge: null }); } catch (e) { again = e; }
+      assert(again && again.extra && again.extra.alreadySettled, 'liquidar dos veces no suma');
+      near((await B.approvalOf(ap0.id)).spent_usd, 0.04, 'una vez en spent_usd');
+      await B.closeApproval(ap0.id, 'done', null);
+    });
+
+    await check('L20 (B10 fix 2 N3) retoma fallida sin cobro → el pago intermedio se descarta; conciliar → re-aprobar → produce (sin quedar `preparing`); un job aceptado sin espera ni conciliación falla CERRADO y visible', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '10.00', reason: 'QA r107 B10 L20' });
+      const { it, g, w, pl, cap } = await pendingWait('L20', { simulated: false, videogenPendingPolls: 1e9, pollTimeoutMs: 60000, videogenJobId: 'vg_sim_l20' });
+      // La llamada deja de estar en vuelo sin cobro conocido (p. ej. la aprobación se cerró ambigua) y el reclamo murió.
+      await ds.query(`update public.workshop_ai_approvals set calls = jsonb_set(calls, array[$2::text, 'status'], '"ambiguous"'::jsonb), status = 'ambiguous', updated_at = now() - interval '2 minutes' where id = $1`, [g.approval.id, w.callId]);
+      await ds.query(`update public.workshop_requests set updated_at = now() - interval '2 minutes' where id = (select request_id from public.workshop_plan_items where id = $1)`, [it.id]);
+      const simB = SIMLIB.simProviders(distRoot, { simulated: false, videogenJobId: 'vg_sim_l20b' });
+      const B = procB(simB, 'Rehace el video del capítulo 1 (L20).');
+      await B.sweep(); await B.whenIdle();
+      let rq = await reqRow(B, it.id);
+      eq([rq.status, rq.details.regenPending ?? null, rq.details.regenPaid.videogen, rq.details.regenAmbiguous.externalId], ['awaiting_generation', null, null, 'vg_sim_l20'], 'espera cerrada, pago intermedio descartado, pendiente de conciliación');
+      const again = { itemIds: [it.id], confirmEstimateUsd: Number(it.plannedCall.expectedUsd), capUsd: cap };
+      eq(await errCode(B.approveGeneration({ id: U }, sid, pl.planId, again)), 'WORKSHOP_REGEN_PENDING_PROVIDER', 'sin conciliar → 409');
+      await ctl.reconcileWorkshopReservation({ reservationKey: `workshop:approval:${g.approval.id}`, outcome: 'not_charged', reason: 'Videogen no muestra el render' }, saUser);
+      const g2 = await B.approveGeneration({ id: U }, sid, pl.planId, again);
+      await B.whenIdle();
+      rq = await reqRow(B, it.id);
+      eq([rq.status, (await B.approvalOf(g2.approval.id)).status, simB.calls.videogen.filter((c) => c.op === 'create').length], ['resolved', 'done', 1], 'conciliada → re-aprobada → producida (render nuevo)');
+      // priorOf: un job aceptado SIN liquidar y SIN espera.
+      const q2 = 'Rehace el video del capítulo 1 (L20b).';
+      const P2 = procB(simB, q2);
+      await approveIntake(P2, q2);
+      const pl2 = await P2.getPlan({ id: U }, sid);
+      const it2 = pl2.items.filter((i) => i.quote === q2 && i.requestStatus === 'awaiting_generation').pop();
+      const mod = { originalSha1: (await svc.planSessionById(sid)).originalSha1, operation: 'regenerate_video', moduleId: 1016 };
+      const setPaid = (approvalId) => ds.query(`update public.workshop_requests set details = details || jsonb_build_object('regenPaid', $2::jsonb) where id = (select request_id from public.workshop_plan_items where id = $1)`, [it2.id, JSON.stringify({ ...mod, videogen: { jobId: 'vg_huerfano', charged: false, callId: 'x', approvalId } })]);
+      // (a) sin conciliar (la aprobación de L16, cerrada `done`) → falla cerrado y visible, no queda `preparing`.
+      await setPaid(g2.approval.id);
+      const creates0 = simB.calls.videogen.filter((c) => c.op === 'create').length;
+      const opts2 = { itemIds: [it2.id], confirmEstimateUsd: Number(it2.plannedCall.expectedUsd), capUsd: cap };
+      await P2.approveGeneration({ id: U }, sid, pl2.planId, opts2); await P2.whenIdle();
+      rq = await reqRow(P2, it2.id);
+      eq([rq.status, rq.details.regenAmbiguous && rq.details.regenAmbiguous.externalId, simB.calls.videogen.filter((c) => c.op === 'create').length - creates0], ['awaiting_generation', 'vg_huerfano', 0], 'falla cerrado: visible, sin reenviar');
+      assert(/conciliaci/.test(rq.reason), `motivo: ${rq.reason}`);
+      // (b) conciliado `not_charged` → se vuelve a enviar y produce.
+      await setPaid(g.approval.id);
+      await ds.query(`update public.workshop_requests set details = details - 'regenAmbiguous' where id = $1`, [rq.id]);
+      await P2.approveGeneration({ id: U }, sid, pl2.planId, opts2); await P2.whenIdle();
+      rq = await reqRow(P2, it2.id);
+      eq([rq.status, simB.calls.videogen.filter((c) => c.op === 'create').length - creates0], ['resolved', 1], 'conciliado not_charged → reenvía y produce');
+    });
+
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});
