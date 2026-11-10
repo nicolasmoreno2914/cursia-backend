@@ -253,6 +253,12 @@ jobs:
       - name: Check r107 Taller de cursos — motor de parches (puro, sintéticos)
         run: node scripts/r107/check-r107-patch.js --ci
 
+      # r107 B5: pedidos, preguntas y plan (interpretación con esquema estricto, D6 preguntas, contenido validado, prueba en
+      # seco del motor, costo con el estimator, avisos de desalineación). IA SIMULADA: el SDK de Anthropic y fetch quedan
+      # interceptados y el check falla si algo intenta una llamada real (USD 0, sin red).
+      - name: Check r107 Taller de cursos — pedidos, preguntas y plan (IA simulada)
+        run: node scripts/r107/check-r107-plan.js --ci
+
       # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
       - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
         env:

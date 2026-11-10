@@ -250,6 +250,12 @@ jobs:
       - name: Check r107 Taller de cursos — motor de parches (puro, sintéticos)
         run: node scripts/r107/check-r107-patch.js --ci
 
+      # r107 B5: pedidos, preguntas y plan (interpretación con esquema estricto, D6 preguntas, contenido validado, prueba en
+      # seco del motor, costo con el estimator, avisos de desalineación). IA SIMULADA: el SDK de Anthropic y fetch quedan
+      # interceptados y el check falla si algo intenta una llamada real (USD 0, sin red).
+      - name: Check r107 Taller de cursos — pedidos, preguntas y plan (IA simulada)
+        run: node scripts/r107/check-r107-plan.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -895,6 +901,12 @@ jobs:
                # anon/authenticated). Staging-only (EXCLUDED del plan de producción). Aditiva e idempotente; requiere [5i].
                echo "━━━ [5k] r107 B3: Taller de cursos (diagnóstico técnico) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r107-b3-diagnosis.js
+
+               # r107 B5: pedidos, preguntas y plan (workshop_intakes, workshop_requests, workshop_plans, workshop_plan_items:
+               # tablas NUEVAS, RLS + sin anon/authenticated). Staging-only (EXCLUDED del plan de producción). Aditiva e
+               # idempotente; requiere [5i].
+               echo "━━━ [5l] r107 B5: Taller de cursos (pedidos y plan) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r107-b5-plan.js
 
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod

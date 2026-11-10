@@ -209,6 +209,19 @@ interface Row {
   updated_at: Date | string;
 }
 
+/** r107 B5: lo que necesitan los pedidos y el plan de una sesión identificada. */
+export interface WorkshopPlanSession {
+  id: string;
+  ownerId: string;
+  institutionId: string | null;
+  status: WorkshopStatus;
+  originalSha1: string | null;
+  originalSize: number | null;
+  container: 'zip' | 'tar.gz' | null;
+  filename: string | null;
+  identifiedCourseId: number | null;
+}
+
 /** `GET …/sessions/:id/inventory`: listo, armándose (sondear) o fallido con el motivo. */
 export interface WorkshopInventoryResponse {
   sessionId: string;
@@ -403,6 +416,44 @@ export class CourseWorkshopService {
   }
 
   // ── API ──
+
+  /**
+   * r107 B5: sesión del actor para los pedidos y el plan (mismas compuertas que B1: ajeno → 404). Exige el original
+   * verificado (`identified`); un original cambiado o borrado → 409 con su código (nunca se arma un plan sobre él).
+   */
+  async planSessionFor(actor: WorkshopActor, id: string, permission: Permission): Promise<WorkshopPlanSession> {
+    let row = await this.loadForActor(actor, id, permission);
+    row = await this.expireIfStale(row);
+    const gone = this.originalGone(row);
+    if (gone) throw new ConflictException({ code: gone.code, message: gone.message });
+    if (row.status !== 'identified' || !row.original_sha1) {
+      throw new ConflictException({ code: WORKSHOP_ERRORS.NOT_IDENTIFIED, message: 'Los pedidos de cambio se pueden hacer cuando termina la identificación del paquete.', status: row.status });
+    }
+    return this.planSessionOf(row);
+  }
+
+  /**
+   * r107 B5: inventario PERSISTIDO de la sesión (sin HTML: títulos, capítulos, ids, preguntas) — alcanza para estimar
+   * la interpretación de un pedido sin abrir el original. null si todavía no está.
+   */
+  async persistedInventory(sessionId: string): Promise<(WorkshopCourse & { htmlOmitted: true }) | null> {
+    const [r] = await this.q<any[]>(this.dataSource, `select inventory from public.workshop_sessions where id = $1`, [sessionId]);
+    return r?.inventory && typeof r.inventory === 'object' ? r.inventory : null;
+  }
+
+  /** r107 B5: la misma vista por id (para el trabajo en segundo plano), sin compuertas de actor. */
+  async planSessionById(id: string): Promise<WorkshopPlanSession | null> {
+    const [row] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS} from public.workshop_sessions where id = $1`, [id]);
+    return row ? this.planSessionOf(row) : null;
+  }
+
+  private planSessionOf(row: Row): WorkshopPlanSession {
+    return {
+      id: row.id, ownerId: row.owner_id, institutionId: row.institution_id ?? null, status: row.status, originalSha1: row.original_sha1,
+      originalSize: row.original_size === null || row.original_size === undefined ? null : Number(row.original_size), container: row.container ?? null,
+      filename: row.identification?.upload?.filename ?? null, identifiedCourseId: row.identified_course_id ?? null,
+    };
+  }
 
   async createSession(actor: WorkshopActor, input: { filename: unknown; sizeBytes: unknown }, institutionHeader: string | null = null): Promise<CreateSessionResult> {
     const filename = sanitizeUploadFilename(input.filename);
