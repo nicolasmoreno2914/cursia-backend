@@ -20,8 +20,11 @@ import type { FieldChange, NewQuestion, PatchOperation, PatchResult } from '../p
 import { xmlUnescape } from '../../visual-design/preview-extract';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import type { WorkshopAiResult, WorkshopTool } from './ai';
-import { WORKSHOP_CONTENT_MAX_TOKENS, WORKSHOP_INTERPRET_MAX_TOKENS, WORKSHOP_LIBRO_MAX_TOKENS } from './ai';
-import { AiCallKind, ZERO_MEM, estimateAiCall, estimateLater, memOf, sumUsd } from './cost';
+import { WORKSHOP_INTERPRET_MAX_TOKENS, WORKSHOP_QUESTION_MAX_TOKENS, htmlMaxTokens, libroMaxTokens } from './ai';
+import { AiCallKind, ZERO_MEM, estimateAiCall, estimateLater, memOf, priceMeasured, sumUsd } from './cost';
+import { llmCallUpperBoundUsage } from '../../finops/llm-usage-ingest';
+import { decideRunSpend } from '../../finops/run-spend-guard';
+import { parseSafetyCapFactor, readSafetyCapFactor, safetyCapOf } from '../../finops/safety-cap';
 import { htmlProblems, libroProblems, questionFrom, questionText } from './content';
 import { InterpretationOutputError, answerRequest, parseInterpretation, resolveRequest } from './interpret';
 import { SearchDoc, misalignmentWarnings, searchDocs } from './misalignment';
@@ -201,7 +204,7 @@ export async function prepareItem(ctx: BuildCtx, req: InterpretedRequest, ai: Ai
       changes: [], files: [], entries: { added: [], removed: [], modified: [] },
       risk: riskOf({ operation: req.operation, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding }),
       cost: { spentUsd: '0', apply: memOf(est), contentEstimate: null, basis: `estimator ${est.estimatorVersion} · ${est.usageModelVersion} · ${ctx.pricing.source}: lo que costaría rehacerlo` },
-      misalignment: [], dryRun: null,
+      misalignment: [], dryRun: null, generated: true,
     };
     return { status: 'phase_later', reason: 'Disponible en una fase posterior del Taller.', view, spentUsd: '0', calls: 0 };
   }
@@ -245,6 +248,7 @@ export async function prepareItem(ctx: BuildCtx, req: InterpretedRequest, ai: Ai
       cost: { spentUsd: spent, apply: ZERO_MEM, contentEstimate: cand.contentEstimate, basis: needsAi ? 'contenido generado al armar el plan: aplicar no vuelve a usar IA' : 'cambio estructural: no usa IA' },
       misalignment: warnings,
       dryRun: { ok: true, failure: null, resolved: res.diagnosis?.resolved.length ?? 0, removed: res.diagnosis?.removed.length ?? 0, engineVersion: PATCH_ENGINE_VERSION },
+      generated: true,
     };
     return { status: 'resolved', reason: null, view, spentUsd: spent, calls };
   }
@@ -292,7 +296,7 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
       const user = htmlUser({ instruction: req.instruction, quote: req.quote, currentHtml: loc.field.html, where, chapterText, forbiddenTokens: req.details.forbiddenTokens ?? [] }) + note;
       const size = { promptChars: user.length + CONTENT_SYSTEM.length, outputChars: loc.field.html.length };
       const est = memOf(estimateAiCall('content_html', size, ctx.pricing));
-      const r = await callAi({ purpose: 'content', kind: 'content_html', system: CONTENT_SYSTEM, user, tool: htmlTool(), maxTokens: WORKSHOP_CONTENT_MAX_TOKENS, size, attempt });
+      const r = await callAi({ purpose: 'content', kind: 'content_html', system: CONTENT_SYSTEM, user, tool: htmlTool(), maxTokens: htmlMaxTokens(loc.field.html.length), size, attempt });
       const input = toolInput(r);
       if (isProblems(input)) return input;
       const keys = input && typeof input === 'object' ? Object.keys(input as object) : [];
@@ -328,7 +332,7 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
       const user = libroUser({ instruction: req.instruction, quote: req.quote, chapters }) + note;
       const size = { promptChars: user.length + CONTENT_SYSTEM.length, chapters: chapters.length };
       const est = memOf(estimateAiCall('content_libro', size, ctx.pricing));
-      const r = await callAi({ purpose: 'content', kind: 'content_libro', system: CONTENT_SYSTEM, user, tool: libroTool(), maxTokens: WORKSHOP_LIBRO_MAX_TOKENS, size, attempt });
+      const r = await callAi({ purpose: 'content', kind: 'content_libro', system: CONTENT_SYSTEM, user, tool: libroTool(), maxTokens: libroMaxTokens(chapters.length), size, attempt });
       const input = toolInput(r);
       if (isProblems(input)) return input;
       const v = libroProblems(input, numbers);
@@ -349,7 +353,7 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
       const user = questionUser({ instruction: req.instruction, quote: req.quote, exam: quiz.title, current: q ? questionText(q) : null, chapterText: chapterPlainText(ctx.course, chapter, PLAN_LIMITS.chapterContextChars) }) + note;
       const size = { promptChars: user.length + CONTENT_SYSTEM.length };
       const est = memOf(estimateAiCall('content_question', size, ctx.pricing));
-      const r = await callAi({ purpose: 'content', kind: 'content_question', system: CONTENT_SYSTEM, user, tool: questionTool(), maxTokens: WORKSHOP_CONTENT_MAX_TOKENS, size, attempt });
+      const r = await callAi({ purpose: 'content', kind: 'content_question', system: CONTENT_SYSTEM, user, tool: questionTool(), maxTokens: WORKSHOP_QUESTION_MAX_TOKENS, size, attempt });
       const input = toolInput(r);
       if (isProblems(input)) return input;
       const v = questionFrom(input);
@@ -417,6 +421,85 @@ async function warningsFor(ctx: BuildCtx, req: InterpretedRequest, cand: Candida
     else w.estimate = memOf(estimateLater(w.suggestedOperation, w.suggestedOperation === 'regenerate_audio' ? { audioTarget: activityOf(ctx.course, w.activity.moduleId)?.kind === 'welcome_audio' ? 'welcome' : 'audiobook' } : {}, ctx.course, ctx.pricing));
   }
   return ws;
+}
+
+// ─── Estimado ANTES de gastar (ronda de decisiones: la IA solo corre con una aprobación y su tope) ─────────────
+
+/** Una llamada planeada: su estimado (estimator) y su COTA (entrada completa + max_tokens de salida, como el proxy). */
+export interface PlannedCall { kind: AiCallKind; promptChars: number; maxTokens: number; size: AiCall['size']; expectedUsd: string; boundUsd: string }
+
+class EstimateOnly extends Error { constructor(readonly call: AiCall) { super('estimate-only'); } }
+
+export function plannedCallOf(call: Pick<AiCall, 'kind' | 'size' | 'maxTokens'>, pricing: DryRunPricing): PlannedCall {
+  return { kind: call.kind, promptChars: call.size.promptChars, maxTokens: call.maxTokens, size: call.size, expectedUsd: estimateAiCall(call.kind, call.size, pricing).totals.expected, boundUsd: callBoundUsd(call.size.promptChars, call.maxTokens, pricing) };
+}
+
+/** Lo que costaría interpretar este texto (la primera llamada; el reintento por validación lo cubre el margen). */
+export function estimateInterpretation(ctx: Pick<BuildCtx, 'course' | 'pricing'>, text: string): PlannedCall {
+  const user = interpretUser({ requestText: text, inventory: inventorySummary(ctx.course) });
+  return plannedCallOf({ kind: 'interpret', size: { promptChars: user.length + INTERPRET_SYSTEM.length }, maxTokens: WORKSHOP_INTERPRET_MAX_TOKENS }, ctx.pricing);
+}
+export function estimateReinterpretation(ctx: Pick<BuildCtx, 'course' | 'pricing'>, req: InterpretedRequest, answersChars: number): PlannedCall {
+  const promptChars = inventorySummary(ctx.course).length + req.quote.length + answersChars + 2_000 + INTERPRET_SYSTEM.length;
+  return plannedCallOf({ kind: 'interpret', size: { promptChars }, maxTokens: WORKSHOP_INTERPRET_MAX_TOKENS }, ctx.pricing);
+}
+
+/**
+ * ¿Este pedido necesita IA para su contenido? Si sí, la llamada EXACTA que se haría (el mismo prompt que armaría
+ * `prepareItem`, sin llamar a nadie) con su estimado y su cota. null = no necesita IA (estructural).
+ */
+export async function estimateContent(ctx: BuildCtx, req: InterpretedRequest): Promise<PlannedCall | null | { unavailable: string }> {
+  if (req.status !== 'resolved' || !needsContent(req)) return null;
+  try {
+    const r = await candidateFor(ctx, req, async (c) => { throw new EstimateOnly(c); }, 1, null);
+    if ('unavailable' in r) return { unavailable: r.unavailable };
+    return null;
+  } catch (e) {
+    if (e instanceof EstimateOnly) return plannedCallOf(e.call, ctx.pricing);
+    throw e;
+  }
+}
+export { needsContent };
+
+/** Vista del ítem en etapa de ESTIMADO: sin contenido generado, con lo que costaría generarlo (D8). */
+export function estimateItemView(ctx: Pick<BuildCtx, 'pricing'>, req: InterpretedRequest, call: PlannedCall, opts: { fromFinding?: boolean } = {}): PlanItemView {
+  const est = memOf(estimateAiCall(call.kind, call.size, ctx.pricing));
+  return {
+    operation: req.operation!, params: null, available: true,
+    summary: `${summaryOf(req)} — el contenido nuevo se genera cuando apruebes su costo.`,
+    changes: [], files: [], entries: { added: [], removed: [], modified: [] },
+    risk: riskOf({ operation: req.operation!, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding }),
+    cost: { spentUsd: '0', apply: ZERO_MEM, contentEstimate: est, basis: 'estimado ANTES de generar (estimator de FinOps); la IA corre solo con tu aprobación y su tope' },
+    misalignment: [], dryRun: null, generated: false, plannedCall: call,
+  };
+}
+
+/** Cota USD de una llamada: entrada completa como escritura de caché (lo más caro) + max_tokens de salida. */
+export function callBoundUsd(promptChars: number, maxTokens: number, pricing: DryRunPricing): string {
+  const u = llmCallUpperBoundUsage(promptChars, maxTokens);
+  return priceMeasured({ cache_creation_input_tokens: u.cache_write_tokens, output_tokens: u.output_tokens }, 'claude-sonnet-4-6', pricing);
+}
+
+/**
+ * Tope propuesto para aprobar = estimado + margen: el mayor entre (a) el tope de seguridad de FinOps (esperado ×
+ * factor) y (b) la suma de las COTAS de las llamadas principales (el tope tiene que alcanzar al menos para hacerlas).
+ * Redondeado hacia arriba al centavo.
+ */
+export function proposedCapOf(calls: PlannedCall[], capFactor?: number): { expectedUsd: string; boundUsd: string; proposedCapUsd: string } {
+  const expected = sumUsd('0', ...calls.map((c) => c.expectedUsd));
+  const bound = sumUsd('0', ...calls.map((c) => c.boundUsd));
+  const safety = Number(safetyCapOf(expected, parseSafetyCapFactor(capFactor ?? readSafetyCapFactor())));
+  const cap = Math.ceil(Math.max(safety, Number(bound)) * 100 - 1e-9) / 100;
+  return { expectedUsd: expected, boundUsd: bound, proposedCapUsd: cap.toFixed(2) };
+}
+
+/**
+ * Guarda del tope aprobado ANTES de cada llamada (regla 1 de run-spend-guard: gastado + cota de esta llamada ≤
+ * autorizado). Lo que no entra NO se llama: se corta limpio con el motivo visible.
+ */
+export function capDecision(spentUsd: string, call: Pick<AiCall, 'size' | 'maxTokens'>, capUsd: string, pricing: DryRunPricing) {
+  const bound = Number(callBoundUsd(call.size.promptChars, call.maxTokens, pricing));
+  return decideRunSpend({ authorizedBudget: Number(capUsd), runSpent: Number(spentUsd), nextCost: bound, itemSpent: null, itemExpected: null, itemEstimatedMax: null, runExpected: null, progressExpected: null });
 }
 
 /** Prueba en seco del plan COMBINADO (todas las operaciones disponibles, en orden): el plan entero tiene que aplicar. */

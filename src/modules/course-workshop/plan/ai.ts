@@ -53,12 +53,24 @@ export interface WorkshopAiResult {
 
 export interface WorkshopAiClient {
   call(req: WorkshopAiRequest): Promise<WorkshopAiResult>;
+  /** true SOLO en el cliente simulado de las pruebas: la reserva del tope se registra `mock`. */
+  simulated?: boolean;
 }
 
 export const WORKSHOP_AI_TIMEOUT_MS = 120_000;
 export const WORKSHOP_INTERPRET_MAX_TOKENS = 4_000;
-export const WORKSHOP_CONTENT_MAX_TOKENS = 6_000;
-export const WORKSHOP_LIBRO_MAX_TOKENS = 8_000;
+export const WORKSHOP_QUESTION_MAX_TOKENS = 1_500;
+/**
+ * Ronda de decisiones (controlador): el tope de salida de cada llamada se ajusta a lo que se pide (no un tope fijo
+ * enorme): es la COTA de la llamada que se compara con el tope aprobado antes de llamar. HTML: el campo entero vuelve
+ * (≈ caracteres / 2,5 tokens) + margen; Libro: ≈ 3.000 tokens por capítulo.
+ */
+export function htmlMaxTokens(fieldChars: number): number {
+  return Math.min(16_000, Math.max(1_000, Math.ceil(fieldChars / 2.5) + 800));
+}
+export function libroMaxTokens(chapters: number): number {
+  return Math.min(16_000, 3_000 * Math.max(1, chapters) + 1_000);
+}
 
 /** Modelo fijado por Cursia (no lo elige el usuario: memoria «Models fixed by Cursia»). */
 export function workshopModel(env: NodeJS.ProcessEnv = process.env): string {

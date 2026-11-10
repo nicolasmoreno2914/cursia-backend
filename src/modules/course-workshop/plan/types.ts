@@ -36,7 +36,11 @@ export type RequestOperation = Phase2Operation | LaterOperation;
 /** Lo que la IA puede responder en `operation` (catálogo cerrado + las dos salidas sin operación). */
 export const AI_OPERATION_VALUES = Object.freeze([...PHASE2_OPERATIONS, ...LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'] as const);
 
-export type RequestStatus = 'needs_answer' | 'preparing' | 'resolved' | 'phase_later' | 'out_of_scope' | 'unavailable' | 'failed' | 'withdrawn';
+/**
+ * Ronda de decisiones: `awaiting_confirmation` = la re-interpretación (IA) espera que el docente apruebe su costo;
+ * `awaiting_generation` = resuelto, su contenido nuevo (IA) espera aprobación con tope (`POST …/plans/:id/generate`).
+ */
+export type RequestStatus = 'needs_answer' | 'awaiting_confirmation' | 'awaiting_generation' | 'preparing' | 'resolved' | 'phase_later' | 'out_of_scope' | 'unavailable' | 'failed' | 'withdrawn';
 
 export type IntakeSource = 'text' | 'document' | 'finding' | 'misalignment';
 
@@ -81,7 +85,7 @@ export interface InterpretedRequest {
   /** Qué cambiar, en una frase (lo usa la generación de contenido). */
   instruction: string;
   operation: RequestOperation | null;
-  status: Exclude<RequestStatus, 'preparing' | 'withdrawn'>;
+  status: Exclude<RequestStatus, 'preparing' | 'withdrawn' | 'awaiting_confirmation' | 'awaiting_generation'>;
   target: ResolvedTarget | null;
   /** Lo que la IA o el hallazgo dijeron del destino (sin resolver), para re-interpretar. */
   rawTarget: Record<string, unknown> | null;
@@ -169,6 +173,10 @@ export interface PlanItemView {
   cost: PlanItemCost;
   misalignment: MisalignmentWarning[];
   dryRun: PlanItemDryRun | null;
+  /** false = etapa de ESTIMADO: todavía sin contenido generado (sin antes/después); se genera al aprobarlo con tope. */
+  generated: boolean;
+  /** La llamada de IA que generaría el contenido (estimado + cota), mientras no se generó. */
+  plannedCall?: { kind: string; promptChars: number; maxTokens: number; size: { promptChars: number; outputChars?: number; chapters?: number }; expectedUsd: string; boundUsd: string } | null;
 }
 
 export type Phase2Op = EditHtmlOp | EditLibroSectionOp | ExamQuestionReplaceOp | ExamQuestionAddOp | ExamQuestionRemoveOp | BrandReplaceOp | RemoveActivityOp;

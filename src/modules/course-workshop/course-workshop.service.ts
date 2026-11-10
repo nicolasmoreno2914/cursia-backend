@@ -432,6 +432,15 @@ export class CourseWorkshopService {
     return this.planSessionOf(row);
   }
 
+  /**
+   * r107 B5: inventario PERSISTIDO de la sesión (sin HTML: títulos, capítulos, ids, preguntas) — alcanza para estimar
+   * la interpretación de un pedido sin abrir el original. null si todavía no está.
+   */
+  async persistedInventory(sessionId: string): Promise<(WorkshopCourse & { htmlOmitted: true }) | null> {
+    const [r] = await this.q<any[]>(this.dataSource, `select inventory from public.workshop_sessions where id = $1`, [sessionId]);
+    return r?.inventory && typeof r.inventory === 'object' ? r.inventory : null;
+  }
+
   /** r107 B5: la misma vista por id (para el trabajo en segundo plano), sin compuertas de actor. */
   async planSessionById(id: string): Promise<WorkshopPlanSession | null> {
     const [row] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS} from public.workshop_sessions where id = $1`, [id]);

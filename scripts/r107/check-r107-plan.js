@@ -519,6 +519,33 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     eq(tool.input_schema.properties.requests.items.properties.operation.enum, [...PL.PHASE2_OPERATIONS, ...PL.LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'], 'catálogo cerrado en el esquema');
   });
 
+
+  await check('C10 (ronda de decisiones) estimado ANTES de gastar: la llamada exacta se estima sin llamar; cota y tope propuesto; la guarda del tope corta ANTES de la llamada que no entra', async () => {
+    const req = (await PL.interpretText(ctxV1, 'cambia «Bienvenidos» por «Hola»', simAi(() => interp([{ quote: 'cambia «Bienvenidos» por «Hola»', operation: 'edit_html', instruction: 'Cambiar «Bienvenidos» por «Hola».', target: { moduleId: 901 } }])))).requests[0];
+    const est = await PL.estimateContent(ctxV1, req);
+    assert(est && est.kind === 'content_html' && Number(est.expectedUsd) > 0 && Number(est.boundUsd) > Number(est.expectedUsd), `estimado + cota: ${JSON.stringify(est)}`);
+    // Es la MISMA llamada que se hace al generar (mismo tamaño y tope de salida).
+    const ai = simAi((c) => goodHtml(c, (h) => h.replace('Bienvenidos', 'Hola')));
+    await PL.prepareItem(ctxV1, req, ai);
+    eq([ai.calls[0].size, ai.calls[0].maxTokens], [est.size, est.maxTokens], 'estimado = llamada real');
+    eq(est.expectedUsd, PL.estimateAiCall('content_html', est.size, PRICING).totals.expected, 'estimator');
+    // Estructural → no necesita IA; fuera de lo resuelto → nada.
+    eq(await PL.estimateContent(ctxV1, { ...req, operation: 'remove_activity', target: { kind: 'activity', moduleId: 912, title: 'x', chapterNumber: 1 } }), null, 'estructural: sin IA');
+    eq(await PL.estimateContent(ctxV1, { ...req, details: { fixedChange: { kind: 'token', token: '$@RESOURCEVIEWBYID*903@$', action: 'unlink' } } }), null, 'arreglo determinista: sin IA');
+    const iv = PL.estimateInterpretation(ctxV1, 'cambia «Bienvenidos» por «Hola»');
+    eq([iv.kind, iv.maxTokens], ['interpret', 4000], 'interpretación');
+    // Tope propuesto = max(esperado × factor, Σ cotas), al centavo hacia arriba.
+    const cap = PL.proposedCapOf([iv, est], 1.5);
+    const want = Math.ceil(Math.max(Number(PL.sumUsd(iv.expectedUsd, est.expectedUsd)) * 1.5, Number(iv.boundUsd) + Number(est.boundUsd)) * 100) / 100;
+    eq(Number(cap.proposedCapUsd), want, 'tope propuesto');
+    // Guarda: gastado + cota ≤ tope.
+    const call = { size: est.size, maxTokens: est.maxTokens };
+    eq(PL.capDecision('0', call, est.boundUsd, PRICING).allow, true, 'entra justo');
+    const no = PL.capDecision('0.01', call, est.boundUsd, PRICING);
+    eq([no.allow, no.reason], [false, 'run_budget_cap'], 'no entra → no se llama');
+    eq([PL.htmlMaxTokens(100), PL.htmlMaxTokens(25000), PL.htmlMaxTokens(100000), PL.libroMaxTokens(1), PL.libroMaxTokens(9)], [1000, 10800, 16000, 4000, 16000], 'topes de salida por llamada');
+  });
+
   console.log(`\n${ok} ok, ${fail} fail · llamadas reales: anthropic ${REAL.anthropic}, fetch ${REAL.fetch}`);
   process.exit(fail || REAL.anthropic || REAL.fetch ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

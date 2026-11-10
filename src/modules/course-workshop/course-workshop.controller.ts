@@ -7,7 +7,7 @@ import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 import { CourseWorkshopFlagGuard } from './course-workshop-flag.guard';
 import { CourseWorkshopService, WorkshopActor } from './course-workshop.service';
 import { CreateWorkshopSessionDto } from './dto/create-workshop-session.dto';
-import { AnswerRequestDto, CreateDocumentRequestDto, CreateTextRequestDto } from './dto/plan.dto';
+import { AnswerRequestDto, ConfirmSpendDto, CreateDocumentRequestDto, CreateTextRequestDto, GenerateItemsDto } from './dto/plan.dto';
 import { WorkshopPlanService } from './plan/workshop-plan.service';
 
 const actorOf = (user: AuthUser): WorkshopActor => ({ id: user.id, email: user.email });
@@ -68,9 +68,10 @@ export class CourseWorkshopController {
 
   // ── r107 B5 · pedidos, preguntas y plan (IA con compuerta de saldo; el plan queda `draft`: aprobar y aplicar es B6) ──
 
-  // POST /api/v1/course-workshop/sessions/:id/requests { text } → 202 entrada `queued` (sondear GET …/requests)
+  // POST /api/v1/course-workshop/sessions/:id/requests { text } → 201 entrada `awaiting_confirmation` con el COSTO ESTIMADO de
+  // interpretarla y el tope propuesto. No llama a la IA (se aprueba con POST …/intakes/:intakeId/interpret).
   @Post('sessions/:id/requests')
-  @HttpCode(HttpStatus.ACCEPTED)
+  @HttpCode(HttpStatus.CREATED)
   createRequest(@Param('id') id: string, @Body() body: CreateTextRequestDto, @CurrentUser() user: AuthUser) {
     return this.plan.createTextIntake(actorOf(user), id, body.text);
   }
@@ -80,6 +81,29 @@ export class CourseWorkshopController {
   @HttpCode(HttpStatus.CREATED)
   createDocumentRequest(@Param('id') id: string, @Body() body: CreateDocumentRequestDto, @CurrentUser() user: AuthUser) {
     return this.plan.createDocumentIntake(actorOf(user), id, { filename: body.filename, sizeBytes: body.sizeBytes });
+  }
+
+  // POST /api/v1/course-workshop/sessions/:id/intakes/:intakeId/interpret { confirmEstimateUsd, capUsd } → 202: aprueba el gasto,
+  // RESERVA el tope en FinOps y recién entonces corre la IA (409 tope menor que el estimado / estimado distinto / sin saldo).
+  @Post('sessions/:id/intakes/:intakeId/interpret')
+  @HttpCode(HttpStatus.ACCEPTED)
+  confirmInterpretation(@Param('id') id: string, @Param('intakeId') intakeId: string, @Body() body: ConfirmSpendDto, @CurrentUser() user: AuthUser) {
+    return this.plan.confirmInterpretation(actorOf(user), id, intakeId, body);
+  }
+
+  // POST /api/v1/course-workshop/sessions/:id/requests/:requestId/interpret { confirmEstimateUsd, capUsd } → 202: re-interpretar con las respuestas
+  @Post('sessions/:id/requests/:requestId/interpret')
+  @HttpCode(HttpStatus.ACCEPTED)
+  confirmReinterpretation(@Param('id') id: string, @Param('requestId') requestId: string, @Body() body: ConfirmSpendDto, @CurrentUser() user: AuthUser) {
+    return this.plan.confirmReinterpretation(actorOf(user), id, requestId, body);
+  }
+
+  // POST /api/v1/course-workshop/sessions/:id/plans/:planId/generate { itemIds, confirmEstimateUsd, capUsd } → 202: genera el antes/después
+  // de esos ítems dentro del tope aprobado (reservado en FinOps); si no alcanza, se corta limpio con el motivo
+  @Post('sessions/:id/plans/:planId/generate')
+  @HttpCode(HttpStatus.ACCEPTED)
+  generate(@Param('id') id: string, @Param('planId') planId: string, @Body() body: GenerateItemsDto, @CurrentUser() user: AuthUser) {
+    return this.plan.approveGeneration(actorOf(user), id, planId, body);
   }
 
   // POST /api/v1/course-workshop/sessions/:id/intakes/:intakeId/uploaded → 202 (409 WORKSHOP_DOCUMENT_NOT_UPLOADED)
