@@ -18,6 +18,7 @@
  */
 import type { EditHtmlOp, EditLibroSectionOp, ExamQuestionAddOp, ExamQuestionRemoveOp, ExamQuestionReplaceOp, BrandReplaceOp, RemoveActivityOp, FieldChange, PatchOperation } from '../patch/types';
 import type { MinExpMax } from '../../finops/estimator';
+import { PHASE3_OPERATIONS } from '../regenerate/types';
 
 export const PLAN_CODE_VERSION = 'b5-r0';
 
@@ -27,14 +28,21 @@ export const PHASE2_OPERATIONS = Object.freeze([
 ] as const);
 export type Phase2Operation = (typeof PHASE2_OPERATIONS)[number];
 
+/**
+ * r107 B10: operaciones de la Fase 3 (rehacer una actividad con proveedores pagos): se resuelven como las de la Fase 2,
+ * pero su contenido se PRODUCE con aprobación y tope (etapa de estimado → `…/plans/:id/generate`) antes de aplicar.
+ */
+export { PHASE3_OPERATIONS } from '../regenerate/types';
+export type Phase3Operation = (typeof PHASE3_OPERATIONS)[number];
+
 /** Operaciones de fases posteriores: visibles en el plan como «no disponible todavía», con su costo (D8). */
-export const LATER_OPERATIONS = Object.freeze(['regenerate_scorm', 'regenerate_video', 'regenerate_gamma', 'regenerate_audio', 'add_chapter', 'add_module'] as const);
+export const LATER_OPERATIONS = Object.freeze(['add_chapter', 'add_module'] as const);
 export type LaterOperation = (typeof LATER_OPERATIONS)[number];
 
-export type RequestOperation = Phase2Operation | LaterOperation;
+export type RequestOperation = Phase2Operation | Phase3Operation | LaterOperation;
 
 /** Lo que la IA puede responder en `operation` (catálogo cerrado + las dos salidas sin operación). */
-export const AI_OPERATION_VALUES = Object.freeze([...PHASE2_OPERATIONS, ...LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'] as const);
+export const AI_OPERATION_VALUES = Object.freeze([...PHASE2_OPERATIONS, ...PHASE3_OPERATIONS, ...LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'] as const);
 
 /**
  * Ronda de decisiones: `awaiting_confirmation` = la re-interpretación (IA) espera que el docente apruebe su costo;
@@ -47,7 +55,7 @@ export type IntakeSource = 'text' | 'document' | 'finding' | 'misalignment';
 /** Destino RESUELTO contra el inventario (ids de ESTE paquete). */
 export type ResolvedTarget =
   | { kind: 'html'; moduleId: number | null; sectionId?: number | null; field: string; title: string; chapterNumber: number | null }
-  | { kind: 'libro'; moduleId: number; chapters: number[]; title: string; recompose: boolean }
+  | { kind: 'libro'; moduleId: number; chapters: number[]; title: string; recompose: boolean; pdf?: boolean }
   | { kind: 'question'; quizModuleId: number; questionId: number; title: string; chapterNumber: number | null }
   | { kind: 'exam'; quizModuleId: number; title: string }
   | { kind: 'activity'; moduleId: number; title: string; chapterNumber: number | null }
@@ -107,6 +115,8 @@ export interface RequestDetails {
   allowFiles?: string[];
   /** Regenerar audio: audiolibro o bienvenida. */
   audioTarget?: 'audiobook' | 'welcome';
+  /** r107 B10: resultado producido de una regeneración (artifact del Taller) y sus cifras verificables. */
+  regenResult?: { artifactId: string; sha256: string; bytes: number } | null;
   /** Agregar capítulos / módulo: cuántos (para el costo). */
   chapters?: number | null;
   /** Enlace muerto (`href="#"`) de un hallazgo: se reemplaza el enlace por su texto (sin IA). */

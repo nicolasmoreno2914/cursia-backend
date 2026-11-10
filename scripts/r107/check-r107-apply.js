@@ -242,7 +242,7 @@ const sha = (alg, b) => crypto.createHash(alg).update(b).digest('hex');
     eq((await LV.regenerateLibroV3Pdf(AS, src, [{ number: 99, md: 'x' }], build)).code, 'chapter_unknown', 'capítulo desconocido');
     eq((await LV.regenerateLibroV3Pdf(V1, src, [{ number: 1, md: 'x' }], build)).code, 'no_pdf', 'V1: no es PDF');
     const none = await LV.SERVER_LIBRO_V3_RESOLVER.resolve({ id: 's', ownerId: 'o', institutionId: null, identifiedCourseId: 1 });
-    assert('unavailable' in none && /todavía no se puede regenerar/.test(none.unavailable), 'el servidor dice por qué no (todavía)');
+    assert('unavailable' in none && /no se puede regenerar/.test(none.unavailable), 'sin los servicios del generador dice por qué no (r107 B10: el del servidor vive en serverLibroV3Resolver)');
     // El motor rechaza un PDF que no es PDF o uno regenerado sobre otro original.
     const bad = await A.runApply({ original: AS, expectedSha1: sha('sha1', AS), items: [item('b', { ...op, pdf: { base64: Buffer.from('hola').toString('base64'), previousSha1: cur.sha1 } })] });
     eq([bad.ok, bad.stage, bad.code], [false, 'engine', 'WORKSHOP_APPLY_INVALID_CONTENT'], 'no es PDF');

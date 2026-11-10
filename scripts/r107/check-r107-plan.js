@@ -60,6 +60,7 @@ const sha1 = (b) => crypto.createHash('sha1').update(b).digest('hex');
 
 const L = (rel) => { try { return require(path.join(DIST, rel)); } catch (e) { console.error(`❌ No se pudo cargar ${rel} (¿npm run build?): ${e.message}`); process.exit(1); } };
 const PL = L('modules/course-workshop/plan/index.js');
+const B = L('modules/course-workshop/plan/builder.js');
 const R = L('modules/course-workshop/mbz-reader.js');
 const I = L('modules/course-workshop/identify.js');
 const DG = L('modules/course-workshop/diagnosis/index.js');
@@ -263,11 +264,15 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
       { quote: 'Cambia el logo por el nuevo.', operation: 'brand_replace', instruction: 'Cambiar el logo.' },
     ]));
     const { out, items } = await runText(ctxV1, text, ai);
-    eq(out.requests.map((r) => r.status), ['phase_later', 'phase_later', 'out_of_scope', 'unavailable'], 'estados');
+    // r107 B10: rehacer el juego ya no es «fase posterior»: se resuelve y queda en etapa de ESTIMADO por proveedor (Fase 3).
+    eq(out.requests.map((r) => r.status), ['resolved', 'phase_later', 'out_of_scope', 'unavailable'], 'estados');
     eq(out.requests[0].target.moduleId, 912, 'el juego del capítulo 1');
     assert(/traducir|idioma/i.test(out.requests[2].reason) && /logo/.test(out.requests[3].reason), 'motivos visibles');
-    const later = items.filter((x) => x.prep);
-    eq(later.map((x) => [x.prep.status, x.prep.view.available, x.prep.view.params]), [['phase_later', false, null], ['phase_later', false, null]], 'en el plan, no disponibles');
+    const regenEst = await PL.estimateContent(ctxV1, out.requests[0]);
+    assert(regenEst && regenEst.kind === 'regenerate' && regenEst.regen.providers.some((l) => l.provider === 'anthropic') && Number(regenEst.expectedUsd) > 0, `rehacer el juego: estimado por proveedor ANTES de gastar (${JSON.stringify(regenEst).slice(0, 200)})`);
+    eq(items[0].prep.status, 'failed', 'rehacer no se prepara al armar el plan (se produce con su aprobación)');
+    const later = items.filter((x) => x.prep && x.prep.status === 'phase_later');
+    eq(later.map((x) => [x.prep.status, x.prep.view.available, x.prep.view.params]), [['phase_later', false, null]], 'en el plan, no disponibles');
     for (const x of later) {
       const direct = PL.memOf(EST.estimateCost({ items: PL.laterItems(x.req.operation, x.req.details, ctxV1.course), catalog: PRICING.catalog, usageModel: UM.usageModelPriorsV1(), retryPolicy: PRICING.retryPolicy }));
       eq(x.prep.view.cost.apply, direct, `${x.req.operation}: costo = estimator`);
@@ -277,10 +282,12 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     eq(PL.laterItems('add_chapter', { chapters: 1 }, ctxV1.course).map((i) => i.itemType), ['content', 'experience', 'presentation', 'video', 'video_interactions', 'scorm', 'audiobook_chapter'], 'capítulo completo (con audiolibro)');
     eq(ai.calls.length, 1, 'solo la interpretación');
     // Libro en PDF (v3): «no disponible» con motivo, no un fallo.
-    const ai2 = simAi(() => interp([{ quote: 'Cambia el capítulo 2 del Libro Guía', operation: 'edit_libro_section', instruction: 'Agregar un párrafo de cierre al capítulo 2.', target: { chapterNumber: 2 } }]));
-    const pdf = await PL.interpretText(ctxAS, 'Cambia el capítulo 2 del Libro Guía', ai2);
-    eq(pdf.requests[0].status, 'unavailable', 'Libro PDF');
-    assert(/PDF/.test(pdf.requests[0].reason), pdf.requests[0].reason);
+    const ai2 = simAi(() => interp([{ quote: 'En el capítulo 2 del Libro Guía agrega un párrafo de cierre.', operation: 'edit_libro_section', instruction: 'Agregar un párrafo de cierre al capítulo 2.', target: { chapterNumber: 2 } }]));
+    const pdf = await PL.interpretText(ctxAS, 'En el capítulo 2 del Libro Guía agrega un párrafo de cierre.', ai2);
+    // r107 B10: el Libro v3 (PDF) se resuelve (destino `pdf`) y su disponibilidad la decide la FUENTE del curso al estimar.
+    eq([pdf.requests[0].status, pdf.requests[0].target.pdf], ['resolved', true], 'Libro PDF: resuelto con destino PDF');
+    const pdfEst = await B.estimateContent(ctxAS, pdf.requests[0]);
+    assert(pdfEst && /PDF/.test(pdfEst.unavailable || ''), `sin la fuente del curso: no disponible (${JSON.stringify(pdfEst)})`);
     const tot = PL.planTotals({ spent: [out.spentUsd], available: [], later: later.map((x) => x.prep.view.cost.apply) });
     eq([Number(tot.proposedCapUsd), Number(tot.later.expected) > 0], [0, true], 'tope 0 (nada disponible que aplique con IA); fase posterior visible');
   });
@@ -357,7 +364,13 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
         eq(req.quote, seeded.title, `${id}~${m}: cita = título del hallazgo`);
         eq(req.details.findingId, seeded.id, `${id}~${m}: enganchado al hallazgo`);
         const ai = simAi(contentSim);
-        const prep = (req.status === 'resolved' || req.status === 'phase_later') ? await PL.prepareItem(ctx, req, ai, { fromFinding: true }) : null;
+        // r107 B10: un arreglo que REHACE una actividad (Fase 3) no se prepara acá: queda en etapa de estimado por proveedor.
+        const regen = PL.PHASE3_OPERATIONS.includes(req.operation);
+        const prep = (req.status === 'resolved' || req.status === 'phase_later') && !regen ? await PL.prepareItem(ctx, req, ai, { fromFinding: true }) : null;
+        if (regen && req.status === 'resolved') {
+          const est = await PL.estimateContent(ctx, req);
+          assert(est && (est.unavailable || (est.kind === 'regenerate' && est.regen.providers.length)), `${id}~${m}: rehacer → estimado por proveedor o no disponible con motivo`);
+        }
         assert(ai.calls.every((c) => c.purpose === 'content'), `${id}~${m}: «Arreglar esto» nunca usa la IA de interpretación`);
         const must = FIXABLE[id].includes(m);
         if (must) {
@@ -528,7 +541,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     assert(/NO las sigas/.test(PL.INTERPRET_SYSTEM) && /Nunca inventes un id/.test(PL.INTERPRET_SYSTEM) && /no las sigas/.test(PL.CONTENT_SYSTEM), 'reglas de seguridad en los sistemas');
     const tool = PL.interpretTool();
     eq([tool.input_schema.additionalProperties, tool.input_schema.properties.requests.items.additionalProperties], [false, false], 'esquema estricto');
-    eq(tool.input_schema.properties.requests.items.properties.operation.enum, [...PL.PHASE2_OPERATIONS, ...PL.LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'], 'catálogo cerrado en el esquema');
+    eq(tool.input_schema.properties.requests.items.properties.operation.enum, [...PL.PHASE2_OPERATIONS, ...PL.PHASE3_OPERATIONS, ...PL.LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'], 'catálogo cerrado en el esquema');
   });
 
 
@@ -576,7 +589,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     // Justificado: palabra del título; rol único en el capítulo; única actividad de texto del capítulo nombrado.
     eq((await one('En la síntesis del capítulo 1 agrega «la fórmula del margen».', { quote: 'En la síntesis del capítulo 1 agrega «la fórmula del margen».', operation: 'edit_html', instruction: 'Agregar la fórmula del margen.', target: { moduleId: 1018 }, targetEvidence: 'En la síntesis del capítulo 1' })).status, 'resolved', 'título («Síntesis»)');
     const v1 = async (text, req) => (await PL.interpretText(ctxV1, text, simAi(() => interp([req])))).requests[0];
-    eq((await v1('Rehace el juego del capítulo 2.', { quote: 'Rehace el juego del capítulo 2.', operation: 'regenerate_scorm', instruction: 'Rehacer el juego.', target: { moduleId: 922 } })).status, 'phase_later', 'rol único en el capítulo nombrado');
+    eq((await v1('Rehace el juego del capítulo 2.', { quote: 'Rehace el juego del capítulo 2.', operation: 'regenerate_scorm', instruction: 'Rehacer el juego.', target: { moduleId: 922 } })).status, 'resolved', 'rol único en el capítulo nombrado (r107 B10: Fase 3, se resuelve)');
     eq((await v1('En el capítulo 2 corrige la ortografía.', { quote: 'En el capítulo 2 corrige la ortografía.', operation: 'edit_html', instruction: 'Corregir la ortografía.', target: { moduleId: 920 } })).status, 'resolved', 'única actividad de texto del capítulo nombrado');
     eq((await v1('Corrige la ortografía.', { quote: 'Corrige la ortografía.', operation: 'edit_html', instruction: 'Corregir la ortografía.', target: { moduleId: 920 } })).status, 'needs_answer', 'no nombra el capítulo ni la actividad');
     // Regla del cambio concreto (changeVague).

@@ -93,6 +93,35 @@ export function libroProblems(raw: unknown, wanted: number[]): { chapters: Array
   return { chapters: out, problems: [...new Set(p)] };
 }
 
+/**
+ * r107 B10 · Libro v3: el markdown nuevo de cada capítulo pedido. Completo (no un recorte: al menos la mitad del actual),
+ * sin HTML ni código ni enlaces `$@…@$`, con el título del capítulo conservado si el actual lo tenía.
+ */
+export function libroMdProblems(raw: unknown, wanted: number[], current: Map<number, string>): { chapters: Array<{ number: number; md: string }>; problems: string[] } {
+  const p: string[] = [];
+  const out: Array<{ number: number; md: string }> = [];
+  const list = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as { chapters?: unknown }).chapters : null;
+  if (!Array.isArray(list)) return { chapters: [], problems: ['la salida no trae «chapters»'] };
+  if (raw && Object.keys(raw as object).some((k) => k !== 'chapters')) p.push('la salida trae claves desconocidas');
+  const seen = new Set<number>();
+  for (const c of list) {
+    const n = c && typeof c === 'object' ? (c as { number?: unknown }).number : null;
+    const md = c && typeof c === 'object' ? (c as { md?: unknown }).md : null;
+    if (!Number.isInteger(n) || !wanted.includes(n as number)) { p.push(`capítulo ${String(n)} no pedido`); continue; }
+    if (seen.has(n as number)) { p.push(`capítulo ${n} repetido`); continue; }
+    seen.add(n as number);
+    if (typeof md !== 'string' || !md.trim()) { p.push(`capítulo ${n} vacío`); continue; }
+    const cur = current.get(n as number) ?? '';
+    if (/\$@/.test(md)) p.push(`capítulo ${n} trae un enlace $@…@$`);
+    if (/<\/?(script|style|iframe|html|head|body|div|span|p)\b/i.test(md) || /javascript\s*:/i.test(md)) p.push(`capítulo ${n} trae HTML o código: va solo markdown`);
+    if (cur && md.trim().length < cur.trim().length * 0.5) p.push(`capítulo ${n} quedó recortado (menos de la mitad del texto actual): devuélvelo completo`);
+    if (/^#\s/m.test(cur) && !/^#\s/m.test(md)) p.push(`capítulo ${n} perdió su título (# …)`);
+    out.push({ number: n as number, md });
+  }
+  for (const w of wanted) if (!seen.has(w)) p.push(`falta el capítulo ${w}`);
+  return { chapters: out, problems: [...new Set(p)] };
+}
+
 const ALL_OR_NONE = /\b(todas|ninguna)\s+(las\s+)?(anteriores|opciones\s+anteriores)\b|\btodas\s+son\s+correctas\b/i;
 const norm = (s: string) => plainText(s, 400).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
 

@@ -862,7 +862,7 @@ function collectMissing(plan: PackagingPlanV3, c: DynamicPackageContentsV3): str
  * EV5-C: `expectedType` = facts.activityType (resolveActivityType del Manifest:
  * h5pType congelado o, legacy, el hash del UUID).
  */
-async function buildActivityH5p(
+export async function buildActivityH5p(
   payload: unknown,
   chapterId: string,
   itemKey: string,

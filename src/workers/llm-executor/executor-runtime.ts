@@ -71,7 +71,19 @@ export interface ExecutorRuntime {
   draftFailField(item: unknown): 'examBankDraftArtifactId' | 'applicationDraftArtifactId' | null;
 }
 
-export function createExecutorRuntime(deps: ExecutorRuntimeDeps): ExecutorRuntime {
+/**
+ * r107 B10: el contexto vm del ejecutor (los MISMOS scripts y globales del servidor), sin el ciclo de un item. Lo usa
+ * `createExecutorRuntime` y el Taller de cursos para llamar directamente a funciones del generador (motor SCORM v2,
+ * validadores) sin reescribirlas. Sin red: `fetch` solo resuelve `srv://<id>`; la IA entra únicamente por `api()`.
+ */
+export interface ExecutorSandbox {
+  /** Contexto vm (globales del generador). */
+  ctx: Record<string, any>;
+  /** Corre una expresión del generador con argumentos JSON (copias: nada del llamador se comparte con el vm). */
+  call<T = unknown>(fn: string, ...args: unknown[]): Promise<T>;
+}
+
+export function createExecutorSandbox(deps: ExecutorRuntimeDeps): ExecutorSandbox {
   const mem = new Map<string, string>();
   const noop = () => undefined;
   const stubEl = (): any => ({
@@ -152,6 +164,23 @@ export function createExecutorRuntime(deps: ExecutorRuntimeDeps): ExecutorRuntim
   // capítulo se paga una vez por llamada). El navegador sigue con 3.500 / 8.000.
   ctx.DYN_EXAM_BANK_MAX_OUTPUT_EST = EXAM_BANK_WORKER_OUTPUT_EST;
   ctx.DYN_EXAM_BANK_CALL_MAX_TOKENS = Math.min(EXAM_BANK_WORKER_MAX_TOKENS, LLM_WORKER_MAX_TOKENS_CAP);
+  const callers = new Map<string, (j: string) => Promise<unknown>>();
+  return {
+    ctx,
+    call: async <T,>(fn: string, ...args: unknown[]): Promise<T> => {
+      if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(fn)) throw new Error(`executor sandbox: nombre de función inválido «${fn}»`);
+      let c = callers.get(fn);
+      if (!c) {
+        c = vm.runInContext(`(function (j) { return ${fn}.apply(null, JSON.parse(j)); })`, ctx) as (j: string) => Promise<unknown>;
+        callers.set(fn, c);
+      }
+      return (await c(JSON.stringify(args))) as T;
+    },
+  };
+}
+
+export function createExecutorRuntime(deps: ExecutorRuntimeDeps): ExecutorRuntime {
+  const { ctx } = createExecutorSandbox(deps);
   const runner = vm.runInContext('(function (j) { return _dynRunItem(JSON.parse(j)); })', ctx) as (j: string) => Promise<ExecutorRunResult>;
   return {
     run: (item) => runner(JSON.stringify(item)),

@@ -22,7 +22,8 @@
 import type { FinopsLedgerService, RecordChargeInput } from '../../finops/finops-ledger.service';
 import { LLM_RESERVATION_RELEASABLE_STATUSES } from '../../finops/llm-usage-ingest';
 
-export type CallStatus = 'sent' | 'charged' | 'not_charged' | 'not_sent' | 'ambiguous' | 'charge_unrecorded';
+/** r107 B10 fix 2 (N2): `settling` = un proceso ganó la liquidación de una llamada aceptada (sigue sin liquidar). */
+export type CallStatus = 'sent' | 'settling' | 'charged' | 'not_charged' | 'not_sent' | 'ambiguous' | 'charge_unrecorded';
 
 export interface ApprovalCall {
   id: string;
@@ -48,7 +49,21 @@ export function callErrorOutcome(err: unknown): { status: 'not_charged' | 'not_s
   return { status: n !== null && (LLM_RESERVATION_RELEASABLE_STATUSES as readonly number[]).includes(n) ? 'not_charged' : 'ambiguous', providerStatus: n };
 }
 
-const UNRESOLVED: ReadonlySet<CallStatus> = new Set(['sent', 'ambiguous', 'charge_unrecorded']);
+const UNRESOLVED: ReadonlySet<CallStatus> = new Set(['sent', 'settling', 'ambiguous', 'charge_unrecorded']);
+
+/** Llamadas EN VUELO (enviadas y sin liquidar): su cota está comprometida. */
+export const IN_FLIGHT: ReadonlySet<string> = new Set(['sent', 'settling']);
+
+/**
+ * r107 B10 fix 2 (N1): lo COMPROMETIDO de una aprobación = lo gastado + la cota de cada llamada enviada y sin liquidar
+ * (la cota se reserva AL ENVIAR; al liquidarse se reemplaza por lo medido —o la cota si no hay medición—, que entra en
+ * `spent_usd`). ÚNICA fuente de verdad de la guarda del tope: la usan `invokerFor` (B5) y `regenGateFor` (B10).
+ */
+export function committedUsd(spentUsd: unknown, calls: Record<string, { status?: string; boundUsd?: unknown }> | null | undefined): string {
+  let t = Number(spentUsd ?? 0) || 0;
+  for (const c of Object.values(calls ?? {})) if (c && IN_FLIGHT.has(String(c.status)) && Number.isFinite(Number(c.boundUsd))) t += Number(c.boundUsd);
+  return t.toFixed(6);
+}
 
 export interface CloseOutcome {
   /** released = reserva liberada; pending = queda pendiente (ambigua); none = no había reserva (modo simulado). */

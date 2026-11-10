@@ -270,6 +270,12 @@ jobs:
       - name: Check r107 Taller de cursos — calidad + preguntas puntuales (IA simulada)
         run: node scripts/r107/check-r107-quality.js --ci
 
+      # r107 B10: Fase 3 — rehacer juego / video / Gamma / audio con los generadores existentes y TODOS los proveedores
+      # SIMULADOS (Anthropic, OpenAI TTS, Videogen, Gamma, YouTube, pdftoppm, ffmpeg); SDK, fetch, http(s), net/tls y
+      # binarios bloqueados: el check falla si algo intenta salir (USD 0, sin red).
+      - name: Check r107 Taller de cursos — rehacer actividades (proveedores simulados)
+        run: node scripts/r107/check-r107-regenerate.js --ci
+
       # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
       - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
         env:
