@@ -7,8 +7,9 @@ import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 import { CourseWorkshopFlagGuard } from './course-workshop-flag.guard';
 import { CourseWorkshopService, WorkshopActor } from './course-workshop.service';
 import { CreateWorkshopSessionDto } from './dto/create-workshop-session.dto';
-import { AnswerRequestDto, ConfirmSpendDto, CreateDocumentRequestDto, CreateTextRequestDto, GenerateItemsDto } from './dto/plan.dto';
+import { AnswerRequestDto, ApplyPlanDto, ConfirmSpendDto, CreateDocumentRequestDto, CreateTextRequestDto, GenerateItemsDto } from './dto/plan.dto';
 import { WorkshopPlanService } from './plan/workshop-plan.service';
+import { WorkshopApplyService } from './apply/workshop-apply.service';
 
 const actorOf = (user: AuthUser): WorkshopActor => ({ id: user.id, email: user.email });
 
@@ -21,7 +22,7 @@ const actorOf = (user: AuthUser): WorkshopActor => ({ id: user.id, email: user.e
 @Controller('course-workshop')
 @UseGuards(SupabaseJwtGuard, CourseWorkshopFlagGuard) // flag antes que los pipes: apagado → 404 con cualquier cuerpo
 export class CourseWorkshopController {
-  constructor(private readonly workshop: CourseWorkshopService, private readonly plan: WorkshopPlanService) {}
+  constructor(private readonly workshop: CourseWorkshopService, private readonly plan: WorkshopPlanService, private readonly versions: WorkshopApplyService) {}
 
   // POST /api/v1/course-workshop/sessions { filename, sizeBytes } → { session, upload: { method, url?, token?, bucket, storagePath, maxBytes } }
   @Post('sessions')
@@ -163,5 +164,43 @@ export class CourseWorkshopController {
   @HttpCode(HttpStatus.ACCEPTED)
   fixFinding(@Param('id') id: string, @Param('findingId') findingId: string, @CurrentUser() user: AuthUser) {
     return this.plan.fixFinding(actorOf(user), id, findingId);
+  }
+
+  // ── r107 B6 · aplicar el plan + versiones (D10) ──
+
+  // POST /api/v1/course-workshop/sessions/:id/plans/:planId/apply { itemIds, confirmItemIds? } → 202 versión `queued` (sondear
+  // GET …/versions/:versionId). 409: ítems sin generar / plan cambiado / falta confirmar uno por uno los de riesgo alto
+  // (con los ids y los avisos) / prueba en seco vencida o que no pasa / plan ya aplicado. Aplicar la Fase 2 no usa IA.
+  @Post('sessions/:id/plans/:planId/apply')
+  @HttpCode(HttpStatus.ACCEPTED)
+  apply(@Param('id') id: string, @Param('planId') planId: string, @Body() body: ApplyPlanDto, @CurrentUser() user: AuthUser) {
+    return this.versions.apply(actorOf(user), id, planId, body);
+  }
+
+  // GET /api/v1/course-workshop/sessions/:id/versions → { chain: original → arreglo 1 → …, versions }
+  @Get('sessions/:id/versions')
+  listVersions(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.versions.listVersions(actorOf(user), id);
+  }
+
+  // GET /api/v1/course-workshop/sessions/:id/versions/:versionId → versión con su informe (antes/después por ítem), diagnóstico,
+  // validación y restoreCheck (`not_available` en este entorno: «Verificado en su estructura; …»)
+  @Get('sessions/:id/versions/:versionId')
+  getVersion(@Param('id') id: string, @Param('versionId') versionId: string, @CurrentUser() user: AuthUser) {
+    return this.versions.getVersion(actorOf(user), id, versionId);
+  }
+
+  // GET /api/v1/course-workshop/sessions/:id/versions/:versionId/download → URL firmada de 5 min (solo quien ve la sesión)
+  @Get('sessions/:id/versions/:versionId/download')
+  downloadVersion(@Param('id') id: string, @Param('versionId') versionId: string, @CurrentUser() user: AuthUser) {
+    return this.versions.downloadVersion(actorOf(user), id, versionId);
+  }
+
+  // POST /api/v1/course-workshop/sessions/:id/versions/:versionId/session → 202 sesión HIJA cuyo original es esta versión
+  // (encadenar arreglos: hereda el curso identificado y el alcance; no se sube nada). Idempotente: una por versión.
+  @Post('sessions/:id/versions/:versionId/session')
+  @HttpCode(HttpStatus.ACCEPTED)
+  openChildSession(@Param('id') id: string, @Param('versionId') versionId: string, @CurrentUser() user: AuthUser) {
+    return this.versions.openChildSession(actorOf(user), id, versionId);
   }
 }

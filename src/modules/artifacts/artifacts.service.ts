@@ -205,6 +205,10 @@ export class StorageHttpError extends Error {
 /** r107 B2: el .mbz original del Taller (lo registra course-workshop.service) no se borra por DELETE /artifacts/:id. */
 export const WORKSHOP_ORIGINAL_ARTIFACT_TYPE = 'workshop_original';
 export const ARTIFACT_WORKSHOP_ORIGINAL_IMMUTABLE = 'artifact_workshop_original_immutable';
+/** r107 B6: cada versión del Taller tampoco se borra por DELETE /artifacts/:id (D10: el historial es la forma de deshacer). */
+export const WORKSHOP_VERSION_ARTIFACT_TYPE = 'workshop_version';
+export const ARTIFACT_WORKSHOP_VERSION_IMMUTABLE = 'artifact_workshop_version_immutable';
+const WORKSHOP_IMMUTABLE_TYPES: readonly string[] = [WORKSHOP_ORIGINAL_ARTIFACT_TYPE, WORKSHOP_VERSION_ARTIFACT_TYPE];
 
 /** r107 (fix P1-1): el objeto de Storage pesa más que el tope de la lectura (nunca se materializa entero). */
 export const STORAGE_OBJECT_TOO_LARGE = 'storage_object_too_large';
@@ -956,6 +960,9 @@ export class ArtifactsService {
       if (row.type === WORKSHOP_ORIGINAL_ARTIFACT_TYPE) {
         throw new ForbiddenException({ code: ARTIFACT_WORKSHOP_ORIGINAL_IMMUTABLE, message: 'El original de una sesión del Taller de cursos no se puede borrar: es la base de sus versiones.' });
       }
+      if (row.type === WORKSHOP_VERSION_ARTIFACT_TYPE) {
+        throw new ForbiddenException({ code: ARTIFACT_WORKSHOP_VERSION_IMMUTABLE, message: 'Una versión del Taller de cursos no se puede borrar: es parte del historial del curso (y puede ser la base de otra versión).' });
+      }
       // DoD follow-up (R4): un .mbz QA / degradado NUEVO es solo de SUPER_ADMIN; para el dueño no existe
       // (mismo 404 que GET /artifacts/:id) — nunca se borra la fila ni el objeto `qa-internal/`.
       if (!opts.allowAdminOnlyPackage && isAdminOnlyPackageArtifact(row)) throw new NotFoundException(`Artifact ${id} not found`);
@@ -967,7 +974,8 @@ export class ArtifactsService {
       // otra; para una legacy, solo las dynamic (entre legacy, semántica de main).
       // r107 B2 (fix round 2, P2-8): una fila `workshop_original` que comparte la ruta SIEMPRE bloquea el borrado del objeto
       // (el original de una sesión del Taller es inmutable aunque se borre otra fila que lo nombre).
-      const blocking = isDynamicArtifactRow(row) ? sharers : sharers.filter((x) => isDynamicArtifactRow(x) || x.type === WORKSHOP_ORIGINAL_ARTIFACT_TYPE);
+      // r107 B6: lo mismo para una `workshop_version` (y una sesión hija registra su original sobre la MISMA ruta).
+      const blocking = isDynamicArtifactRow(row) ? sharers : sharers.filter((x) => isDynamicArtifactRow(x) || WORKSHOP_IMMUTABLE_TYPES.includes(x.type));
       deleteObject = blocking.length === 0;
       if (!deleteObject) {
         this.logger.log(`remove(${row.id}): ${blocking.length} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);
@@ -987,6 +995,19 @@ export class ArtifactsService {
       deleteObject = false;
     }
     if (deleteObject) await this.deleteStorageObject(row);
+  }
+
+  /**
+   * r107 B6: borra un objeto que el SERVIDOR subió y que NINGUNA fila de `artifacts` nombra (p. ej. el paquete de una
+   * versión del Taller cuya registración falló después de subirlo: nunca un objeto huérfano). Solo dentro de la carpeta
+   * del dueño; si alguna fila usa la ruta, no se toca. Best effort: devuelve si lo intentó.
+   */
+  async deleteUnreferencedServerObject(ownerId: string, bucket: string, storagePath: string): Promise<boolean> {
+    if (!storagePathOwnedBy(ownerId, bucket, storagePath)) return false;
+    const [ref] = await this.artifactRepo.manager.query(`select 1 as x from public.artifacts where storage_bucket = $1 and storage_path = $2 limit 1`, [bucket, storagePath]);
+    if (ref) return false;
+    await this.deleteStorageObject({ storage_provider: 'supabase', storage_bucket: bucket, storage_path: storagePath });
+    return true;
   }
 
   /** Borra el objeto de Storage de una fila (best effort: los fallos se loguean, nunca se propagan). */

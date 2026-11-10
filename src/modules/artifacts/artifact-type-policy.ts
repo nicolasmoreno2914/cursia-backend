@@ -11,7 +11,8 @@
  *  - `dynamic_audio_segment`          → provider-real (segmentos del audiolibro);
  *  - `dynamic_video`                  → dynamic-item-worker (Videogen / YouTube);
  *  - `dynamic_coherence_report_json`  → coherence.service (reporte del motor de coherencia);
- *  - `workshop_original`              → course-workshop.service (r107: el .mbz subido al Taller, verificado).
+ *  - `workshop_original`              → course-workshop.service (r107: el .mbz subido al Taller, verificado);
+ *  - `workshop_version`               → workshop-apply.service (r107 B6: cada versión arreglada, verificada).
  * El ejecutor del navegador (45-dynamic-generation-executor.js → dynArtifactUpload) sube SOLO los
  * tipos LLM (`dynamic_content_md`, `dynamic_scorm_*`, `dynamic_exam_*`, `dynamic_*_json` de plan,
  * intros, experiencia, H5P, interacciones, aplicación, práctica guiada, contexto, borradores) y el
@@ -31,6 +32,9 @@ export const SERVER_ONLY_ARTIFACT_TYPES: readonly string[] = Object.freeze([
   // r107: el .mbz ORIGINAL que el usuario subió al Taller de cursos. Lo registra el servidor al verificarlo (sha1/sha256,
   // límites del lector seguro); el cliente nunca lo declara (si no, podría hacer pasar cualquier objeto por «el original»).
   'workshop_original',
+  // r107 B6: cada VERSIÓN arreglada por el Taller (paquete nuevo verificado por el motor + compuerta + validador). La
+  // registra solo el trabajo de aplicar; el cliente nunca la declara.
+  'workshop_version',
 ]);
 
 /** 403 de `POST /artifacts` con un tipo que solo crea el servidor (clase: rechazo de cliente, no reintentable). */

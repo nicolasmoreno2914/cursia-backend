@@ -202,6 +202,8 @@ interface Attribution {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** r59: clave de una reserva de TTS de OpenAI (`reservationKey` de finops-worker-hooks: `reservation:tts:<itemRunId>:g…:a…:<tag>`). */
 export const TTS_RESERVATION_KEY_RE = /^reservation:tts:[0-9a-f-]{36}:[A-Za-z0-9_.:-]{1,200}$/;
+/** r107 B6: reserva del TOPE de una aprobación de IA del Taller de cursos (`workshop:approval:<uuid de la aprobación>`). */
+export const WORKSHOP_APPROVAL_RESERVATION_KEY_RE = /^workshop:approval:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** r59: decisión pura sobre la fila de la reserva (null = no existe como reserva CHARGE). */
 export function ttsReservationCheckOf(row: { item_status?: unknown } | null): 'ok' | 'not_tts' | 'item_running' {
   if (!row) return 'not_tts';
@@ -1429,6 +1431,71 @@ export class FinopsLedgerService {
     );
     if (!r) return 'not_worker';
     return r.item_status === 'running' ? 'item_running' : 'ok';
+  }
+
+  /**
+   * r107 B6: reservas del TOPE de las aprobaciones de IA del Taller de cursos (`workshop:approval:<id>`) que siguen
+   * PENDIENTES: alguna llamada de la aprobación quedó con resultado desconocido (timeout, red, 5xx, caída a mitad) o sin
+   * su cargo registrado, y la reserva entera sigue contando contra el saldo del usuario hasta que un SUPER_ADMIN la
+   * concilie contra la consola de Anthropic. Se excluyen las aprobaciones todavía EN CURSO (pueden liquidarse solas).
+   * Con la tabla del Taller (staging): trae el estado de la aprobación y sus llamadas ambiguas; sin ella, solo el ledger.
+   */
+  async pendingWorkshopApprovalReservations(filter: { courseId?: number; limit?: number } = {}): Promise<Array<{
+    reservationKey: string; approvalId: string; createdAt: string; ownerId: string | null; courseId: number | null; model: string | null; amount: string;
+    approvalStatus: string | null; sessionId: string | null; kind: string | null; spentUsd: string | null; stopReason: string | null;
+    calls: Array<{ id: string; kind: string; status: string; boundUsd: string | null; providerStatus: number | null; at: string | null }>;
+  }>> {
+    const where: string[] = [`e.idempotency_key like 'workshop:approval:%'`, `e.event_kind = 'CHARGE'`, `(e.metadata->>'reservation') = 'true'`,
+      `not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`];
+    const params: unknown[] = [];
+    if (filter.courseId !== undefined) { params.push(filter.courseId); where.push(`e.course_id = $${params.length}`); }
+    params.push(Math.min(Math.max(Math.trunc(filter.limit ?? 200), 1), 1000));
+    const [t] = await this.dataSource.query(`select to_regclass('public.workshop_ai_approvals') is not null as ok`);
+    const withTable = t?.ok === true;
+    const rows = await this.dataSource.query(
+      withTable
+        ? `select e.idempotency_key, e.created_at, e.owner_id, e.course_id, e.model_or_product, e.amount::text as amount,
+                  w.status as approval_status, w.session_id::text as session_id, w.kind, w.spent_usd::text as spent_usd, w.stop_reason, w.calls
+             from public.generation_cost_events e
+             left join public.workshop_ai_approvals w on w.id::text = substr(e.idempotency_key, length('workshop:approval:') + 1)
+            where ${where.join(' and ')} and coalesce(w.status, '') not in ('reserved', 'running') order by e.created_at limit $${params.length}`
+        : `select e.idempotency_key, e.created_at, e.owner_id, e.course_id, e.model_or_product, e.amount::text as amount
+             from public.generation_cost_events e where ${where.join(' and ')} order by e.created_at limit $${params.length}`,
+      params,
+    );
+    return rows.map((r: any) => ({
+      reservationKey: r.idempotency_key, approvalId: String(r.idempotency_key).slice('workshop:approval:'.length),
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      ownerId: r.owner_id ?? null, courseId: r.course_id ?? null, model: r.model_or_product ?? null, amount: r.amount,
+      approvalStatus: r.approval_status ?? null, sessionId: r.session_id ?? null, kind: r.kind ?? null, spentUsd: r.spent_usd ?? null, stopReason: r.stop_reason ?? null,
+      calls: Object.values((r.calls ?? {}) as Record<string, any>).filter((c) => c && c.status !== 'charged' && c.status !== 'not_charged' && c.status !== 'not_sent')
+        .map((c) => ({ id: String(c.id), kind: String(c.kind), status: String(c.status), boundUsd: c.boundUsd ?? null, providerStatus: Number.isInteger(c.providerStatus) ? c.providerStatus : null, at: c.at ?? null })),
+    }));
+  }
+
+  /** r107 B6: ¿es la reserva de una aprobación del Taller, y la aprobación ya no está en curso? Solo esas se concilian. */
+  async workshopApprovalReservationState(reservationKey: string): Promise<'ok' | 'not_workshop' | 'approval_running'> {
+    if (!WORKSHOP_APPROVAL_RESERVATION_KEY_RE.test(reservationKey)) return 'not_workshop';
+    const [r] = await this.dataSource.query(
+      `select 1 as x from public.generation_cost_events e where e.idempotency_key = $1 and e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'`, [reservationKey]);
+    if (!r) return 'not_workshop';
+    const [t] = await this.dataSource.query(`select to_regclass('public.workshop_ai_approvals') is not null as ok`);
+    if (t?.ok !== true) return 'ok';
+    const [a] = await this.dataSource.query(`select status from public.workshop_ai_approvals where id::text = $1`, [reservationKey.slice('workshop:approval:'.length)]);
+    return a && (a.status === 'reserved' || a.status === 'running') ? 'approval_running' : 'ok';
+  }
+
+  /**
+   * r107 B6: deja la decisión del SUPER_ADMIN en la aprobación del Taller (estado `reconciled` + quién, cuándo, qué y por
+   * qué), para que el docente vea que su saldo ya no está retenido. Sin la tabla (otro entorno), no hace nada.
+   */
+  async noteWorkshopApprovalReconciled(reservationKey: string, decision: { outcome: string; amount: string | null; countedAmount: string | null; reason: string; decidedBy: string; evidence?: unknown }): Promise<boolean> {
+    const [t] = await this.dataSource.query(`select to_regclass('public.workshop_ai_approvals') is not null as ok`);
+    if (t?.ok !== true) return false;
+    const r = await this.dataSource.query(
+      `update public.workshop_ai_approvals set status = 'reconciled', reconciliation = $2::jsonb, updated_at = now() where id::text = $1 and status in ('ambiguous', 'failed', 'stopped', 'done') returning id`,
+      [reservationKey.slice('workshop:approval:'.length), JSON.stringify({ ...decision, at: new Date().toISOString() })]);
+    return Array.isArray(r) ? (Array.isArray(r[0]) ? r[0].length > 0 : r.length > 0) : false;
   }
 
   /**

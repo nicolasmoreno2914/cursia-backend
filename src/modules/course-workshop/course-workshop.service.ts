@@ -528,6 +528,70 @@ export class CourseWorkshopService {
     return this.toRecord(claimed[0]);
   }
 
+  /**
+   * r107 B6 · encadenar arreglos (ruling del controlador): una sesión HIJA cuyo original es una versión `ready`. Reusa
+   * B1–B5 tal cual: misma ingesta (pero sin subir nada: el objeto ya es el paquete de la versión, en la carpeta del
+   * dueño), la identificación verifica que los bytes sean EXACTAMENTE los de la versión y hereda el curso identificado;
+   * inventario, diagnóstico y plan corren igual que en cualquier sesión. Mismo dueño e institución que la de origen
+   * (el alcance no cambia). Idempotente: una hija por versión (índice único); abrirla otra vez devuelve la misma.
+   * Quien llama ya verificó las compuertas sobre la sesión de origen y que la versión esté lista.
+   */
+  async openChildSession(actor: WorkshopActor, v: {
+    parentSessionId: string; ownerId: string; institutionId: string | null; versionId: string; versionNumber: number; storagePath: string;
+    filename: string; sha1: string; sha256: string; size: number; inheritCourseId: number | null;
+  }): Promise<{ session: WorkshopSessionRecord; created: boolean }> {
+    const existing = async () => {
+      const [r] = await this.q<Row[]>(this.dataSource, `select ${SESSION_COLS} from public.workshop_sessions where parent_version_id = $1`, [v.versionId]);
+      return r ?? null;
+    };
+    let row = await existing();
+    if (row) return { session: this.toRecord(await this.expireIfStale(row)), created: false };
+    const identification = {
+      upload: {
+        filename: v.filename, declaredBytes: v.size, createdBy: actor.id, fromVersionId: v.versionId, fromVersionNumber: v.versionNumber,
+        fromSessionId: v.parentSessionId, inheritCourseId: v.inheritCourseId, expect: { sha1: v.sha1, sha256: v.sha256, size: v.size },
+      },
+    };
+    try {
+      [row] = await this.q<Row[]>(this.dataSource,
+        `insert into public.workshop_sessions (owner_id, institution_id, status, storage_path, identification, parent_version_id)
+         values ($1, $2, 'uploaded', $3, $4::jsonb, $5) returning ${SESSION_COLS}`,
+        [v.ownerId, v.institutionId, v.storagePath, JSON.stringify(identification), v.versionId]);
+    } catch (err) {
+      if ((err as { code?: string })?.code === '23505') {
+        const again = await existing();
+        if (again) return { session: this.toRecord(again), created: false };
+      }
+      throw err;
+    }
+    const claimId = randomUUID();
+    const [claimed] = returningRows(await this.q(this.dataSource,
+      `update public.workshop_sessions
+          set status = 'identifying', error = null, updated_at = now(),
+              identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{claim}', jsonb_build_object('id', $2::text, 'at', now(), 'headBytes', $3::bigint))
+        where id = $1 and status = 'uploaded' returning *`,
+      [row.id, claimId, v.size]));
+    if (!claimed) return { session: this.toRecord(row), created: true };
+    const p = this.withSlot(() => this.withMemory(`identify:${row!.id}`, v.size * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row!.id, claimId)))
+      .catch((err) => this.logger.error(`workshop ${row!.id}: la identificación de la sesión hija terminó con error: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => this.inFlight.delete(row!.id));
+    this.inFlight.set(row.id, p);
+    return { session: this.toRecord(claimed), created: true };
+  }
+
+  /** r107 B6: la versión de origen de una sesión (null = sesión de un .mbz subido). Columna de B6: se lee aparte. */
+  async parentVersionOf(sessionId: string): Promise<string | null> {
+    const [r] = await this.q<any[]>(this.dataSource, `select parent_version_id::text as v from public.workshop_sessions where id = $1`, [sessionId]);
+    return r?.v ?? null;
+  }
+
+  /** r107 B6: la misma sesión con sus compuertas (para el Taller de versiones), sin exigir que esté identificada. */
+  async sessionForActor(actor: WorkshopActor, id: string, permission: Permission): Promise<WorkshopPlanSession & { record: WorkshopSessionRecord }> {
+    let row = await this.loadForActor(actor, id, permission);
+    row = await this.expireIfStale(row);
+    return { ...this.planSessionOf(row), record: this.toRecord(row) };
+  }
+
   // ── identificación ──
 
   /** Identificaciones corriendo ahora en este proceso (las pruebas lo leen). */
@@ -586,6 +650,13 @@ export class CourseWorkshopService {
     }
     const { buf, sha1, sha256 } = dl;
     const size = buf.length;
+    // r107 B6: una sesión HIJA se abre sobre una versión ya verificada: sus bytes tienen que ser EXACTAMENTE los de esa
+    // versión (si el objeto cambió en Storage, no se usa: terminal, como un original cambiado).
+    const expect = row.identification?.upload?.expect;
+    if (expect && (expect.sha1 !== sha1 || expect.sha256 !== sha256 || Number(expect.size) !== size)) {
+      await fail(WORKSHOP_ERRORS.ORIGINAL_CHANGED, 'La versión de origen cambió en el almacenamiento después de verificarla (ya no tiene la misma huella): por seguridad no se usa.', false, { sha1, size });
+      return;
+    }
     // Se verifica lo DESCARGADO, no el HEAD: si el objeto cambió entre el HEAD y la descarga, se pide reintentar (el
     // reintento vuelve a hacer HEAD y a hashear lo que llegue).
     if (Number.isFinite(headBytes) && headBytes !== size) {
@@ -615,7 +686,16 @@ export class CourseWorkshopService {
       const { catalog, truncated } = await this.loadCatalog(scope, {
         sha256, courseIds: [facts.cursiaMeta?.courseId ?? null, facts.v3NameCourseId].filter((x): x is number => typeof x === 'number'), title: facts.title,
       });
-      const result = identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope, catalog, catalogTruncated: truncated });
+      let result = identifyPackage({ facts, sha1, sha256, sizeBytes: size, scope, catalog, catalogTruncated: truncated });
+      // r107 B6: la sesión hija HEREDA el curso identificado de su sesión de origen (la versión es un arreglo de ESE curso;
+      // su huella nueva no está en el catálogo). Solo si sigue en el alcance (loadSources lo vuelve a verificar).
+      const inherited = row.identification?.upload?.inheritCourseId;
+      if (inherited !== undefined && row.identification?.upload?.fromVersionId) {
+        result = {
+          ...result, courseId: typeof inherited === 'number' ? inherited : null, needsConfirmation: false,
+          notes: [...result.notes, `Sesión abierta desde la versión ${String(row.identification.upload.fromVersionNumber ?? '')} de otra sesión: hereda su curso identificado.`],
+        };
+      }
       // B2: inventario con los MISMOS bytes recién hasheados (son los que quedan como original: verificado por
       // construcción). Una falla del inventario no tumba la identificación, pero queda visible (identification.inventory).
       const inv = await this.composeInventory(pkg, { family: result.family, builderLine: result.builder.line, builderVersion: result.builder.version }, result.courseId, scope);
@@ -947,8 +1027,35 @@ export class CourseWorkshopService {
       return await fn();
     } finally {
       this.memoryReservations.delete(key);
-      this.pumpDiagnosis();
+      this.memoryReleased();
     }
+  }
+
+  /**
+   * r107 B6: reserva de memoria QUE ESPERA (aplicar un plan y los trabajos del plan de B5): arranca solo si su estimado
+   * entra en lo que queda del presupuesto del proceso, o si no hay nada reservado (un trabajo solo siempre puede correr;
+   * el que nunca entra lo rechaza antes quien llama, con su motivo). Devuelve la función que la suelta.
+   */
+  async acquireMemory(key: string, bytes: number): Promise<() => void> {
+    const need = Math.max(0, bytes);
+    while (this.reservedMemoryBytes > 0 && this.reservedMemoryBytes + need > this.memoryBudgetBytes) {
+      await new Promise<void>((r) => this.memoryWaiters.push(r));
+    }
+    this.memoryReservations.set(key, need);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.memoryReservations.delete(key);
+      this.memoryReleased();
+    };
+  }
+  private readonly memoryWaiters: Array<() => void> = [];
+  /** Al soltarse memoria: despierta a los que esperan (vuelven a mirar) y al diagnóstico en cola. */
+  private memoryReleased(): void {
+    const ws = this.memoryWaiters.splice(0);
+    for (const w of ws) w();
+    this.pumpDiagnosis();
   }
   /** Bytes reservados ahora en este proceso (las pruebas lo leen). */
   get reservedMemoryBytes(): number {
@@ -1082,7 +1189,7 @@ export class CourseWorkshopService {
         this.diagnosisLane = null;
         this.beat(job.claimId, false);
         job.done();
-        this.pumpDiagnosis();
+        this.memoryReleased();
       });
   }
 

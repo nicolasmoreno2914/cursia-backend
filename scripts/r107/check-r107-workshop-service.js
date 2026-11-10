@@ -69,6 +69,21 @@
 //   W46 «Arreglar esto» determinista: listo sin aprobación ni IA; idempotente
 //   W47 avisos → pedido aparte en estimado; quitar/reagregar/retirar; interrumpido → reserva liberada; ledger real vs mock
 //
+//   r107 B6 (aplicar + versiones; IA SIMULADA y aplicar la Fase 2 no la usa):
+//   W55 migración B6 aditiva e idempotente (workshop_versions + columnas / estados de tablas del Taller; CHECK «listo» exige
+//       paquete + restoreCheck); se niega sin staging
+//   W56 plan → aplicar: confirmación uno por uno de los de riesgo alto (409 con ids + avisos), plan cambiado 409, 202 →
+//       worker → `ready` con artifact workshop_version, informe, diagnóstico, validación, restoreCheck not_available, costo
+//   W57 sin generar / prueba en seco vencida / que no pasa → 409 sin versión; motor que falla en el worker → failed sin
+//       artifact ni objeto; reintento sobre la misma fila
+//   W58 falla a mitad (al registrar / Storage caído) → failed, sin artifact, objeto borrado (nunca huérfano)
+//   W59 reinicio a mitad: boot id + latido; reclamo por GET y barrido; el zombi no escribe; tope de reclamos
+//   W60 sesión hija desde una versión → versión 2 con padre correcto; cadena; versiones anteriores intactas; versión alterada
+//   W61 descarga: URL firmada de 5 min solo dueño / SA / alcance; no lista 409; objeto cambiado 409
+//   W62 protección contra borrado de workshop_version
+//   W63 carril de 1 + presupuesto de memoria (espera; nunca entra → 409)
+//   W64 B5: reclamo + latido entre procesos para entradas / pedidos / aprobaciones
+//
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
 require('reflect-metadata');
@@ -1132,6 +1147,8 @@ function rawZip(entries) {
         for (let i = 0; i < 2; i++) { await c.query('begin'); await c.query(SQL_B5); await c.query('commit'); }
         eq((await c.query('show lock_timeout')).rows[0].lock_timeout, '0', 'lock_timeout local');
         eq(await colsOf(), before, 'tablas existentes intactas');
+        // r107 B6: el código del plan ya usa las columnas de B6 (reclamo de las aprobaciones): se aplica junto (W55 la verifica).
+        await c.query('begin'); await c.query(fs.readFileSync(path.join(REPO, 'supabase-migration-r107-b6-apply.sql'), 'utf8')); await c.query('commit');
         const T = ['workshop_ai_approvals', 'workshop_intakes', 'workshop_plan_items', 'workshop_plans', 'workshop_requests'];
         eq((await c.query(`select relname, relrowsecurity from pg_class where relname = any($1) order by 1`, [T])).rows.map((x) => [x.relname, x.relrowsecurity]), T.map((t) => [t, true]), 'RLS');
         for (const t of T) {
@@ -1597,6 +1614,345 @@ function rawZip(entries) {
         eq([r.ap.status, r.ap.calls.map((c) => c.status), ledger.settled.length], ['ambiguous', ['ambiguous'], 0], 'después de enviar → reserva pendiente');
         eq(REAL_AI.n, 0, 'el SDK real nunca se usó');
       } finally { if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = savedKey; }
+    });
+
+    // ── r107 B6: aplicar + versiones + reclamo/latido de B5 (IA SIMULADA; aplicar la Fase 2 no la usa) ──
+    const APS = D('modules/course-workshop/apply/workshop-apply.service.js');
+    const AC = D('modules/course-workshop/apply/apply-core.js');
+    const SQL_B6 = fs.readFileSync(path.join(REPO, 'supabase-migration-r107-b6-apply.sql'), 'utf8');
+    // Storage falso: subida del servidor, URL firmada y borrado de un objeto sin filas (mismos controles de carpeta).
+    storage.puts = []; storage.deleted = []; storage.signedDownloads = []; storage.failPut = false;
+    storage.putStorageObject = async function (input) {
+      ART.assertWritableStoragePath(input.ownerId, input.storageBucket ?? 'cursia-artifacts', input.storagePath);
+      if (this.failPut) throw new Error('Storage caído (simulado)');
+      objects.set(input.storagePath, Buffer.from(input.buffer)); this.puts.push(input.storagePath);
+      return { sizeBytes: input.buffer.length, adopted: false, sha256: sha('sha256', input.buffer) };
+    };
+    storage.getDownloadUrl = async function (id, ownerId, ttl) {
+      const [a] = await ds.query(`select storage_path, storage_bucket from public.artifacts where id = $1 and owner_id = $2`, [id, ownerId]);
+      if (!a) { const { NotFoundException } = require('@nestjs/common'); throw new NotFoundException(`Artifact ${id} not found`); }
+      this.signedDownloads.push({ id, ttl });
+      return { url: `http://storage.local/sign/${a.storage_path}?ttl=${ttl}`, storagePath: a.storage_path, bucket: a.storage_bucket, method: 'backend' };
+    };
+    storage.deleteUnreferencedServerObject = async function (ownerId, bucket, p) {
+      const [ref] = await ds.query(`select 1 x from public.artifacts where storage_path = $1 limit 1`, [p]);
+      if (ref || !p.startsWith(`${ownerId.toLowerCase()}/`)) return false;
+      objects.delete(p); this.deleted.push(p); return true;
+    };
+    const apply = new APS.WorkshopApplyService(ds, storage, svc);
+    const idleA = () => apply.whenIdle();
+    const readyPlanFor = async (fn, { remove = true } = {}) => {
+      const res = await newIdentified(fn);
+      const sid = res.session.id;
+      aiSim.handler = (req) => (req.purpose === 'interpret' ? { requests: [
+        { quote: 'Agrega una línea a la bienvenida.', operation: 'edit_html', instruction: 'Agregar al final de la bienvenida una línea sobre la actualización 2026.', target: { moduleId: 1000 } },
+        ...(remove ? [{ quote: 'quita «Metodología»', operation: 'remove_activity', instruction: 'Quitar «Metodología».', target: { moduleId: 1003 } }] : []),
+      ] } : appendP(req));
+      const a = await plan.createTextIntake(OWNER, sid, `Agrega una línea a la bienvenida.${remove ? ' Y quita «Metodología».' : ''}`);
+      await approve(sid, a); await idle();
+      await generateAll(sid); await idle();
+      return { sid, p: await plan.getPlan(OWNER, sid) };
+    };
+    const vrow = async (id) => (await ds.query(`select * from public.workshop_versions where id = $1`, [id]))[0];
+    const applyAll = (sid, p, extra = {}) => apply.apply(OWNER, sid, p.planId, { itemIds: p.items.filter((i) => i.status === 'proposed' && i.available).map((i) => i.id), confirmItemIds: p.items.filter((i) => i.requiresItemConfirm).map((i) => i.id), ...extra });
+    let b6 = null; // { sid, p, version }
+
+    await check('W55 migración B6 aditiva e idempotente: workshop_versions (RLS, sin anon/authenticated, CHECKs: «listo» exige paquete + restoreCheck), sesiones hijas, estados nuevos de plan y aprobación; nada anterior al Taller cambia; el script se niega sin MIGRATION_ENV=staging', async () => {
+      await withClient(DB, async (c) => {
+        const colsOf = async () => (await c.query(`select table_name, column_name, data_type from information_schema.columns where table_name in ('courses','artifacts','workshop_diagnoses','workshop_findings','workshop_intakes','workshop_requests','workshop_plan_items') order by 1, 2`)).rows;
+        const before = await colsOf();
+        for (let i = 0; i < 2; i++) { await c.query('begin'); await c.query(SQL_B6); await c.query('commit'); }
+        eq(await colsOf(), before, 'tablas anteriores (y las de B5 sin columnas nuevas) intactas');
+        eq((await c.query(`select relrowsecurity from pg_class where relname = 'workshop_versions'`)).rows[0].relrowsecurity, true, 'RLS');
+        const g = (await c.query(`select has_table_privilege('authenticated', 'public.workshop_versions', 'select') a, has_table_privilege('anon', 'public.workshop_versions', 'insert') b`)).rows[0];
+        eq([g.a, g.b], [false, false], 'sin anon/authenticated');
+        const has = async (t, col) => (await c.query(`select 1 from information_schema.columns where table_name = $1 and column_name = $2`, [t, col])).rows.length === 1;
+        eq([await has('workshop_sessions', 'parent_version_id'), await has('workshop_plans', 'applied_version_id'), await has('workshop_ai_approvals', 'claim_id'), await has('workshop_ai_approvals', 'reconciliation')], [true, true, true, true], 'columnas nuevas en tablas del Taller');
+        const code = async (sql, p = []) => { try { await c.query('savepoint s'); await c.query(sql, p); await c.query('release savepoint s'); return null; } catch (e) { await c.query('rollback to savepoint s'); return e.code; } };
+        await c.query('begin');
+        const [ses] = (await c.query(`select id, original_sha1 from public.workshop_sessions where status = 'identified' and original_sha1 is not null limit 1`)).rows;
+        const [pl] = (await c.query(`insert into public.workshop_plans (session_id, original_sha1, status) values ($1, $2, 'applying') returning id`, [ses.id, ses.original_sha1])).rows;
+        eq(await code(`update public.workshop_plans set status = 'aplicado' where id = $1`, [pl.id]), '23514', 'CHECK del estado del plan');
+        eq(await code(`insert into public.workshop_versions (session_id, plan_id, number, base_sha1, status, created_by) values ($1, $2, 1, $3, 'ready', $4)`, [ses.id, pl.id, ses.original_sha1, OWNER.id]), '23514', '«listo» sin paquete → rechazado por la base');
+        eq(await code(`insert into public.workshop_versions (session_id, plan_id, number, base_sha1, status, restore_check, created_by) values ($1, $2, 1, $3, 'queued', 'restaurado', $4)`, [ses.id, pl.id, ses.original_sha1, OWNER.id]), '23514', 'restore_check solo passed / failed / not_available');
+        eq(await code(`update public.workshop_ai_approvals set status = 'reconciled' where false`), null, 'estado reconciled aceptado');
+        await c.query('rollback');
+      });
+      const res = spawnSync(process.execPath, [path.join(REPO, 'scripts/migrate-r107-b6-apply.js')], { env: { ...cleanEnv(), DB_HOST: '127.0.0.1', DB_PORT: String(port), DB_USER: 'postgres', DB_NAME: DB }, encoding: 'utf8', cwd: os.tmpdir() });
+      assert(res.status !== 0 && /MIGRATION_ENV/.test(res.stderr), `B6 debió negarse: ${res.status} ${res.stderr}`);
+    });
+
+    await check('W56 plan → APLICAR: riesgo alto sin confirmar → 409 con los ids y los avisos; plan cambiado → 409; confirmado → 202 `queued`, plan `applying` (no se edita); worker → versión `ready` con artifact `workshop_version`, informe y diagnóstico; restoreCheck not_available; costo; 0 llamadas a la IA al aplicar', async () => {
+      const { sid, p } = await readyPlanFor('b6-aplicar.mbz');
+      const edit = p.items.find((i) => i.operation === 'edit_html');
+      const rm = p.items.find((i) => i.operation === 'remove_activity');
+      eq([edit.stage, rm.stage, rm.requiresItemConfirm, p.combined && p.combined.ok], ['ready', 'ready', true, true], 'plan listo para aplicar');
+      const ids = [edit.id, rm.id];
+      const body = await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: ids }), 409, 'WORKSHOP_APPLY_CONFIRM_REQUIRED', 'sin confirmar');
+      eq([body.missingItemIds, body.warnings.map((w) => w.code)], [[rm.id], ['REMOVALS']], 'los ids que faltan + los avisos otra vez');
+      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: [edit.id], confirmItemIds: [rm.id] }), 409, 'WORKSHOP_APPLY_PLAN_CHANGED', 'no es lo que vio');
+      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: ids, confirmItemIds: [crypto.randomUUID()] }), 400, 'WORKSHOP_APPLY_ITEMS_INVALID', 'confirmación ajena');
+      await rejects(apply.apply(OTHER, sid, p.planId, { itemIds: ids, confirmItemIds: [rm.id] }), 404, null, 'ajeno');
+      eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [sid]))[0].n, 0, 'ningún 409 crea una versión');
+      const calls0 = aiSim.calls.length; const charges0 = ledger.charges.length;
+      let hold; const gate = new Promise((r) => { hold = r; });
+      apply.testHook = async (stage) => { if (stage === 'building') await gate; };
+      const r = await apply.apply(OWNER, sid, p.planId, { itemIds: ids, confirmItemIds: [rm.id] });
+      eq([r.version.status, r.version.number, r.version.parent.kind, r.plan.status], ['queued', 1, 'original', 'applying'], '202 en cola');
+      eq((await plan.getPlan(OWNER, sid)).status, 'applying', 'el plan dice applying');
+      await rejects(plan.createTextIntake(OWNER, sid, 'Otro cambio'), 409, 'WORKSHOP_PLAN_APPLYING', 'no se edita mientras se aplica');
+      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: ids, confirmItemIds: [rm.id] }), 409, 'WORKSHOP_PLAN_NOT_DRAFT', 'no se aplica dos veces');
+      hold(); await idleA(); apply.testHook = null;
+      const v = await apply.getVersion(OWNER, sid, r.version.id);
+      eq([v.status, v.number, v.error, v.restoreCheck], ['ready', 1, null, { status: 'not_available', message: AC.RESTORE_NOT_AVAILABLE_MESSAGE }], 'versión lista, sin decir «restaurado»');
+      const obj = objects.get(SVC.workshopStoragePath(OWNER.id, sid).replace('original.mbz', '') + `versions/v1-${v.sha1.slice(0, 12)}.mbz`);
+      assert(obj && sha('sha256', obj) === v.sha256 && obj.length === v.sizeBytes, 'el paquete está en la carpeta del dueño con su huella');
+      const [art] = await ds.query(`select type, owner_id::text o, checksum_sha256, size_bytes::int s, metadata from public.artifacts where id = $1`, [v.artifactId]);
+      eq([art.type, art.o, art.checksum_sha256, art.s, art.metadata.workshopVersionId, art.metadata.number], ['workshop_version', OWNER.id, v.sha256, v.sizeBytes, v.id, 1], 'artifact workshop_version (del servidor)');
+      eq(v.report.items.map((x) => [x.itemId, x.operation]), [[edit.id, 'edit_html'], [rm.id, 'remove_activity']], 'informe por ítem');
+      assert(v.report.items[0].fields[0].after.includes('Actualizado en 2026') && v.report.items[0].fields[0].before !== v.report.items[0].fields[0].after, 'antes / después');
+      assert(v.report.items[1].entries.removed.some((e) => /activities\/label_1003\//.test(e)), 'archivos quitados');
+      eq([v.diagnosis.introduced, v.validation.mode, v.validation.introduced], [[], 'v3_structure', []], 'diagnóstico y validador sin nuevos');
+      assert(Number(v.cost.planAiUsd) >= 0 && v.cost.applyUsd === '0.000000' && v.cost.totalUsd === v.cost.planAiUsd && v.cost.currency === 'USD', `costo total del arreglo: ${JSON.stringify(v.cost)}`);
+      eq([aiSim.calls.length - calls0, ledger.charges.length - charges0], [0, 0], 'aplicar NO llamó a la IA ni cargó nada');
+      const pl = await plan.getPlan(OWNER, sid);
+      eq([pl.status, pl.appliedVersionId], ['applied', v.id], 'plan aplicado');
+      await rejects(plan.fixFinding(OWNER, sid, 'T04.token_orphan.000000000000'), 409, 'WORKSHOP_PLAN_APPLIED', 'plan aplicado: no se edita');
+      const [s] = await ds.query(`select status, original_sha1 from public.workshop_sessions where id = $1`, [sid]);
+      eq([s.status, s.original_sha1, sha('sha1', objects.get(SVC.workshopStoragePath(OWNER.id, sid)))], ['identified', sha('sha1', MBZ), sha('sha1', MBZ)], 'el original no cambió');
+      b6 = { sid, p, version: v };
+    });
+
+    await check('W57 no se aplica sin generar ni con la prueba en seco vencida / que no pasa (409, sin versión); si en el worker el motor falla → versión `failed` con motivo y el ítem, plan `failed`, SIN artifact ni objeto; corregido → reintento', async () => {
+      // (a) ítem sin generar
+      const res = await newIdentified('b6-sin-generar.mbz');
+      aiSim.handler = (req) => (req.purpose === 'interpret' ? { requests: [{ quote: 'Agrega una línea a la bienvenida.', operation: 'edit_html', instruction: 'Agregar al final de la bienvenida una línea sobre 2026.', target: { moduleId: 1000 } }] } : appendP(req));
+      const a = await plan.createTextIntake(OWNER, res.session.id, 'Agrega una línea a la bienvenida.');
+      await approve(res.session.id, a); await idle();
+      const p0 = await plan.getPlan(OWNER, res.session.id);
+      const b0 = await rejects(apply.apply(OWNER, res.session.id, p0.planId, { itemIds: [p0.items[0].id] }), 409, 'WORKSHOP_APPLY_NOT_READY', 'sin generar');
+      assert(/generó su contenido/.test(b0.blocking[0].reason), b0.blocking[0].reason);
+      // (b) prueba en seco: vencida y que no pasa
+      const { sid, p } = await readyPlanFor('b6-seco.mbz', { remove: false });
+      const it = p.items[0];
+      const savedCombined = (await ds.query(`select combined from public.workshop_plans where id = $1`, [p.planId]))[0].combined;
+      await ds.query(`update public.workshop_plans set combined = jsonb_set(combined, '{itemIds}', '[]'::jsonb) where id = $1`, [p.planId]);
+      await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] }), 409, 'WORKSHOP_APPLY_DRY_RUN_STALE', 'vencida');
+      await ds.query(`update public.workshop_plans set combined = $2::jsonb where id = $1`, [p.planId, JSON.stringify({ ...savedCombined, ok: false, failure: { opIndex: 0, code: 'stale_target', message: 'el campo cambió' }, failedItemId: it.id })]);
+      const bf = await rejects(apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] }), 409, 'WORKSHOP_APPLY_DRY_RUN_FAILED', 'no pasa');
+      eq(bf.failedItemId, it.id, 'dice qué ítem');
+      eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [sid]))[0].n, 0, 'sin versión');
+      // (c) la prueba en seco del plan pasaba pero el motor falla en el worker (la operación quedó vencida en la base)
+      await ds.query(`update public.workshop_plans set combined = $2::jsonb where id = $1`, [p.planId, JSON.stringify(savedCombined)]);
+      const goodParams = (await ds.query(`select params from public.workshop_plan_items where id = $1`, [it.id]))[0].params;
+      await ds.query(`update public.workshop_plan_items set params = jsonb_set(params, '{expectRawSha1}', to_jsonb($2::text)) where id = $1`, [it.id, '0'.repeat(40)]);
+      const puts0 = storage.puts.length;
+      const r = await apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] });
+      await idleA();
+      const v = await apply.getVersion(OWNER, sid, r.version.id);
+      eq([v.status, v.error.stage, v.error.failedItemId, v.error.retryable, v.artifactId], ['failed', 'engine', it.id, false, null], 'falla visible, con el ítem');
+      assert(/No se pudo aplicar el ítem/.test(v.error.message), v.error.message);
+      eq([(await plan.getPlan(OWNER, sid)).status, storage.puts.length - puts0], ['failed', 0], 'plan failed; nada subido');
+      eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_version' and metadata->>'workshopSessionId' = $1`, [sid]))[0].n, 0, 'sin artifact');
+      // (d) corregido → el plan vuelve a borrador al editarlo y se reintenta: la MISMA fila, con la falla anterior en el informe
+      await ds.query(`update public.workshop_plan_items set params = $2::jsonb where id = $1`, [it.id, JSON.stringify(goodParams)]);
+      const r2 = await apply.apply(OWNER, sid, p.planId, { itemIds: [it.id] });
+      await idleA();
+      const v2 = await apply.getVersion(OWNER, sid, r2.version.id);
+      eq([v2.id, v2.status, v2.report.previousFailures.length, v2.report.previousFailures[0].stage], [v.id, 'ready', 1, 'engine'], 'reintento listo; la falla anterior queda en el informe');
+    });
+
+    await check('W58 falla A MITAD (después de subir el paquete, al registrar) → versión `failed` reintentable, plan `failed`, SIN artifact y el objeto subido BORRADO (nunca huérfano); el original no cambia; reintento → `ready`', async () => {
+      const { sid, p } = await readyPlanFor('b6-mitad.mbz', { remove: false });
+      apply.testHook = (stage) => { if (stage === 'register') throw new Error('base caída al registrar (simulada)'); };
+      const deleted0 = storage.deleted.length; const puts0 = storage.puts.length;
+      const r = await apply.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      await idleA(); apply.testHook = null;
+      const v = await apply.getVersion(OWNER, sid, r.version.id);
+      eq([v.status, v.error.stage, v.error.retryable, v.artifactId, (await plan.getPlan(OWNER, sid)).status], ['failed', 'register', true, null, 'failed'], 'falla visible');
+      eq([storage.puts.length - puts0, storage.deleted.length - deleted0], [1, 1], 'subido y BORRADO');
+      assert(!objects.has(storage.puts[storage.puts.length - 1]), 'sin objeto huérfano');
+      eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_version' and metadata->>'workshopSessionId' = $1`, [sid]))[0].n, 0, 'sin artifact');
+      // Storage caído al subir → failed reintentable, nada registrado.
+      storage.failPut = true;
+      const r1 = await apply.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      await idleA(); storage.failPut = false;
+      eq([(await vrow(r1.version.id)).status, (await vrow(r1.version.id)).error.code], ['failed', 'WORKSHOP_APPLY_UPLOAD_FAILED'], 'subida caída');
+      const r2 = await apply.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      await idleA();
+      eq((await apply.getVersion(OWNER, sid, r2.version.id)).status, 'ready', 'reintento listo');
+      eq(sha('sha1', objects.get(SVC.workshopStoragePath(OWNER.id, sid))), sha('sha1', MBZ), 'original intacto');
+    });
+
+    await check('W59 reinicio a mitad (boot id + latido): el proceso A muere con la versión `building`; B no la toca mientras A late, la reclama cuando deja de latir (GET y barrido) y corre UNA vez; lo que A termine después no escribe nada; tope de reclamos', async () => {
+      const { sid, p } = await readyPlanFor('b6-reinicio.mbz', { remove: false });
+      const svcB = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const A = apply;
+      const B = new APS.WorkshopApplyService(ds, storage, svcB);
+      let release; const blocked = new Promise((r) => { release = r; });
+      A.testHook = async (stage) => { if (stage === 'building') await blocked; };
+      const r = await A.apply(OWNER, sid, p.planId, { itemIds: [p.items[0].id] });
+      for (let i = 0; i < 20 && (await vrow(r.version.id)).status !== 'building'; i++) await new Promise((x) => setTimeout(x, 25));
+      eq((await vrow(r.version.id)).status, 'building', 'A la tomó');
+      await A.heartbeat();
+      eq([(await B.listVersions(OWNER, sid)).versions[0].status, await B.sweep(), B.runs], ['building', 0, 0], 'B no toca lo que A late');
+      A.simulateDeathForTests();
+      await ds.query(`update public.workshop_versions set updated_at = now() - interval '31 seconds' where id = $1`, [r.version.id]);
+      const l = await B.listVersions(OWNER, sid);
+      eq(l.versions[0].status, 'queued', 'el GET de B la reclamó');
+      await B.whenIdle();
+      const v = await B.getVersion(OWNER, sid, r.version.id);
+      eq([v.status, v.attempts, B.runs], ['ready', 2, 1], 'B la corrió UNA vez (segundo reclamo)');
+      const before = await vrow(r.version.id);
+      release(); await A.whenIdle().catch(() => {});
+      await new Promise((x) => setTimeout(x, 50));
+      const after = await vrow(r.version.id);
+      eq([after.status, after.sha1, after.artifact_id, String(after.updated_at)], [before.status, before.sha1, before.artifact_id, String(before.updated_at)], 'A (zombi) no escribió nada');
+      eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_version' and metadata->>'workshopVersionId' = $1`, [r.version.id]))[0].n, 1, 'un solo artifact');
+      assert(objects.has(after.storage_path), 'el paquete de B sigue en Storage (A no borró un objeto con fila)');
+      // Barrido: una versión `queued` de un arranque muerto la toma el barrido de cualquier proceso; tras APPLY_MAX_ATTEMPTS, falla con motivo.
+      const q2 = await readyPlanFor('b6-barrido.mbz', { remove: false });
+      const C = new APS.WorkshopApplyService(ds, storage, new SVC.CourseWorkshopService(ds, storage, permissions));
+      C.simulateDeathForTests(); // C encola y muere antes de correr
+      const r2 = await C.apply(OWNER, q2.sid, q2.p.planId, { itemIds: [q2.p.items[0].id] });
+      await ds.query(`update public.workshop_versions set attempts = $2, updated_at = now() - interval '31 seconds' where id = $1`, [r2.version.id, APS.APPLY_MAX_ATTEMPTS]);
+      eq(await B.sweep(), 0, 'agotó los reclamos: no se reclama');
+      const f = await vrow(r2.version.id);
+      eq([f.status, f.error.code, f.error.retryable], ['failed', 'WORKSHOP_APPLY_INTERRUPTED', true], 'falla visible tras el tope');
+      A.testHook = null;
+    });
+
+    // El servicio A murió en W59: el resto usa uno nuevo sobre el mismo arranque de `svc`.
+    const apply2 = new APS.WorkshopApplyService(ds, storage, svc);
+
+    await check('W60 encadenar: sesión HIJA desde la versión 1 (sin subir nada; bytes verificados = la versión; hereda curso y alcance; idempotente) → su plan → versión 2 con padre = v1; cadena original → arreglo 1 → arreglo 2; el original y la v1 no cambian', async () => {
+      const { sid, version: v1 } = b6;
+      await rejects(apply2.openChildSession(OTHER, sid, v1.id), 404, null, 'ajeno');
+      const c = await apply2.openChildSession(OWNER, sid, v1.id);
+      eq([c.created, c.session.status, c.fromVersion.number], [true, 'identifying', 1], '202 identificando');
+      await settle(c.session.id);
+      const child = await svc.get(OWNER, c.session.id);
+      const [parentS] = await ds.query(`select identified_course_id, institution_id, owner_id from public.workshop_sessions where id = $1`, [sid]);
+      eq([child.status, child.originalSha1, child.originalSize, child.identifiedCourseId, child.institutionId], ['identified', v1.sha1, v1.sizeBytes, parentS.identified_course_id, parentS.institution_id], 'identificada sobre los bytes de la v1, curso heredado');
+      assert(child.identification.notes.some((n) => /hereda su curso/.test(n)), 'lo dice');
+      eq((await ds.query(`select parent_version_id::text v, storage_path from public.workshop_sessions where id = $1`, [c.session.id]))[0].v, v1.id, 'padre');
+      eq((await apply2.openChildSession(OWNER, sid, v1.id)).session.id, c.session.id, 'idempotente: la misma hija');
+      const origs = await ds.query(`select type from public.artifacts where storage_path = (select storage_path from public.workshop_sessions where id = $1) order by type`, [c.session.id]);
+      eq(origs.map((x) => x.type), ['workshop_original', 'workshop_version'], 'el original de la hija es la misma ruta (dos filas, ambas protegidas)');
+      // Plan de la hija → versión 2.
+      aiSim.handler = (req) => (req.purpose === 'interpret' ? { requests: [{ quote: 'Agrega una línea a la bienvenida.', operation: 'edit_html', instruction: 'Agregar al final de la bienvenida otra línea.', target: { moduleId: 1000 } }] } : appendP(req));
+      const a = await plan.createTextIntake(OWNER, c.session.id, 'Agrega una línea a la bienvenida.');
+      await approve(c.session.id, a); await idle(); await generateAll(c.session.id); await idle();
+      const pc = await plan.getPlan(OWNER, c.session.id);
+      const r = await apply2.apply(OWNER, c.session.id, pc.planId, { itemIds: [pc.items[0].id] });
+      eq([r.version.number, r.version.parent], [2, { kind: 'version', versionId: v1.id }], 'número 2, padre v1');
+      await apply2.whenIdle();
+      const v2 = await apply2.getVersion(OWNER, c.session.id, r.version.id);
+      eq(v2.status, 'ready', 'v2 lista');
+      assert(v2.report.items[0].fields[0].before.includes('Actualizado en 2026'), 'el «antes» de la v2 es la v1');
+      const l = await apply2.listVersions(OWNER, c.session.id);
+      eq(l.chain.map((x) => [x.kind, x.number, x.sessionId]), [['original', 0, sid], ['version', 1, sid], ['version', 2, c.session.id]], 'cadena');
+      const v1now = await vrow(v1.id);
+      eq([v1now.status, v1now.sha1, v1now.sha256, sha('sha256', objects.get(v1now.storage_path))], ['ready', v1.sha1, v1.sha256, v1.sha256], 'la v1 no cambió');
+      eq(sha('sha1', objects.get(SVC.workshopStoragePath(OWNER.id, sid))), sha('sha1', MBZ), 'el original no cambió');
+      // La versión de origen cambiada en Storage → la hija de OTRA versión no se usa.
+      const altered = Buffer.concat([objects.get(v2.report.items.length ? (await vrow(v2.id)).storage_path : ''), Buffer.from('x')]);
+      objects.set((await vrow(v2.id)).storage_path, altered);
+      const c2 = await apply2.openChildSession(OWNER, c.session.id, v2.id);
+      await settle(c2.session.id);
+      const g2 = await svc.get(OWNER, c2.session.id);
+      eq([g2.status, g2.error && g2.error.code, g2.error && g2.error.retryable], ['failed', 'WORKSHOP_ORIGINAL_CHANGED', false], 'versión alterada → no se usa');
+      b6.child = { sid: c.session.id, v2 };
+    });
+
+    await check('W61 descargar: URL firmada de 5 min SOLO para quien ve la sesión (dueño, SuperAdmin; ajeno 404; miembro solo con RBAC enforce y sesión de su institución); no lista → 409; objeto cambiado → 409', async () => {
+      const { sid, version: v1 } = b6;
+      const d = await apply2.downloadVersion(OWNER, sid, v1.id);
+      eq([d.expiresInSeconds, d.sizeBytes, d.sha256, /ttl=300$/.test(d.url)], [300, v1.sizeBytes, v1.sha256, true], 'URL corta');
+      eq((await apply2.downloadVersion(ADMIN, sid, v1.id)).versionId, v1.id, 'SuperAdmin');
+      await rejects(apply2.downloadVersion(OTHER, sid, v1.id), 404, null, 'ajeno');
+      process.env.CURSIA_RBAC_MODE = 'enforce';
+      try { await rejects(apply2.downloadVersion(MEMBER, sid, v1.id), 404, null, 'miembro sin institución en la sesión'); } finally { delete process.env.CURSIA_RBAC_MODE; }
+      await rejects(apply2.downloadVersion(OWNER, sid, crypto.randomUUID()), 404, 'WORKSHOP_VERSION_NOT_FOUND', 'inexistente');
+      await rejects(apply2.downloadVersion(OWNER, b6.child.sid, v1.id), 404, 'WORKSHOP_VERSION_NOT_FOUND', 'versión de otra sesión');
+      const failedV = (await ds.query(`select id, session_id from public.workshop_versions where status = 'failed' limit 1`))[0];
+      await rejects(apply2.downloadVersion(OWNER, failedV.session_id, failedV.id), 409, 'WORKSHOP_VERSION_NOT_READY', 'no lista');
+      await rejects(apply2.downloadVersion(OWNER, b6.child.sid, b6.child.v2.id), 409, 'WORKSHOP_VERSION_CHANGED', 'objeto alterado (W60)');
+    });
+
+    await check('W62 protección: DELETE /artifacts/:id de una `workshop_version` → 403 con motivo; una fila gemela que comparte su ruta se borra sin borrar el objeto; el cliente no puede declarar el tipo', async () => {
+      const ARTS = new ART.ArtifactsService({ manager: { connection: ds } }, { get: () => undefined });
+      const body = await rejects(ARTS.remove(b6.version.artifactId, OWNER.id), 403, 'artifact_workshop_version_immutable', 'versión');
+      assert(/historial/.test(body.message), 'motivo');
+      const [vr] = await ds.query(`select storage_path from public.artifacts where id = $1`, [b6.version.artifactId]);
+      const [twin] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path) values ($1, 'x', 'mbz_final', $2) returning id::text as id`, [OWNER.id, vr.storage_path]);
+      let deletes = 0;
+      ARTS.deleteStorageObject = async () => { deletes++; };
+      await ARTS.remove(twin.id, OWNER.id);
+      eq(deletes, 0, 'el objeto de la versión no se borra');
+      const POL = D('modules/artifacts/artifact-type-policy.js');
+      eq([POL.isServerOnlyArtifactType('workshop_version'), POL.isServerOnlyArtifactType('workshop_original')], [true, true], 'tipos solo del servidor');
+    });
+
+    await check('W63 carril de 1 + memoria: tres aplicaciones a la vez → nunca más de 1 corriendo; con la memoria ocupada espera y arranca al soltarse; un original que nunca entra → 409 WORKSHOP_APPLY_TOO_LARGE sin encolar', async () => {
+      const plans = [];
+      for (const n of [1, 2, 3]) plans.push(await readyPlanFor(`b6-carril-${n}.mbz`, { remove: false }));
+      let running = 0; let peak = 0;
+      apply2.testHook = async (stage) => { if (stage === 'building') { running++; peak = Math.max(peak, running); await new Promise((x) => setTimeout(x, 30)); } if (stage === 'register') running--; };
+      const release = await svc.acquireMemory('test:ocupada', svc.memoryBudgetBytes - 1);
+      const rs = [];
+      for (const q of plans) rs.push(await apply2.apply(OWNER, q.sid, q.p.planId, { itemIds: [q.p.items[0].id] }));
+      await new Promise((x) => setTimeout(x, 80));
+      eq((await vrow(rs[0].version.id)).status, 'queued', 'espera memoria (no arrancó)');
+      release();
+      await apply2.whenIdle(); apply2.testHook = null;
+      eq([peak, ...(await Promise.all(rs.map(async (r) => (await vrow(r.version.id)).status)))], [1, 'ready', 'ready', 'ready'], 'de a una');
+      eq(svc.reservedMemoryBytes, 0, 'sin reservas colgadas');
+      const big = await readyPlanFor('b6-grande.mbz', { remove: false });
+      const saved = svc.memoryBudgetBytes;
+      svc.memoryBudgetBytes = MBZ.length * 5;
+      try {
+        const b = await rejects(apply2.apply(OWNER, big.sid, big.p.planId, { itemIds: [big.p.items[0].id] }), 409, 'WORKSHOP_APPLY_TOO_LARGE', 'nunca entra');
+        assert(/7× su tamaño/.test(b.message), b.message);
+      } finally { svc.memoryBudgetBytes = saved; }
+      eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [big.sid]))[0].n, 0, 'sin versión');
+    });
+
+    await check('W64 B5 reclamo + latido entre procesos: una entrada `interpreting` de OTRO arranque que late NO se da por interrumpida (ni a los 15 min); deja de latir → en ~30 s sí; la de ESTE arranque sin trabajo vivo → enseguida; el latido refresca', async () => {
+      const res = await newIdentified('b6-latido.mbz');
+      const sid = res.session.id;
+      const ins = async (claim, ageSec) => (await ds.query(`insert into public.workshop_intakes (session_id, original_sha1, created_by, source, status, text, claim_id, updated_at) values ($1, $2, $3, 'text', 'interpreting', 'x', $4, now() - ($5::int * interval '1 second')) returning id`, [sid, sha('sha1', MBZ), OWNER.id, claim, ageSec]))[0].id;
+      const other = `${crypto.randomUUID()}.${crypto.randomUUID()}`;
+      const fresh = await ins(other, 20);           // otro arranque, latió hace 20 s
+      const old15 = await ins(other, 20 * 60);       // otro arranque, sin latir hace 20 min
+      const mine = await ins(`${svc.bootId}.${crypto.randomUUID()}`, 1); // este arranque, nadie la tiene
+      const legacy = await ins(null, 60);            // sin reclamo (anterior a B6), 1 min
+      await plan.listRequests(OWNER, sid);
+      const st = async (id) => (await ds.query(`select status from public.workshop_intakes where id = $1`, [id]))[0].status;
+      eq([await st(fresh), await st(old15), await st(mine), await st(legacy)], ['interpreting', 'failed', 'failed', 'interpreting'], 'solo lo abandonado');
+      await ds.query(`update public.workshop_intakes set updated_at = now() - interval '31 seconds' where id = $1`, [fresh]);
+      await plan.listRequests(OWNER, sid);
+      eq(await st(fresh), 'failed', 'dejó de latir → interrumpida');
+      // Un trabajo real de ESTE proceso: su fila lleva el reclamo y el latido la refresca.
+      aiSim.handler = (req) => (req.purpose === 'interpret' ? { requests: [{ quote: 'Agrega una línea a la bienvenida.', operation: 'edit_html', instruction: 'Agregar al final de la bienvenida una línea.', target: { moduleId: 1000 } }] } : appendP(req));
+      let hold; const gate = new Promise((r) => { hold = r; });
+      const realCall = aiSim.call;
+      aiSim.call = async function (req) { await gate; return realCall.call(this, req); };
+      const a = await plan.createTextIntake(OWNER, sid, 'Agrega una línea a la bienvenida.');
+      await approve(sid, a);
+      for (let i = 0; i < 40; i++) { const [r] = await ds.query(`select status, claim_id from public.workshop_intakes where id = $1`, [a.id]); if (r.status === 'interpreting') break; await new Promise((x) => setTimeout(x, 25)); }
+      const [row] = await ds.query(`select claim_id, status from public.workshop_intakes where id = $1`, [a.id]);
+      assert(row.status === 'interpreting' && String(row.claim_id).startsWith(`${svc.bootId}.`), `reclamada por este arranque: ${JSON.stringify(row)}`);
+      const [ap] = await ds.query(`select claim_id from public.workshop_ai_approvals where intake_id = $1`, [a.id]);
+      eq(ap.claim_id, row.claim_id, 'la aprobación lleva el mismo reclamo');
+      await ds.query(`update public.workshop_intakes set updated_at = now() - interval '1 hour' where id = $1`, [a.id]);
+      await plan.heartbeat();
+      const [hb] = await ds.query(`select (now() - updated_at) < interval '5 seconds' as fresh from public.workshop_intakes where id = $1`, [a.id]);
+      eq(hb.fresh, true, 'el latido la refrescó');
+      await plan.listRequests(OWNER, sid);
+      eq(await st(a.id), 'interpreting', 'viva: no se interrumpe');
+      hold(); await idle(); aiSim.call = realCall;
+      eq(await st(a.id), 'ready', 'terminó');
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

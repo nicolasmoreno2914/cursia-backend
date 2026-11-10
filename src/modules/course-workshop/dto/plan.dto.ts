@@ -70,3 +70,18 @@ export class GenerateItemsDto extends ConfirmSpendDto {
   @IsUUID('all', { each: true })
   itemIds: string[];
 }
+
+/** r107 B6 · `POST …/plans/:planId/apply`: los ítems que el docente aprueba aplicar (los que vio) + las confirmaciones uno por uno. */
+export class ApplyPlanDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(100)
+  @IsUUID('all', { each: true })
+  itemIds: string[];
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsUUID('all', { each: true })
+  confirmItemIds?: string[];
+}
