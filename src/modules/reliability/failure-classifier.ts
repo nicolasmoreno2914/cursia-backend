@@ -40,6 +40,9 @@ import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv
 import { PROVIDER_RECONCILE_MAX_RESUBMITS, providerReconcileDecision } from '../dynamic-generation/provider-reconcile';
 import { spendControlHoldOf } from './spend-control-hold';
 import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
+// r106: el `adminAction` de cada regla tiene que ser EJECUTABLE en el estado en que el fallo deja la parte (`failed`):
+// mismas compuertas que RunsService (scripts/check-rel-admin-actions.js recorre la tabla contra ellas).
+import { isAmbiguousYoutubeUpload, reconcileActionFor } from '../dynamic-generation/admin-action-eligibility';
 
 export type FailureClass = 'A' | 'B' | 'C' | 'D';
 export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
@@ -280,6 +283,23 @@ function providerFromMessage(error: string): FailureProvider | null {
   return m ? (m[1].toLowerCase() as FailureProvider) : null;
 }
 
+/**
+ * r106: YouTube — youtube-resolution solo acepta una subida AMBIGUA; con la subida no ambigua (auth / cuota / rechazo) el
+ * retry simple re-sube sin re-renderizar (uploadPhaseRetry) y youtube-resolution respondería 409 not_ambiguous.
+ */
+function youtubeActionRefine({ error, outputSummary }: RefineCtx): Partial<Rule> {
+  return { adminAction: isAmbiguousYoutubeUpload({ error, output_summary: outputSummary }) ? 'resolve_youtube' : 'retry_item' };
+}
+
+/**
+ * r106: conciliación con pago incierto → la acción que el endpoint admite para ese tipo y ese error. Sin tipo, o sin ningún
+ * reenvío explícito que lo admita (reconcileActionFor → null), se conserva la de la regla.
+ */
+function reconcileRefine(itemType: string | null, error: string, outputSummary: Record<string, any>): Partial<Rule> | null {
+  const a = reconcileActionFor(itemType, error, outputSummary);
+  return a ? { adminAction: a } : null;
+}
+
 const ITEM_RULES: readonly Rule[] = Object.freeze([
   // ── Infraestructura, lease y transporte ────────────────────────────────────
   {
@@ -306,7 +326,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     // Variante de descarga (A) vs. de contrato (D: el capítulo llegó con ≠ 1 artifacts).
     id: 'exam_bank_chapter_md_missing', codes: ['EXAM_BANK_CHAPTER_MD_MISSING'], class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3,
     refine: ({ error }) => (/llegó con \d+ artifacts|se esperaba 1/.test(error)
-      ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item', provider: undefined }
+      // r106: la parte queda `failed` → `regenerate_item` era un 409 item_not_completed; el reintento la vuelve a reclamar.
+      ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_item', provider: undefined }
       : null),
   },
   // r83 (incidente #91): Supabase Storage no respondió durante todo el presupuesto de reintentos (StorageUnavailableError).
@@ -415,8 +436,15 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     // capítulo no alcanza con las reglas del banco) → D: ninguna regeneración automática la arregla; decide una persona.
     // 2026-10-15: EXAM_BANK_SET_RULE_CAPACITY = la regla de conjunto (≤ 30 % «correcta la más larga») no avanzó con la
     // revisión de longitud en 2 intentos → también D.
-    refine: ({ code }) => (code === 'EXAM_BANK_CLAIM' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item' }
-      : (code === 'EXAM_BANK_LEAF_CAPACITY' || code === 'EXAM_BANK_SET_RULE_CAPACITY') ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'unrecoverable', adminAction: 'regenerate_item' } : null),
+    // r106: las tres dejan la parte `failed`, y regenerateItem solo acepta una `completed` (item_not_completed) → la acción
+    // ejecutable es `retry_item`. SET_RULE_CAPACITY: desde r105 cada intento que llegaría a esa falla hace el reemplazo
+    // acotado del excedente con preguntas nuevas, así que el reintento manual avanza (y si baja el excedente sigue como
+    // borrador bank_rule). LEAF_CAPACITY: el reintento es el único camino ejecutable sobre la parte, pero NO cambia la
+    // entrada (mismo texto del capítulo y mismo plan; la memoria por hoja vuelve desde el último borrador y el corte se
+    // recalcula tras ≥ 1 ronda seca): puede avanzar, sin garantía. Lo que cambia la entrada es regenerar el contenido del
+    // capítulo (solo con el run activo: run_not_regenerable si ya terminó `failed`) o corregir el plan del examen.
+    refine: ({ code }) => (code === 'EXAM_BANK_CLAIM' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_item' }
+      : (code === 'EXAM_BANK_LEAF_CAPACITY' || code === 'EXAM_BANK_SET_RULE_CAPACITY') ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'unrecoverable', adminAction: 'retry_item' } : null),
   },
   {
     id: 'corrupt_dependency',
@@ -490,7 +518,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       // Motor pedagógico Fase 2: brief pedagógico del claim con forma inválida en el navegador (versiones desalineadas).
       'PEDAGOGY_BRIEF_INVALID'],
     family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,
-    class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item',
+    // r106: un contrato roto deja la parte `failed` (regenerate_item = 409 item_not_completed): se reintenta (tras el
+    // arreglo, que es lo mismo que hace la reanudación automática de la pausa como bug de Cursia).
+    class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_item',
     // r62 (d8): un claim incompleto por un DATO de la dependencia (video del capítulo) no es un contrato roto: B
     // `regenerate_dependency` (lo aplica solo el barrido autoRecoverClaimPayloadUnavailable, una vez y con presupuesto).
     refine: ({ code, error }) => (code === 'claim_payload_unavailable' && CLAIM_PAYLOAD_DEPENDENCY_RE.test(error)
@@ -532,19 +562,22 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   {
     id: 'youtube_ambiguous', codes: ['youtube_upload_ambiguous', 'ambiguous_youtube_upload', 'youtube_ambiguous'],
     class: 'C', strategy: 'provider_check', paidRisk: 'none', provider: 'youtube', rounds: 1, adminAction: 'resolve_youtube',
+    refine: youtubeActionRefine,
   },
   { id: 'youtube_quota', codes: ['youtube_blocked_quota', 'wait_quota', 'blocked_quota'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'youtube', rounds: 3 },
   // r62 (P, d6): la cuota siguió agotada durante TODA la espera larga (default 7 días, con alerta a las 24 h) → excepción
   // registrada (sin gasto; el video ya está pagado): una persona revisa la cuota del canal y reintenta la subida.
   {
     id: 'youtube_quota_exhausted', codes: ['youtube_quota_exhausted'],
-    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
+    refine: youtubeActionRefine,
   },
   {
     id: 'youtube_auth',
     codes: ['youtube_blocked_auth', 'blocked_auth', 'reauth_required', 'reconnect_youtube', 'youtube_preflight_failed', 'needs_youtube_preflight',
       'channel_unresolved', 'youtube_publisher_not_configured', 'oauth_failed'],
-    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
+    refine: youtubeActionRefine,
   },
   // r67 (B4): blocked_auth NO definitivo (403 forbidden / sin reason): espera persistente con sonda 5 min / 30 min / 2 h
   // (sin gasto: el render ya está pago); tras la 3.ª sonda fallida el worker emite `youtube_blocked_auth` (humano).
@@ -556,7 +589,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // determinista, no se reintenta solo.
   {
     id: 'youtube_upload_rejected', codes: ['youtube_upload_rejected'],
-    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
+    refine: youtubeActionRefine,
   },
   {
     id: 'youtube_verify',
@@ -615,7 +649,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     refine: ({ error, itemType, outputSummary }) => {
       // r62 (resultado pagado perdido): también el guion LLM del audiolibro cobrado y no guardado (un reenvío acotado).
       const lostLlm = itemType === 'audiobook_chapter' && isLostPaidResultError(error);
-      if (!((/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error) || lostLlm) && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter'))) return null;
+      // r106: video → resubmitVideo (`reconcile_videogen`); una parte de la IA → `retry_item` (resubmitProvider no aplica).
+      if (!((/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error) || lostLlm) && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter'))) {
+        return reconcileRefine(itemType, error, outputSummary);
+      }
       const used = outputSummary?.ambiguousAudioResubmit;
       if (used && (used.declined || Number(used.rounds ?? 0) >= 1)) {
         return { strategy: 'hold_for_human', provider: lostLlm ? 'anthropic' : 'openai', rounds: 0, humanReason: /budget|presupuesto|over_threshold/i.test(String(used.declined ?? '')) ? 'budget' : 'duplicate_charge' };
@@ -1017,7 +1054,7 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
     return unclassifiedVerdict(extractFailureCode(error), httpStatus, 'package', 'none');
   }
 
-  return spendControlWait(moneyFloor(classifyItem(input, error, ctxBase), error), error, itemType);
+  return spendControlWait(moneyFloor(classifyItem(input, error, ctxBase), error, itemType, os), error, itemType);
 }
 
 /**
@@ -1043,7 +1080,7 @@ function spendControlWait(v: FailureVerdict, error: string, itemType: string | n
  * (`wait_provider`, p.ej. la cuota de YouTube, que ya es una espera sin gasto).
  */
 const MONEY_FLOOR_EXTRA: readonly RegExp[] = Object.freeze([/\bsaldo\b/i]);
-function moneyFloor(v: FailureVerdict, error: string): FailureVerdict {
+function moneyFloor(v: FailureVerdict, error: string, itemType: string | null = null, outputSummary: Record<string, any> = {}): FailureVerdict {
   if (v.class === 'C' || v.class === 'D' || v.strategy === 'wait_provider') return v;
   // Códigos de VALIDACIÓN que contienen la palabra (EXAM_ARTIFACT_AMBIGUOUS = dos artifacts de examen, no un pago)
   // no cuentan: el piso mira el texto, no los códigos internos ya clasificados.
@@ -1060,7 +1097,9 @@ function moneyFloor(v: FailureVerdict, error: string): FailureVerdict {
     targetRounds: 0,
     paidRisk: budget || config ? v.paidRisk : 'uncertain',
     humanReason: budget ? 'budget' : config ? 'config' : 'duplicate_charge',
-    adminAction: budget ? 'approve_budget' : config ? 'retry_item' : 'reconcile_provider',
+    // r106: la conciliación que el endpoint admite para ese tipo y ese error (reconcileActionFor); sin ninguna, la de siempre.
+    adminAction: budget ? 'approve_budget' : config ? 'retry_item'
+      : reconcileActionFor(itemType, error, outputSummary) ?? (itemType === 'video' ? 'reconcile_videogen' : 'reconcile_provider'),
     moneyFloor: true,
   };
 }
