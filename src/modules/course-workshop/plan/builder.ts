@@ -1,0 +1,427 @@
+/**
+ * r107 B5 · Arma el PLAN: por pedido resuelto → contenido nuevo (IA, si hace falta) → operación del motor con sus
+ * parámetros resueltos → PRUEBA EN SECO con el motor de B4 sobre el original (el plan solo ofrece lo que el motor puede
+ * aplicar) → antes / después del informe de cambios, riesgo, costo, avisos de desalineación.
+ *
+ * La IA entra solo por `AiInvoke` (el servicio pone la compuerta de saldo, el ledger y el cliente; las pruebas, uno
+ * simulado). Reintento de contenido: UNA vez, con la lista de problemas (validación propia o rechazo del motor por
+ * contenido inválido / hallazgos nuevos); si tampoco sirve, el pedido queda `failed` con el motivo visible.
+ *
+ * Puro (sin base ni red): abre el original en memoria, nunca lo modifica.
+ */
+import { MbzPackage, openMbz } from '../mbz-reader';
+import { WorkshopFamily, builderLineOf, familyOf, readPackageFacts } from '../identify';
+import { WorkshopActivity, WorkshopCourse, WorkshopHtmlField, plainText } from '../course-model';
+import { buildInventory } from '../inventory';
+import { DiagnosisReport, runTechnicalDiagnosis } from '../diagnosis/diagnose';
+import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
+import { libroStructure } from '../patch/op-libro';
+import type { FieldChange, NewQuestion, PatchOperation, PatchResult } from '../patch/types';
+import { xmlUnescape } from '../../visual-design/preview-extract';
+import type { DryRunPricing } from '../../pedagogy/dry-run';
+import type { WorkshopAiResult, WorkshopTool } from './ai';
+import { WORKSHOP_CONTENT_MAX_TOKENS, WORKSHOP_INTERPRET_MAX_TOKENS, WORKSHOP_LIBRO_MAX_TOKENS } from './ai';
+import { AiCallKind, ZERO_MEM, estimateAiCall, estimateLater, memOf, sumUsd } from './cost';
+import { htmlProblems, libroProblems, questionFrom, questionText } from './content';
+import { InterpretationOutputError, answerRequest, parseInterpretation, resolveRequest } from './interpret';
+import { SearchDoc, misalignmentWarnings, searchDocs } from './misalignment';
+import {
+  CONTENT_SYSTEM, INTERPRET_SYSTEM, htmlTool, htmlUser, interpretTool, interpretUser, libroTool, libroUser, questionTool, questionUser, reinterpretUser,
+} from './prompts';
+import { riskOf } from './risk';
+import { activityLabel, activityOf, chapterPlainText, inventorySummary } from './summary';
+import { ClarifyAnswer, InterpretedRequest, MisalignmentWarning, PLAN_LIMITS, PlanItemView, RequestOperation } from './types';
+
+// ─── IA ────────────────────────────────────────────────────────────────────
+
+export interface AiCall {
+  purpose: 'interpret' | 'content';
+  kind: AiCallKind;
+  system: string;
+  user: string;
+  tool: WorkshopTool;
+  maxTokens: number;
+  /** Tamaño de lo que se manda (para el estimado y la compuerta de saldo). */
+  size: { promptChars: number; outputChars?: number; chapters?: number };
+  /** 1 = principal, 2 = reintento por validación. */
+  attempt: number;
+}
+/** Llamada a la IA con compuerta de saldo + ledger (servicio) o simulada (pruebas). Devuelve lo medido y su costo. */
+export type AiInvoke = (call: AiCall) => Promise<{ result: WorkshopAiResult; costUsd: string }>;
+
+/** Error de IA que corta el proceso con motivo visible (sin saldo, proveedor caído, kill switch). */
+export class AiUnavailableError extends Error {
+  constructor(readonly code: string, message: string, readonly extra: Record<string, unknown> = {}) { super(message); }
+}
+
+// ─── Contexto ──────────────────────────────────────────────────────────────
+
+export interface BuildCtx {
+  original: Buffer;
+  filename: string | null;
+  pkg: MbzPackage;
+  course: WorkshopCourse;
+  family: WorkshopFamily;
+  builderLine: string;
+  pricing: DryRunPricing;
+  baseline: { originalSha1: string; report: DiagnosisReport } | null;
+  docs: SearchDoc[] | null;
+  originalSha1: string;
+}
+
+export async function openBuildCtx(original: Buffer, opts: { filename?: string | null; originalSha1: string; pricing: DryRunPricing; baseline?: { originalSha1: string; report: DiagnosisReport } | null }): Promise<BuildCtx> {
+  const pkg = await openMbz(original);
+  const facts = await readPackageFacts(pkg, opts.filename ?? null);
+  const family = familyOf(facts);
+  const builderLine = builderLineOf(facts);
+  const course = await buildInventory(pkg, { family, builderLine });
+  return { original, filename: opts.filename ?? null, pkg, course, family, builderLine, pricing: opts.pricing, baseline: opts.baseline ?? null, docs: null, originalSha1: opts.originalSha1 };
+}
+
+async function baselineOf(ctx: BuildCtx) {
+  if (!ctx.baseline) {
+    const report = await runTechnicalDiagnosis({ pkg: ctx.pkg, packageBytes: ctx.original, family: ctx.family, builderLine: ctx.builderLine, builderVersion: null }, { prevalidateFixes: false });
+    ctx.baseline = { originalSha1: ctx.originalSha1, report };
+  }
+  return ctx.baseline;
+}
+async function read(ctx: BuildCtx, entry: string): Promise<Buffer | null> {
+  return ctx.pkg.has(entry) ? ctx.pkg.readEntry(entry) : null;
+}
+async function docsOf(ctx: BuildCtx): Promise<SearchDoc[]> {
+  if (!ctx.docs) ctx.docs = await searchDocs(ctx.course, (e) => read(ctx, e));
+  return ctx.docs;
+}
+
+export async function dryRun(ctx: BuildCtx, operations: PatchOperation[]): Promise<PatchResult> {
+  return applyPatchPlan({ original: ctx.original, filename: ctx.filename, operations, baseline: await baselineOf(ctx) });
+}
+
+// ─── Interpretación ────────────────────────────────────────────────────────
+
+export interface InterpretOutcome {
+  ok: boolean;
+  requests: InterpretedRequest[];
+  /** Motivo visible si no sirvió (tras el reintento). */
+  reason: string | null;
+  problems: string[];
+  spentUsd: string;
+  calls: number;
+}
+
+async function interpretLoop(ctx: BuildCtx, ai: AiInvoke, make: (retry: string[] | null) => string, quoteSource: string, single: boolean): Promise<InterpretOutcome> {
+  let spent = '0';
+  let calls = 0;
+  let problems: string[] = [];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const user = make(attempt === 2 ? problems : null);
+    const { result, costUsd } = await ai({ purpose: 'interpret', kind: 'interpret', system: INTERPRET_SYSTEM, user, tool: interpretTool(), maxTokens: WORKSHOP_INTERPRET_MAX_TOKENS, size: { promptChars: user.length + INTERPRET_SYSTEM.length }, attempt });
+    calls++;
+    spent = sumUsd(spent, costUsd);
+    if (result.stopReason === 'max_tokens' || result.input === null || result.input === undefined) {
+      problems = [result.stopReason === 'max_tokens' ? 'la respuesta se cortó por longitud' : 'el modelo no usó la herramienta'];
+      continue;
+    }
+    try {
+      const raw = parseInterpretation(result.input, quoteSource, { single });
+      return { ok: true, requests: raw.map((r) => resolveRequest(r, ctx.course)), reason: null, problems: [], spentUsd: spent, calls };
+    } catch (e) {
+      if (!(e instanceof InterpretationOutputError)) throw e;
+      problems = e.problems;
+    }
+  }
+  return { ok: false, requests: [], reason: `La IA no devolvió una interpretación válida del pedido (${problems.slice(0, 3).join('; ')}). No se creó ningún pedido; vuelve a enviarlo con otras palabras.`, problems, spentUsd: spent, calls };
+}
+
+const retryNote = (problems: string[] | null) => (problems && problems.length ? `\n\nTu respuesta anterior no sirvió por esto: ${problems.slice(0, 8).join('; ')}. Corrígelo.` : '');
+
+/** Texto del docente → pedidos estructurados (validados y resueltos contra el inventario). */
+export async function interpretText(ctx: BuildCtx, text: string, ai: AiInvoke): Promise<InterpretOutcome> {
+  const inventory = inventorySummary(ctx.course);
+  return interpretLoop(ctx, ai, (retry) => interpretUser({ requestText: text, inventory }) + retryNote(retry), text, false);
+}
+
+/** Respuestas del docente a un pedido `needs_answer`: sin IA si las preguntas eran del servidor; si no, re-interpreta SOLO ese pedido. */
+export async function answerAndResolve(ctx: BuildCtx, req: InterpretedRequest, answers: ClarifyAnswer[], ai: AiInvoke): Promise<InterpretOutcome> {
+  const a = answerRequest(req, answers, ctx.course);
+  if ('resolved' in a) return { ok: true, requests: [a.resolved], reason: null, problems: [], spentUsd: '0', calls: 0 };
+  const inventory = inventorySummary(ctx.course);
+  const previous = { operation: req.operation, instruction: req.instruction, target: req.rawTarget, questions: req.questions.map((q) => q.text) };
+  const out = await interpretLoop(ctx, ai, (retry) => reinterpretUser({ quote: req.quote, previous, qa: a.reinterpret, inventory }) + retryNote(retry), req.quote, true);
+  if (out.ok) out.requests = out.requests.map((r) => ({ ...r, details: { ...req.details, ...r.details } }));
+  return out;
+}
+
+// ─── Ítem del plan ─────────────────────────────────────────────────────────
+
+export interface PreparedItem {
+  status: 'resolved' | 'phase_later' | 'unavailable' | 'failed';
+  reason: string | null;
+  view: PlanItemView | null;
+  spentUsd: string;
+  calls: number;
+}
+
+function htmlFieldOf(course: WorkshopCourse, t: { moduleId: number | null; sectionId?: number | null; field: string }): { field: WorkshopHtmlField; activity: WorkshopActivity | null } | null {
+  if (t.moduleId !== null && t.moduleId !== undefined) {
+    const a = activityOf(course, t.moduleId);
+    const f = a?.html.find((h) => h.field === t.field);
+    return a && f ? { field: f, activity: a } : null;
+  }
+  const s = course.sections.find((x) => x.id === t.sectionId);
+  const f = s?.html.find((h) => h.field === (t.field || 'summary')) ?? s?.html[0];
+  return f ? { field: f, activity: null } : null;
+}
+
+/** Libro HTML del paquete (el archivo principal del recurso o el contenido de la página). */
+async function libroHtmlOf(ctx: BuildCtx, a: WorkshopActivity): Promise<string | null> {
+  if (a.modname === 'page') return a.html.find((h) => h.field === 'content')?.html ?? null;
+  const main = a.files.filter((x) => x.filearea === 'content' && x.filename !== '.');
+  const f = main.find((x) => /\.html?$/i.test(x.filename));
+  if (!f || !f.blobPresent) return null;
+  const b = await read(ctx, f.blobEntry);
+  return b ? b.toString('utf8') : null;
+}
+
+const retryable = (code: string | undefined) => code === 'invalid_content' || code === 'new_findings';
+const unavailableCode = (code: string | undefined) => code === 'unsupported' || code === 'unavailable' || code === 'target_not_found';
+
+interface Candidate { op: PatchOperation; changes?: FieldChange[]; before: string; after: string; contentEstimate: ReturnType<typeof memOf> | null; notes?: string[] }
+
+/**
+ * Pedido resuelto (o de fase posterior) → ítem del plan. Nunca lanza salvo AiUnavailableError (sin saldo / IA caída:
+ * el servicio corta el proceso entero con el motivo visible).
+ */
+export async function prepareItem(ctx: BuildCtx, req: InterpretedRequest, ai: AiInvoke, opts: { fromFinding?: boolean } = {}): Promise<PreparedItem> {
+  if (req.status === 'phase_later' && req.operation) {
+    const est = estimateLater(req.operation, req.details, ctx.course, ctx.pricing);
+    const view: PlanItemView = {
+      operation: req.operation, params: null, available: false,
+      summary: `${laterEs(req.operation)} — ${req.target ? req.target.title : 'curso'} (todavía no disponible en el Taller: llega en una fase posterior).`,
+      changes: [], files: [], entries: { added: [], removed: [], modified: [] },
+      risk: riskOf({ operation: req.operation, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding }),
+      cost: { spentUsd: '0', apply: memOf(est), contentEstimate: null, basis: `estimator ${est.estimatorVersion} · ${est.usageModelVersion} · ${ctx.pricing.source}: lo que costaría rehacerlo` },
+      misalignment: [], dryRun: null,
+    };
+    return { status: 'phase_later', reason: 'Disponible en una fase posterior del Taller.', view, spentUsd: '0', calls: 0 };
+  }
+  if (req.status !== 'resolved' || !req.operation || !req.target) return { status: req.status === 'needs_answer' ? 'failed' : (req.status as PreparedItem['status']), reason: req.reason, view: null, spentUsd: '0', calls: 0 };
+
+  let spent = '0';
+  let calls = 0;
+  const callAi = async (c: AiCall) => { const r = await ai(c); calls++; spent = sumUsd(spent, r.costUsd); return r.result; };
+  let problems: string[] = [];
+  let lastFailure: { code: string; message: string } | null = null;
+  const needsAi = needsContent(req);
+  for (let attempt = 1; attempt <= (needsAi ? 2 : 1); attempt++) {
+    let cand: Candidate | { problems: string[] } | { unavailable: string };
+    try {
+      cand = await candidateFor(ctx, req, callAi, attempt, attempt === 2 ? problems : null);
+    } catch (e) {
+      if (e instanceof AiUnavailableError) throw e;
+      return { status: 'failed', reason: `No se pudo preparar el cambio: ${e instanceof Error ? e.message : String(e)}`, view: null, spentUsd: spent, calls };
+    }
+    if ('unavailable' in cand) return { status: 'unavailable', reason: cand.unavailable, view: null, spentUsd: spent, calls };
+    if ('problems' in cand) { problems = cand.problems; lastFailure = { code: 'invalid_content', message: problems.join('; ') }; continue; }
+    const res = await dryRun(ctx, [cand.op]);
+    if (!res.ok) {
+      lastFailure = res.failure ? { code: res.failure.code, message: res.failure.message } : { code: 'invariant', message: 'el motor rechazó el cambio' };
+      if (needsAi && retryable(res.failure?.code)) { problems = [`el motor de parches rechazó el contenido: ${lastFailure.message}`]; continue; }
+      const st = unavailableCode(res.failure?.code) ? 'unavailable' : 'failed';
+      return { status: st, reason: `El motor de parches no puede aplicar este cambio a este paquete: ${lastFailure.message}`, view: null, spentUsd: spent, calls };
+    }
+    const rep = res.operations[0];
+    const changes = cand.changes ?? rep.fields;
+    const warnings = await warningsFor(ctx, req, cand, [...(cand.notes ?? []), ...rep.misalignment]);
+    const view: PlanItemView = {
+      operation: req.operation,
+      params: cand.op,
+      available: true,
+      summary: rep.summary || summaryOf(req),
+      changes,
+      files: rep.files.map((f) => ({ filename: f.filename, before: f.before.contenthash, after: f.after.contenthash })),
+      entries: { added: rep.entriesAdded, removed: rep.entriesRemoved, modified: rep.entriesModified },
+      risk: riskOf({ operation: req.operation, target: req.target, changes, misalignment: warnings, fromFinding: !!opts.fromFinding, params: cand.op }),
+      cost: { spentUsd: spent, apply: ZERO_MEM, contentEstimate: cand.contentEstimate, basis: needsAi ? 'contenido generado al armar el plan: aplicar no vuelve a usar IA' : 'cambio estructural: no usa IA' },
+      misalignment: warnings,
+      dryRun: { ok: true, failure: null, resolved: res.diagnosis?.resolved.length ?? 0, removed: res.diagnosis?.removed.length ?? 0, engineVersion: PATCH_ENGINE_VERSION },
+    };
+    return { status: 'resolved', reason: null, view, spentUsd: spent, calls };
+  }
+  return { status: 'failed', reason: `La IA no produjo un contenido válido tras el reintento (${(lastFailure?.message ?? problems.join('; ')).slice(0, 400)}). No se agregó al plan.`, view: null, spentUsd: spent, calls };
+}
+
+function laterEs(op: RequestOperation): string {
+  return ({ regenerate_scorm: 'Rehacer el juego', regenerate_video: 'Rehacer el video', regenerate_gamma: 'Rehacer la presentación', regenerate_audio: 'Rehacer el audio', add_chapter: 'Agregar capítulo', add_module: 'Agregar módulo' } as Record<string, string>)[op] ?? op;
+}
+function summaryOf(req: InterpretedRequest): string {
+  return `${req.operation} — ${req.target?.title ?? ''}`;
+}
+
+function needsContent(req: InterpretedRequest): boolean {
+  switch (req.operation) {
+    case 'edit_html': return !req.details.fixedChange && !req.details.deadLink;
+    case 'edit_libro_section': case 'exam_question_replace': case 'exam_question_add': return true;
+    default: return false;
+  }
+}
+
+async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: AiCall) => Promise<WorkshopAiResult>, attempt: number, retry: string[] | null): Promise<Candidate | { problems: string[] } | { unavailable: string }> {
+  const t = req.target!;
+  const note = retryNote(retry);
+  const toolInput = (r: WorkshopAiResult): unknown | { problems: string[] } => (r.stopReason === 'max_tokens' ? { problems: ['la respuesta se cortó por longitud'] } : r.input === null || r.input === undefined ? { problems: ['el modelo no usó la herramienta'] } : r.input);
+  const isProblems = (x: unknown): x is { problems: string[] } => !!x && typeof x === 'object' && Array.isArray((x as { problems?: unknown }).problems) && Object.keys(x as object).length === 1;
+  switch (req.operation) {
+    case 'edit_html': {
+      if (t.kind !== 'html') return { unavailable: 'destino inválido' };
+      const loc = htmlFieldOf(ctx.course, t);
+      if (!loc) return { unavailable: 'El campo ya no está en el paquete.' };
+      const target = t.moduleId !== null ? { moduleId: t.moduleId, field: t.field } : { sectionId: t.sectionId as number, field: 'summary' as const };
+      const expect = req.details.expectRawSha1 ?? loc.field.rawSha1;
+      if (req.details.fixedChange) return { op: { op: 'edit_html', target, expectRawSha1: expect, change: req.details.fixedChange }, before: plainText(loc.field.html, 100_000), after: '', contentEstimate: null };
+      if (req.details.deadLink) {
+        const d = req.details.deadLink;
+        const b = await read(ctx, d.entry);
+        if (!b) return { unavailable: 'El campo ya no está en el paquete.' };
+        const rawLink = b.subarray(d.fieldRawOffset + d.rawByteOffset, d.fieldRawOffset + d.rawByteOffset + d.rawBytes).toString('utf8');
+        const text = xmlUnescape(rawLink).replace(/<[^>]+>/g, '');
+        return { op: { op: 'edit_html', target, expectRawSha1: expect, change: { kind: 'range', rawByteOffset: d.rawByteOffset, rawBytes: d.rawBytes, html: text } }, before: '', after: '', contentEstimate: null };
+      }
+      const where = loc.activity ? activityLabel(loc.activity) : 'presentación de una sección';
+      const chapterText = chapterPlainText(ctx.course, t.chapterNumber, PLAN_LIMITS.chapterContextChars);
+      const user = htmlUser({ instruction: req.instruction, quote: req.quote, currentHtml: loc.field.html, where, chapterText, forbiddenTokens: req.details.forbiddenTokens ?? [] }) + note;
+      const size = { promptChars: user.length + CONTENT_SYSTEM.length, outputChars: loc.field.html.length };
+      const est = memOf(estimateAiCall('content_html', size, ctx.pricing));
+      const r = await callAi({ purpose: 'content', kind: 'content_html', system: CONTENT_SYSTEM, user, tool: htmlTool(), maxTokens: WORKSHOP_CONTENT_MAX_TOKENS, size, attempt });
+      const input = toolInput(r);
+      if (isProblems(input)) return input;
+      const keys = input && typeof input === 'object' ? Object.keys(input as object) : [];
+      const html = (input as { html?: unknown }).html;
+      const p = [...(keys.some((k) => k !== 'html') ? ['la salida trae claves desconocidas'] : []), ...htmlProblems(html, loc.field.html, { forbiddenTokens: req.details.forbiddenTokens, allowFiles: req.details.allowFiles })];
+      if (p.length) return { problems: p };
+      return { op: { op: 'edit_html', target, expectRawSha1: expect, change: { kind: 'replace', html: html as string } }, before: plainText(loc.field.html, 100_000), after: plainText(html as string, 100_000), contentEstimate: est };
+    }
+    case 'edit_libro_section': {
+      if (t.kind !== 'libro') return { unavailable: 'destino inválido' };
+      const a = activityOf(ctx.course, t.moduleId);
+      if (!a) return { unavailable: 'El Libro Guía ya no está en el paquete.' };
+      const html = await libroHtmlOf(ctx, a);
+      if (html === null) return { unavailable: 'El Libro Guía no es un HTML que el Taller pueda editar (o no viene en el paquete).' };
+      const st = libroStructure(html);
+      const complete = new Map(st.chapters.filter((c) => c.complete).map((c) => [c.number, c]));
+      const intact = /<\/html>\s*$/i.test(html);
+      // Libro cortado: hay que dar TODOS los capítulos que el corte se llevó (los del curso que no quedaron completos).
+      let numbers = t.chapters;
+      if (t.recompose || !intact) numbers = [...new Set([...t.chapters, ...ctx.course.chapters.map((c) => c.number).filter((n) => !complete.has(n))])].sort((x, y) => x - y);
+      if (!numbers.length) return { unavailable: 'El Libro Guía ya tiene todos sus capítulos completos: no hay nada que recomponer.' };
+      const titleOf = (n: number) => ctx.course.chapters.find((c) => c.number === n)?.title ?? `Capítulo ${n}`;
+      const chapters: Array<{ number: number; title: string; currentHtml: string | null; context: string }> = [];
+      for (const n of numbers) {
+        const c = complete.get(n);
+        const src = ctx.course.chapters.find((x) => x.number === n);
+        // Fuente DENTRO del paquete (builders viejos: libro_guia/libro_capN.md): el mejor contexto para reescribirlo.
+        let md = '';
+        for (const e of src?.packageSources ?? []) if (/\.md$/i.test(e)) { const b = await read(ctx, e); if (b) md += `${b.toString('utf8')}\n`; }
+        const context = [md, chapterPlainText(ctx.course, n, PLAN_LIMITS.chapterContextChars)].filter(Boolean).join('\n').slice(0, PLAN_LIMITS.chapterContextChars) || (src?.title ?? '');
+        chapters.push({ number: n, title: titleOf(n), currentHtml: c ? html.slice(c.headEnd, c.bodyEnd) : null, context });
+      }
+      const user = libroUser({ instruction: req.instruction, quote: req.quote, chapters }) + note;
+      const size = { promptChars: user.length + CONTENT_SYSTEM.length, chapters: chapters.length };
+      const est = memOf(estimateAiCall('content_libro', size, ctx.pricing));
+      const r = await callAi({ purpose: 'content', kind: 'content_libro', system: CONTENT_SYSTEM, user, tool: libroTool(), maxTokens: WORKSHOP_LIBRO_MAX_TOKENS, size, attempt });
+      const input = toolInput(r);
+      if (isProblems(input)) return input;
+      const v = libroProblems(input, numbers);
+      if (v.problems.length) return { problems: v.problems };
+      const byN = new Map(v.chapters.map((c) => [c.number, c.html]));
+      const front = intact ? null : frontFor(ctx, html, st);
+      const op: PatchOperation = { op: 'edit_libro_section', moduleId: a.moduleId, chapters: numbers.map((n) => ({ number: n, html: byN.get(n)!, ...(complete.has(n) ? {} : { title: titleOf(n) }) })), ...(front ? { front: front.front } : {}) };
+      const changes: FieldChange[] = numbers.map((n) => ({ entry: a.dir, field: `libro:capitulo ${n}`, moduleId: a.moduleId, sectionId: null, before: chapters.find((c) => c.number === n)!.currentHtml ?? '', after: byN.get(n)!, beforeRawSha1: '', afterRawSha1: '' }));
+      return { op, changes, before: chapters.map((c) => plainText(c.currentHtml ?? '', 100_000)).join('\n'), after: v.chapters.map((c) => plainText(c.html, 100_000)).join('\n'), contentEstimate: est, notes: front ? [front.note] : [] };
+    }
+    case 'exam_question_replace': case 'exam_question_add': {
+      const quizId = t.kind === 'question' ? t.quizModuleId : t.kind === 'exam' ? t.quizModuleId : null;
+      const quiz = activityOf(ctx.course, quizId);
+      if (!quiz || !quiz.exam) return { unavailable: 'El examen ya no está en el paquete.' };
+      const q = t.kind === 'question' ? quiz.exam.questions.find((x) => x.id === t.questionId) ?? null : null;
+      if (t.kind === 'question' && !q) return { unavailable: 'La pregunta ya no está en el examen.' };
+      const chapter = q?.chapterNumber ?? null;
+      const user = questionUser({ instruction: req.instruction, quote: req.quote, exam: quiz.title, current: q ? questionText(q) : null, chapterText: chapterPlainText(ctx.course, chapter, PLAN_LIMITS.chapterContextChars) }) + note;
+      const size = { promptChars: user.length + CONTENT_SYSTEM.length };
+      const est = memOf(estimateAiCall('content_question', size, ctx.pricing));
+      const r = await callAi({ purpose: 'content', kind: 'content_question', system: CONTENT_SYSTEM, user, tool: questionTool(), maxTokens: WORKSHOP_CONTENT_MAX_TOKENS, size, attempt });
+      const input = toolInput(r);
+      if (isProblems(input)) return input;
+      const v = questionFrom(input);
+      if (!v.question) return { problems: v.problems };
+      const after = questionPlain(v.question);
+      if (req.operation === 'exam_question_replace') {
+        return { op: { op: 'exam_question_replace', quizModuleId: quiz.moduleId, questionId: q!.id, question: v.question }, before: q ? plainText(questionText(q), 10_000) : '', after, contentEstimate: est };
+      }
+      const cats = [...new Set(quiz.exam.questions.filter((x) => x.qtype !== 'random' && x.categoryId !== null).map((x) => x.categoryId as number))];
+      const random = quiz.exam.questions.some((x) => x.qtype === 'random');
+      const categoryId = random ? (cats.length === 1 ? cats[0] : undefined) : undefined;
+      return { op: { op: 'exam_question_add', quizModuleId: quiz.moduleId, question: v.question, ...(categoryId !== undefined ? { categoryId } : {}) }, changes: [{ entry: 'questions.xml', field: 'pregunta nueva', moduleId: quiz.moduleId, sectionId: null, before: '', after: v.question.text, beforeRawSha1: '', afterRawSha1: '' }], before: '', after, contentEstimate: est };
+    }
+    case 'exam_question_remove': {
+      if (t.kind !== 'question') return { unavailable: 'destino inválido' };
+      return { op: { op: 'exam_question_remove', quizModuleId: t.quizModuleId, questionId: t.questionId }, before: '', after: '', contentEstimate: null };
+    }
+    case 'brand_replace': {
+      const colors = Object.fromEntries((req.details.colors ?? []).map((c) => [c.from, c.to]));
+      if (!Object.keys(colors).length) return { unavailable: 'Faltan los colores (de #hex a #hex).' };
+      return { op: { op: 'brand_replace', colors }, before: '', after: '', contentEstimate: null };
+    }
+    case 'remove_activity': {
+      if (t.kind !== 'activity') return { unavailable: 'destino inválido' };
+      return { op: { op: 'remove_activity', moduleId: t.moduleId }, before: '', after: '', contentEstimate: null };
+    }
+    default:
+      return { unavailable: 'Operación fuera del catálogo de esta fase.' };
+  }
+}
+
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/**
+ * Libro cortado ANTES del primer capítulo (el caso del bug #7: el corte cae en la imagen base64 de la portada): el motor
+ * no recompone sin portada (`front`). Se conserva el <head> original si llegó completo (estilos) y se rehace una portada
+ * SIMPLE con el título del curso — visible como aviso en el plan (no es la portada original: sin el logo).
+ */
+function frontFor(ctx: BuildCtx, html: string, st: ReturnType<typeof libroStructure>): { front: { headHtml: string; coverHtml: string }; note: string } | null {
+  const first = st.chapters[0];
+  const head = first ? html.slice(0, first.blockStart) : html;
+  if (first && /<\/head\s*>/i.test(head) && /<body\b[^>]*>/i.test(head)) return null;
+  const title = ctx.course.course.title ?? 'Curso';
+  const origHead = /<head\b[^>]*>([\s\S]*?)<\/head\s*>/i.exec(html)?.[1];
+  const headHtml = origHead && !/<script\b/i.test(origHead) ? origHead : `<meta charset="utf-8"><title>${esc(title)} — Libro Guía</title>`;
+  const coverHtml = `<div style="text-align:center;padding:48px 16px"><h1>Libro Guía</h1><h2>${esc(title)}</h2></div>`;
+  return { front: { headHtml, coverHtml }, note: 'La portada original del Libro Guía se perdió en el corte: se rehace una portada simple con el título del curso (sin el logo ni el índice originales). Revísala antes de aplicar.' };
+}
+
+function questionPlain(q: NewQuestion): string {
+  return q.qtype === 'multichoice' ? [plainText(q.text, 2000), ...q.answers.map((a) => plainText(a.html, 500))].join('\n') : plainText(q.text, 2000);
+}
+
+async function warningsFor(ctx: BuildCtx, req: InterpretedRequest, cand: Candidate, engineNotes: string[]): Promise<MisalignmentWarning[]> {
+  const ws = misalignmentWarnings({ course: ctx.course, operation: req.operation!, target: req.target!, before: cand.before, after: cand.after, docs: await docsOf(ctx), engineNotes });
+  // Costo de cada aviso como pedido aparte (estimator): contenido nuevo de la actividad, o rehacerla.
+  for (const w of ws) {
+    if (!w.suggestedOperation || !w.activity) continue;
+    if (w.suggestedOperation === 'edit_html') {
+      const a = activityOf(ctx.course, w.activity.moduleId);
+      const len = a?.html.reduce((s, h) => s + h.html.length, 0) ?? 2000;
+      w.estimate = memOf(estimateAiCall('content_html', { promptChars: len + 3000, outputChars: len }, ctx.pricing));
+    } else if (w.suggestedOperation === 'exam_question_replace') w.estimate = memOf(estimateAiCall('content_question', { promptChars: 3000 }, ctx.pricing));
+    else if (w.suggestedOperation === 'edit_libro_section') w.estimate = memOf(estimateAiCall('content_libro', { promptChars: 12_000, chapters: 1 }, ctx.pricing));
+    else w.estimate = memOf(estimateLater(w.suggestedOperation, w.suggestedOperation === 'regenerate_audio' ? { audioTarget: activityOf(ctx.course, w.activity.moduleId)?.kind === 'welcome_audio' ? 'welcome' : 'audiobook' } : {}, ctx.course, ctx.pricing));
+  }
+  return ws;
+}
+
+/** Prueba en seco del plan COMBINADO (todas las operaciones disponibles, en orden): el plan entero tiene que aplicar. */
+export async function combinedDryRun(ctx: BuildCtx, ops: PatchOperation[]): Promise<{ ok: boolean; failure: { opIndex: number | null; code: string; message: string } | null; resolved: number; operations: number }> {
+  if (!ops.length) return { ok: true, failure: null, resolved: 0, operations: 0 };
+  const r = await dryRun(ctx, ops);
+  return { ok: r.ok, failure: r.failure ? { opIndex: r.failure.opIndex, code: r.failure.code, message: r.failure.message } : null, resolved: r.diagnosis?.resolved.length ?? 0, operations: ops.length };
+}
