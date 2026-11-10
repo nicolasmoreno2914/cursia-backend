@@ -28,15 +28,12 @@ import { PACKAGE_KINDS, PackageKind, QA_INTERNAL_STORAGE_PREFIX, QA_PACKAGE_FILE
 import { frozenProviderModesOf } from '../modules/dynamic-generation/provider-modes';
 import { validateMbzV3 } from '../package/v3/mbz-validator-v3';
 import { PackageSizeLimits, packageSizeBudget, packageSizeLimitsFromEnv } from '../package/v3/package-size-budget';
-import { buildPackagingPlanV3 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import {
   ContentLoadersV3,
   artifactsServiceLoadersV3,
-  loadContentsV3,
   prepareV3Package,
-  loadPracticeFilesV3,
 } from '../modules/dynamic-packaging/packaging-v3';
-import { resolveTheme } from '../modules/theme-engine';
+import { composeV3BuildInput, packageDeclaredHours, packageDeclaredHoursSource } from '../modules/dynamic-packaging/compose-v3-build-input';
 import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 import { hoursReportSummary } from '../modules/study-time/hours-ledger';
@@ -622,46 +619,16 @@ export async function processV3PackageJob(
   const blueprint = await deps.blueprints.getByNumberAnySchema(job.course_id, job.owner_id, blueprintNumber);
   if (blueprint.schemaVersion !== 2) throw new Error(`el run v3 exige un Blueprint schemaVersion 2 (vino ${blueprint.schemaVersion})`);
   const snapshot = blueprint.snapshot as BlueprintSnapshotV2;
-  const pendingVideoChapterIds = prepared.pendingVideos.map((p) => p.chapterId);
-  const omittedVideoKeys = prepared.pendingVideos.map((p) => p.itemKey);
-  const plan = buildPackagingPlanV3(manifest.manifest, snapshot, { manifestId: manifest.id, omitVideoChapterIds: pendingVideoChapterIds });
-  const theme = resolveTheme(prepared.profiles.theme.input);
+  // r107 B10: la composición de la entrada del builder vive en compose-v3-build-input.ts (la comparte el Taller de cursos
+  // para el Libro v3 en PDF); mismo comportamiento.
   const loaders = deps.loadersV3 ? deps.loadersV3(job.owner_id) : artifactsServiceLoadersV3(deps.artifacts, job.owner_id);
-  const loaded = await loadContentsV3(loaders, plan, prepared.byItem, prepared.run, { familyId: theme.familyId, mode: theme.mode });
-  // T5 (r57): archivos de trabajo SUBIDOS del perfil (los de tabla los genera el builder). Sin ellos, la entrada de siempre.
-  const practiceFiles = await loadPracticeFilesV3(q, loaders, job.owner_id, prepared.profiles.assessment);
-  if (practiceFiles.size) loaded.contents.practiceFiles = practiceFiles;
+  const { buildInput, loaded, omittedVideoKeys } = await composeV3BuildInput({
+    q, loaders, ownerId: job.owner_id, prepared, manifest, snapshot, moodleRequested, qa,
+    ts: (deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000)))(),
+  });
   if (isLeaseLost()) return;
 
   const build = deps.buildMbzV3 ?? buildDynamicMbzV3;
-  const buildInput: BuildDynamicMbzV3Input = {
-    manifest: manifest.manifest,
-    blueprint: snapshot,
-    manifestId: manifest.id,
-    assessmentProfile: prepared.profiles.assessment,
-    presentation: prepared.profiles.theme.input,
-    contents: loaded.contents,
-    ts: (deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000)))(),
-    moodleVersion: moodleRequested,
-    pendingVideoChapterIds,
-    // r19 (L3): logo de la cuenta (o ninguno → Cursia) y nombre de la institución para el Libro Guía en PDF.
-    // fix round 3: candidatos en orden (brand_profile → user_settings); el builder usa el primero que valida.
-    libroBrand: {
-      logo: prepared.libroBrand?.candidates ?? prepared.libroBrand?.logo ?? null,
-      name: prepared.libroBrand?.name ?? null,
-      // r76 «Diseño visual»: marca de agua y logo en la bienvenida (solo si el perfil se aparta de lo de siempre).
-      ...(prepared.libroBrand?.watermark === false ? { watermark: false } : {}),
-      ...(prepared.libroBrand?.showInCourse === true ? { showInCourse: true } : {}),
-    },
-    libroReferences: prepared.libroReferences ?? null,
-    // r58 (I3) fix: horas objetivo congeladas en el Blueprint → «Duración estimada: X h (definida por la institución)» en
-    // la bienvenida y «Carga horaria declarada» en la Guía del docente. Antes nunca se pasaban (facts.hours = null siempre).
-    hours: packageDeclaredHours(snapshot),
-    // Review r1 (M-5): «(definida por la institución)» solo si el Blueprint congeló que las horas vienen del documento.
-    hoursSource: packageDeclaredHoursSource(snapshot),
-    // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
-    ...(qa ? { qaPreviewNotice: true } : {}),
-  };
   // §Q.8: el validador corre sobre los BYTES del paquete, antes de subir. Un hallazgo = fail loud.
   // G6 M1: la evaluación esperada se resuelve ACÁ, del perfil que cargó el worker (no se confía en la del builder).
   // F1 (I3): con los mismos itemCounts del Manifest que usa el builder.
@@ -830,23 +797,8 @@ export async function processV3PackageJob(
   if (!ok) logger.warn(`Job ${job.id}: el .mbz v3 se subió (artifact ${artifact.id}) pero completeJob devolvió false (lease perdida)`);
 }
 
-/**
- * r58 (I3): horas que la bienvenida muestra como «definidas por la institución»: las horas objetivo congeladas en el
- * Blueprint (perfil del curso o documento). Sin objetivo → null (la bienvenida no muestra duración; nunca se inventa).
- */
-export function packageDeclaredHours(snapshot: BlueprintSnapshotV2): number | null {
-  const t = snapshot?.course?.targetHours;
-  return typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null;
-}
-
-/**
- * Review r1 (M-5): origen de las horas objetivo. `document` solo si el Blueprint lo congeló explícitamente
- * (`course.targetHoursSource = 'document'`); hoy el lock no lo congela (decisión #9 pendiente) → null = redacción neutra
- * «Duración estimada del curso: X h.» (el objetivo puede venir del perfil, de una propuesta de Cursia o del documento).
- */
-export function packageDeclaredHoursSource(snapshot: BlueprintSnapshotV2): 'document' | null {
-  return packageDeclaredHours(snapshot) !== null && (snapshot?.course as Record<string, unknown> | undefined)?.['targetHoursSource'] === 'document' ? 'document' : null;
-}
+// r107 B10: movidas a compose-v3-build-input.ts (las usa también el Taller); se re-exportan para los checks de siempre.
+export { packageDeclaredHours, packageDeclaredHoursSource };
 
 /**
  * r98 (escalera de remediación, rung 2): partes aceptadas con marca de calidad (`output_summary.quality.warnings`) →
