@@ -26,6 +26,8 @@ export function requestFromFinding(f: Finding, course: WorkshopCourse): Interpre
   const p = fx.params as Record<string, any>;
   const op = fx.operation as RequestOperation;
   const fallbackNote = f.fixPrecheck?.status === 'fallback' && f.fixPrecheck.reason ? ` (${f.fixPrecheck.reason})` : '';
+  // r107 B8: los hallazgos de CALIDAD traen su instrucción concreta en los parámetros (qué cambiar, con la cita).
+  const given = typeof p.instruction === 'string' && p.instruction.trim() ? p.instruction.trim().slice(0, 1000) : null;
   const viaResolve = (raw: Partial<RawAiRequest>): InterpretedRequest => {
     const r = resolveRequest({ quote, operation: op as RawAiRequest['operation'], instruction: raw.instruction ?? `Arreglar: ${f.title}`, target: raw.target ?? null, colors: [], chapters: null, reason: null, questions: [] }, course, { trustedTarget: true, trustedChange: true });
     return { ...r, details: { ...r.details, findingId: f.id } };
@@ -39,11 +41,11 @@ export function requestFromFinding(f: Finding, course: WorkshopCourse): Interpre
     case 'remove_activity':
       return viaResolve({ target: { moduleId: p.moduleId } });
     case 'exam_question_replace':
-      return viaResolve({ target: { quizModuleId: p.quizModuleId, questionId: p.questionId }, instruction: `Corregir la pregunta para que cumpla las reglas del banco (exactamente una respuesta correcta, opciones distintas): ${f.title}` });
+      return viaResolve({ target: { quizModuleId: p.quizModuleId, questionId: p.questionId }, instruction: given ?? `Corregir la pregunta para que cumpla las reglas del banco (exactamente una respuesta correcta, opciones distintas): ${f.title}` });
     case 'exam_question_remove':
       return viaResolve({ target: { quizModuleId: p.quizModuleId, questionId: p.questionId } });
     case 'exam_question_add':
-      return viaResolve({ target: { quizModuleId: p.quizModuleId }, instruction: `Escribir una pregunta de opción múltiple para este examen, sobre los capítulos que evalúa: ${f.title}` });
+      return viaResolve({ target: { quizModuleId: p.quizModuleId }, instruction: given ?? `Escribir una pregunta de opción múltiple para este examen, sobre los capítulos que evalúa: ${f.title}` });
     case 'edit_libro_section': {
       const a = activityOf(course, p.moduleId);
       if (!a) return blank({ reason: 'El Libro Guía ya no está en el paquete.' });
@@ -52,7 +54,7 @@ export function requestFromFinding(f: Finding, course: WorkshopCourse): Interpre
       const chapters: number[] = Array.isArray(p.chapters) ? p.chapters.filter((n: unknown) => Number.isInteger(n)) : [];
       return {
         quote, operation: 'edit_libro_section', status: 'resolved',
-        instruction: p.section === 'all' ? 'Recomponer el Libro Guía: escribir completos los capítulos que se perdieron, con el mismo estilo que los que quedaron.' : `Escribir los capítulos que faltan en el Libro Guía (${chapters.join(', ')}).`,
+        instruction: given ?? (p.section === 'all' ? 'Recomponer el Libro Guía: escribir completos los capítulos que se perdieron, con el mismo estilo que los que quedaron.' : `Escribir los capítulos que faltan en el Libro Guía (${chapters.join(', ')}).`),
         target: { kind: 'libro', moduleId: a.moduleId, chapters, title: a.title, recompose: p.section === 'all' },
         rawTarget: { moduleId: a.moduleId, chapters }, details: { findingId: f.id }, questions: [], reason: null,
       };
@@ -64,7 +66,7 @@ export function requestFromFinding(f: Finding, course: WorkshopCourse): Interpre
       const field = a ? (editableField(a, p.field) ?? p.field) : 'summary';
       const chapterNumber = a && a.placement.scope === 'chapter' ? a.placement.chapterNumber : null;
       const target = { kind: 'html' as const, moduleId: a ? a.moduleId : null, sectionId, field, title: a ? a.title : 'Presentación de una sección', chapterNumber };
-      const base: InterpretedRequest = { quote, operation: 'edit_html', status: 'resolved', instruction: `Arreglar: ${f.title}${fallbackNote}`, target, rawTarget: { moduleId: a?.moduleId, field }, details: { findingId: f.id }, questions: [], reason: null };
+      const base: InterpretedRequest = { quote, operation: 'edit_html', status: 'resolved', instruction: given ? `${given}${fallbackNote}` : `Arreglar: ${f.title}${fallbackNote}`, target, rawTarget: { moduleId: a?.moduleId, field }, details: { findingId: f.id }, questions: [], reason: null };
       if (typeof p.token === 'string' && p.token) {
         if (typeof p.replaceWith === 'string' && p.replaceWith) return { ...base, details: { ...base.details, fixedChange: { kind: 'token', token: p.token, action: 'retarget', to: p.replaceWith } } };
         if (p.mode !== 'replace') return { ...base, details: { ...base.details, fixedChange: { kind: 'token', token: p.token, action: 'unlink' } } };

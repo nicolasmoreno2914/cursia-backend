@@ -264,6 +264,12 @@ jobs:
       - name: Check r107 Taller de cursos — aplicar + versiones (puro)
         run: node scripts/r107/check-r107-apply.js --ci
 
+      # r107 B8: diagnóstico de calidad Q01–Q05 (reglas deterministas + revisión por capítulo con IA SIMULADA, citas
+      # literales verificadas, estimado = llamada real, aprobaciones de B5) y preguntas puntuales con evidencia citada. El
+      # SDK de Anthropic y fetch interceptados: el check falla si algo intenta una llamada real (USD 0, sin red).
+      - name: Check r107 Taller de cursos — calidad + preguntas puntuales (IA simulada)
+        run: node scripts/r107/check-r107-quality.js --ci
+
       # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
       - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
         env:

@@ -38,7 +38,7 @@ import { ClarifyAnswer, InterpretedRequest, MisalignmentWarning, PLAN_LIMITS, Pl
 // ─── IA ────────────────────────────────────────────────────────────────────
 
 export interface AiCall {
-  purpose: 'interpret' | 'content';
+  purpose: 'interpret' | 'content' | 'quality' | 'question';
   kind: AiCallKind;
   system: string;
   user: string;

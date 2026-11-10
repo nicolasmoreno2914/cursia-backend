@@ -75,5 +75,48 @@ async function audiobookOf(v3buf) {
   return best;
 }
 
+// ── r107 B8: edición de paquetes para sembrar defectos de CALIDAD (sin red, USD 0) ──────────────────────────────────────
+const exactEsc = (s) => String(s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;').split('"').join('&quot;');
+const xmlUnesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>').split('&lt;').join('<').split('&amp;').join('&');
+async function zipEdit(buf, fn) { const z = await JSZip.loadAsync(buf); await fn(z); return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }); }
+/** Reescribe el `<intro>` de una actividad (`fn` recibe y devuelve el HTML desescapado; se escribe con el xmlEsc exacto). */
+async function setIntro(z, dir, fn) {
+  const p = `activities/${dir}/${dir.split('_')[0]}.xml`;
+  const x = await z.file(p).async('string');
+  const i = x.indexOf('<intro>'); const j = x.indexOf('</intro>', i);
+  z.file(p, x.slice(0, i + 7) + exactEsc(fn(xmlUnesc(x.slice(i + 7, j)))) + x.slice(j));
+}
+/** Reemplaza el CONTENIDO de un archivo por nombre (blob nuevo por su sha1; files.xml con su hash y tamaño). */
+async function replaceBlob(z, filename, fn) {
+  let files = await z.file('files.xml').async('string');
+  const m = new RegExp(`<contenthash>([0-9a-f]{40})</contenthash>(?:(?!</file>)[\\s\\S])*?<filename>${filename.replace(/\./g, '\\.')}</filename>`).exec(files);
+  const old = m[1];
+  const buf = Buffer.from(fn(await z.file(`files/${old.slice(0, 2)}/${old}`).async('string')));
+  const h = sha1(buf);
+  z.remove(`files/${old.slice(0, 2)}/${old}`);
+  z.file(`files/${h.slice(0, 2)}/${h}`, buf);
+  files = files.split(old).join(h).replace(new RegExp(`(<contenthash>${h}</contenthash>(?:(?!</file>)[\\s\\S])*?<filesize>)\\d+(</filesize>)`), `$1${buf.length}$2`);
+  z.file('files.xml', files);
+}
+/** Reescribe el json_content de un hvp (V1). */
+async function editHvp(z, dir, fn) {
+  const p = `activities/${dir}/hvp.xml`;
+  const x = await z.file(p).async('string');
+  const i = x.indexOf('<json_content>') + 14; const j = x.indexOf('</json_content>');
+  z.file(p, x.slice(0, i) + exactEsc(JSON.stringify(fn(JSON.parse(xmlUnesc(x.slice(i, j)))))) + x.slice(j));
+}
+const setHvpQuestion = (text) => (j) => { j.interactiveVideo.assets.interactions[0].action.params.question = text; return j; };
+/** El V1 mínimo con datos COHERENTES entre Libro, video y textos de sus dos capítulos (base limpia de la calidad, B8). */
+async function qualityV1(audioMp3) {
+  return zipEdit(await miniV1(audioMp3), async (z) => {
+    await setIntro(z, 'label_910', () => '<p>MÓDULO 1 · CAPÍTULO 1</p><p>La distancia mínima de seguridad entre equipos es de 2 metros.</p><p>📺 Instrucciones: mira el video.</p>');
+    await setIntro(z, 'label_920', () => '<p>MÓDULO 1 · CAPÍTULO 2</p><p>La distancia mínima de seguridad entre equipos es de 2 metros.</p><p>📺 Instrucciones: mira el video.</p>');
+    await replaceBlob(z, 'libro_guia_completo.html', (h) => h
+      .replace('<p>Contenido del primero.</p>', '<p>Contenido del primero.</p><p>La velocidad máxima en zona escolar es de 30 km/h.</p>')
+      .replace('<p>Contenido del segundo.</p>', '<p>Contenido del segundo.</p><p>Usa guantes de nitrilo para manipular los reactivos del taller.</p>'));
+    await editHvp(z, 'hvp_911', setHvpQuestion('<p>Según el video, la velocidad máxima en zona escolar es de 30 km/h. ¿Es cierto?</p>'));
+    await editHvp(z, 'hvp_921', setHvpQuestion('<p>Según el video, usa guantes de nitrilo para manipular los reactivos del taller. ¿Es cierto?</p>'));
+  });
+}
 
-module.exports = { esc, LIBRO_HTML, MANIFEST, GAME, HVP_JSON, miniV1, audiobookOf };
+module.exports = { esc, LIBRO_HTML, MANIFEST, GAME, HVP_JSON, miniV1, audiobookOf, exactEsc, xmlUnesc, zipEdit, setIntro, replaceBlob, editHvp, setHvpQuestion, qualityV1 };
