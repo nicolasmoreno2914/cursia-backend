@@ -14,7 +14,7 @@
  */
 import JSZip = require('jszip');
 import { WorkshopActivity, WorkshopFile } from '../course-model';
-import { formatDurationEs, mp3DurationSeconds } from '../../../package/audio';
+import { audioFramesOf, formatDurationEs, mp3DurationSeconds, parseMp3 } from '../../../package/audio';
 import { pdfPageCount, pngDimensions } from '../../../package/presentation';
 import { parseScormManifestIds } from '../../../package/v3/moodle-activities-v3';
 import { audioProblems } from '../regenerate/audio';
@@ -104,7 +104,13 @@ export async function producedProblems(p: ProducedRegen, expect: { chapters?: nu
     case 'h5p_practice': {
       const hj = await h5pJsonOf(p.h5p);
       if (!hj) return ['el .h5p de la práctica no abre'];
-      return [...(hj.mainLibrary !== p.mainLibrary ? [`el .h5p dice ${hj.mainLibrary}, no ${p.mainLibrary}`] : []), ...(p.questions < 1 ? ['la práctica no tiene preguntas'] : [])];
+      // Fix round 1 (P2-6): las preguntas se RECUENTAN del content.json del .h5p (nunca el campo declarado).
+      const n = practiceQuestionsOf(hj.mainLibrary, hj.content);
+      return [
+        ...(hj.mainLibrary !== p.mainLibrary ? [`el .h5p dice ${hj.mainLibrary}, no ${p.mainLibrary}`] : []),
+        ...(n < 1 ? ['la práctica no tiene preguntas (recontadas del .h5p)'] : []),
+        ...(n >= 1 && n !== p.questions ? [`la práctica dice ${p.questions} pregunta(s) y el .h5p trae ${n}`] : []),
+      ];
     }
     case 'video': {
       let content: any = null;
@@ -120,6 +126,8 @@ export async function producedProblems(p: ProducedRegen, expect: { chapters?: nu
       return [
         ...(!url.includes(p.youtubeId) ? ['el video no apunta al video de YouTube producido'] : []),
         ...(st.questions < 1 ? ['el video no tiene preguntas'] : []),
+        // Fix round 1 (P2-6): el número de preguntas sale del contenido, no del campo declarado.
+        ...(st.questions >= 1 && st.questions !== p.interactions ? [`el video dice ${p.interactions} pregunta(s) y su contenido trae ${st.questions}`] : []),
         ...(st.singleCorrect !== st.questions ? [`${st.questions - st.singleCorrect} pregunta(s) del video no tienen exactamente una respuesta correcta`] : []),
       ];
     }
@@ -130,10 +138,48 @@ export async function producedProblems(p: ProducedRegen, expect: { chapters?: nu
       if (p.language !== 'es-419') out.push('la presentación no se pidió en español latinoamericano');
       return out;
     }
-    case 'audio': return audioProblems(p, p.audio === 'audiobook' ? expect.chapters ?? p.chapters.map((c) => c.number) : []);
+    case 'audio': return [...audioProblems(p, p.audio === 'audiobook' ? expect.chapters ?? p.chapters.map((c) => c.number) : []), ...audioRecountProblems(p)];
     case 'libro_pdf': return ['un PDF del Libro no es el resultado de una regeneración de actividad'];
   }
   return ['resultado desconocido'];
+}
+
+/** Preguntas de una práctica H5P contadas en su content.json (por tipo). */
+export function practiceQuestionsOf(mainLibrary: string, content: any): number {
+  const stars = (t: string) => Math.floor((String(t).match(/\*[^*\n]+\*/g) || []).length);
+  if (/^H5P\.QuestionSet\b/.test(mainLibrary)) return Array.isArray(content?.questions) ? content.questions.length : 0;
+  if (/^H5P\.DragText\b/.test(mainLibrary)) return stars(content?.textField ?? '');
+  if (/^H5P\.Blanks\b/.test(mainLibrary)) return Array.isArray(content?.questions) ? stars(content.questions.join('\n')) : 0;
+  if (/^H5P\.BranchingScenario\b/.test(mainLibrary)) {
+    const xs = Array.isArray(content?.branchingScenario?.content) ? content.branchingScenario.content : [];
+    return xs.filter((x: any) => /^H5P\.BranchingQuestion\b/.test(String(x?.type?.library ?? x?.library ?? ''))).length;
+  }
+  return 0;
+}
+
+/**
+ * Fix round 1 (P2-6): duración y capítulos del audio RECONTADOS de los frames del MP3 (no de los campos declarados):
+ * la duración total sale de los frames; en el audiolibro, los frames de cada capítulo suman los del archivo y cada
+ * capítulo dura lo que dicen SUS frames.
+ */
+export function audioRecountProblems(p: Extract<ProducedRegen, { kind: 'audio' }>): string[] {
+  let frames: Array<{ samples: number; sampleRate: number }>;
+  try { frames = audioFramesOf(parseMp3(p.mp3)); } catch { return []; /* audioProblems ya lo informa */ }
+  if (!frames.length) return [];
+  const spf = frames[0].samples / frames[0].sampleRate;
+  const total = frames.length * spf;
+  const out: string[] = [];
+  if (Math.abs(total - p.durationSec) > 0.05) out.push(`el audio dice durar ${p.durationSec.toFixed(1)} s y sus frames suman ${total.toFixed(1)} s`);
+  if (p.audio === 'audiobook') {
+    const declared = p.chapters.map((c) => (c as any).frames);
+    if (declared.some((f) => !Number.isInteger(f) || f <= 0)) out.push('el audiolibro no trae los frames de cada capítulo para recontarlo');
+    else {
+      const sum = declared.reduce((a: number, b: number) => a + b, 0);
+      if (sum !== frames.length) out.push(`los capítulos suman ${sum} frames y el MP3 trae ${frames.length}`);
+      p.chapters.forEach((c, i) => { if (Math.abs(declared[i] * spf - c.seconds) > 0.05) out.push(`el capítulo ${c.number} dice ${c.seconds.toFixed(1)} s y sus frames dan ${(declared[i] * spf).toFixed(1)} s`); });
+    }
+  }
+  return out;
 }
 
 /** sco / sco_data nuevos en su rango (60000+), sin repetir NINGÚN id del paquete. */

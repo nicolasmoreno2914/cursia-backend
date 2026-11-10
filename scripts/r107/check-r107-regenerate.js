@@ -21,6 +21,11 @@
 //   R6  D7: rehacer el video avisa que el Libro y las preguntas del examen del capítulo pueden quedar desalineados
 //   R7  motor: precondición vencida, resultado de otra actividad, ids sco en su rango 60000+ sin repetir, artifact
 //       (zip determinista) ida y vuelta con huella, catálogo de la interpretación
+//   R8  Libro v3 (PDF) en el plan
+//   Ronda de arreglos 1: R9 sin medición → la cota (P1-1) · R10 medido > cota → WORKSHOP_PROVIDER_OVER_BOUND (P1-2c) y
+//   cotas por lo pedido (P1-2b) · R11 consulta transitoria ≠ ambigua, modo diferido (P1-3) · R12 lo pagado se reusa
+//   (P2-3) · R13 el motor recuenta del bundle (P2-6) · R14 child_process / fetch / SDK bloqueados (P2-9) y piso del
+//   audiolibro (P2-5). R1 además: estimado de IA con el pedido y el max_tokens reales, cota ≥ estimado (P2-1).
 //
 // Uso: npm run build && node scripts/r107/check-r107-regenerate.js --ci [--dist dist]
 'use strict';
@@ -74,7 +79,8 @@ const L = (rel) => { try { return require(path.join(DIST, rel)); } catch (e) { c
   const AS = SIM.built.mbz;
   const V1base = await FX.miniV1(await FX.audiobookOf(AS));
   // V1 con YouTube real (el mínimo trae ids inválidos) y un Libro Guía con capítulos largos (fuente del audiolibro).
-  const longCh = (n) => Array.from({ length: 14 }, (_, i) => `<p>En el capítulo ${n}, la idea ${i + 1} explica cómo atender a un cliente con calma, escuchar su problema, confirmar lo entendido con palabras propias y acordar un próximo paso claro que se pueda cumplir en el servicio diario.</p>`).join('');
+  // Fix round 1 (P2-5): el audiolibro completo exige el piso de 25 min (≥ 4148 palabras de fuente): capítulos de ~2200.
+  const longCh = (n) => Array.from({ length: 58 }, (_, i) => `<p>En el capítulo ${n}, la idea ${i + 1} explica cómo atender a un cliente con calma, escuchar su problema, confirmar lo entendido con palabras propias y acordar un próximo paso claro que se pueda cumplir en el servicio diario.</p>`).join('');
   const V1 = await FX.zipEdit(V1base, async (z) => {
     for (const n of [1, 2]) await FX.editHvp(z, `hvp_${900 + n * 10 + 1}`, (j) => { j.interactiveVideo.video.files[0].path = `https://youtu.be/Abc${n}Def${n}Ghi`; return j; });
     await FX.replaceBlob(z, 'libro_guia_completo.html', (html) => html.replace('<p>Contenido del primero.</p>', longCh(1)).replace('<p>Contenido del segundo.</p>', longCh(2)));
@@ -156,10 +162,19 @@ const L = (rel) => { try { return require(path.join(DIST, rel)); } catch (e) { c
       eq(call.regen.providers.map((l) => l.provider), provs, `${op} ${mid}: proveedores`);
       const tl = call.regen.providers.reduce((s, l) => s + Number(l.boundUsd), 0);
       assert(Math.abs(tl - Number(call.regen.totalBoundUsd)) < 1e-6, 'Σ cotas');
-      // Estimado = estimator directo con los mismos items del generador.
+      // Estimado (fix round 1, P2-1): las líneas que NO son de IA = estimator directo con los items del generador; la de
+      // IA se mide con el pedido y el max_tokens REALES (reintento dirigido incluido); el ítem = Σ líneas.
       const lines = EST.estimateCost({ items: types.map((t, k) => ({ itemKey: `k${k}`, itemType: t, action: 'REGENERATE' })), catalog: PRICING.catalog, usageModel: UM.usageModelPriorsV1(), retryPolicy: PRICING.retryPolicy });
-      if (!/audio/.test(op)) eq(call.expectedUsd, lines.totals.expected, `${op}: esperado = estimator`);
-      for (const l of call.regen.providers) assert(l.what && Number(l.expectedUsd) >= 0, 'línea con qué y cuánto');
+      if (!/audio/.test(op)) for (const l of call.regen.providers.filter((x) => x.provider !== 'anthropic' && x.provider !== 'youtube')) eq(l.expectedUsd, lines.totals.byProvider[l.provider].expected, `${op}: ${l.provider} esperado = estimator`);
+      const sumExp = call.regen.providers.reduce((a, l) => a + Number(l.expectedUsd), 0);
+      assert(Math.abs(sumExp - Number(call.expectedUsd)) < 1e-6, `${op}: esperado del ítem = Σ líneas`);
+      // P2-1 · invariante: en cada línea y en el ítem, cota ≥ estimado.
+      for (const l of call.regen.providers) assert(l.what && Number(l.expectedUsd) >= 0 && Number(l.boundUsd) + 1e-9 >= Number(l.expectedUsd), `${op}: ${l.provider} cota ${l.boundUsd} ≥ estimado ${l.expectedUsd}`);
+      assert(Number(call.regen.totalBoundUsd) + 1e-9 >= Number(call.expectedUsd), `${op}: cota del ítem ≥ estimado`);
+      const ai = call.regen.providers.find((l) => l.provider === 'anthropic');
+      if (ai) assert(ai.calls % 2 === 0 && /reintento|continuaci/.test(ai.what), `${op}: la línea de IA cuenta el reintento dirigido (${ai.calls} llamadas: ${ai.what})`);
+      // P1-2b: precio no verificado del catálogo (Videogen «observed», Gamma «placeholder») → margen mayor, dicho en el plan.
+      for (const l of call.regen.providers.filter((x) => x.provider === 'videogen' || x.provider === 'gamma')) assert(l.note && /margen/.test(l.note) && (call.regen.notes || []).includes(l.note), `${op}: nota de margen de ${l.provider}`);
       const view = B.estimateItemView(ctx, reqFor(ctx, op, mid), call);
       assert(view.generated === false && view.plannedCall === call && /proveedor/.test(view.cost.basis) && view.cost.contentEstimate.expected === call.expectedUsd, `${op}: vista de estimado`);
       const cap = Number(PL.proposedCapOf([call]).proposedCapUsd);
@@ -528,9 +543,130 @@ const L = (rel) => { try { return require(path.join(DIST, rel)); } catch (e) { c
     eq(LV.libroV3ResolverOf(fakeDs(), {}, null), LV.SERVER_LIBRO_V3_RESOLVER, 'sin los servicios del generador → no disponible');
   });
 
+  // ── Ronda de arreglos 1 (B10) ──
+  const PO = L('modules/course-workshop/regenerate/ports.js');
+  const OPR = L('modules/course-workshop/patch/op-regenerate.js');
+  const produceWith = async (buf, op, mid, o = {}) => {
+    const ctx = await ctxOf(buf, o.db || null);
+    const prov = o.prov || SIMLIB.simProviders(DIST, o.sim || {});
+    const gate = o.gate || SIMLIB.memGate(DIST, { capUsd: o.capUsd ?? 20 });
+    const paid = [];
+    const ext = { mode: o.mode || 'inline', prior: o.prior || {}, onPaid: async (p) => { paid.push(JSON.parse(JSON.stringify(p))); } };
+    let prep = null; let err = null;
+    try { prep = await B.prepareRegenItem(ctx, reqFor(ctx, op, mid), { providers: prov, gate, spent: gate.spent, ext }); } catch (e) { err = e; }
+    return { ctx, prov, gate, prep, err, paid, last: paid[paid.length - 1] || {} };
+  };
+
+  await check('R9 P1-1 sin medición del proveedor se cuenta la COTA (Gamma sin créditos, Videogen sin costo); kinds `<proveedor>:<qué>`', async () => {
+    const g = await produceWith(AS, 'regenerate_gamma', V3.gamma, { sim: { fault: { gammaNoCredits: true } } });
+    eq(g.prep && g.prep.status, 'resolved', `gamma: ${g.err && g.err.message}`);
+    const gc = g.gate.calls.find((c) => c.provider === 'gamma');
+    eq(gc.costUsd, PO.gammaBound(PRICING, 10).boundUsd, 'Gamma sin creditsDeducted → la cota (nunca 0)');
+    assert(Number(gc.costUsd) > 0 && Number(g.gate.spent()) >= Number(gc.costUsd), 'cuenta en lo gastado');
+    const v = await produceWith(V1, 'regenerate_video', V1M.video, { sim: { fault: { videogenNoCost: true } } });
+    eq(v.prep && v.prep.status, 'resolved', `video: ${v.err && v.err.message}`);
+    const vc = v.gate.calls.find((c) => c.provider === 'videogen');
+    assert(Number(vc.costUsd) === Number(vc.boundUsd) && Number(vc.costUsd) > 0, `Videogen sin costo → la cota (${vc.costUsd} vs ${vc.boundUsd})`);
+    const kinds = [...new Set([...g.gate.calls, ...v.gate.calls].map((c) => c.kind))].sort();
+    eq(kinds, ['anthropic:video_interactions', 'gamma:generate', 'videogen:render', 'youtube:upload'], 'kinds sin repetir el proveedor');
+  });
+
+  await check('R10 P1-2c medido > cota → WORKSHOP_PROVIDER_OVER_BOUND: queda lo real, se cortan las llamadas que faltan', async () => {
+    const v = await produceWith(V1, 'regenerate_video', V1M.video, { sim: { videogenCost: 999 } });
+    assert(v.err && v.err.code === 'over_bound' && /WORKSHOP_PROVIDER_OVER_BOUND/.test(v.err.message), `video: ${v.err && v.err.message}`);
+    const vc = v.gate.calls.find((c) => c.provider === 'videogen');
+    assert(vc.status === 'charged' && vc.costUsd === '999' && vc.overBound === true, 'se registra lo medido real');
+    eq(v.gate.calls.map((c) => c.provider), ['videogen'], 'ni YouTube ni IA después del incidente');
+    eq(v.prov.calls.youtube.length + v.prov.calls.anthropic.length, 0, 'el simulador no recibió nada más');
+    let again = null;
+    try { await v.gate.begin({ provider: 'anthropic', kind: 'x', boundUsd: '0.01', attempt: 1 }); } catch (e) { again = e; }
+    assert(again && again.code === 'over_bound', 'la aprobación queda cortada');
+    const g = await produceWith(AS, 'regenerate_gamma', V3.gamma, { sim: { gammaCredits: 100000 } });
+    assert(g.err && g.err.code === 'over_bound', `gamma: ${g.err && g.err.message}`);
+    // Cotas por lo pedido (P1-2b): Videogen por minutos del texto (o 1 render) × margen; Gamma por tarjetas × créditos × margen.
+    const gb = PO.gammaBound(PRICING, 10);
+    eq(gb.boundUsd, PO.gammaMeasuredUsd(PRICING, 10 * PO.GAMMA_MAX_CREDITS_PER_CARD * PO.REGEN_UNVERIFIED_PRICE_MARGIN), 'Gamma: 10 × 15 × 2 (precio placeholder)');
+    assert(/placeholder/.test(gb.note), 'nota del precio no verificado');
+    const vb = PO.videogenBound(PRICING, 2400);
+    assert(Number(vb.boundUsd) >= Number(PO.videogenCatalogUsd(PRICING)) * PO.REGEN_UNVERIFIED_PRICE_MARGIN - 0.01 && /observed/.test(vb.note) && /21 min/.test(vb.note), `Videogen: ${JSON.stringify(vb)}`);
+  });
+
+  await check('R11 P1-3 errores TRANSITORIOS de la consulta se reintentan (no ambiguos); en modo diferido se corta tras aceptar, sin cobrar ni reenviar', async () => {
+    const v = await produceWith(V1, 'regenerate_video', V1M.video, { sim: { fault: { videogenPollErrors: 3 }, videogenPendingPolls: 5 } });
+    eq(v.prep && v.prep.status, 'resolved', `video: ${v.err && v.err.message}`);
+    eq(v.prov.calls.videogen.filter((c) => c.op === 'create').length, 1, '1 solo envío');
+    assert(v.gate.calls.every((c) => c.status === 'charged'), 'nada ambiguo');
+    const g = await produceWith(AS, 'regenerate_gamma', V3.gamma, { sim: { fault: { gammaPollErrors: 2 }, gammaPendingPolls: 4 } });
+    eq(g.prep && g.prep.status, 'resolved', `gamma: ${g.err && g.err.message}`);
+    // Solo el plazo TOTAL vencido es ambiguo (con errores en todas las consultas).
+    const t = await produceWith(AS, 'regenerate_gamma', V3.gamma, { sim: { fault: { gammaPollErrors: 1e9 }, pollTimeoutMs: 40 } });
+    assert(t.err && t.err.code === 'call_ambiguous', `plazo vencido → ambiguo (${t.err && t.err.message})`);
+    // Diferido: el id externo queda guardado (onPaid) y la producción se corta con la espera, la llamada sigue `sent`.
+    const d = await produceWith(V1, 'regenerate_video', V1M.video, { mode: 'defer' });
+    assert(d.err && d.err.name === 'RegenDeferred' && d.err.wait.externalId === 'vg_sim_1' && d.err.wait.provider === 'videogen', `diferido: ${d.err && d.err.message}`);
+    eq(d.last.videogen, { jobId: 'vg_sim_1', charged: false, callId: d.gate.calls[0].id, approvalId: d.gate.charge.approvalId }, 'id externo guardado antes de soltar el carril');
+    eq(d.gate.calls.map((c) => `${c.kind}:${c.status}:${c.externalId}`), ['videogen:render:sent:vg_sim_1'], 'la llamada sigue enviada (esperando)');
+    eq(d.prov.calls.videogen.filter((c) => c.op === 'status').length, 0, 'el productor no espera en el carril');
+  });
+
+  await check('R12 P2-3 lo YA pagado se reusa: render + YouTube tras fallar las preguntas; PDF de Gamma tras fallar la portada', async () => {
+    const a = await produceWith(V1, 'regenerate_video', V1M.video, { sim: { fault: { vintNoQuestions: true } } });
+    assert(a.prep && a.prep.status === 'failed' && a.prep.failure.retryable, `1.º intento falla en las preguntas: ${a.err && a.err.message}`);
+    assert(a.last.videogen && a.last.videogen.charged === true && a.last.youtube && a.last.youtube.videoId === 'SimVideo001', `pagado guardado: ${JSON.stringify(a.last)}`);
+    const b = await produceWith(V1, 'regenerate_video', V1M.video, { prior: a.last });
+    eq(b.prep && b.prep.status, 'resolved', `reintento: ${b.err && b.err.message}`);
+    eq(b.prov.calls.videogen.filter((c) => c.op === 'create').length + b.prov.calls.youtube.length, 0, 'ni re-render ni otra subida (sin video huérfano)');
+    eq(b.gate.calls.map((c) => c.provider), ['anthropic', 'anthropic'].slice(0, b.gate.calls.length), 'solo se vuelven a pagar las preguntas');
+    eq(b.prep.produced.youtubeId, 'SimVideo001', 'el video publicado es el mismo');
+    const g1 = await produceWith(AS, 'regenerate_gamma', V3.gamma, { sim: { fault: { rasterFailOnce: true } } });
+    assert(g1.prep && g1.prep.status === 'failed' && g1.last.gamma && g1.last.gamma.charged === true, `Gamma: falla la portada con el PDF pagado (${g1.err && g1.err.message})`);
+    const g2 = await produceWith(AS, 'regenerate_gamma', V3.gamma, { prior: g1.last });
+    eq(g2.prep && g2.prep.status, 'resolved', `reintento Gamma: ${g2.err && g2.err.message}`);
+    eq(g2.prov.calls.gamma.filter((c) => c.op === 'create').length + g2.gate.calls.length, 0, 'sin regenerar ni pagar la presentación otra vez');
+  });
+
+  await check('R13 P2-6 la revalidación del motor RECUENTA del bundle (preguntas del .h5p / content.json, duración y capítulos de los MP3)', async () => {
+    const pr = await produceWith(AS, 'regenerate_scorm', V3.practice, { db: dbAS });
+    const vi = await produceWith(AS, 'regenerate_video', V3.video);
+    const ab = await produceWith(AS, 'regenerate_audio', V3.audiobook, { db: dbAS, capUsd: 50 });
+    for (const x of [pr, vi, ab]) eq(x.prep && x.prep.status, 'resolved', x.err && x.err.message);
+    eq(await OPR.producedProblems(pr.prep.produced), [], 'práctica íntegra');
+    eq(await OPR.producedProblems(vi.prep.produced), [], 'video íntegro');
+    eq(await OPR.producedProblems(ab.prep.produced, { chapters: ab.prep.produced.chapters.map((c) => c.number) }), [], 'audiolibro íntegro');
+    assert((await OPR.producedProblems({ ...pr.prep.produced, questions: pr.prep.produced.questions + 3 })).some((m) => /trae/.test(m)), 'práctica: preguntas declaradas ≠ recontadas');
+    assert((await OPR.producedProblems({ ...vi.prep.produced, interactions: vi.prep.produced.interactions + 1 })).some((m) => /contenido trae/.test(m)), 'video: preguntas declaradas ≠ recontadas');
+    const p = ab.prep.produced;
+    assert((await OPR.producedProblems({ ...p, durationSec: p.durationSec + 60 })).some((m) => /frames suman/.test(m)), 'audio: duración declarada ≠ frames');
+    const ch = p.chapters.map((c, i) => (i === 0 ? { ...c, seconds: c.seconds + 30 } : c));
+    assert((await OPR.producedProblems({ ...p, chapters: ch })).some((m) => /capítulo 1 dice/.test(m)), 'audio: segundos de un capítulo ≠ sus frames');
+    const ch2 = p.chapters.map((c, i) => (i === 0 ? { ...c, frames: c.frames + 7 } : c));
+    assert((await OPR.producedProblems({ ...p, chapters: ch2 })).some((m) => /suman/.test(m)), 'audio: frames por capítulo ≠ MP3');
+  });
+
+  await check('R14 P2-9 el simulador bloquea child_process (binarios), fetch global y los SDK; P2-5 audiolibro bajo el piso de 25 min → no disponible', async () => {
+    const cp = require('child_process');
+    for (const [fn, args] of [['execFile', ['ffmpeg', ['-version']]], ['spawn', ['pdftoppm', ['-v']]], ['exec', ['curl https://api.openai.com']], ['execSync', ['ls']], ['spawnSync', ['ffmpeg']]]) {
+      let threw = false;
+      try { cp[fn](...args); } catch { threw = true; }
+      assert(threw, `child_process.${fn} bloqueado`);
+    }
+    assert(REAL.spawn === 5, `intentos contados (${REAL.spawn})`);
+    REAL.spawn = 0;
+    let threw = false;
+    try { await globalThis.fetch('https://api.openai.com/v1/audio/speech'); } catch { threw = true; }
+    assert(threw && REAL.fetch === 1, 'globalThis.fetch bloqueado (undici interno de Node)');
+    REAL.fetch = 0;
+    // P2-5: el V1 base con capítulos de ~530 palabras (≈ 7 min) → no disponible con el motivo, sin gastar.
+    const shortV1 = await FX.zipEdit(V1base, async (z) => { await FX.replaceBlob(z, 'libro_guia_completo.html', (html) => html.replace('<p>Contenido del primero.</p>', Array.from({ length: 14 }, () => '<p>' + 'palabra '.repeat(38) + '</p>').join('')).replace('<p>Contenido del segundo.</p>', Array.from({ length: 14 }, () => '<p>' + 'texto '.repeat(38) + '</p>').join(''))); });
+    const c = await ctxOf(shortV1);
+    const ab = await B.estimateContent(c, reqFor(c, 'regenerate_audio', V1M.audiobook));
+    assert(ab && /25 min/.test(ab.unavailable || '') && /4148/.test(ab.unavailable), `audiolibro corto: ${JSON.stringify(ab).slice(0, 300)}`);
+    assert(RG && PR, 'módulos');
+  });
+
   console.log(`   estimados: ${JSON.stringify(results).slice(0, 1600)}`);
   const real = Object.entries(REAL).filter(([, v]) => v > 0);
   if (real.length) { fail++; console.log(`❌ llamadas REALES intentadas: ${JSON.stringify(REAL)}`); }
-  console.log(`\n${fail ? '❌' : '✅'} check-r107-regenerate --ci: ${ok}/${ok + fail} · llamadas reales: anthropic ${REAL.anthropic}, fetch ${REAL.fetch}, http ${REAL.http}, net ${REAL.net}, binarios ${REAL.spawn}`);
+  console.log(`\n${fail ? '❌' : '✅'} check-r107-regenerate --ci: ${ok}/${ok + fail} · llamadas reales: anthropic ${REAL.anthropic}, openai ${REAL.openai}, fetch ${REAL.fetch}, undici ${REAL.undici}, http ${REAL.http}, net ${REAL.net}, binarios ${REAL.spawn}`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

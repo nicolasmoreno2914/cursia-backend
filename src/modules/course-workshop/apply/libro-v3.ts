@@ -78,8 +78,10 @@ export function serverLibroV3Resolver(d: LibroV3ResolverDeps): LibroV3SourceReso
       const ident = ses?.identification && typeof ses.identification === 'object' ? ses.identification : {};
       const artId = ident?.result?.matchedArtifactId;
       if (typeof artId !== 'string' || !artId) return no('el paquete no se identificó por su huella exacta con un paquete de Cursia (se necesita la fuente con la que se armó).');
-      const [art] = await d.dataSource.query(`select id::text as id, owner_id::text as owner_id, job_id::text as job_id, type, metadata from public.artifacts where id::text = $1`, [artId]);
+      const [art] = await d.dataSource.query(`select id::text as id, owner_id::text as owner_id, job_id::text as job_id, type, status, metadata from public.artifacts where id::text = $1`, [artId]);
       if (!art || art.type !== 'dynamic_mbz') return no('el paquete identificado no es un paquete v3 del generador.');
+      // Fix round 1 (P2-4): el `.mbz` identificado tiene que seguir vigente (no deshabilitado).
+      if (art.status === 'disabled') return no('el paquete identificado está deshabilitado.');
       const [course] = await d.dataSource.query(`select id, owner_id::text as owner_id, institution_id::text as institution_id from public.courses where id = $1`, [session.identifiedCourseId]);
       if (!course) return no('el curso ya no existe.');
       const inScope = session.institutionId ? String(course.institution_id ?? '').toLowerCase() === session.institutionId.toLowerCase() : String(course.owner_id).toLowerCase() === session.ownerId.toLowerCase();
@@ -88,6 +90,8 @@ export function serverLibroV3Resolver(d: LibroV3ResolverDeps): LibroV3SourceReso
       const payload = job ? (typeof job.input_payload === 'string' ? JSON.parse(job.input_payload) : job.input_payload ?? {}) : null;
       if (!job || !payload?.runId || !Number.isInteger(Number(payload.manifestId)) || !Number.isInteger(Number(payload.blueprintNumber))) return no('no se encontró el empaquetado que armó este paquete.');
       if (String(job.owner_id).toLowerCase() !== String(course.owner_id).toLowerCase()) return no('el empaquetado es de otra cuenta.');
+      // Fix round 1 (P2-4): el empaquetado que armó el paquete es del curso IDENTIFICADO (nunca otro curso del dueño).
+      if (Number(job.course_id) !== Number(session.identifiedCourseId)) return no('el empaquetado que armó este paquete es de otro curso.');
       if (payload.packageKind && payload.packageKind !== 'final') return no('el paquete es una vista previa (QA), no el final.');
       const courseId = Number(job.course_id);
       const manifest = await d.manifests.getById(courseId, job.owner_id, Number(payload.blueprintNumber), Number(payload.manifestId));

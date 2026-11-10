@@ -7,14 +7,37 @@
 const path = require('path');
 const vm = require('vm');
 
-/** Bloquea TODA salida de red y el SDK de Anthropic; cuenta los intentos (el check falla si hay alguno). */
+/**
+ * Bloquea TODA salida de red y los SDK de los proveedores; cuenta los intentos (el check falla si hay alguno).
+ * Fix round 1 (P2-9): + `child_process` (exec/execFile/spawn/fork y sus *Sync con binarios que no sean este node),
+ * undici (fetch/request/stream/Agent) y `globalThis.fetch`, y el SDK de OpenAI.
+ */
 function blockNetwork(tag) {
-  const REAL = { anthropic: 0, fetch: 0, http: 0, net: 0, spawn: 0 };
+  const REAL = { anthropic: 0, openai: 0, fetch: 0, undici: 0, http: 0, net: 0, spawn: 0 };
   const sdk = require('@anthropic-ai/sdk');
   const Anthropic = sdk.default || sdk.Anthropic || sdk;
   const proto = (Anthropic.Messages || sdk.Messages) && (Anthropic.Messages || sdk.Messages).prototype;
   if (proto) proto.create = function () { REAL.anthropic++; throw new Error(`${tag}: llamada REAL a Anthropic bloqueada`); };
-  global.fetch = async (u) => { REAL.fetch++; throw new Error(`${tag}: red bloqueada (${String(u).slice(0, 80)})`); };
+  // SDK de OpenAI (si está instalado): cualquier request del cliente base queda bloqueada.
+  try {
+    const oa = require('openai');
+    const OpenAI = oa.default || oa.OpenAI || oa;
+    const blockOa = function () { REAL.openai++; throw new Error(`${tag}: llamada REAL a OpenAI bloqueada`); };
+    for (const P of [OpenAI && OpenAI.prototype, oa.APIClient && oa.APIClient.prototype].filter(Boolean)) {
+      for (const k of ['request', 'makeRequest', 'post', 'get', 'fetchWithTimeout']) if (typeof P[k] === 'function') P[k] = blockOa;
+    }
+  } catch { /* sin el SDK de OpenAI instalado: nada que bloquear */ }
+  const blockedFetch = async (u) => { REAL.fetch++; throw new Error(`${tag}: red bloqueada (${String(u && u.url ? u.url : u).slice(0, 80)})`); };
+  global.fetch = blockedFetch;
+  globalThis.fetch = blockedFetch;
+  try {
+    const undici = require('undici');
+    for (const k of ['fetch', 'request', 'stream', 'pipeline', 'connect']) {
+      if (typeof undici[k] === 'function') undici[k] = async function () { REAL.undici++; throw new Error(`${tag}: undici.${k} bloqueado`); };
+    }
+    if (undici.Agent && undici.Agent.prototype) undici.Agent.prototype.dispatch = function () { REAL.undici++; throw new Error(`${tag}: undici.Agent bloqueado`); };
+    if (undici.Dispatcher && undici.Dispatcher.prototype) undici.Dispatcher.prototype.dispatch = function () { REAL.undici++; throw new Error(`${tag}: undici bloqueado`); };
+  } catch { /* sin undici instalado */ }
   for (const m of ['http', 'https']) {
     const mod = require(m);
     mod.request = function () { REAL.http++; throw new Error(`${tag}: ${m}.request bloqueado`); };
@@ -23,12 +46,17 @@ function blockNetwork(tag) {
   const net = require('net');
   net.connect = net.createConnection = function () { REAL.net++; throw new Error(`${tag}: net.connect bloqueado`); };
   require('tls').connect = function () { REAL.net++; throw new Error(`${tag}: tls.connect bloqueado`); };
+  // child_process: solo se permite volver a lanzar ESTE node (p. ej. un harness hijo); ffmpeg, pdftoppm, curl, etc. no.
   const cp = require('child_process');
-  const origSpawn = cp.spawn;
-  cp.spawn = function (cmd, ...rest) {
-    if (/ffmpeg|pdftoppm/.test(String(cmd))) { REAL.spawn++; throw new Error(`${tag}: ${cmd} no se usa con proveedores simulados`); }
-    return origSpawn.call(this, cmd, ...rest);
-  };
+  const allowed = (cmd) => { const c = String(cmd || '').trim().split(/\s+/)[0]; return c === process.execPath || c === 'node'; };
+  for (const k of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
+    const orig = cp[k];
+    if (typeof orig !== 'function') continue;
+    cp[k] = function (cmd, ...rest) {
+      if (k === 'fork' || !allowed(cmd)) { REAL.spawn++; throw new Error(`${tag}: child_process.${k}(${String(cmd).slice(0, 40)}) bloqueado con proveedores simulados`); }
+      return orig.call(this, cmd, ...rest);
+    };
+  }
   return REAL;
 }
 
@@ -124,8 +152,13 @@ function simProviders(DIST, opts = {}) {
       },
       async getGeneration(id) {
         calls.gamma.push({ op: 'poll', id });
+        const n = calls.gamma.filter((c) => c.op === 'poll').length;
         if (fault.gammaPoll === 'timeout') return { status: 'pending', gammaId: null, gammaUrl: null, exportUrl: null, creditsDeducted: null, creditsRemaining: null, error: null };
-        return { status: 'completed', gammaId: 'g1', gammaUrl: null, exportUrl: 'sim://gamma.pdf', creditsDeducted: 55, creditsRemaining: 945, error: null };
+        // Fix round 1: errores TRANSITORIOS de la consulta (las primeras N) y esperas «pending» antes de terminar.
+        if (fault.gammaPollErrors && n <= fault.gammaPollErrors) throw err(503, `sim: Gamma consulta 503 (#${n})`);
+        if (opts.gammaPendingPolls && n <= opts.gammaPendingPolls) return { status: 'pending', gammaId: null, gammaUrl: null, exportUrl: null, creditsDeducted: null, creditsRemaining: null, error: null };
+        const credits = fault.gammaNoCredits ? null : (opts.gammaCredits ?? 55);
+        return { status: 'completed', gammaId: 'g1', gammaUrl: null, exportUrl: 'sim://gamma.pdf', creditsDeducted: credits, creditsRemaining: 945, error: null };
       },
       async download() { calls.gamma.push({ op: 'download' }); return SM.syntheticPdf(opts.slides || 10); },
     },
@@ -133,25 +166,28 @@ function simProviders(DIST, opts = {}) {
       async create(payload) {
         calls.videogen.push({ op: 'create', chars: payload.content_txt.length, ref: payload.client_reference_id });
         if (fault.videogenCreate === 'ambiguous') throw err(504, 'sim: Videogen 504');
-        return { jobId: 'vg_sim_1' };
+        return { jobId: opts.videogenJobId || 'vg_sim_1' };
       },
       async status(jobId) {
         calls.videogen.push({ op: 'status', jobId });
+        const n = calls.videogen.filter((c) => c.op === 'status').length;
+        if (fault.videogenPollErrors && n <= fault.videogenPollErrors) throw err(502, `sim: Videogen consulta 502 (#${n})`);
+        if (opts.videogenPendingPolls && n <= opts.videogenPendingPolls) return { job_id: jobId, chapter_number: 1, status: 'processing' };
         if (fault.videogenRender === 'timeout') return { job_id: jobId, chapter_number: 1, status: 'processing' };
         if (fault.videogenRender === 'failed') return { job_id: jobId, chapter_number: 1, status: 'failed', error: 'sim render failed' };
         // Guion por escenas (lo que Videogen informa en el status): 8 escenas iguales con su narración.
         const scenes = opts.noScenes ? null : Array.from({ length: 8 }, (_, i) => ({ scene_order: i + 1, duration_seconds: VIDEO_SEC / 8, narration: `Escena ${i + 1}: el narrador explica una parte del capítulo con un ejemplo del servicio diario.` }));
         return { job_id: jobId, chapter_number: 1, status: 'completed', download_url: 'sim://video.mp4', duration_seconds: VIDEO_SEC, scenes };
       },
-      async cost() { return 0.94; },
+      async cost() { if (fault.videogenNoCost) return null; return opts.videogenCost ?? 0.94; },
       async download() { throw new Error('simulador: el video no se descarga (la duración viene en el status)'); },
     },
     youtube: {
       async ready() { return fault.youtube === 'disconnected' ? 'Tu cuenta no tiene YouTube conectado.' : null; },
-      async upload(a) { calls.youtube.push({ url: a.videoUrl }); return { videoId: 'SimVideo001' }; },
+      async upload(a) { calls.youtube.push({ url: a.videoUrl }); return { videoId: opts.youtubeId || 'SimVideo001' }; },
     },
     media: {
-      rasterizer: { available: async () => fault.raster !== 'missing', firstPagePng: async () => { calls.raster++; return SM.syntheticCoverPng(1600, 900, '#0F766E'); } },
+      rasterizer: { available: async () => fault.raster !== 'missing', firstPagePng: async () => { calls.raster++; if (fault.rasterFailOnce && calls.raster === 1) throw new Error('sim: pdftoppm falló'); return SM.syntheticCoverPng(1600, 900, '#0F766E'); } },
       transcoderAvailable: async () => fault.ffmpeg !== 'missing',
       transcode: async (mp3) => { calls.transcode++; return mp3; },
     },
@@ -161,19 +197,30 @@ function simProviders(DIST, opts = {}) {
 
 /** Compuerta en memoria: la MISMA regla que WorkshopPlanService.regenGateFor (tope, sent antes, ambiguo = cota gastada). */
 function memGate(DIST, opts = {}) {
-  const { RegenError } = require(path.join(DIST, 'modules/course-workshop/regenerate/types.js'));
+  const { RegenError, PROVIDER_OVER_BOUND } = require(path.join(DIST, 'modules/course-workshop/regenerate/types.js'));
   const g = {
+    stopReason: null,
     capUsd: Number(opts.capUsd ?? 100), spentUsd: 0, calls: [], charges: [],
     charge: { payer: '00000000-0000-4000-8000-0000000000aa', courseId: null, approvalId: '00000000-0000-4000-8000-00000000a0a0', sessionId: '00000000-0000-4000-8000-00000000c0c0', simulated: true },
     async begin(spec) {
+      if (g.stopReason) throw new RegenError('over_bound', g.stopReason, { code: PROVIDER_OVER_BOUND });
       if (g.spentUsd + Number(spec.boundUsd) > g.capUsd + 1e-9) throw new RegenError('cap_reached', `tope alcanzado (gastado ${g.spentUsd.toFixed(4)} + cota ${spec.boundUsd} > ${g.capUsd})`);
-      const rec = { id: `call-${g.calls.length + 1}`, provider: spec.provider, kind: spec.kind, boundUsd: spec.boundUsd, status: 'sent', externalId: null };
+      const rec = { id: `call-${g.calls.length + 1}`, provider: spec.provider, kind: `${spec.provider}:${spec.kind}`, boundUsd: spec.boundUsd, status: 'sent', externalId: null };
       g.calls.push(rec);
       return {
         id: rec.id,
         async accepted(ext) { rec.externalId = ext; },
-        async charged(m) { rec.status = 'charged'; rec.costUsd = m.costUsd; g.spentUsd += Number(m.costUsd); if (m.charge) g.charges.push(m.charge); if (m.externalId) rec.externalId = m.externalId; },
+        async charged(m) {
+          rec.status = 'charged'; rec.costUsd = m.costUsd; g.spentUsd += Number(m.costUsd); if (m.charge) g.charges.push(m.charge); if (m.externalId) rec.externalId = m.externalId;
+          // Misma regla que la compuerta del servicio (P1-2c): medido > cota → incidente, se cortan las llamadas que faltan.
+          if (Number(m.costUsd) > Number(spec.boundUsd) + 1e-9) {
+            rec.overBound = true;
+            g.stopReason = `${PROVIDER_OVER_BOUND}: ${spec.provider} midió ${m.costUsd} > cota ${spec.boundUsd}`;
+            throw new RegenError('over_bound', g.stopReason, { code: PROVIDER_OVER_BOUND });
+          }
+        },
         async failed(e, outcome) {
+          rec.error = e && e.message ? e.message : String(e);
           rec.status = outcome;
           if (outcome === 'ambiguous') { g.spentUsd += Number(spec.boundUsd); return new RegenError('call_ambiguous', `${spec.provider}: resultado desconocido (no se reenvía)`); }
           if (outcome === 'not_sent') return new RegenError('not_sent', `${spec.provider}: no enviada`);

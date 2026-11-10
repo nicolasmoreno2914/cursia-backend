@@ -67,7 +67,7 @@ async function speak(a: { providers: RegenProviders; gate: PaidCallGate; pricing
   let attempt = 0;
   for (const chunk of splitForTts(text, segChars)) {
     attempt++;
-    const r = await paidCall(a.gate, { provider: 'openai', kind: 'tts:chunk', boundUsd: ttsBoundUsd(a.pricing, P.config.ttsModel, chunk.length), attempt },
+    const r = await paidCall(a.gate, { provider: 'openai', kind: 'chunk', boundUsd: ttsBoundUsd(a.pricing, P.config.ttsModel, chunk.length), attempt },
       () => P.tts.speech({ model: P.config.ttsModel, voice: P.config.ttsVoice, input: chunk }), classifyTts,
       (res, callId) => {
         const secs = mp3DurationSeconds(res.audio); // no medible → ambiguo (paidCall), nunca un 0 inventado
@@ -103,13 +103,13 @@ export async function produceAudio(a: { target: AudioTarget; course: WorkshopCou
   const llm: ScriptLlm = async (prompt, role) => {
     attempt++;
     const m = P.config.llmModel;
-    const r = await paidCall(a.gate, { provider: 'anthropic', kind: `llm:audiobook_${role}`, boundUsd: llmBoundUsd(a.pricing, m, prompt.system.length + prompt.user.length, prompt.maxTokens), attempt },
+    const r = await paidCall(a.gate, { provider: 'anthropic', kind: `audiobook_${role}`, boundUsd: llmBoundUsd(a.pricing, m, prompt.system.length + prompt.user.length, prompt.maxTokens), attempt },
       () => P.llm.messages({ model: m, system: prompt.system, user: prompt.user, maxTokens: prompt.maxTokens }), classifyAnthropic,
       (res, callId) => ({ costUsd: llmMeasuredUsd(a.pricing, res.model || m, res.usage), charge: llmChargeInput(a.gate.charge, callId, { model: res.model || m, messageId: res.messageId, usage: res.usage }, `audiobook_${role}`), externalId: res.messageId }));
     return { text: r.text, messageId: r.messageId, truncated: r.stopReason === 'max_tokens' };
   };
   const chapterAudio: Buffer[] = [];
-  const records: Array<{ number: number; words: number; seconds: number; scriptSha256: string }> = [];
+  const records: Array<{ number: number; words: number; seconds: number; scriptSha256: string; frames: number }> = [];
   let words = 0;
   for (const n of t.chapters) {
     const src = byN.get(n)!;
@@ -135,7 +135,7 @@ export async function produceAudio(a: { target: AudioTarget; course: WorkshopCou
     chapterAudio.push(v.mp3);
     const w = wordCount(script);
     words += w;
-    records.push({ number: n, words: w, seconds: v.seconds, scriptSha256: sha256(script) });
+    records.push({ number: n, words: w, seconds: v.seconds, scriptSha256: sha256(script), frames: audioFramesOf(parseMp3(v.mp3)).length });
   }
   const mp3 = concatMp3(chapterAudio);
   const f = mp3Format(mp3);

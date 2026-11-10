@@ -2731,6 +2731,16 @@ function rawZip(entries) {
         eq(regenCharges.map((c) => [c.provider, c.operation, c.mode, c.metadata.approvalId]).sort(), [['anthropic', 'llm.workshop_regenerate', 'mock', g.approval.id], ['videogen', 'videogen.workshop_regenerate', 'mock', g.approval.id]], 'cargos por proveedor con approvalId (simulados = mock)');
         eq(ledger.settled.map((x) => x.key), [`workshop:approval:${g.approval.id}`], 'reserva liberada (todo cobrado y medido)');
         eq([p.combined.ok, p.combined.operations], [true, 1], 'plan combinado con el resultado cargado');
+        // Fix round 1 (P2-8): la prueba en seco combinada que corre CUALQUIER trabajo (acá, el de quitar/volver a proponer
+        // un ítem) reserva también la memoria de los resultados producidos que carga.
+        const seen = [];
+        const realMem = svc.withMemory;
+        svc.withMemory = function (k, b, ...rest) { seen.push([k, b]); return realMem.call(this, k, b, ...rest); };
+        try { await plan.setItemStatus(OWNER, sid, it.id, 'proposed'); await idle(); } finally { svc.withMemory = realMem; }
+        const sess = await svc.planSessionById(sid);
+        const base = Number(sess.originalSize) * SVC.diagnosisMemoryFactor(sess.container);
+        const mine = seen.filter(([k]) => k === `plan:${sid}`);
+        assert(mine.length >= 1 && mine.every(([, b]) => b >= base + 2 * it.params.result.bytes), `memoria del trabajo combinado = original + 2 × resultado (${JSON.stringify(mine)} vs ${base} + 2×${it.params.result.bytes})`);
         // Un servicio de aplicar propio (el compartido puede tener el carril ocupado por pruebas anteriores de espera de memoria).
         console.log(`   (carril del servicio de aplicar compartido: ${apply.lane ?? 'libre'} · cola ${apply.queue ? apply.queue.length : '?'} · muerto ${apply.dead})`);
         const apply10 = new APS.WorkshopApplyService(ds, storage, svc);
@@ -2800,23 +2810,55 @@ function rawZip(entries) {
       } finally { plan.regenProviders = realProviders; if (prev === undefined) delete process.env.FINOPS_PROVIDER_ALLOWLIST; else process.env.FINOPS_PROVIDER_ALLOWLIST = prev; }
     });
 
-    await check('W91 (B10) fuente de la BASE: el markdown y el Context Package del run (artifacts del curso identificado, mismo dueño) habilitan rehacer la práctica H5P v3; ajenos / deshabilitados no cuentan', async () => {
+    await check('W91 (B10 fix 1 P2-4) fuente de la BASE atada al run que armó el .mbz identificado (huella → dynamic_mbz vigente → su empaquetado del MISMO curso → runId): habilita rehacer la práctica H5P v3; otro run del curso, ajenos, deshabilitados u otro curso no cuentan', async () => {
       const res = await newIdentified('b10-fuente.mbz');
       const sid = res.session.id;
       const [own] = await ds.query(`select identified_course_id id from public.workshop_sessions where id = $1`, [sid]);
       assert(own && own.id, 'curso identificado');
       const inv = await svc.persistedInventory(sid);
       const ch1 = inv.chapters.find((c) => c.number === 1);
-      const md = `${'Este capítulo explica el punto de equilibrio con ejemplos del servicio diario y pasos concretos. '.repeat(20)}`;
+      // Tablas mínimas del generador (forma de staging) para atar la fuente al run.
+      await ds.query(`create table if not exists public.production_jobs (id uuid primary key default gen_random_uuid(), owner_id uuid, course_id integer, input_payload jsonb, status text, execution_mode text, worker_status text)`);
+      await ds.query(`create table if not exists public.generation_item_runs (id uuid primary key default gen_random_uuid(), job_id uuid, item_key text, status text, generation integer default 1, type text)`);
+      const md = `${'Este capítulo explica el punto de equilibrio con ejemplos del servicio diario y pasos concretos. '.repeat(40)}`;
+      const otherMd = `${'Versión de OTRO run del mismo curso (más nueva). '.repeat(80)}`;
       const cp = { contextPackageVersion: 1, chapterId: ch1.builderUuid, moduleId: 'm', course: { title: 'Curso', objective: null }, module: { title: 'M1', objective: null, summary: 'Resumen' }, chapter: { title: ch1.title, objective: null, concepts_introduced: ['equilibrio'], concepts_assumed: [], key_terms: ['equilibrio'] }, previous_chapter_summary: null, accumulated_concepts: [], next_chapter: null };
-      for (const [type, body, owner, status] of [['dynamic_content_md', md, OWNER.id, null], ['dynamic_context_package_json', JSON.stringify(cp), OWNER.id, null], ['dynamic_content_md', 'AJENO '.repeat(300), OTHER.id, null], ['dynamic_context_package_json', '{"x":1}', OWNER.id, 'disabled']]) {
+      const [run] = await ds.query(`insert into public.production_jobs (owner_id, course_id, input_payload, execution_mode, status) values ($1, $2, '{}'::jsonb, 'dynamic_generation', 'completed') returning id::text id`, [OWNER.id, own.id]);
+      const [run2] = await ds.query(`insert into public.production_jobs (owner_id, course_id, input_payload, execution_mode, status) values ($1, $2, '{}'::jsonb, 'dynamic_generation', 'completed') returning id::text id`, [OWNER.id, own.id]);
+      const [pkgJob] = await ds.query(`insert into public.production_jobs (owner_id, course_id, input_payload, status) values ($1, $2, $3::jsonb, 'completed') returning id::text id`, [OWNER.id, own.id, JSON.stringify({ runId: run.id, manifestId: 1, blueprintNumber: 1, packageKind: 'final' })]);
+      const art = async (type, body, owner, status, runId, ageSec) => {
         const sp = `${owner}/c/${crypto.randomUUID()}.txt`;
         objects.set(sp, Buffer.from(body));
-        await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, storage_bucket, chapter_id, status, created_at) values ($1, $2, $3, $4, 'cursia-artifacts', $5, $6, now() - ($7 || ' seconds')::interval)`, [owner, String(own.id), type, sp, ch1.builderUuid, status, status ? '0' : '10']);
-      }
+        const [g] = await ds.query(`insert into public.generation_item_runs (job_id, item_key, status, type) values ($1, $2, 'completed', $3) returning id::text id`, [runId, `${type}:${ch1.builderUuid}:${crypto.randomUUID().slice(0, 4)}`, type]);
+        await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, storage_bucket, chapter_id, status, item_run_id, created_at) values ($1, $2, $3, $4, 'cursia-artifacts', $5, $6, $7, now() - ($8 || ' seconds')::interval)`, [owner, String(own.id), type, sp, ch1.builderUuid, status, g.id, String(ageSec)]);
+      };
+      await art('dynamic_content_md', md, OWNER.id, null, run.id, 100);
+      await art('dynamic_context_package_json', JSON.stringify(cp), OWNER.id, null, run.id, 100);
+      await art('dynamic_content_md', otherMd, OWNER.id, null, run2.id, 1); // más nuevo, de OTRO run: no cuenta
+      await art('dynamic_content_md', 'AJENO '.repeat(600), OTHER.id, null, run.id, 0);
+      await art('dynamic_context_package_json', '{"x":1}', OWNER.id, 'disabled', run.id, 0);
+      const [mbz] = await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, job_id, status) values ($1, $2, 'dynamic_mbz', $3, $4, null) returning id::text id`, [OWNER.id, String(own.id), `${OWNER.id}/c/pkg.mbz`, pkgJob.id]);
       const s = await svc.planSessionById(sid);
-      const db = await plan.regenDbSources(s, inv);
-      assert(db && db.chapterMd.get(1) === md && db.contextPackage.get(1).chapterId === ch1.builderUuid, 'fuente del dueño, no la ajena ni la deshabilitada');
+      // La identificación del fixture apunta a su paquete (no v3): «lo más reciente del curso» ya no sirve de fuente.
+      let db = await plan.regenDbSources(s, inv);
+      assert(db && db.chapterMd.size === 0 && db.unavailable, `paquete no v3: ${JSON.stringify(db && db.unavailable)}`);
+      // Sin huella exacta (identificación sin artifact) → sin fuente de la base, con el motivo.
+      await ds.query(`update public.workshop_sessions set identification = identification #- '{result,matchedArtifactId}' where id = $1`, [sid]);
+      db = await plan.regenDbSources(s, inv);
+      assert(db && db.chapterMd.size === 0 && /huella exacta/.test(db.unavailable), `sin huella: ${JSON.stringify(db && db.unavailable)}`);
+      await ds.query(`update public.workshop_sessions set identification = jsonb_set(coalesce(identification, '{}'::jsonb), '{result,matchedArtifactId}', to_jsonb($2::text), true) where id = $1`, [sid, mbz.id]);
+      db = await plan.regenDbSources(s, inv);
+      assert(db && db.chapterMd.get(1) === md && db.contextPackage.get(1).chapterId === ch1.builderUuid && db.tiedTo.runId === run.id, `fuente del run del paquete (no la del otro run, ni ajena, ni deshabilitada): ${JSON.stringify(db && [db.unavailable, db.tiedTo, (db.chapterMd.get(1) || '').slice(0, 40)])}`);
+      // El empaquetado es de OTRO curso → no se ata.
+      await ds.query(`update public.production_jobs set course_id = course_id + 1000 where id = $1`, [pkgJob.id]);
+      db = await plan.regenDbSources(s, inv);
+      assert(db.chapterMd.size === 0 && /otro curso/.test(db.unavailable), `otro curso: ${db.unavailable}`);
+      await ds.query(`update public.production_jobs set course_id = course_id - 1000 where id = $1`, [pkgJob.id]);
+      // El .mbz identificado deshabilitado → no se ata.
+      await ds.query(`update public.artifacts set status = 'disabled' where id = $1`, [mbz.id]);
+      db = await plan.regenDbSources(s, inv);
+      assert(db.chapterMd.size === 0 && /deshabilitado/.test(db.unavailable), `deshabilitado: ${db.unavailable}`);
+      await ds.query(`update public.artifacts set status = null where id = $1`, [mbz.id]);
       const B = D('modules/course-workshop/plan/builder.js');
       const original = await svc.loadVerifiedOriginal(sid);
       const ctx = await B.openBuildCtx(original.buffer, { originalSha1: original.sha1, pricing: DRY.seedPricing() });
@@ -2827,6 +2869,12 @@ function rawZip(entries) {
       ctx.regenDbLoader = () => plan.regenDbSources(s, ctx.course);
       const con = await B.estimateContent(ctx, req);
       assert(con && con.kind === 'regenerate' && /Cursia/.test(con.regen.notes.join(' ')), `con la fuente: estimado (${JSON.stringify(con).slice(0, 200)})`);
+      // Sin atar (huella quitada) → la práctica no disponible CON el motivo del atado.
+      await ds.query(`update public.workshop_sessions set identification = identification #- '{result,matchedArtifactId}' where id = $1`, [sid]);
+      const ctx2 = await B.openBuildCtx(original.buffer, { originalSha1: original.sha1, pricing: DRY.seedPricing() });
+      ctx2.regenDbLoader = () => plan.regenDbSources(s, ctx2.course);
+      const no = await B.estimateContent(ctx2, req);
+      assert(no.unavailable && /huella exacta/.test(no.unavailable), `motivo visible: ${no.unavailable}`);
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

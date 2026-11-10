@@ -48,7 +48,7 @@ export function workshopExecutor(p: { providers: RegenProviders; gate: PaidCallG
     }
     attempt++;
     try {
-      const r = await paidCall(p.gate, { provider: 'anthropic', kind: `llm:${p.what}`, boundUsd: bound, attempt },
+      const r = await paidCall(p.gate, { provider: 'anthropic', kind: p.what, boundUsd: bound, attempt },
         () => p.providers.llm.messages({ model: m, system: sys, user: usr, maxTokens, ...(schema ? { schema } : {}) } as any),
         classifyAnthropic,
         (res, callId) => ({ costUsd: llmMeasuredUsd(p.pricing, res.model || m, res.usage), charge: llmChargeInput(p.gate.charge, callId, { model: res.model || m, messageId: res.messageId, usage: res.usage }, p.what), externalId: res.messageId }));

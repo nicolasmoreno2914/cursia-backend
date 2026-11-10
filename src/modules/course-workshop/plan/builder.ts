@@ -34,7 +34,7 @@ import {
 import { requiresItemConfirm, riskOf } from './risk';
 import { activityLabel, activityOf, chapterPlainText, inventorySummary } from './summary';
 import { ClarifyAnswer, InterpretedRequest, MisalignmentWarning, PLAN_LIMITS, PlanItemView, RequestOperation } from './types';
-import { isRegenOperation, ProducedRegen, RegenError, RegenerateOp } from '../regenerate/types';
+import { isRegenOperation, ProducedRegen, RegenError, RegenExternal, RegenerateOp } from '../regenerate/types';
 import type { PaidCallGate, RegenProviders } from '../regenerate/ports';
 import type { RegenDbSources } from '../regenerate/sources';
 import type { RegenPlannedCall } from '../regenerate/estimate';
@@ -602,16 +602,18 @@ const wid = (...xs: unknown[]) => createHash('sha1').update(JSON.stringify(xs)).
 async function estimateRegenItem(ctx: BuildCtx, req: InterpretedRequest): Promise<PlannedCall | { unavailable: string }> {
   const t = req.target;
   if (!t || t.kind !== 'activity') return { unavailable: 'destino inválido' };
-  const res = await resolveRegen({ course: ctx.course, read: regenReader(ctx), op: req.operation as any, moduleId: t.moduleId, instruction: req.instruction, audioTarget: req.details.audioTarget ?? null, db: await regenDbOf(ctx) });
+  const db = await regenDbOf(ctx);
+  const res = await resolveRegen({ course: ctx.course, read: regenReader(ctx), op: req.operation as any, moduleId: t.moduleId, instruction: req.instruction, audioTarget: req.details.audioTarget ?? null, db });
   if ('unavailable' in res) return res;
   let call: RegenPlannedCall;
   try {
-    call = regenEstimate(res, ctx.course, ctx.pricing, ctx.ttsModel ?? 'gpt-4o-mini-tts-2025-03-20');
+    call = regenEstimate(res, ctx.course, ctx.pricing, ctx.ttsModel ?? 'gpt-4o-mini-tts-2025-03-20', db);
   } catch (e) {
-    return { unavailable: `No se puede estimar el costo (precio faltante en el catálogo de FinOps): ${e instanceof Error ? e.message.slice(0, 200) : String(e)}. No se llama a ningún proveedor.` };
+    return { unavailable: `No se puede estimar el costo (${e instanceof Error ? e.message.slice(0, 200) : String(e)}). No se llama a ningún proveedor.` };
   }
   (call.regen as any).before = beforeFacts(res.target);
-  (call.regen as any).notes = res.notes;
+  // P1-2b: el plan dice cuándo la cota de un proveedor usa un margen mayor por un precio no verificado.
+  (call.regen as any).notes = [...res.notes, ...call.regen.providers.map((l) => l.note).filter((n): n is string => !!n)];
   (call.regen as any).target = { op: res.target.op, moduleId: res.target.moduleId, title: res.target.title };
   return call as unknown as PlannedCall;
 }
@@ -686,7 +688,7 @@ export interface PreparedRegenItem extends PreparedItem {
  * Produce (por la compuerta de la aprobación) → resultado validado → operación del motor → PRUEBA EN SECO sobre el
  * original → vista con antes/después verificable. Una falla nunca deja un ítem «listo» a medias.
  */
-export async function prepareRegenItem(ctx: BuildCtx, req: InterpretedRequest, deps: { providers: RegenProviders; gate: PaidCallGate; spent: () => string }, opts: { fromFinding?: boolean } = {}): Promise<PreparedRegenItem> {
+export async function prepareRegenItem(ctx: BuildCtx, req: InterpretedRequest, deps: { providers: RegenProviders; gate: PaidCallGate; spent: () => string; ext?: RegenExternal }, opts: { fromFinding?: boolean } = {}): Promise<PreparedRegenItem> {
   const t = req.target;
   const fail = (status: PreparedItem['status'], reason: string, code: string, retryable: boolean): PreparedRegenItem => ({ status, reason, view: null, spentUsd: deps.spent(), calls: 0, produced: null, failure: { code, retryable } });
   if (!t || t.kind !== 'activity' || !isRegenOperation(req.operation)) return fail('unavailable', 'destino inválido', 'unavailable', false);
@@ -694,12 +696,12 @@ export async function prepareRegenItem(ctx: BuildCtx, req: InterpretedRequest, d
   if ('unavailable' in res) return fail('unavailable', res.unavailable, 'unavailable', false);
   let produced: ProducedRegen;
   try {
-    produced = await produceRegen({ res, course: ctx.course, read: regenReader(ctx), providers: deps.providers, gate: deps.gate, pricing: ctx.pricing, db: await regenDbOf(ctx) });
+    produced = await produceRegen({ res, course: ctx.course, read: regenReader(ctx), providers: deps.providers, gate: deps.gate, pricing: ctx.pricing, db: await regenDbOf(ctx), ext: deps.ext });
   } catch (e) {
     if (!(e instanceof RegenError)) throw e;
     if (e.code === 'unavailable') return fail('unavailable', e.message, e.code, false);
     // tope / ambiguo / no enviado / proveedor sin configurar → el servicio corta la aprobación con el motivo.
-    if (e.code === 'cap_reached' || e.code === 'call_ambiguous' || e.code === 'not_sent' || e.code === 'provider_rejected' || e.code === 'provider_not_ready') throw e;
+    if (e.code === 'cap_reached' || e.code === 'call_ambiguous' || e.code === 'not_sent' || e.code === 'provider_rejected' || e.code === 'provider_not_ready' || e.code === 'over_bound') throw e;
     return fail('failed', `La regeneración no produjo un resultado válido: ${e.message} Lo gastado queda registrado; no se aplica nada.`, e.code, true);
   }
   const summary = { ...beforeFacts(res.target), before: beforeFacts(res.target), after: producedSummary(produced), ...(res.target.op === 'regenerate_audio' ? { chapters: res.target.chapters } : {}), ...(res.target.op === 'regenerate_video' ? { youtubeIdBefore: res.target.youtubeIdBefore, questionsBefore: res.target.questionsBefore } : {}) };

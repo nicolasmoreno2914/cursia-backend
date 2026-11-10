@@ -23,7 +23,17 @@
 //   L11 pregunta puntual con el ledger REAL: lo mismo con `question` / `llm.workshop_question`; una llamada ambigua deja la
 //       reserva PENDIENTE (aparece en la conciliación del admin con su tipo)
 //
-// Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js
+//   r107 B10 fix round 1 (P1-4) — la compuerta REAL (`regenGateFor`, no la copia del simulador):
+//   L14 tope por debajo de la cota de la 2.ª llamada → `cap_reached` ANTES de enviarla (0 envíos); aprobar una
+//       regeneración exige tope ≥ Σ cotas (409 CAP_BELOW_CALL_BOUND)
+//   L15 medido > cota → WORKSHOP_PROVIDER_OVER_BOUND: lo real queda en la aprobación y en el ledger, se cortan las
+//       llamadas que faltaban, el ítem falla visible
+//   L16 esperando al proveedor / ambigua sin conciliar → re-aprobar = 409 WORKSHOP_REGEN_PENDING_PROVIDER (el plan lo dice);
+//       el carril y la memoria se sueltan durante la espera; tras la conciliación del admin, se re-aprueba
+//   L17 espera retomada tras matar el proceso → el MISMO id externo, 1 solo envío
+//
+// Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js [--bite]
+//   --bite: copia dist/, quita `if (!d.allow)` de la compuerta real y verifica que L14 FALLA.
 'use strict';
 const fs = require('fs');
 const os = require('os');
@@ -43,8 +53,34 @@ const REAL_AI = { n: 0 };
 const { Logger } = require('@nestjs/common');
 Logger.overrideLogger(false);
 
+const oi = process.argv.indexOf('--only');
+const ONLY = oi > 0 ? process.argv[oi + 1] : null;
+if (process.argv.includes('--bite')) {
+  // Mordida (P1-4): sin `if (!d.allow)` la compuerta deja pasar la 2.ª llamada → L14 tiene que fallar.
+  const tmp = fs.mkdtempSync(path.join(REPO, '.r107-bite-')); // dentro del repo: resuelve node_modules
+  let code = 1;
+  try {
+    fs.cpSync(distRoot, tmp, { recursive: true });
+    const f = path.join(tmp, 'modules/course-workshop/plan/workshop-plan.service.js');
+    const src = fs.readFileSync(f, 'utf8');
+    // Solo el de la compuerta de la regeneración (`regenGateFor`); el de la IA del Taller (invokerFor, B5) no se toca.
+    const at = src.indexOf('regenGateFor(s, approval, simulated)');
+    const k = at < 0 ? -1 : src.indexOf('if (!d.allow)', at);
+    if (at < 0 || k < 0 || src.indexOf('if (!d.allow)', k + 1) >= 0) console.error('❌ mordida: no encontré un único «if (!d.allow)» dentro de regenGateFor');
+    else {
+      fs.writeFileSync(f, src.slice(0, k) + 'if (false)' + src.slice(k + 'if (!d.allow)'.length));
+      const r = spawnSync(process.execPath, [__filename, '--dist', tmp, '--only', 'L14'], { encoding: 'utf8', env: process.env, maxBuffer: 64 * 1024 * 1024 });
+      const out = (r.stdout || '') + (r.stderr || '');
+      const bit = r.status !== 0 && /❌ L14/.test(out);
+      console.log(bit ? '✅ mordida: sin `if (!d.allow)` L14 FALLA (la 2.ª llamada se envía por encima del tope)' : `❌ mordida: la mutación NO hizo fallar L14\n${out.slice(-2000)}`);
+      code = bit ? 0 : 1;
+    }
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  process.exit(code);
+}
+
 let passes = 0; let failures = 0;
-async function check(name, fn) { try { await fn(); passes++; console.log(`✅ ${name}`); } catch (err) { failures++; console.log(`❌ ${name}\n   ${err && err.stack ? err.stack.split('\n').slice(0, 6).join('\n   ') : err}`); } }
+async function check(name, fn) { if (ONLY && !name.startsWith(ONLY)) return; try { await fn(); passes++; console.log(`✅ ${name}`); } catch (err) { failures++; console.log(`❌ ${name}\n   ${err && err.stack ? err.stack.split('\n').slice(0, 6).join('\n   ') : err}`); } }
 const assert = (c, m) => { if (!c) throw new Error(m); };
 const eq = (a, b, m) => { const x = JSON.stringify(a); const y = JSON.stringify(b); if (x !== y) throw new Error(`${m}: esperado ${y}, encontrado ${x}`); };
 const near = (a, b, m) => assert(Math.abs(Number(a) - Number(b)) < 1e-6, `${m}: esperado ${b}, encontrado ${a}`);
@@ -417,7 +453,8 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       p.regenProviders = () => sim;
       const r = await approveIntake(p, quote);
       const plan0 = await p.getPlan({ id: U }, sid);
-      const it = plan0.items.find((i) => i.operation === op && i.stage === 'estimate');
+      // El ítem MÁS NUEVO de esta operación que espera generación (la sesión acumula los de las pruebas anteriores).
+      const it = plan0.items.filter((i) => i.operation === op && i.stage === 'estimate' && i.requestStatus === 'awaiting_generation' && i.quote === quote).pop();
       assert(it, `ítem en estimado: ${JSON.stringify(plan0.items.map((i) => [i.operation, i.stage]))}`);
       // Solo ESTE ítem (la sesión trae otros pedidos de L7–L11 esperando): su estimado y un tope que cubre sus cotas.
       const cap = Math.ceil(Math.max(Number(it.plannedCall.expectedUsd) * 1.5, Number(it.plannedCall.regen.totalBoundUsd)) * 100) / 100;
@@ -454,6 +491,139 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq([out.outcome, out.reconciled], ['charged_partial', true], 'conciliada');
       near(await net(r.key), 0.55, 'cuenta lo que Gamma cobró');
       eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+    // ── r107 B10 fix round 1 (P1-4): la compuerta REAL del servicio ──
+    const PO = L('modules/course-workshop/regenerate/ports.js');
+    const llmOk = (msg) => async () => ({ text: '{}', messageId: msg, model: 'claude-sonnet-4-6', usage: { input_tokens: 100, output_tokens: 100 }, stopReason: 'end_turn' });
+    const reqRow = async (p, itemId) => (await ds.query(`select r.* from public.workshop_requests r join public.workshop_plan_items i on i.request_id = r.id where i.id = $1`, [itemId]))[0];
+    const until = async (fn, what, ms = 10000) => { const t0 = Date.now(); for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timeout esperando ${what}`); await new Promise((r) => setTimeout(r, 20)); } };
+
+    await check('L14 (B10 P1-4) compuerta REAL: tope por debajo de la cota de la 2.ª llamada → cap_reached ANTES de enviarla (0 envíos a la 2.ª); aprobar una regeneración exige tope ≥ Σ cotas', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '2.00', reason: 'QA r107 B10 L14' });
+      const Q14 = 'Rehace el video del capítulo 1 (L14).';
+      const p = planFor(regenClient('regenerate_video', 1016, Q14));
+      const s = await svc.planSessionById(sid);
+      const ap0 = await p.openApproval(s, { id: U }, { kind: 'generate', estimate: p.estimateOf([], 'L14'), capUsd: '0.300000' });
+      await p.startApproval(ap0.id);
+      const gate = p.regenGateFor(s, await p.approvalOf(ap0.id), false);
+      await PO.paidCall(gate, { provider: 'anthropic', kind: 'scorm_room', boundUsd: '0.200000', attempt: 1 }, llmOk('msg_l14_1'), PO.classifyAnthropic, () => ({ costUsd: '0.150000', charge: null, externalId: 'msg_l14_1' }));
+      let sent2 = 0; let e = null;
+      try { await PO.paidCall(gate, { provider: 'anthropic', kind: 'scorm_room', boundUsd: '0.200000', attempt: 2 }, async () => { sent2++; return llmOk('msg_l14_2')(); }, PO.classifyAnthropic, () => ({ costUsd: '0.150000', charge: null })); } catch (x) { e = x; }
+      assert(e && e.code === 'cap_reached', `2.ª llamada: ${e && e.message}`);
+      eq(sent2, 0, '0 envíos a la 2.ª llamada');
+      const ap = await p.approvalOf(ap0.id);
+      eq(Object.values(ap.calls).map((c) => [c.kind, c.status]), [['anthropic:scorm_room', 'charged']], 'solo la 1.ª quedó registrada');
+      near(ap.spent_usd, 0.15, 'gastado = la 1.ª');
+      await p.closeApproval(ap0.id, 'stopped', 'L14');
+      near(await net(`workshop:approval:${ap0.id}`), 0, 'reserva liberada');
+      // P1-2a: tope ≥ estimado pero < Σ cotas de la regeneración → 409 (antes de reservar).
+      const r = await approveIntake(p, Q14);
+      const pl = await p.getPlan({ id: U }, sid);
+      const it = pl.items.filter((i) => i.operation === 'regenerate_video' && i.stage === 'estimate' && i.requestStatus === 'awaiting_generation' && i.quote === Q14).pop();
+      if (!it) throw new Error(`items: ${JSON.stringify(pl.items.map((i) => [i.operation, i.stage, i.requestStatus, i.status, i.quote]))} pending ${JSON.stringify(pl.pending.map((x) => [x.status, x.operation, x.reason]))} excl ${JSON.stringify(pl.excluded)}`);
+      const exp = Number(it.plannedCall.expectedUsd);
+      const cap = Math.ceil(exp * 101) / 100;
+      assert(cap < Number(it.plannedCall.regen.totalBoundUsd), `el caso: ${cap} < ${it.plannedCall.regen.totalBoundUsd}`);
+      eq(await errCode(p.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [it.id], confirmEstimateUsd: exp, capUsd: cap })), 'WORKSHOP_CAP_BELOW_CALL_BOUND', 'tope < Σ cotas → 409');
+      assert(r, 'intake');
+    });
+
+    await check('L15 (B10 P1-2c) medido > cota → WORKSHOP_PROVIDER_OVER_BOUND: lo real en la aprobación Y en el ledger; se cortan las llamadas que faltaban; el ítem falla visible', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '20.00', reason: 'QA r107 B10 L15' });
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false, videogenCost: 7.77, videogenJobId: 'vg_sim_l15' }); // id propio: el ledger es idempotente por job
+      const r = await regenPlan('regenerate_video', 1016, 'Rehace el video del capítulo 1 (L15).', sim);
+      const ap = await r.p.approvalOf(r.g.approval.id);
+      const cs = Object.values(ap.calls);
+      eq(cs.map((c) => [c.kind, c.status, c.costUsd, c.overBound === true]), [['videogen:render', 'charged', '7.77', true]], 'solo el render, cobrado con lo REAL y marcado');
+      assert(String(ap.stop_reason).startsWith('WORKSHOP_PROVIDER_OVER_BOUND'), `motivo: ${ap.stop_reason}`);
+      near(ap.spent_usd, 7.77, 'lo real en la aprobación');
+      eq([sim.calls.youtube.length, sim.calls.anthropic.length], [0, 0], 'ni YouTube ni IA después');
+      const [row] = await ds.query(`select amount::text a, provider from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [r.g.approval.id]);
+      eq([row.provider, Number(row.a)], ['videogen', 7.77], 'lo real en el ledger');
+      const req = await reqRow(r.p, r.it.id);
+      eq([req.status, req.details.lastError.code], ['failed', 'WORKSHOP_PROVIDER_OVER_BOUND'], 'el ítem falla visible');
+      eq(ap.status, 'failed', 'aprobación cerrada como fallida');
+      near(await net(r.key), 0, 'reserva liberada (todo con su cargo)');
+    });
+
+    await check('L16 (B10 P1-5) esperando al proveedor → re-aprobar 409 y el plan lo dice; carril y memoria sueltos; ambigua sin conciliar → 409; tras la conciliación del admin se re-aprueba', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '10.00', reason: 'QA r107 B10 L16' });
+      const simOpts = { simulated: false, videogenPendingPolls: 1e9, pollTimeoutMs: 60000 };
+      const sim = SIMLIB.simProviders(distRoot, simOpts);
+      const p = planFor(regenClient('regenerate_video', 1016, 'Rehace el video del capítulo 1 (L16).'));
+      p.regenProviders = () => sim;
+      await approveIntake(p, 'Rehace el video del capítulo 1 (L16).');
+      const pl = await p.getPlan({ id: U }, sid);
+      const it = pl.items.filter((i) => i.operation === 'regenerate_video' && i.stage === 'estimate' && i.requestStatus === 'awaiting_generation').pop();
+      const cap = Math.ceil(Math.max(Number(it.plannedCall.expectedUsd) * 1.5, Number(it.plannedCall.regen.totalBoundUsd)) * 100) / 100;
+      const g = await p.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it.plannedCall.expectedUsd), capUsd: cap });
+      const w = await until(async () => (await reqRow(p, it.id)).details.regenPending, 'la espera');
+      eq([w.provider, w.externalId, w.approvalId], ['videogen', 'vg_sim_1', g.approval.id], 'id externo guardado con la aprobación');
+      await until(async () => !p.laneBusy && svc.memoryReservations.size === 0, 'carril y memoria libres');
+      const v = await p.getPlan({ id: U }, sid);
+      eq([v.items.find((i) => i.id === it.id).providerWait.state, v.items.find((i) => i.id === it.id).providerWait.label], ['waiting_provider', 'esperando al proveedor'], 'el plan lo dice');
+      eq(await errCode(p.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it.plannedCall.expectedUsd), capUsd: cap })), 'WORKSHOP_REGEN_PENDING_PROVIDER', 'esperando → 409');
+      eq((await p.approvalOf(g.approval.id)).status, 'running', 'la aprobación sigue viva (reserva intacta)');
+      simOpts.videogenPendingPolls = 0; // el proveedor termina
+      await p.whenIdle();
+      const done = await p.getPlan({ id: U }, sid);
+      eq([done.items.find((i) => i.id === it.id).stage, done.items.find((i) => i.id === it.id).providerWait], ['ready', null], 'terminó: ítem listo');
+      eq([(await p.approvalOf(g.approval.id)).status, sim.calls.videogen.filter((c) => c.op === 'create').length], ['done', 1], 'cerrada con 1 envío');
+      // Ambigua (plazo total vencido sin estado final) → 409 hasta conciliar; conciliada → se re-aprueba.
+      const simT = SIMLIB.simProviders(distRoot, { simulated: false, fault: { videogenRender: 'timeout' }, pollTimeoutMs: 60 });
+      const r = await regenPlan('regenerate_video', 1016, 'Rehace el video del capítulo 1 (L16 ambiguo).', simT);
+      const rq = await reqRow(r.p, r.it.id);
+      eq([rq.status, rq.details.regenAmbiguous && rq.details.regenAmbiguous.externalId, (await r.p.approvalOf(r.g.approval.id)).status], ['awaiting_generation', 'vg_sim_1', 'ambiguous'], 'ambigua solo al vencer el plazo');
+      const v2 = await r.p.getPlan({ id: U }, sid);
+      const it2 = v2.items.find((i) => i.id === r.it.id);
+      eq(it2.providerWait && it2.providerWait.label, 'pendiente de conciliación', 'el plan lo dice');
+      const again = { itemIds: [r.it.id], confirmEstimateUsd: Number(r.it.plannedCall.expectedUsd), capUsd: Math.ceil(Math.max(Number(r.it.plannedCall.expectedUsd) * 1.5, Number(r.it.plannedCall.regen.totalBoundUsd)) * 100) / 100 };
+      eq(await errCode(r.p.approveGeneration({ id: U }, sid, v2.planId, again)), 'WORKSHOP_REGEN_PENDING_PROVIDER', 'ambigua sin conciliar → 409');
+      await ctl.reconcileWorkshopReservation({ reservationKey: r.key, outcome: 'not_charged', reason: 'Videogen no muestra el render' }, saUser);
+      const simOk = SIMLIB.simProviders(distRoot, { simulated: false });
+      r.p.regenProviders = () => simOk;
+      const g2 = await r.p.approveGeneration({ id: U }, sid, v2.planId, again);
+      await r.p.whenIdle();
+      eq([(await r.p.approvalOf(g2.approval.id)).status, (await r.p.getPlan({ id: U }, sid)).items.find((i) => i.id === r.it.id).stage], ['done', 'ready'], 'conciliada → re-aprobada y producida');
+    });
+
+    await check('L17 (B10 P1-3) espera RETOMADA tras matar el proceso (pm2 reload): el mismo id externo, 1 solo envío, el ítem termina', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '10.00', reason: 'QA r107 B10 L17' });
+      const simOpts = { simulated: false, videogenPendingPolls: 1e9, pollTimeoutMs: 60000 };
+      const sim = SIMLIB.simProviders(distRoot, simOpts);
+      const svcA = new SVC.CourseWorkshopService(ds, storage, null);
+      const A = new PLS.WorkshopPlanService(ds, storage, svcA, ledger, budget, regenClient('regenerate_video', 1016, 'Rehace el video del capítulo 1 (L17).'));
+      A.pricingLoader = async () => DRY.seedPricing();
+      A.regenProviders = () => sim;
+      await approveIntake(A, 'Rehace el video del capítulo 1 (L17).');
+      const pl = await A.getPlan({ id: U }, sid);
+      const it = pl.items.filter((i) => i.operation === 'regenerate_video' && i.stage === 'estimate' && i.requestStatus === 'awaiting_generation').pop();
+      const cap = Math.ceil(Math.max(Number(it.plannedCall.expectedUsd) * 1.5, Number(it.plannedCall.regen.totalBoundUsd)) * 100) / 100;
+      const g = await A.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it.plannedCall.expectedUsd), capUsd: cap });
+      const w = await until(async () => (await reqRow(A, it.id)).details.regenPending, 'la espera de A');
+      await until(async () => sim.calls.videogen.some((c) => c.op === 'status'), 'A consultando');
+      A.simulateDeathForTests(); // pm2 reload: A deja de latir y de consultar
+      await A.whenIdle();
+      // El reclamo de A deja de latir: pasado el umbral de latido, otro proceso lo retoma.
+      await ds.query(`update public.workshop_requests set updated_at = now() - interval '2 minutes' where id = (select request_id from public.workshop_plan_items where id = $1)`, [it.id]);
+      await ds.query(`update public.workshop_ai_approvals set updated_at = now() - interval '2 minutes' where id = $1`, [g.approval.id]);
+      simOpts.videogenPendingPolls = 0;
+      const svcB = new SVC.CourseWorkshopService(ds, storage, null);
+      assert(svcB.bootId !== svcA.bootId, 'otro arranque');
+      const B = new PLS.WorkshopPlanService(ds, storage, svcB, ledger, budget, regenClient('regenerate_video', 1016, 'x'));
+      B.pricingLoader = async () => DRY.seedPricing();
+      B.regenProviders = () => sim;
+      await B.sweep();
+      await B.whenIdle();
+      const creates = sim.calls.videogen.filter((c) => c.op === 'create');
+      eq(creates.length, 1, '1 solo envío a Videogen');
+      eq([...new Set(sim.calls.videogen.filter((c) => c.op === 'status').map((c) => c.jobId))], [w.externalId], 'A y B consultaron el MISMO id externo');
+      const rq = await reqRow(B, it.id);
+      assert(!rq.details.regenPending && String(rq.claim_id || '').startsWith(`${svcB.bootId}.`), `retomada por B: ${JSON.stringify([rq.status, rq.claim_id])}`);
+      const ap = await B.approvalOf(g.approval.id);
+      eq([ap.status, Object.values(ap.calls).map((c) => [c.kind, c.status]).sort()], ['done', [['anthropic:video_interactions', 'charged'], ['videogen:render', 'charged'], ['youtube:upload', 'charged']]], 'liquidada y terminada por B');
+      eq((await B.getPlan({ id: U }, sid)).items.find((i) => i.id === it.id).stage, 'ready', 'ítem listo');
+      near(await net(`workshop:approval:${g.approval.id}`), 0, 'reserva liberada');
     });
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }

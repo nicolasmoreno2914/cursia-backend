@@ -14,16 +14,16 @@ import type { DryRunPricing } from '../../pedagogy/dry-run';
 import type { WorkshopCourse } from '../course-model';
 import { buildVideoActivity, videoScenesFromVideogen } from '../../../package/h5p/interactive-video';
 import { durationFromVideogenStatus, parseMp4DurationSec } from '../../../workers/video-duration';
-import { isJobCompleted, isJobFailed } from '../../../video-engine/videogen.service';
+import { VideogenBatchJob, isJobCompleted } from '../../../video-engine/videogen.service';
+import { pollUntilFinal, settleVideogenJob, videogenFinal } from './async-wait';
 import { cleanAudioText } from '../../../workers/provider-real/audio-scripts';
 import { workshopExecutor } from './executor';
-import { PaidCallGate, RegenProviders, classifySubmission, paidCall, videogenBoundUsd, videogenCatalogUsd, videogenChargeInputOf } from './ports';
+import { PaidCallGate, RegenProviders, classifySubmission, paidCall, videogenBound } from './ports';
 import { courseContextOf } from './scorm';
 import type { RegenDbSources } from './sources';
-import { ProducedRegen, RegenError, RegenTarget } from './types';
+import { ProducedRegen, RegenDeferred, RegenError, RegenExternal, RegenPrior, RegenTarget, inlineExternal } from './types';
 
 type VideoTarget = Extract<RegenTarget, { op: 'regenerate_video' }>;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Preguntas de un contenido H5P.InteractiveVideo y cuántas tienen EXACTAMENTE una respuesta correcta. */
 export function videoQuestionStats(content: any): { questions: number; singleCorrect: number } {
@@ -41,7 +41,7 @@ export function videoQuestionStats(content: any): { questions: number; singleCor
   return { questions: q, singleCorrect: ok };
 }
 
-export async function produceVideo(a: { target: VideoTarget; course: WorkshopCourse; providers: RegenProviders; gate: PaidCallGate; pricing: DryRunPricing; db: RegenDbSources | null; chapterMd: string }): Promise<ProducedRegen> {
+export async function produceVideo(a: { target: VideoTarget; course: WorkshopCourse; providers: RegenProviders; gate: PaidCallGate; pricing: DryRunPricing; db: RegenDbSources | null; chapterMd: string; ext?: RegenExternal }): Promise<ProducedRegen> {
   const t = a.target;
   const P = a.providers;
   const notReady = await P.youtube.ready();
@@ -49,38 +49,51 @@ export async function produceVideo(a: { target: VideoTarget; course: WorkshopCou
   if (P.config.missing.some((m) => /VIDEOGEN/.test(m))) throw new RegenError('provider_not_ready', `Falta la configuración del Video Engine (${P.config.missing.filter((m) => /VIDEOGEN/.test(m)).join(', ')}): no se pagó nada.`);
   const chapterId = a.course.chapters.find((c) => c.number === t.chapterNumber)?.builderUuid ?? `workshop-${t.moduleId}`;
 
-  // ── 2. render (envío → aceptado → espera → costo medido) ──
-  const ticket = await a.gate.begin({ provider: 'videogen', kind: 'videogen:render', boundUsd: videogenBoundUsd(a.pricing), attempt: 1 });
+  // ── 2. render (envío → aceptado → espera → costo medido). P2-3: un render YA pagado se reusa, nunca se re-renderiza ──
+  const ext = a.ext ?? inlineExternal();
+  const prior: RegenPrior = { ...ext.prior };
+  const words = a.chapterMd.split(/\s+/).filter(Boolean).length;
+  const bound = videogenBound(a.pricing, words);
   let jobId: string;
-  try {
-    ({ jobId } = await P.videogen.create({
-      title: t.chapterTitle, content_txt: cleanAudioText(a.chapterMd), chapter_number: t.chapterNumber,
-      client_reference_id: `workshop:${a.gate.charge.approvalId}:${t.moduleId}`,
-      tts_voice: P.config.ttsVoice, external_metadata: { tts_model: P.config.ttsModel, source: 'course_workshop' },
-    }));
-  } catch (err) {
-    throw await ticket.failed(err, classifySubmission(err));
-  }
-  await ticket.accepted(jobId);
-  const t0 = Date.now();
-  let job;
-  for (;;) {
+  let job: VideogenBatchJob;
+  if (prior.videogen?.jobId && prior.videogen.charged) {
+    jobId = prior.videogen.jobId;
+    // Consulta gratuita del render ya pagado (sin reenviar ni cobrar).
     try {
-      job = await P.videogen.status(jobId);
-    } catch (err) {
-      throw await ticket.failed(err, 'ambiguous');
+      job = await pollUntilFinal({ fetch: () => P.videogen.status(jobId), isFinal: videogenFinal, intervalMs: P.poll.intervalMs, deadlineAt: Date.now() + P.poll.timeoutMs, what: `el render ${jobId}` });
+    } catch (e) {
+      throw new RegenError('invalid_result', `No se pudo consultar el render ya pagado ${jobId}: ${e instanceof Error ? e.message : String(e)}. No se re-renderiza.`);
     }
-    if (isJobCompleted(job.status) || isJobFailed(job.status)) break;
-    if (Date.now() - t0 > P.poll.timeoutMs) throw await ticket.failed(new Error(`el render ${jobId} no terminó en ${Math.round(P.poll.timeoutMs / 1000)} s`), 'ambiguous');
-    await sleep(P.poll.intervalMs);
+    if (!isJobCompleted(job.status)) throw new RegenError('invalid_result', `El render ya pagado ${jobId} no está listo (${job.status}). No se re-renderiza.`);
+  } else if (prior.videogen?.jobId) {
+    // Aceptado pero sin liquidar: la espera es del trabajo aparte (nunca un segundo envío).
+    throw new RegenDeferred({ provider: 'videogen', externalId: prior.videogen.jobId, callId: prior.videogen.callId ?? '', boundUsd: bound.boundUsd, kind: 'render' });
+  } else {
+    const ticket = await a.gate.begin({ provider: 'videogen', kind: 'render', boundUsd: bound.boundUsd, attempt: 1 });
+    try {
+      ({ jobId } = await P.videogen.create({
+        title: t.chapterTitle, content_txt: cleanAudioText(a.chapterMd), chapter_number: t.chapterNumber,
+        client_reference_id: `workshop:${a.gate.charge.approvalId}:${t.moduleId}`,
+        tts_voice: P.config.ttsVoice, external_metadata: { tts_model: P.config.ttsModel, source: 'course_workshop' },
+      }));
+    } catch (err) {
+      // El envío inicial falló: sin respuesta → ambiguo; rechazo documentado → sin cobro.
+      throw await ticket.failed(err, classifySubmission(err));
+    }
+    await ticket.accepted(jobId);
+    prior.videogen = { jobId, charged: false, callId: ticket.id, approvalId: a.gate.charge.approvalId };
+    await ext.onPaid({ ...prior });
+    if (ext.mode === 'defer') throw new RegenDeferred({ provider: 'videogen', externalId: jobId, callId: ticket.id, boundUsd: bound.boundUsd, kind: 'render' });
+    try {
+      job = await pollUntilFinal({ fetch: () => P.videogen.status(jobId), isFinal: videogenFinal, intervalMs: P.poll.intervalMs, deadlineAt: Date.now() + P.poll.timeoutMs, what: `el render ${jobId}` });
+    } catch (e) {
+      // Solo el plazo TOTAL vencido sin estado final es ambiguo (los errores de consulta se reintentaron).
+      throw await ticket.failed(e, 'ambiguous');
+    }
+    await settleVideogenJob({ ticket, job, jobId, boundUsd: bound.boundUsd, providers: P, charge: a.gate.charge });
+    prior.videogen = { ...prior.videogen, charged: true };
+    await ext.onPaid({ ...prior });
   }
-  if (isJobFailed(job.status)) {
-    // Un render fallido pudo cobrarse (Videogen informa el costo aparte): ambiguo, nunca un reenvío automático.
-    throw await ticket.failed(new Error(`Videogen: el render ${jobId} falló (${job.error ?? 'sin detalle'})`), 'ambiguous');
-  }
-  let cost: number | null = null;
-  try { cost = await P.videogen.cost(jobId); } catch { cost = null; }
-  await ticket.charged({ costUsd: cost !== null && Number.isFinite(cost) ? String(cost) : videogenCatalogUsd(a.pricing), charge: videogenChargeInputOf(a.gate.charge, ticket.id, { jobId, cost }), externalId: jobId });
   if (!job.download_url) throw new RegenError('invalid_result', `Videogen terminó el render ${jobId} sin la URL del video.`);
   let durationSec = durationFromVideogenStatus(job);
   if (durationSec === null) {
@@ -92,10 +105,18 @@ export async function produceVideo(a: { target: VideoTarget; course: WorkshopCou
   const script = scenes ? scenes.map((s) => s.narration).join('\n') : '';
 
   // ── 3. YouTube (USD 0: cuota de la cuenta) ──
-  const up = await paidCall(a.gate, { provider: 'youtube', kind: 'youtube:upload', boundUsd: '0', attempt: 1 },
-    () => P.youtube.upload({ videoUrl: job.download_url as string, title: t.chapterTitle }), classifySubmission,
-    (r) => ({ costUsd: '0', charge: null, externalId: r.videoId }));
-  if (!/^[A-Za-z0-9_-]{11}$/.test(up.videoId)) throw new RegenError('invalid_result', 'YouTube devolvió un id de video inválido.');
+  // P2-3: el video ya publicado se reusa (nunca un video huérfano ni una segunda subida).
+  let up: { videoId: string };
+  if (prior.youtube?.videoId) {
+    up = { videoId: prior.youtube.videoId };
+  } else {
+    up = await paidCall(a.gate, { provider: 'youtube', kind: 'upload', boundUsd: '0', attempt: 1 },
+      () => P.youtube.upload({ videoUrl: job.download_url as string, title: t.chapterTitle }), classifySubmission,
+      (r) => ({ costUsd: '0', charge: null, externalId: r.videoId }));
+    if (!/^[A-Za-z0-9_-]{11}$/.test(up.videoId)) throw new RegenError('invalid_result', 'YouTube devolvió un id de video inválido.');
+    prior.youtube = { videoId: up.videoId };
+    await ext.onPaid({ ...prior });
+  }
 
   // ── 4. preguntas desde el guion nuevo (generador existente) ──
   const ex = workshopExecutor({ providers: P, gate: a.gate, pricing: a.pricing, what: 'video_interactions', texts: new Map([['ws-md', a.chapterMd]]), ownerId: a.gate.charge.payer });

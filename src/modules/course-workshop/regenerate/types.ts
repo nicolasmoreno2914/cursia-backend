@@ -90,7 +90,7 @@ export type ProducedRegen =
     kind: 'audio'; moduleId: number; audio: 'welcome' | 'audiobook'; mp3: Buffer; durationSec: number;
     bitrateKbps: number | null; channels: number | null;
     /** Audiolibro: un registro por capítulo narrado (número, palabras del guion, segundos). Bienvenida: []. */
-    chapters: Array<{ number: number; words: number; seconds: number; scriptSha256: string }>;
+    chapters: Array<{ number: number; words: number; seconds: number; scriptSha256: string; frames?: number }>;
     scriptWords: number;
   };
 
@@ -114,11 +114,46 @@ export interface RegenerateOp {
 /** Errores tipados de la producción (motivo en español). */
 export type RegenErrorCode =
   | 'unavailable' | 'invalid_result' | 'cap_reached' | 'call_ambiguous' | 'provider_rejected' | 'provider_not_ready'
-  | 'not_sent' | 'source_missing' | 'internal';
+  | 'not_sent' | 'source_missing' | 'internal' | 'over_bound';
 
 export class RegenError extends Error {
   constructor(readonly code: RegenErrorCode, message: string, readonly extra: Record<string, unknown> = {}) {
     super(message);
     this.name = 'RegenError';
   }
+}
+
+/** Fix round 1 (P1-2c): lo medido de una llamada superó su cota → incidente; código visible del ítem. */
+export const PROVIDER_OVER_BOUND = 'WORKSHOP_PROVIDER_OVER_BOUND';
+
+/**
+ * Fix round 1 (P1-3/P1-5): el proveedor ACEPTÓ un pedido asíncrono (render de Videogen, generación de Gamma) y la espera
+ * sigue como trabajo aparte (claim + latido, reanudable). La producción se corta acá: el servicio guarda el id externo,
+ * suelta el carril y la memoria, y retoma con `RegenPrior` cuando el proveedor termina.
+ */
+export class RegenDeferred extends Error {
+  constructor(readonly wait: { provider: 'videogen' | 'gamma'; externalId: string; callId: string; boundUsd: string; kind: string }) {
+    super(`esperando a ${wait.provider} (${wait.externalId})`);
+    this.name = 'RegenDeferred';
+  }
+}
+
+/** Fix round 1 (P2-3): lo YA pagado de una regeneración (se reusa en el reintento; nunca se vuelve a pagar). */
+export interface RegenPrior {
+  videogen?: { jobId: string; charged: boolean; callId?: string | null; approvalId?: string | null } | null;
+  youtube?: { videoId: string } | null;
+  gamma?: { generationId: string; charged: boolean; callId?: string | null; approvalId?: string | null } | null;
+}
+
+/** Cómo se esperan los proveedores asíncronos: en línea (pruebas puras) o diferida (servicio). */
+export interface RegenExternal {
+  mode: 'inline' | 'defer';
+  prior: RegenPrior;
+  /** Guarda lo pagado apenas existe (id externo, video de YouTube). */
+  onPaid(p: RegenPrior): Promise<void>;
+}
+
+/** Espera en línea sin nada previo (pruebas puras / llamadas directas). */
+export function inlineExternal(prior: RegenPrior = {}): RegenExternal {
+  return { mode: 'inline', prior, onPaid: async () => undefined };
 }

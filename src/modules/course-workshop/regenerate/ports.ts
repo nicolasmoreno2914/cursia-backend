@@ -72,7 +72,7 @@ export interface RegenProviders {
 
 export interface PaidCallSpec {
   provider: RegenProvider;
-  /** Qué se paga (p. ej. `llm:scorm_room`, `tts:chunk`, `gamma:generate`, `videogen:render`, `youtube:upload`). */
+  /** Qué se paga (sin el proveedor: `scorm_room`, `chunk`, `generate`, `render`, `upload`; el registro queda `<proveedor>:<qué>`). */
   kind: string;
   /** Cota USD de ESTA llamada (lo máximo que puede costar): la guarda del tope la usa antes de llamar. */
   boundUsd: string;
@@ -186,16 +186,56 @@ export function ttsBoundUsd(pricing: DryRunPricing, model: string, chars: number
 export function ttsMeasuredUsd(pricing: DryRunPricing, model: string, seconds: number): string {
   return PRICE(pricing, 'openai', 'audio.speech', model, { audio_seconds: (Math.round(seconds * 1000) / 1000).toFixed(3) });
 }
-export function gammaBoundUsd(pricing: DryRunPricing): string {
-  return PRICE(pricing, 'gamma', 'generations', 'gamma-generate', { gamma_credit: Math.ceil(GAMMA_CREDITS_P90 * REGEN_PROVIDER_MARGIN) });
+/**
+ * Fix round 1 (P1-2b): las cotas de los proveedores asíncronos salen de LO QUE SE PIDE y del catálogo. Un precio que el
+ * catálogo marca `observed` / `placeholder` (no publicado por el proveedor) lleva un margen MAYOR y el plan lo dice.
+ */
+export const REGEN_UNVERIFIED_PRICE_MARGIN = 2;
+/** Tarjetas que se piden a Gamma (gammaGenerationBody → numCards) y el máximo de créditos por tarjeta que se cuenta. */
+export const GAMMA_MAX_CREDITS_PER_CARD = 15;
+/** Duración máxima que se cuenta para un render de Videogen (minutos): ~120 palabras narradas por minuto + 1, tope 30. */
+export const VIDEO_WORDS_PER_MINUTE = 120;
+export const VIDEO_MAX_MINUTES = 30;
+
+function catalogRow(pricing: DryRunPricing, provider: string, product: string, meter: string): { source: string | null } | null {
+  const r = (pricing.catalog as unknown as Array<Record<string, any>>).find((x) => x.provider === provider && (x.product_or_model ?? x.product) === product && x.meter === meter && !x.effective_to);
+  return r ? { source: typeof r.source === 'string' ? r.source : null } : null;
 }
+const unverified = (src: string | null | undefined) => src === 'observed' || src === 'placeholder';
+export interface ProviderBound { boundUsd: string; note: string | null }
+
+export function gammaBound(pricing: DryRunPricing, numCards: number): ProviderBound {
+  const row = catalogRow(pricing, 'gamma', 'gamma-generate', 'gamma_credit');
+  const margin = unverified(row?.source) ? REGEN_UNVERIFIED_PRICE_MARGIN : REGEN_PROVIDER_MARGIN;
+  const credits = Math.ceil(Math.max(1, numCards) * GAMMA_MAX_CREDITS_PER_CARD * margin);
+  return {
+    boundUsd: PRICE(pricing, 'gamma', 'generations', 'gamma-generate', { gamma_credit: credits }),
+    note: unverified(row?.source) ? `El precio de Gamma del catálogo es «${row?.source}» (no publicado): la cota cuenta ${numCards} tarjeta(s) × ${GAMMA_MAX_CREDITS_PER_CARD} créditos × ${margin} de margen.` : null,
+  };
+}
+export function gammaBoundUsd(pricing: DryRunPricing, numCards = 10): string { return gammaBound(pricing, numCards).boundUsd; }
 export function gammaMeasuredUsd(pricing: DryRunPricing, credits: number): string {
   return PRICE(pricing, 'gamma', 'generations', 'gamma-generate', { gamma_credit: credits });
 }
-export function videogenBoundUsd(pricing: DryRunPricing): string {
-  const one = Number(PRICE(pricing, 'videogen', 'render', 'video', { video_render: 1 }));
-  return (Math.ceil(one * REGEN_PROVIDER_MARGIN * 100) / 100).toFixed(6);
+/** Minutos máximos que se cuentan para el video de un texto de `words` palabras. */
+export function videoMaxMinutes(words: number): number {
+  return Math.min(VIDEO_MAX_MINUTES, Math.ceil(Math.max(0, words) / VIDEO_WORDS_PER_MINUTE) + 1);
 }
+export function videogenBound(pricing: DryRunPricing, words: number): ProviderBound {
+  const minutes = videoMaxMinutes(words);
+  const perMin = catalogRow(pricing, 'videogen', 'video', 'video_minute');
+  const perRender = catalogRow(pricing, 'videogen', 'video', 'video_render');
+  const src = perMin ? perMin.source : perRender?.source;
+  const margin = unverified(src) ? REGEN_UNVERIFIED_PRICE_MARGIN : REGEN_PROVIDER_MARGIN;
+  const base = perMin ? Number(PRICE(pricing, 'videogen', 'render', 'video', { video_minute: minutes })) : Number(PRICE(pricing, 'videogen', 'render', 'video', { video_render: 1 }));
+  return {
+    boundUsd: (Math.ceil(base * margin * 100) / 100).toFixed(6),
+    note: perMin
+      ? (unverified(src) ? `El precio por minuto de Videogen del catálogo es «${src}»: la cota cuenta ${minutes} min × ${margin} de margen.` : null)
+      : `El catálogo de Videogen cobra por render (no por minuto; el video de este texto dura hasta ~${minutes} min)${unverified(src) ? ` y su precio es «${src}»` : ''}: la cota cuenta 1 render × ${margin} de margen.`,
+  };
+}
+export function videogenBoundUsd(pricing: DryRunPricing, words = 0): string { return videogenBound(pricing, words).boundUsd; }
 export function videogenCatalogUsd(pricing: DryRunPricing): string {
   return PRICE(pricing, 'videogen', 'render', 'video', { video_render: 1 });
 }

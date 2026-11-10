@@ -27,9 +27,19 @@ export interface RegenDbSources {
   chapterMd: Map<number, string>;
   contextPackage: Map<number, unknown>;
   courseContext: Record<string, unknown> | null;
+  /** Fix round 1 (P2-4): el empaquetado al que se ató la fuente (el que armó el `.mbz` identificado). */
+  tiedTo?: { artifactId: string; jobId: string; runId: string } | null;
+  /** Por qué NO hay fuente de la base para este paquete (no se pudo atar al empaquetado que lo armó). */
+  unavailable?: string | null;
 }
 
-export const SOURCE_MIN_WORDS = 120;
+/**
+ * Fix round 1 (P2-5): mínimo de palabras de la fuente de UN capítulo. El piso del audiolibro r19 (25 min) equivale a
+ * AUDIOBOOK_FLOOR_SOURCE_WORDS ≈ 4148 palabras de fuente para todo el curso (≈ 461 por capítulo en el curso típico de 9);
+ * 400 deja fuera los «capítulos» que en realidad son una etiqueta o un resumen (antes 120) y queda por encima del bloque
+ * mínimo del guion (AUDIOBOOK_CHUNK_MIN_WORDS = 250). El piso total del audiolibro se exige aparte (resolveRegen).
+ */
+export const SOURCE_MIN_WORDS = 400;
 const words = (s: string) => (s.match(/[\p{L}\p{N}]+/gu) || []).length;
 
 /** HTML → markdown simple (títulos `##`, párrafos y listas): suficiente para el guion y los prompts. */

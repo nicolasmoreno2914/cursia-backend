@@ -6,13 +6,15 @@
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import type { WorkshopCourse } from '../course-model';
 import { produceAudio, welcomeTextOf } from './audio';
+import { AUDIOBOOK_FLOOR_MINUTES, AUDIOBOOK_FLOOR_SOURCE_WORDS, AUDIOBOOK_TARGET_RATIO, AUDIOBOOK_WPM_REF } from '../../../package/audio/audiobook-policy';
 import { RegenPlannedCall, estimateRegen } from './estimate';
 import { produceGamma } from './gamma';
+import { regenLlmSizes } from './llm-sizes';
 import { PaidCallGate, RegenProviders } from './ports';
 import { producePracticeH5p, produceScormV2 } from './scorm';
 import { ChapterSource, ORIGIN_ES, RegenDbSources, chapterSources } from './sources';
 import { Reader, RegenTargetInput, regenTargetOf } from './target';
-import { ProducedRegen, RegenError, RegenOperation, RegenTarget } from './types';
+import { ProducedRegen, RegenError, RegenExternal, RegenOperation, RegenTarget } from './types';
 import { produceVideo } from './video';
 
 /** Modelo de IA del generador (DYN_GENERATION_MODEL del ejecutor y default del guion del audiolibro): lo fija Cursia. */
@@ -48,7 +50,15 @@ export async function resolveRegen(i: RegenTargetInput & { db: RegenDbSources | 
       : `No hay texto del capítulo ${missing.join(', ')} (ni en Cursia ni en el paquete) para rehacerlo.` };
   }
   if (t.op === 'regenerate_scorm' && t.engine === 'h5p_practice' && !i.db?.contextPackage.get(t.chapterNumber)) {
-    return { unavailable: 'La práctica H5P de este curso se arma con el Context Package del capítulo guardado en Cursia, y no está disponible (curso sin identificar o sin su fuente): no se puede rehacer.' };
+    return { unavailable: `La práctica H5P de este curso se arma con el Context Package del capítulo guardado en Cursia, y no está disponible (${i.db?.unavailable ? i.db.unavailable.replace(/\.$/, '') : 'curso sin identificar o sin su fuente'}): no se puede rehacer.` };
+  }
+  // Fix round 1 (P2-5): el audiolibro COMPLETO tiene el piso del dueño (r19: ≥ 25 min) ANTES de pagar nada.
+  if (t.op === 'regenerate_audio' && t.audio === 'audiobook') {
+    const total = sources.reduce((a, s) => a + s.words, 0);
+    if (total < AUDIOBOOK_FLOOR_SOURCE_WORDS) {
+      const minutes = Math.floor((total * AUDIOBOOK_TARGET_RATIO / AUDIOBOOK_WPM_REF) * 10) / 10;
+      return { unavailable: `El texto de los ${sources.length} capítulo(s) (${total} palabras) da un audiolibro de ~${minutes} min, por debajo del mínimo de ${AUDIOBOOK_FLOOR_MINUTES} min (hacen falta al menos ${AUDIOBOOK_FLOOR_SOURCE_WORDS} palabras de fuente): no se paga un audiolibro corto.` };
+    }
   }
   if (t.op === 'regenerate_audio' && t.audio === 'welcome' && !welcomeTextOf(i.course)) return { unavailable: 'El curso no tiene un texto de bienvenida para narrar.' };
   const notes: string[] = [];
@@ -61,12 +71,13 @@ export async function resolveRegen(i: RegenTargetInput & { db: RegenDbSources | 
   return { target: t, expect: r.expect, sources, notes };
 }
 
-export function regenEstimate(res: RegenResolved, course: WorkshopCourse, pricing: DryRunPricing, ttsModel: string): RegenPlannedCall {
-  return estimateRegen(res.target, { pricing, llmModel: REGEN_LLM_MODEL, ttsModel, sources: res.sources, welcomeChars: res.target.op === 'regenerate_audio' && res.target.audio === 'welcome' ? (welcomeTextOf(course)?.length ?? null) : null });
+export function regenEstimate(res: RegenResolved, course: WorkshopCourse, pricing: DryRunPricing, ttsModel: string, db: RegenDbSources | null = null): RegenPlannedCall {
+  const llmSizes = regenLlmSizes(res.target, { course, db, sources: res.sources });
+  return estimateRegen(res.target, { pricing, llmModel: REGEN_LLM_MODEL, ttsModel, sources: res.sources, llmSizes, welcomeChars: res.target.op === 'regenerate_audio' && res.target.audio === 'welcome' ? (welcomeTextOf(course)?.length ?? null) : null });
 }
 
 /** Produce el resultado (gasta por la compuerta). Lanza RegenError con el motivo; nunca devuelve algo a medias. */
-export async function produceRegen(a: { res: RegenResolved; course: WorkshopCourse; read: Reader; providers: RegenProviders; gate: PaidCallGate; pricing: DryRunPricing; db: RegenDbSources | null }): Promise<ProducedRegen> {
+export async function produceRegen(a: { res: RegenResolved; course: WorkshopCourse; read: Reader; providers: RegenProviders; gate: PaidCallGate; pricing: DryRunPricing; db: RegenDbSources | null; ext?: RegenExternal }): Promise<ProducedRegen> {
   const t = a.res.target;
   const md = (n: number) => a.res.sources.find((s) => s.number === n)?.md ?? '';
   switch (t.op) {
@@ -78,8 +89,8 @@ export async function produceRegen(a: { res: RegenResolved; course: WorkshopCour
       if (!cur) throw new RegenError('unavailable', 'La práctica actual no trae su .h5p.');
       return producePracticeH5p({ target: t, course: a.course, providers: a.providers, gate: a.gate, pricing: a.pricing, db: a.db, chapterMd: md(t.chapterNumber), currentH5p: cur });
     }
-    case 'regenerate_video': return produceVideo({ target: t, course: a.course, providers: a.providers, gate: a.gate, pricing: a.pricing, db: a.db, chapterMd: md(t.chapterNumber) });
-    case 'regenerate_gamma': return produceGamma({ target: t, providers: a.providers, gate: a.gate, pricing: a.pricing, chapterMd: md(t.chapterNumber) });
+    case 'regenerate_video': return produceVideo({ target: t, course: a.course, providers: a.providers, gate: a.gate, pricing: a.pricing, db: a.db, chapterMd: md(t.chapterNumber), ext: a.ext });
+    case 'regenerate_gamma': return produceGamma({ target: t, providers: a.providers, gate: a.gate, pricing: a.pricing, chapterMd: md(t.chapterNumber), ext: a.ext });
     case 'regenerate_audio': return produceAudio({ target: t, course: a.course, providers: a.providers, gate: a.gate, pricing: a.pricing, sources: a.res.sources });
   }
   throw new RegenError('unavailable', 'Operación fuera del catálogo.');
