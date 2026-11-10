@@ -77,25 +77,58 @@ export function workshopModel(env: NodeJS.ProcessEnv = process.env): string {
   return (env.WORKSHOP_AI_MODEL || '').trim() || 'claude-sonnet-4-6';
 }
 
+/**
+ * Fix round 2 (N1): error ANTES de que el pedido salga (kill switch, sin ANTHROPIC_API_KEY, construcción del cliente,
+ * configuración). Anthropic no pudo cobrar nada: la llamada queda `not_sent` y la reserva se libera.
+ */
+export class WorkshopAiNotSentError extends Error {
+  readonly notSent = true;
+  constructor(readonly cause: unknown) {
+    super(`no se envió la llamada a la IA: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'WorkshopAiNotSentError';
+  }
+}
+
+type AnthropicLike = { messages: { create: (body: any, opts?: any) => Promise<any> } };
+
 export class AnthropicWorkshopAiClient implements WorkshopAiClient {
-  private client: Anthropic | null = null;
+  private client: AnthropicLike | null = null;
+
+  /**
+   * `sdkFactory` solo para pruebas (un SDK falso: ninguna red). En producción, el SDK real, que exige la clave: el SDK
+   * instalado no falla al construirse sin ella (fallaría ya dentro de `messages.create`, después de la frontera), así
+   * que se verifica acá, antes de enviar.
+   */
+  constructor(private readonly sdkFactory: () => AnthropicLike = () => {
+    if (!String(process.env.ANTHROPIC_API_KEY ?? '').trim()) throw new Error('falta ANTHROPIC_API_KEY en el servidor');
+    return new Anthropic({ timeout: WORKSHOP_AI_TIMEOUT_MS, maxRetries: 0 }) as unknown as AnthropicLike;
+  }) {}
 
   async call(req: WorkshopAiRequest): Promise<WorkshopAiResult> {
-    // Kill switch / allow-list de proveedores ANTES de llamar. maxRetries 0: el SDK no repite (duplicaría costo); el
-    // único reintento es el de validación, que decide el llamador.
-    assertDirectCallAllowed('anthropic');
-    if (!this.client) this.client = new Anthropic({ timeout: WORKSHOP_AI_TIMEOUT_MS, maxRetries: 0 });
-    const res = await this.client.messages.create(
-      {
+    // FRONTERA EXPLÍCITA (N1): todo lo anterior a `sending = true` ocurre antes de que el pedido salga → cualquier error
+    // ahí es «no enviado». Desde que se invoca `messages.create`, un error es INCIERTO (pudo cobrarse).
+    let sending = false;
+    let res: any;
+    try {
+      // Kill switch / allow-list de proveedores ANTES de llamar. maxRetries 0: el SDK no repite (duplicaría costo); el
+      // único reintento es el de validación, que decide el llamador.
+      assertDirectCallAllowed('anthropic');
+      if (!this.client) this.client = this.sdkFactory(); // sin ANTHROPIC_API_KEY el SDK lanza acá
+      const body = {
         model: req.model,
         max_tokens: req.maxTokens,
         system: req.system,
         tools: [req.tool as any],
         tool_choice: { type: 'tool', name: req.tool.name },
         messages: [{ role: 'user', content: req.user }],
-      } as any,
-      { timeout: Math.max(5_000, Math.min(req.timeoutMs, WORKSHOP_AI_TIMEOUT_MS)) },
-    );
+      };
+      const opts = { timeout: Math.max(5_000, Math.min(req.timeoutMs, WORKSHOP_AI_TIMEOUT_MS)) };
+      sending = true;
+      res = await this.client.messages.create(body as any, opts);
+    } catch (err) {
+      if (!sending) throw new WorkshopAiNotSentError(err);
+      throw err;
+    }
     const block = (res.content || []).find((b: any) => b && b.type === 'tool_use' && b.name === req.tool.name) as { input?: unknown } | undefined;
     return {
       input: block && block.input !== undefined ? block.input : null,

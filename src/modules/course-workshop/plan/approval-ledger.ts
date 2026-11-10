@@ -7,11 +7,13 @@
  *   sent              enviada, sin respuesta todavía (si el proceso se cae acá, queda así → ambigua);
  *   charged           respondió y su cargo quedó en el ledger;
  *   not_charged       Anthropic la rechazó con un estado documentado SIN cobro (401/403/404/413/429/500/529);
+ *   not_sent          (fix round 2, N1) falló ANTES de que el pedido saliera (kill switch, sin clave, construcción del
+ *                     cliente): no pudo cobrarse;
  *   ambiguous         se envió y falló sin un rechazo seguro (timeout, red, 400, 5xx…): pudo cobrarse;
  *   charge_unrecorded respondió, pero `recordCharge` falló: se reintenta al cerrar con el MISMO cargo (idempotente).
  *
- * Al cerrar: se reintentan los cargos no registrados; si después de eso TODAS las llamadas enviadas son `charged` o
- * `not_charged`, la reserva se libera (`settleReservation(key, null)`). Si queda alguna `sent` / `ambiguous` /
+ * Al cerrar: se reintentan los cargos no registrados; si después de eso TODAS las llamadas son `charged`, `not_charged`
+ * o `not_sent`, la reserva se libera (`settleReservation(key, null)`). Si queda alguna `sent` / `ambiguous` /
  * `charge_unrecorded`, la reserva queda PENDIENTE (cuenta el tope entero contra el saldo) para la conciliación
  * administrativa, y la aprobación pasa a `ambiguous` con el motivo visible.
  *
@@ -20,7 +22,7 @@
 import type { FinopsLedgerService, RecordChargeInput } from '../../finops/finops-ledger.service';
 import { LLM_RESERVATION_RELEASABLE_STATUSES } from '../../finops/llm-usage-ingest';
 
-export type CallStatus = 'sent' | 'charged' | 'not_charged' | 'ambiguous' | 'charge_unrecorded';
+export type CallStatus = 'sent' | 'charged' | 'not_charged' | 'not_sent' | 'ambiguous' | 'charge_unrecorded';
 
 export interface ApprovalCall {
   id: string;
@@ -38,7 +40,9 @@ export interface ApprovalCall {
 }
 
 /** ¿El error del proveedor prueba que NO hubo cobro? Solo los estados documentados (los mismos del proxy). */
-export function callErrorOutcome(err: unknown): { status: 'not_charged' | 'ambiguous'; providerStatus: number | null } {
+export function callErrorOutcome(err: unknown): { status: 'not_charged' | 'not_sent' | 'ambiguous'; providerStatus: number | null } {
+  // Fix round 2 (N1): el cliente marca los errores previos al envío (frontera explícita en AnthropicWorkshopAiClient).
+  if ((err as { notSent?: unknown })?.notSent === true) return { status: 'not_sent', providerStatus: null };
   const st = (err as { status?: unknown })?.status;
   const n = typeof st === 'number' ? st : null;
   return { status: n !== null && (LLM_RESERVATION_RELEASABLE_STATUSES as readonly number[]).includes(n) ? 'not_charged' : 'ambiguous', providerStatus: n };

@@ -362,6 +362,7 @@ export class WorkshopPlanService {
           await this.q(this.dataSource, `update public.workshop_ai_approvals set spent_usd = spent_usd + $2, updated_at = now() where id = $1`, [approval.id, bound]);
           throw new AiUnavailableError(PLAN_ERRORS.CALL_AMBIGUOUS, 'La IA no respondió y no se sabe si la llamada se cobró: la reserva del tope queda pendiente hasta conciliarla. Vuelve a intentarlo más tarde.');
         }
+        if (o.status === 'not_sent') throw new AiUnavailableError(PLAN_ERRORS.AI_UNAVAILABLE, 'No se llegó a llamar a la IA (el servicio no está disponible o falta su configuración): no se cobró nada y la reserva se libera.');
         throw new AiUnavailableError(PLAN_ERRORS.AI_UNAVAILABLE, 'El servicio de IA rechazó la llamada sin cobrarla; vuelve a intentarlo en unos minutos.');
       }
       this.aiCalls++;

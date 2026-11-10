@@ -183,6 +183,19 @@ export interface ResolveOptions {
   trustedTarget?: boolean;
   /** El cambio lo escribió el docente o viene de un hallazgo: no pide evidencia. */
   trustedChange?: boolean;
+  /** Texto completo del pedido (fix round 2): una evidencia que es (casi) todo el pedido no apunta a nada. */
+  requestText?: string | null;
+}
+
+/** Fix round 2 (P2-3): pedidos de más de esto, la evidencia del destino tiene que ser ≤ TARGET_EVIDENCE_MAX_SHARE de su largo. */
+export const TARGET_EVIDENCE_MIN_REQUEST_CHARS = 60;
+export const TARGET_EVIDENCE_MAX_SHARE = 0.6;
+/** ¿La evidencia es un fragmento específico (no todo el pedido)? */
+export function evidenceSpecific(evidence: string | null | undefined, requestText: string | null | undefined): boolean {
+  if (!evidence) return false;
+  const req = normalizeQuote(requestText ?? '');
+  if (req.length <= TARGET_EVIDENCE_MIN_REQUEST_CHARS) return true;
+  return normalizeQuote(evidence).length <= req.length * TARGET_EVIDENCE_MAX_SHARE;
 }
 
 /** Resuelve UN pedido de la IA contra el inventario. Nunca lanza. */
@@ -210,7 +223,9 @@ export function resolveRequest(r: RawAiRequest, course: WorkshopCourse, opts: Re
   // D6 en el servidor (fix round 1, P2-3): el destino que eligió la IA tiene que estar JUSTIFICADO por el texto del
   // docente (evidencia literal que nombra la actividad); si no, se pregunta con las candidatas.
   else if (!opts.trustedTarget) {
-    const why = targetUnjustified(res.target, r.targetEvidence ?? null, course, operation);
+    const specific = evidenceSpecific(r.targetEvidence, opts.requestText ?? null);
+    const why = targetUnjustified(res.target, specific ? (r.targetEvidence ?? null) : null, course, operation);
+    if (why && r.targetEvidence && !specific) why.reason = `La evidencia del destino es casi todo el pedido («${short(r.targetEvidence, 60)}»): no señala una actividad. ${why.reason}`;
     if (why) { qs.push(targetQuestion(why.question, why.options)); reasons.push(why.reason); }
   }
   // El cambio: instrucción concreta Y evidencia literal concreta en el pedido («mejora el capítulo 3» no lo es).
@@ -432,8 +447,17 @@ function targetUnjustified(t: ResolvedTarget, evidence: string | null, course: W
     const quiz = activityOf(course, t.quizModuleId);
     const q = quiz?.exam?.questions.find((x) => x.id === t.questionId);
     const stem = q ? words(plainText(q.html, 400)).filter((w) => !GENERIC.has(w)) : [];
-    if (stem.some((w) => evWords.has(w))) return null;
     if ((quiz?.exam?.questions.length ?? 0) === 1) return null;
+    if (stem.some((w) => evWords.has(w))) {
+      // Fix round 2 (P2-3): la evidencia tiene que nombrar a UNA sola pregunta del examen.
+      const qs = (quiz?.exam?.questions ?? []).filter((x) => x.qtype === 'multichoice' || x.qtype === 'truefalse').map((x) => ({ x, n: new Set(words(plainText(x.html, 400)).filter((w) => !GENERIC.has(w) && evWords.has(w))).size })).filter((y) => y.n > 0);
+      const top = Math.max(0, ...qs.map((y) => y.n));
+      const hits = qs.filter((y) => y.n === top).map((y) => y.x);
+      if (hits.length <= 1 && hits.some((x) => x.id === t.questionId)) return null;
+      const target = (quiz?.exam?.questions ?? []).find((x) => x.id === t.questionId);
+      const cand = [...new Map([...hits, ...(target ? [target] : [])].map((x) => [x.id, x])).values()];
+      return { question: `«${short(evidence, 60)}» coincide con ${cand.length} preguntas: ¿cuál?`, options: cand.map((x) => ({ label: short(plainText(x.html, 140), 140), resolves: { quizModuleId: t.quizModuleId, questionId: x.id } })), reason: `La evidencia del pedido no identifica una sola pregunta del examen (${cand.length} posibles): no se elige por el docente.` };
+    }
     return ask(`«${short(evidence, 60)}» no nombra esa pregunta del examen.`);
   }
   if (t.kind === 'exam') {
@@ -452,8 +476,24 @@ function targetUnjustified(t: ResolvedTarget, evidence: string | null, course: W
   }
   const a = t.moduleId !== null ? activityOf(course, t.moduleId) : null;
   if (!a) return null;
-  if (titleHit(a.title)) return null;
   const ch = a.placement.scope === 'chapter' ? a.placement.chapterNumber : null;
+  if (titleHit(a.title)) {
+    // Fix round 2 (P2-3): la evidencia tiene que identificar UNA sola actividad entre las candidatas del mismo alcance
+    // (las de texto del capítulo para editar; las del mismo rol en el capítulo / fuera de capítulos para lo demás). Si
+    // coincide con dos o más («la parte de seguridad» → «Seguridad eléctrica…» y «Seguridad de procesos…»), se pregunta
+    // con EXACTAMENTE esas.
+    const sameRole = course.activities.filter((x) => !x.missingFolder && (ch !== null ? x.placement.scope === 'chapter' && x.placement.chapterNumber === ch : x.placement.scope !== 'chapter') && String(x.role ?? x.kind) === String(a.role ?? a.kind));
+    const pool = op === 'edit_html' && ch !== null ? [...new Map([...chapterTextCandidates(course, ch), ...sameRole].map((x) => [x.moduleId, x])).values()] : sameRole;
+    // Puntaje = palabras propias del título presentes en la evidencia (+10 si cita el título completo); cuentan las de
+    // MAYOR puntaje: «la Seguridad eléctrica» distingue a «Seguridad eléctrica en planta» de «Seguridad de procesos…».
+    const score = (title: string) => new Set(words(title).filter((w) => !GENERIC.has(w) && evWords.has(w))).size + (cleanT(title).length >= 6 && evClean.includes(cleanT(title)) ? 10 : 0);
+    const scored = pool.map((x) => ({ x, n: score(x.title) })).filter((y) => y.n > 0);
+    const top = Math.max(0, ...scored.map((y) => y.n));
+    const hits = scored.filter((y) => y.n === top).map((y) => y.x);
+    if (hits.length <= 1 && hits.some((x) => x.moduleId === a.moduleId)) return null;
+    if (hits.length <= 1) return { question: `«${short(evidence, 60)}» nombra mejor a otra actividad: ¿cuál quieres cambiar?`, options: [...new Map([...hits, a].map((x) => [x.moduleId, x])).values()].map((x) => textOption(x)), reason: 'La actividad elegida no es la que mejor nombra el pedido: no se elige por el docente.' };
+    return { question: `«${short(evidence, 60)}» coincide con ${hits.length} actividades: ¿cuál quieres cambiar?`, options: hits.map((x) => textOption(x)), reason: `La evidencia del pedido coincide con ${hits.length} actividades: no se elige por el docente.` };
+  }
   const roleKey = String(a.role ?? a.kind);
   const roleNamed = (ROLE_WORDS[roleKey] ?? []).some((w) => ev.includes(w));
   const scope = course.activities.filter((x) => !x.missingFolder && (ch !== null ? x.placement.scope === 'chapter' && x.placement.chapterNumber === ch : true));

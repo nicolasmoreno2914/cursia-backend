@@ -431,7 +431,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     eq([p.status, ai.calls.length], ['failed', 2], 'el motor lo sigue rechazando → failed');
     assert(/hallazgo/.test(p.reason), p.reason);
     // Pregunta: 2 correctas / «todas las anteriores» / repetidas → reintento → failed.
-    const qreq = (await PL.interpretText(ctxV1, 'reescribe la pregunta «¿Cuánto es 2 + 2?» con un contexto cotidiano', simAi(() => interp([{ quote: 'reescribe la pregunta «¿Cuánto es 2 + 2?» con un contexto cotidiano', operation: 'exam_question_replace', instruction: 'Reescribir la pregunta con un contexto cotidiano.', target: { quizModuleId: 930, questionId: 5001 } }])))).requests[0];
+    const qreq = (await PL.interpretText(ctxV1, 'reescribe la pregunta «¿Cuánto es 2 + 2?» con un contexto cotidiano', simAi(() => interp([{ quote: 'reescribe la pregunta «¿Cuánto es 2 + 2?» con un contexto cotidiano', operation: 'exam_question_replace', instruction: 'Reescribir la pregunta con un contexto cotidiano.', target: { quizModuleId: 930, questionId: 5001 }, targetEvidence: 'la pregunta «¿Cuánto es 2 + 2?»' }])))).requests[0];
     eq(qreq.status, 'resolved', 'pregunta nombrada por su enunciado');
     for (const [q, why] of [[{ ...goodQuestion(), answers: goodQuestion().answers.map((a, i) => ({ ...a, correct: i < 2 })) }, 'dos correctas'], [{ ...goodQuestion(), answers: [...goodQuestion().answers.slice(0, 3), { html: 'Todas las anteriores', correct: false }] }, 'todas las anteriores'], [{ ...goodQuestion(), answers: [goodQuestion().answers[0], { html: 'Cuatro  unidades', correct: false }, goodQuestion().answers[2]] }, 'repetidas'], [{ ...goodQuestion(), answers: [{ html: 'La respuesta correcta que es muchísimo más larga y detallada que todas las otras opciones juntas', correct: true }, { html: 'No', correct: false }, { html: 'Tal vez', correct: false }] }, 'la correcta se delata por larga']]) {
       ai = simAi(() => q);
@@ -463,7 +463,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     });
     const ctx = await ctxOf(dmg);
     const ai = simAi((call) => (call.purpose === 'interpret'
-      ? interp([{ quote: 'En el texto del capítulo 1, la empresa se fundó en 1992, no en 1990.', operation: 'edit_html', instruction: 'Cambiar el año de fundación 1990 por 1992.', target: { moduleId: 910 } }])
+      ? interp([{ quote: 'En el texto del capítulo 1, la empresa se fundó en 1992, no en 1990.', operation: 'edit_html', instruction: 'Cambiar el año de fundación 1990 por 1992.', target: { moduleId: 910 }, targetEvidence: 'En el texto del capítulo 1' }])
       : goodHtml(call, (h) => h.replace('1990', '1992'))));
     const { out, items } = await runText(ctx, 'En el texto del capítulo 1, la empresa se fundó en 1992, no en 1990.', ai);
     const v = items[0].prep.view;
@@ -574,7 +574,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     eq([bad.ok, bad.calls], [false, 2], 'evidencia inventada → reintento y falla');
     assert(bad.problems.some((p) => /targetEvidence.*no es un fragmento literal/.test(p)), bad.problems.join(' | '));
     // Justificado: palabra del título; rol único en el capítulo; única actividad de texto del capítulo nombrado.
-    eq((await one('En la síntesis del capítulo 1 agrega «la fórmula del margen».', { quote: 'En la síntesis del capítulo 1 agrega «la fórmula del margen».', operation: 'edit_html', instruction: 'Agregar la fórmula del margen.', target: { moduleId: 1018 } })).status, 'resolved', 'título («Síntesis»)');
+    eq((await one('En la síntesis del capítulo 1 agrega «la fórmula del margen».', { quote: 'En la síntesis del capítulo 1 agrega «la fórmula del margen».', operation: 'edit_html', instruction: 'Agregar la fórmula del margen.', target: { moduleId: 1018 }, targetEvidence: 'En la síntesis del capítulo 1' })).status, 'resolved', 'título («Síntesis»)');
     const v1 = async (text, req) => (await PL.interpretText(ctxV1, text, simAi(() => interp([req])))).requests[0];
     eq((await v1('Rehace el juego del capítulo 2.', { quote: 'Rehace el juego del capítulo 2.', operation: 'regenerate_scorm', instruction: 'Rehacer el juego.', target: { moduleId: 922 } })).status, 'phase_later', 'rol único en el capítulo nombrado');
     eq((await v1('En el capítulo 2 corrige la ortografía.', { quote: 'En el capítulo 2 corrige la ortografía.', operation: 'edit_html', instruction: 'Corregir la ortografía.', target: { moduleId: 920 } })).status, 'resolved', 'única actividad de texto del capítulo nombrado');
@@ -641,6 +641,63 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     eq([o.reservation, L.settled.length], ['pending', 0], 'el cargo sigue fallando → pendiente');
     L = mk(); o = await PL.closeReservation(L, { reservationKey: null, calls: { a: c('a', 'charged') } }, 't');
     eq([o.reservation, L.settled.length], ['none', 0], 'sin reserva (simulado): nada que liberar');
+  });
+
+
+  // ── Fix round 2 ─────────────────────────────────────────────────────────────────────────────────────────────────
+  await check('R2 P2-3 la evidencia del destino tiene que ser ÚNICA y específica: «la parte de seguridad» con dos etiquetas «Seguridad…» → pregunta con EXACTAMENTE esas dos; la evidencia = todo el pedido no cuenta', async () => {
+    const rename = async (z, mid, title) => {
+      const p = `activities/label_${mid}/label.xml`;
+      z.file(p, (await z.file(p).async('string')).replace(/<name>[^<]*<\/name>/, `<name>${title}</name>`));
+      const mb = await z.file('moodle_backup.xml').async('string');
+      z.file('moodle_backup.xml', mb.replace(new RegExp(`(<moduleid>${mid}</moduleid>[\\s\\S]*?<title>)[^<]*(</title>)`), `$1${title}$2`));
+    };
+    const buf = await zipEdit(AS, async (z) => { await rename(z, 1039, 'Seguridad eléctrica en planta'); await rename(z, 1040, 'Seguridad de procesos químicos'); });
+    const ctx = await ctxOf(buf);
+    const T = 'En el capítulo 3 corrige la parte de seguridad: el voltaje máximo es 220 V, no 110 V.';
+    const one = async (req, text = T) => (await PL.interpretText(ctx, text, simAi(() => interp([{ quote: text, operation: 'edit_html', instruction: 'Corregir el voltaje máximo: 220 V, no 110 V.', target: { moduleId: 1039 }, changeEvidence: 'el voltaje máximo es 220 V, no 110 V', ...req }])))).requests[0];
+    for (const mid of [1039, 1040]) {
+      const r = await one({ target: { moduleId: mid }, targetEvidence: 'la parte de seguridad' });
+      eq([r.status, r.questions.length, r.questions[0].purpose], ['needs_answer', 1, 'target'], `la IA eligió ${mid} con evidencia ambigua`);
+      eq(r.questions[0].options.map((o) => o.resolves.moduleId).sort(), [1039, 1040], 'pregunta con EXACTAMENTE las dos que coinciden');
+      assert(/coincide con 2 actividades/.test(r.reason), r.reason);
+    }
+    const whole = await one({ targetEvidence: T });
+    eq(whole.status, 'needs_answer', 'evidencia = todo el pedido → no apunta');
+    assert(/casi todo el pedido/.test(whole.reason), whole.reason);
+    const T2 = 'En el capítulo 3 corrige la Seguridad eléctrica: el voltaje máximo es 220 V, no 110 V.';
+    eq((await one({ targetEvidence: 'la Seguridad eléctrica' }, T2)).status, 'resolved', 'palabra que distingue → única → resuelto');
+    eq([PL.evidenceSpecific('la parte de seguridad', T), PL.evidenceSpecific(T, T), PL.evidenceSpecific(T.slice(0, 50), T), PL.evidenceSpecific('x', 'pedido corto'), PL.evidenceSpecific(null, T)], [true, false, true, true, false], 'evidenceSpecific (≤ 60 % de un pedido de más de 60 caracteres)');
+    // Lo mismo con preguntas: evidencia que coincide con dos enunciados → pregunta con esas dos.
+    const qbuf = await zipEdit(V1, async (z) => { const q = await z.file('questions.xml').async('string'); z.file('questions.xml', q.replace('¿Cuánto es 2 + 2?', '¿Cuánto mide el voltaje de la red?').replace('El agua moja.', 'El voltaje de la red es 220 V.')); });
+    const qctx = await ctxOf(qbuf);
+    const QT = 'cambia la pregunta del voltaje';
+    const qo = await PL.interpretText(qctx, QT, simAi(() => interp([{ quote: QT, operation: 'exam_question_remove', instruction: 'Quitar la pregunta del voltaje.', target: { quizModuleId: 930, questionId: 5001 } }])));
+    assert(qo.ok, `interpretación: ${qo.reason}`);
+    const qr = qo.requests[0];
+    eq([qr.status, qr.questions[0].options.map((o) => o.resolves.questionId).sort()], ['needs_answer', [5001, 5002]], 'dos preguntas coinciden → se pregunta');
+  });
+
+  await check('R2 N1 frontera explícita del envío: errores ANTES de enviar (sin ANTHROPIC_API_KEY, kill switch, construcción del cliente) → `not_sent` (se libera); un error DESPUÉS de enviar (timeout) → ambiguo (queda pendiente)', async () => {
+    const req = { purpose: 'content', model: 'claude-sonnet-4-6', system: 's', user: 'u', tool: PL.htmlTool(), maxTokens: 100, timeoutMs: 1000 };
+    const outcome = async (client, env = {}) => {
+      const prev = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+      for (const [k, v] of Object.entries(env)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      try { await client.call(req); return 'ok'; } catch (e) { return PL.callErrorOutcome(e).status; } finally { for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+    };
+    let built = 0; let sent = 0;
+    const fakeSdk = (fail) => () => { built++; return { messages: { create: async () => { sent++; throw fail; } } }; };
+    eq(await outcome(new PL.AnthropicWorkshopAiClient(), { ANTHROPIC_API_KEY: undefined, FINOPS_KILL_SWITCH: undefined }), 'not_sent', 'sin ANTHROPIC_API_KEY (cliente real por defecto)');
+    eq(await outcome(new PL.AnthropicWorkshopAiClient(fakeSdk(new Error('x'))), { FINOPS_KILL_SWITCH: 'true' }), 'not_sent', 'kill switch dentro del cliente');
+    eq([built, sent], [0, 0], 'ni se construyó el cliente ni se envió');
+    eq(await outcome(new PL.AnthropicWorkshopAiClient(() => { throw new Error('config inválida'); })), 'not_sent', 'falla al construir el cliente');
+    eq(await outcome(new PL.AnthropicWorkshopAiClient(fakeSdk(Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' })))), 'ambiguous', 'timeout DESPUÉS de enviar → incierto');
+    eq(await outcome(new PL.AnthropicWorkshopAiClient(fakeSdk(Object.assign(new Error('rate'), { status: 429 })))), 'not_charged', '429 después de enviar → sin cobro');
+    eq(sent, 2, 'esos dos sí se enviaron');
+    eq(REAL.anthropic, 0, 'el SDK real nunca se usó');
+    const L = { settled: [], async recordCharge() {}, async settleReservation(k) { this.settled.push(k); } };
+    const o = await PL.closeReservation(L, { reservationKey: 'k', calls: { a: { id: 'a', kind: 'content_html', attempt: 1, boundUsd: '0.1', status: 'not_sent', at: 'x' } } }, 't');
+    eq([o.reservation, L.settled], ['released', ['k']], 'no enviada → reserva liberada');
   });
 
   console.log(`\n${ok} ok, ${fail} fail · llamadas reales: anthropic ${REAL.anthropic}, fetch ${REAL.fetch}`);

@@ -11,6 +11,7 @@
 //   L3  una llamada ambigua (o en vuelo) → la reserva queda PENDIENTE (neto = tope + cargos), el disponible no se recupera
 //   L4  un cargo que no se pudo registrar se reintenta al cerrar (idempotente por el id del mensaje) → registrado y liberada
 //   L5  una reserva con el tope por encima del disponible restante → USER_BUDGET_EXHAUSTED (el ledger hace cumplir el saldo)
+//   L6  (fix round 2, N1) una llamada `not_sent` libera la reserva; junto a una ambigua, sigue pendiente
 //
 // Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js
 'use strict';
@@ -164,6 +165,19 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       await ledger.recordCharge(ch); // reintento: idempotente
       eq((await ds.query(`select count(*)::int n from public.generation_cost_events where metadata->>'approvalId' = 'l4' and coalesce(metadata->>'reservation','') <> 'true'`))[0].n, 1, 'un solo cargo');
       assert(await available() > before, 'al liberar se recupera el tope (menos el cargo)');
+    });
+
+    await check('L6 (fix round 2, N1) una llamada que NO llegó a enviarse (`not_sent`) → la reserva se LIBERA en el ledger real; junto a una ambigua → sigue pendiente', async () => {
+      await reserve('l6', '0.100000');
+      const ns = { id: 'c1', kind: 'content_html', attempt: 1, boundUsd: '0.1', status: 'not_sent', at: 'x' };
+      eq(PL.callErrorOutcome(new PL.WorkshopAiNotSentError(new Error('falta ANTHROPIC_API_KEY'))).status, 'not_sent', 'clasificación');
+      let o = await PL.closeReservation(ledger, { reservationKey: 'workshop:approval:l6', calls: { c1: ns } }, 'workshop_approval_failed');
+      eq(o.reservation, 'released', 'liberada');
+      near(await net('workshop:approval:l6'), 0, 'neto 0');
+      await reserve('l6b', '0.100000');
+      o = await PL.closeReservation(ledger, { reservationKey: 'workshop:approval:l6b', calls: { c1: ns, c2: { ...ns, id: 'c2', status: 'ambiguous' } } }, 'workshop_approval_failed');
+      eq(o.reservation, 'pending', 'una ambigua alcanza para retenerla');
+      near(await net('workshop:approval:l6b'), 0.1, 'neto = tope');
     });
 
     await check('L5 el LEDGER hace cumplir el saldo: un tope por encima del disponible restante → USER_BUDGET_EXHAUSTED (aunque la compuerta previa no se hubiera corrido)', async () => {

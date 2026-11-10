@@ -1408,7 +1408,7 @@ function rawZip(entries) {
       const res = await newIdentified('b5-avisos.mbz');
       const sid = res.session.id;
       aiSim.handler = (req) => (req.purpose === 'interpret'
-        ? { requests: [{ quote: 'En la apertura del capítulo 1 cambia «equilibrio» por «balance».', operation: 'edit_html', instruction: 'Cambiar la palabra «equilibrio» por «balance».', target: { moduleId: 1012 } }] }
+        ? { requests: [{ quote: 'En la apertura del capítulo 1 cambia «equilibrio» por «balance».', operation: 'edit_html', instruction: 'Cambiar la palabra «equilibrio» por «balance».', target: { moduleId: 1012 }, targetEvidence: 'En la apertura del capítulo 1' }] }
         : { html: block(req.user, 'contenido_actual').split('equilibrio').join('balance') });
       const a = await plan.createTextIntake(OWNER, sid, 'En la apertura del capítulo 1 cambia «equilibrio» por «balance».');
       await approve(sid, a); await idle();
@@ -1564,6 +1564,39 @@ function rawZip(entries) {
       eq(n.n, rm.length, 'la marca queda guardada (columna) para B6');
       eq(p.warnings.map((w) => w.code), ['REMOVALS', 'BULK_REMOVALS'], 'avisos del plan');
       eq(p.warnings[1].count, rm.length, 'el masivo cuenta las quitas de esa entrada');
+    });
+
+    await check('W54 R2 N1 frontera del envío con el CLIENTE REAL: sin ANTHROPIC_API_KEY o kill switch activado entre chequeos → `not_sent`, reserva LIBERADA; timeout después de enviar → `ambiguous`, reserva pendiente', async () => {
+      const PAI = D('modules/course-workshop/plan/ai.js');
+      const viaClient = async (fn, client) => {
+        const sid = await twoItems(fn);
+        const p2 = new PLS.WorkshopPlanService(ds, storage, svc, ledger, budget, client);
+        p2.pricingLoader = async () => DRY.seedPricing();
+        const p0 = await p2.getPlan(OWNER, sid);
+        ledger.settled = [];
+        const g = await p2.approveGeneration(OWNER, sid, p0.planId, { itemIds: [p0.generation.itemIds[0]], confirmEstimateUsd: Number(p0.generation.calls[0].expectedUsd), capUsd: Number(p0.generation.calls[0].boundUsd) + 0.01 });
+        await p2.whenIdle();
+        return { sid, g, ap: (await p2.listRequests(OWNER, sid)).approvals.find((x) => x.id === g.approval.id), p: await p2.getPlan(OWNER, sid) };
+      };
+      const savedKey = process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+      try {
+        // (1) Cliente real por defecto, sin clave en el servidor.
+        let r = await viaClient('b5-r2-sinclave.mbz', new PAI.AnthropicWorkshopAiClient());
+        eq([r.ap.status, r.ap.calls.map((c) => c.status)], ['failed', ['not_sent']], 'sin clave → no enviada');
+        eq(ledger.settled.map((x) => x.key), [`workshop:approval:${r.g.approval.id}`], 'reserva LIBERADA');
+        assert(/No se llegó a llamar a la IA/.test(r.p.items[0].reason), r.p.items[0].reason);
+        // (2) El kill switch se activa DESPUÉS del chequeo de invokerFor y ANTES del envío (dentro del cliente).
+        let built = 0;
+        class Flip extends PAI.AnthropicWorkshopAiClient { async call(q) { process.env.FINOPS_KILL_SWITCH = 'true'; try { return await super.call(q); } finally { delete process.env.FINOPS_KILL_SWITCH; } } }
+        r = await viaClient('b5-r2-kill.mbz', new Flip(() => { built++; return { messages: { create: async () => { throw new Error('no debería'); } } }; }));
+        eq([r.ap.status, r.ap.calls.map((c) => c.status), built], ['failed', ['not_sent'], 0], 'kill switch entre chequeos → no enviada, cliente ni construido');
+        eq(ledger.settled.length, 1, 'liberada');
+        // (3) Timeout DESPUÉS de enviar (SDK falso que rechaza dentro de messages.create) → ambigua, pendiente.
+        r = await viaClient('b5-r2-timeout.mbz', new PAI.AnthropicWorkshopAiClient(() => ({ messages: { create: async () => { throw Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' }); } } })));
+        eq([r.ap.status, r.ap.calls.map((c) => c.status), ledger.settled.length], ['ambiguous', ['ambiguous'], 0], 'después de enviar → reserva pendiente');
+        eq(REAL_AI.n, 0, 'el SDK real nunca se usó');
+      } finally { if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = savedKey; }
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

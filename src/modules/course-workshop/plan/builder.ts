@@ -127,7 +127,7 @@ async function interpretLoop(ctx: BuildCtx, ai: AiInvoke, make: (retry: string[]
     }
     try {
       const raw = parseInterpretation(result.input, quoteSource, { single, evidenceText });
-      return { ok: true, requests: raw.map((r) => resolveRequest(r, ctx.course)), reason: null, problems: [], spentUsd: spent, calls };
+      return { ok: true, requests: raw.map((r) => resolveRequest(r, ctx.course, { requestText: evidenceText ?? quoteSource })), reason: null, problems: [], spentUsd: spent, calls };
     } catch (e) {
       if (!(e instanceof InterpretationOutputError)) throw e;
       problems = e.problems;
