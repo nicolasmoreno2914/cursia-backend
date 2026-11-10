@@ -20,6 +20,10 @@
 //       carpeta del dueño; encadenar: aplicar sobre la versión 1 produce la 2 con su propio informe
 //   A10 memoria/carril: factores medidos (zip 7×, tar.gz 10×); el tope de subida (200 MB) entra en el presupuesto por defecto
 //   A11 el informe recorta un antes/después enorme con aviso (el paquete lleva el texto completo); mismo plan → mismos bytes
+//   A12 Libro v3 (PDF): con la entrada del builder SIN cambios se reproduce byte a byte el PDF del original; con el markdown
+//       nuevo del capítulo → PDF nuevo (lo arma el builder, no la IA) → el motor lo reemplaza en el original (blob +
+//       files.xml) y la versión pasa la compuerta y el validador; fuente que no reproduce / capítulo desconocido / sin
+//       fuente en el servidor → `unavailable` con motivo; un PDF que no es PDF o vencido → el motor lo rechaza
 //
 // Uso: npm run build && node scripts/r107/check-r107-apply.js --ci [--dist dist]
 'use strict';
@@ -54,7 +58,8 @@ const sha = (alg, b) => crypto.createHash(alg).update(b).digest('hex');
   const COURSES = require(path.join(REPO, 'scripts/fixtures/commercial-simulation/courses.json')).courses;
   const JSZip = require('jszip');
   global.fetch = realFetch; // la simulación no usa red; se vuelve a prohibir después
-  const AS = (await S.simulateCourse(DIST, COURSES.find((c) => c.id === 'A-S'))).built.mbz;
+  const SIM = await S.simulateCourse(DIST, COURSES.find((c) => c.id === 'A-S'));
+  const AS = SIM.built.mbz;
   const V1 = await FX.miniV1(await FX.audiobookOf(AS));
   global.fetch = async (u) => { throw new Error(`RED PROHIBIDA en el check: ${String(u)}`); };
   const inventoryOf = async (buf) => { const pkg = await R.openMbz(buf); const f = await I.readPackageFacts(pkg, 'x.mbz'); return INV.buildInventory(pkg, { family: I.familyOf(f), builderLine: I.builderLineOf(f) }); };
@@ -201,6 +206,44 @@ const sha = (alg, b) => crypto.createHash(alg).update(b).digest('hex');
     const x = await A.runApply(base);
     const y = await A.runApply(base);
     assert(x.ok && y.ok && x.sha1 === y.sha1, 'determinista');
+  });
+
+  await check('A12 Libro v3 (PDF): el builder reproduce el PDF del original con la fuente sin cambios; con el capítulo nuevo → PDF nuevo → el motor lo reemplaza y la versión pasa compuerta + validador; fuente que no reproduce / capítulo desconocido / sin fuente → unavailable', async () => {
+    const LV = L('modules/course-workshop/apply/libro-v3.js');
+    const PP = L('modules/dynamic-packaging/packaging-plan-v3.js');
+    const B = L('package/dynamic-mbz-builder-v3.js');
+    const input = SIM.input;
+    const plan = PP.buildPackagingPlanV3(input.manifest, input.blueprint, { manifestId: input.manifestId ?? null, omitVideoChapterIds: input.pendingVideoChapterIds ?? [] });
+    const byNum = new Map(plan.modules.flatMap((m) => m.chapters.filter((c) => c.kind !== 'practice').map((c) => [c.chapterNumber, c.chapterId])));
+    const src = { buildInput: input, chapterIdByNumber: byNum };
+    const cur = await LV.libroPdfOf(AS);
+    assert(cur && cur.bytes.subarray(0, 5).toString('latin1') === '%PDF-', 'el original trae el Libro en PDF');
+    const md0 = input.contents.contentMd.get(byNum.get(1));
+    let builds = 0;
+    const build = (i) => { builds++; return B.buildDynamicMbzV3(i); };
+    const regen = await LV.regenerateLibroV3Pdf(AS, src, [{ number: 1, md: `${md0}\n\nPárrafo agregado por el Taller en 2026: «ñ», O'Brien.` }], build);
+    assert(regen.ok, JSON.stringify(regen).slice(0, 300));
+    eq([regen.previousSha1, builds], [cur.sha1, 2], 'reprodujo el original (1.er armado) y armó el nuevo (2.º)');
+    assert(regen.sha1 !== cur.sha1, 'el PDF cambió');
+    const op = { op: 'edit_libro_section', moduleId: regen.moduleId, chapters: [{ number: 1, html: '' }], pdf: { base64: regen.pdf.toString('base64'), previousSha1: regen.previousSha1 } };
+    const res = await A.runApply({ original: AS, expectedSha1: sha('sha1', AS), items: [item('lib', op)] });
+    assert(res.ok, JSON.stringify(res).slice(0, 400));
+    const after = await LV.libroPdfOf(res.package);
+    eq([after.sha1, res.diagnosis.introduced, res.validation.introduced], [regen.sha1, [], []], 'el paquete nuevo lleva el PDF nuevo; sin hallazgos ni problemas nuevos');
+    assert(res.items[0].misalignment.some((m) => /mod_book/.test(m)), 'avisa que el Libro en línea no cambió (D7)');
+    // Fuente que NO reproduce el original (otra portada / otro título) → no se regenera.
+    const other = { ...src, buildInput: { ...input, manifest: { ...input.manifest, course: { ...(input.manifest.course || {}), title: 'Otro título' } } } };
+    const nr = await LV.regenerateLibroV3Pdf(AS, other, [{ number: 1, md: 'x' }], build).catch((e) => ({ ok: false, code: 'build_failed', reason: e.message }));
+    assert(!nr.ok && ['not_reproducible', 'build_failed'].includes(nr.code), `no reproduce: ${JSON.stringify(nr).slice(0, 200)}`);
+    eq((await LV.regenerateLibroV3Pdf(AS, src, [{ number: 99, md: 'x' }], build)).code, 'chapter_unknown', 'capítulo desconocido');
+    eq((await LV.regenerateLibroV3Pdf(V1, src, [{ number: 1, md: 'x' }], build)).code, 'no_pdf', 'V1: no es PDF');
+    const none = await LV.SERVER_LIBRO_V3_RESOLVER.resolve({ id: 's', ownerId: 'o', institutionId: null, identifiedCourseId: 1 });
+    assert('unavailable' in none && /todavía no se puede regenerar/.test(none.unavailable), 'el servidor dice por qué no (todavía)');
+    // El motor rechaza un PDF que no es PDF o uno regenerado sobre otro original.
+    const bad = await A.runApply({ original: AS, expectedSha1: sha('sha1', AS), items: [item('b', { ...op, pdf: { base64: Buffer.from('hola').toString('base64'), previousSha1: cur.sha1 } })] });
+    eq([bad.ok, bad.stage, bad.code], [false, 'engine', 'WORKSHOP_APPLY_INVALID_CONTENT'], 'no es PDF');
+    const stale = await A.runApply({ original: AS, expectedSha1: sha('sha1', AS), items: [item('s', { ...op, pdf: { ...op.pdf, previousSha1: '0'.repeat(40) } })] });
+    eq([stale.ok, stale.code], [false, 'WORKSHOP_APPLY_STALE_TARGET'], 'vencido');
   });
 
   console.log(`\n${fail ? '❌' : '✅'} check-r107-apply --ci: ${ok}/${ok + fail}`);

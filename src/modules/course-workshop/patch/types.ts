@@ -54,6 +54,18 @@ export interface EditLibroSectionOp {
   chapters: LibroChapterInput[];
   /** Solo para recomponer: `<head>` (contenido interno) y portada + índice cuando el corte también se los llevó. */
   front?: { headHtml: string; coverHtml: string };
+  /**
+   * r107 B6 · Libro v3 (PDF): el PDF NUEVO ya renderizado por el builder existente (`renderLibroPdfV3`) con la fuente
+   * del curso y el cambio del plan (ver apply/libro-v3.ts: solo si el mismo builder REPRODUCE byte a byte el PDF del
+   * original con la fuente sin cambios). `previousSha1` = sha1 del PDF actual del paquete (precondición). La IA nunca
+   * escribe el PDF: escribe el markdown del capítulo; el PDF lo arma el builder.
+   */
+  pdf?: { base64: string; previousSha1: string };
+  /**
+   * r107 B6 · Libro v3: el markdown NUEVO de cada capítulo (contenido aprobado en B5). El motor no lo usa: el trabajo de
+   * aplicar lo convierte en `pdf` con el builder (apply/libro-v3.ts) antes de llamar al motor; sin fuente → falla visible.
+   */
+  libroV3?: { chapters: Array<{ number: number; md: string }> };
 }
 
 /** Pregunta nueva (contenido ya resuelto). HTML en enunciado, opciones y retroalimentación. */

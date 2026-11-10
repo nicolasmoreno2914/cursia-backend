@@ -33,6 +33,7 @@
 //   --bite:   rompe invariantes en una copia de dist/ y confirma que --ci falla
 //
 // Usage: node scripts/r107/check-r107-patch.js --ci | --corpus [manifest.json] | --moodle | --bite   [--dist dist]
+//   --moodle M4 (r107 B6): restaura las versiones del flujo completo que exporta check-r107-workshop-service (W65).
 'use strict';
 require('reflect-metadata');
 const fs = require('fs');
@@ -1119,6 +1120,28 @@ async function moodleSuite() {
     const removed = inv.activities.find((x) => x.moduleId === ops[2].moduleId);
     eq(o.cms.length, o0.cms.length - 1, `M3: una actividad menos (${removed.title})`);
     console.log(`   M3 curso restaurado ${o.courseid}: ${o.cms.length} actividades (original ${o0.cms.length})`);
+  });
+  // r107 B6: versiones producidas por el FLUJO COMPLETO (sesión → plan → aplicar → versión) — las exporta
+  // `R107_EXPORT_VERSIONS=<dir> check-r107-workshop-service.js` (W65). Sin el manifiesto, M4 falla con la instrucción.
+  const VDIR = process.env.R107_APPLY_VERSIONS || path.join(os.homedir(), 'cursia-test-env/work/r107/apply-versions');
+  await check('M4 versiones del FLUJO COMPLETO (B6: v3 A-S sintético + V1 real) → restauran en Moodle 4.5 sin errores ni warnings y muestran el cambio aplicado', async () => {
+    const mf = path.join(VDIR, 'versions.json');
+    assert(fs.existsSync(mf), `falta ${mf}: correr antes R107_EXPORT_VERSIONS=${VDIR} PG_BIN=… node scripts/r107/check-r107-workshop-service.js`);
+    const man = JSON.parse(fs.readFileSync(mf, 'utf8'));
+    eq(man.versions.map((v) => v.id).sort(), ['v1-real', 'v3-AS'], 'las dos versiones');
+    for (const v of man.versions) {
+      const buf = fs.readFileSync(v.file);
+      eq(sha1(buf), v.sha1, `${v.id}: el paquete es el de la versión`);
+      const o = restore(buf, `r107-b6-version-${v.id}`);
+      clean(o, `M4 ${v.id}`);
+      for (const it of v.items) {
+        // Moodle resuelve los enlaces internos ($@…@$ → URL del sitio) al restaurar: se comparan sin el destino de cada href.
+        const norm = (h) => String(h ?? '').replace(/href="[^"]*"/g, 'href="·"');
+        if (it.operation === 'edit_html') assert(o.cms.some((c) => norm(c.intro) === norm(it.after) && c.intro.includes('Nota del Taller: revisado en 2026')), `${v.id}: la etiqueta editada restaurada con el texto del informe`);
+        if (it.operation === 'remove_activity') assert(!o.cms.some((c) => c.name === it.removedTitle), `${v.id}: «${it.removedTitle}» quitada`);
+      }
+      console.log(`   M4 ${v.id}: restaurado (curso ${o.courseid ?? '—'}), ${v.items.map((x) => x.operation).join(', ')} verificados`);
+    }
   });
 }
 

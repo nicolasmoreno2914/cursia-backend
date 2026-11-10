@@ -15,6 +15,8 @@ import {
   APPLY_CODE_VERSION, ApplyCandidate, ApplyRunFail, ApplyRunItem, RESTORE_NOT_AVAILABLE_MESSAGE, RestoreChecker, applyMemoryFactor, chainOf, confirmationsMissing,
   nextVersionNumber, runApply, selectApplyItems, versionStoragePath,
 } from './apply-core';
+import { LibroV3SourceResolver, SERVER_LIBRO_V3_RESOLVER, regenerateLibroV3Pdf } from './libro-v3';
+import { buildDynamicMbzV3 } from '../../../package/dynamic-mbz-builder-v3';
 
 /**
  * r107 B6 · Taller de cursos — APLICAR un plan aprobado y VERSIONES (diseño §4 «apply» / «verify» / «version», D9, D10).
@@ -103,6 +105,8 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
   private dead = false;
   /** Verificador de restauración (un Moodle). En staging no hay ninguno: null → `not_available` (ruling B6). */
   restoreChecker: RestoreChecker | null = null;
+  /** Fuente del Libro v3 (entrada del builder del curso). En B6 el del servidor responde `unavailable` (ver libro-v3.ts). */
+  libroSource: LibroV3SourceResolver = SERVER_LIBRO_V3_RESOLVER;
   /** SOLO pruebas: corre antes de cada etapa (simular una falla o una caída a mitad). */
   testHook: ((stage: 'building' | 'verifying' | 'upload' | 'register', versionId: string) => Promise<void> | void) | null = null;
   now: () => Date = () => new Date();
@@ -425,6 +429,20 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
         const it = byId.get(id);
         return { id, requestId: it?.requestId ?? '', operation: (v.operations[idx] as PatchOperation).op, quote: it?.quote ?? '', summary: it?.summary ?? '', params: v.operations[idx] };
       });
+      // Libro v3 (PDF): el markdown aprobado → PDF con el builder existente, solo si reproduce el del original.
+      for (const it of runItems) {
+        const op = it.params as PatchOperation & { libroV3?: { chapters: Array<{ number: number; md: string }> }; pdf?: unknown };
+        if (op.op !== 'edit_libro_section' || !op.libroV3 || op.pdf) continue;
+        const src = await this.libroSource.resolve(s);
+        const regen = 'unavailable' in src
+          ? { ok: false as const, reason: src.unavailable }
+          : await regenerateLibroV3Pdf(original.buffer, src, op.libroV3.chapters, (i) => buildDynamicMbzV3(i));
+        if (regen.ok !== true) {
+          await fail({ stage: 'libro', code: 'WORKSHOP_APPLY_LIBRO_UNAVAILABLE', message: `No se pudo regenerar el Libro Guía en PDF: ${(regen as { reason: string }).reason}`, retryable: false, failedItemId: it.id });
+          return;
+        }
+        it.params = { ...op, libroV3: undefined, pdf: { base64: regen.pdf.toString('base64'), previousSha1: regen.previousSha1 } } as PatchOperation;
+      }
       this.runs++;
       const res = await runApply({
         original: original.buffer, expectedSha1: v.base_sha1, filename: s.filename, items: runItems, baseline: await this.baselineOf(s), restoreChecker: this.restoreChecker,

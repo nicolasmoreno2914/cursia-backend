@@ -83,6 +83,7 @@
 //   W62 protección contra borrado de workshop_version
 //   W63 carril de 1 + presupuesto de memoria (espera; nunca entra → 409)
 //   W64 B5: reclamo + latido entre procesos para entradas / pedidos / aprobaciones
+//   W65 (solo con R107_EXPORT_VERSIONS=<dir>) versiones del flujo completo de un v3 sintético y un V1 real, para --moodle
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -1954,6 +1955,55 @@ function rawZip(entries) {
       hold(); await idle(); aiSim.call = realCall;
       eq(await st(a.id), 'ready', 'terminó');
     });
+
+
+    // Opcional (local): R107_EXPORT_VERSIONS=<dir> → versiones producidas por el FLUJO COMPLETO (sesión → identificación →
+    // inventario → pedido → aprobación (IA simulada) → generación → plan → aplicar → versión) de un v3 sintético y de un V1
+    // REAL, guardadas para que `check-r107-patch.js --moodle` las restaure en el Moodle 4.5 local (M4).
+    if (process.env.R107_EXPORT_VERSIONS) {
+      await check('W65 (exportar) versiones del FLUJO COMPLETO: v3 A-S sintético + V1 real → `ready`, guardadas con su manifiesto para la restauración local', async () => {
+        const dir = path.resolve(process.env.R107_EXPORT_VERSIONS);
+        fs.mkdirSync(dir, { recursive: true });
+        const S2 = require(path.join(REPO, 'scripts/lib/commercial-simulation'));
+        const C2 = require(path.join(REPO, 'scripts/fixtures/commercial-simulation/courses.json')).courses;
+        const v1Path = process.env.R107_V1_REAL || path.join(os.homedir(), 'Downloads/Anatomía_y_Fisiología_Animal_moodle (1).mbz');
+        const cases = [
+          { id: 'v3-AS', file: 'flujo-v3-AS.mbz', buf: (await S2.simulateCourse(DIST, C2.find((c) => c.id === 'A-S'))).built.mbz },
+          { id: 'v1-real', file: path.basename(v1Path), buf: fs.readFileSync(v1Path) },
+        ];
+        const out = [];
+        for (const k of cases) {
+          const res = await svc.createSession(OWNER, { filename: k.file, sizeBytes: k.buf.length });
+          objects.set(res.upload.storagePath, k.buf);
+          await svc.markUploaded(OWNER, res.session.id); await settle(res.session.id);
+          const sid = res.session.id;
+          const inv = await svc.persistedInventory(sid);
+          const lbl = inv.activities.find((a) => a.modname === 'label' && a.title && a.title.length > 4 && a.html && a.html.length && !a.missingFolder);
+          const rm = inv.activities.find((a) => /Metodolog/i.test(a.title || '') && !a.referencedBy?.length && a.moduleId !== lbl.moduleId)
+            || (k.id === 'v3-AS' ? inv.activities.find((a) => a.moduleId === 1051) : null);
+          const reqs = [{ quote: `En «${lbl.title}» agrega al final una nota del Taller.`, operation: 'edit_html', instruction: 'Agregar al final una nota breve del Taller.', target: { moduleId: lbl.moduleId }, targetEvidence: `«${lbl.title}»`, changeEvidence: 'agrega al final una nota del Taller' }];
+          if (rm) reqs.push({ quote: `quita «${rm.title}»`, operation: 'remove_activity', instruction: `Quitar «${rm.title}».`, target: { moduleId: rm.moduleId }, targetEvidence: `«${rm.title}»`, changeEvidence: 'quita' });
+          aiSim.handler = (req) => (req.purpose === 'interpret' ? { requests: reqs } : { html: `${block(req.user, 'contenido_actual')}<p>Nota del Taller: revisado en 2026 («ñ», $&amp;, O'Brien).</p>` });
+          const a = await plan.createTextIntake(OWNER, sid, reqs.map((r) => r.quote).join(' '));
+          await approve(sid, a); await idle();
+          const p0 = await plan.getPlan(OWNER, sid);
+          if (p0.generation) { await generateAll(sid); await idle(); }
+          const p = await plan.getPlan(OWNER, sid);
+          assert(p.combined && p.combined.ok, `${k.id}: prueba en seco combinada: ${JSON.stringify(p.combined && p.combined.failure)} ${JSON.stringify(p.items.map((i) => [i.operation, i.requestStatus, i.reason]))}`);
+          const r = await apply2.apply(OWNER, sid, p.planId, { itemIds: p.items.filter((i) => i.available && i.status === 'proposed').map((i) => i.id), confirmItemIds: p.items.filter((i) => i.requiresItemConfirm).map((i) => i.id) });
+          await apply2.whenIdle();
+          const v = await apply2.getVersion(OWNER, sid, r.version.id);
+          assert(v.status === 'ready', `${k.id}: ${JSON.stringify(v.error)}`);
+          eq(v.report.items.map((x) => x.operation).sort(), reqs.map((q) => q.operation).sort(), `${k.id}: todos los pedidos aplicados (${JSON.stringify(p.items.map((i) => [i.operation, i.requestStatus, i.reason]))} ${JSON.stringify((await plan.listRequests(OWNER, sid)).requests.map((x) => [x.operation, x.status, x.reason]))})`);
+          const row = await vrow(v.id);
+          const pkgFile = path.join(dir, `${k.id}-v${v.number}.mbz`);
+          fs.writeFileSync(pkgFile, objects.get(row.storage_path));
+          out.push({ id: k.id, source: k.file, file: pkgFile, sha1: v.sha1, items: v.report.items.map((x) => ({ operation: x.operation, moduleId: x.fields[0]?.moduleId ?? null, after: x.operation === 'edit_html' ? x.fields[0].after : null, removedModuleId: x.operation === 'remove_activity' ? rm.moduleId : null, removedTitle: x.operation === 'remove_activity' ? rm.title : null })) });
+          console.log(`   ${k.id}: versión ${v.number} lista (${v.report.items.map((x) => x.operation).join(', ')}) → ${pkgFile}`);
+        }
+        fs.writeFileSync(path.join(dir, 'versions.json'), JSON.stringify({ builtAt: new Date().toISOString(), versions: out }, null, 2));
+      });
+    }
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {
       const g = new GUARD.CourseWorkshopFlagGuard();
