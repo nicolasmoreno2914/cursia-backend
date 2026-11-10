@@ -17,6 +17,11 @@
 //   L8  conciliación admin de una aprobación `ambiguous`: listado, `charged_partial` con monto real + evidencia, aprobación
 //       `reconciled`, auditoría (admin_audit_log), no-op al repetir, 409 a otra decisión, `charged` entero → 400
 //   L9  `not_charged` libera; una aprobación en curso no figura ni se concilia; solo SuperAdmin
+//   r107 B8 (+ migración B8):
+//   L10 diagnóstico de CALIDAD con el ledger REAL: estimado sin llamar → aprobar → reserva `pending` del tope (tipo
+//       `quality`) → llamada → cargo `llm.workshop_quality` con approvalId → reserva LIBERADA; disponible = antes − cargo
+//   L11 pregunta puntual con el ledger REAL: lo mismo con `question` / `llm.workshop_question`; una llamada ambigua deja la
+//       reserva PENDIENTE (aparece en la conciliación del admin con su tipo)
 //
 // Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js
 'use strict';
@@ -193,7 +198,7 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
     });
 
     // ── r107 B6: openApproval de punta a punta con el ledger REAL + las migraciones r107 sobre el esquema de staging ──
-    for (const s of ['scripts/migrate-r107-workshop-sessions.js', 'scripts/migrate-r107-b2-inventory.js', 'scripts/migrate-r107-b3-diagnosis.js', 'scripts/migrate-r107-b5-plan.js', 'scripts/migrate-r107-b6-apply.js']) {
+    for (const s of ['scripts/migrate-r107-workshop-sessions.js', 'scripts/migrate-r107-b2-inventory.js', 'scripts/migrate-r107-b3-diagnosis.js', 'scripts/migrate-r107-b5-plan.js', 'scripts/migrate-r107-b6-apply.js', 'scripts/migrate-r107-b8-quality.js']) {
       const res = runScript(s, localEnv({ MIGRATION_ENV: 'staging' }));
       assert(res.code === 0, `${s}: exit ${res.code}\n${res.out.slice(-1500)}`);
     }
@@ -314,6 +319,78 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       const { SuperAdminGuard } = L('auth/super-admin.guard.js');
       const guards = Reflect.getMetadata('__guards__', FinopsAdminController) || [];
       assert(guards.includes(SuperAdminGuard), 'el controlador exige SuperAdmin');
+    });
+
+    // ── r107 B8: calidad y preguntas con las MISMAS aprobaciones, contra el ledger real ──
+    const QLS = L('modules/course-workshop/quality/workshop-quality.service.js');
+    await svc.startDiagnosis({ id: U }, sid);
+    await Promise.all([...svc.inFlight.values()]);
+    eq((await svc.getDiagnosis({ id: U }, sid)).status, 'ready', 'diagnóstico técnico listo');
+    const qClient = (mode) => ({
+      simulated: false, calls: 0,
+      async call(req) {
+        this.calls++;
+        if (mode === 'timeout') throw Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' });
+        const input = req.purpose === 'quality' ? { findings: [] } : { verdict: 'sin_evidencia', answer: 'No alcanza.', citations: [] };
+        return { input, stopReason: 'tool_use', model: req.model, messageId: `msg_b8_${crypto.randomUUID()}`, usage: { input_tokens: 2500, output_tokens: 250 }, simulated: false };
+      },
+    });
+
+    await check('L10 (B8) diagnóstico de CALIDAD de punta a punta contra el ledger REAL (enforce): la parte determinista y el estimado sin llamar → aprobar → reserva `pending` del tope (tipo quality) → la llamada → cargo llm.workshop_quality con approvalId → reserva LIBERADA; disponible = antes − cargo', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '2.00', reason: 'QA r107 B8' });
+      const client = qClient('ok');
+      const p = planFor(client);
+      const q = new QLS.WorkshopQualityService(ds, svc, p);
+      await q.startQuality({ id: U }, sid, {});
+      await q.whenIdle();
+      const v = await q.getQuality({ id: U }, sid);
+      eq([v.status, client.calls], ['ready', 0], 'listo sin llamar');
+      const before = await available();
+      const a = await q.startQuality({ id: U }, sid, { chapters: 'all', confirmEstimateUsd: Number(v.ai.all.expectedUsd), capUsd: Number(v.ai.all.proposedCapUsd) });
+      const key = `workshop:approval:${a.approval.id}`;
+      eq([a.approval.kind, a.approval.reserved, (await pending(key)).measurement_status], ['quality', true, 'pending'], 'reserva REAL pendiente antes de llamar');
+      near(await available(), before - Number(v.ai.all.proposedCapUsd), 'el tope reservado descuenta del disponible');
+      await q.whenIdle();
+      const g = await q.getQuality({ id: U }, sid);
+      const ap = g.approvals.find((x) => x.id === a.approval.id);
+      eq([ap.status, ap.calls.map((x) => x.status), client.calls, g.ai.chapters.map((c) => c.status)], ['done', ['charged'], 1, ['reviewed']], 'revisado y cobrado');
+      const [ch] = await ds.query(`select amount::text a, operation from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [a.approval.id]);
+      assert(ch && Number(ch.a) > 0 && /^llm\.workshop_quality/.test(ch.operation), `cargo real: ${JSON.stringify(ch)}`);
+      near(await net(key), 0, 'reserva liberada (neto 0)');
+      near(await available(), before - Number(ch.a), 'disponible = antes − cargo real');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    await check('L11 (B8) pregunta puntual contra el ledger REAL: reserva (tipo question) → cargo llm.workshop_question → liberada; una llamada AMBIGUA deja la reserva PENDIENTE y figura en la conciliación del admin con su tipo', async () => {
+      const client = qClient('ok');
+      const p = planFor(client);
+      const q = new QLS.WorkshopQualityService(ds, svc, p);
+      const ask = async (qq, text) => {
+        const r = await qq.ask({ id: U }, sid, { text });
+        await qq.whenIdle();
+        const h = (await qq.listQuestions({ id: U }, sid)).questions.find((x) => x.id === r.id);
+        assert(h.status === 'awaiting_confirmation', `evidencia recuperada: ${h.status} ${JSON.stringify(h.answer)}`);
+        const c = await qq.ask({ id: U }, sid, { questionId: r.id, confirmEstimateUsd: Number(h.estimate.expectedUsd), capUsd: Number(h.estimate.proposedCapUsd) });
+        await qq.whenIdle();
+        return { c, h: (await qq.listQuestions({ id: U }, sid)).questions.find((x) => x.id === r.id) };
+      };
+      const text = '¿El capítulo 1 explica el tema del curso?';
+      const before = await available();
+      const r1 = await ask(q, text);
+      const key = `workshop:approval:${r1.c.approval.id}`;
+      eq([r1.c.approval.kind, r1.h.status, r1.h.answer.answer, client.calls], ['question', 'answered', 'No encontré evidencia suficiente en el curso para responder', 1], 'respondida (sin evidencia suficiente: el modelo lo dijo)');
+      const [ch] = await ds.query(`select amount::text a, operation from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [r1.c.approval.id]);
+      assert(ch && /^llm\.workshop_question/.test(ch.operation), `cargo: ${JSON.stringify(ch)}`);
+      near(await net(key), 0, 'liberada');
+      near(await available(), before - Number(ch.a), 'disponible = antes − cargo');
+      const q2 = new QLS.WorkshopQualityService(ds, svc, planFor(qClient('timeout')));
+      const r2 = await ask(q2, text);
+      const key2 = `workshop:approval:${r2.c.approval.id}`;
+      eq([r2.h.status, r2.h.error && r2.h.error.code], ['failed', 'WORKSHOP_AI_CALL_AMBIGUOUS'], 'ambigua: visible, no se reintenta a ciegas');
+      eq((await pending(key2)).measurement_status, 'pending', 'reserva PENDIENTE');
+      const row = (await ctl.workshopReservations()).reservations.find((x) => x.reservationKey === key2);
+      assert(row && row.kind === 'question' && row.approvalStatus === 'ambiguous', `en la conciliación: ${JSON.stringify(row)}`);
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }

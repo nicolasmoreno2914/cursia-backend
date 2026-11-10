@@ -10,6 +10,8 @@ import { CreateWorkshopSessionDto } from './dto/create-workshop-session.dto';
 import { AnswerRequestDto, ApplyPlanDto, ConfirmCandidateDto, ConfirmSpendDto, CreateDocumentRequestDto, CreateTextRequestDto, GenerateItemsDto } from './dto/plan.dto';
 import { WorkshopPlanService } from './plan/workshop-plan.service';
 import { WorkshopApplyService } from './apply/workshop-apply.service';
+import { WorkshopQualityService } from './quality/workshop-quality.service';
+import { AskQuestionDto, QualityRunDto } from './dto/quality.dto';
 
 const actorOf = (user: AuthUser): WorkshopActor => ({ id: user.id, email: user.email });
 
@@ -22,7 +24,7 @@ const actorOf = (user: AuthUser): WorkshopActor => ({ id: user.id, email: user.e
 @Controller('course-workshop')
 @UseGuards(SupabaseJwtGuard, CourseWorkshopFlagGuard) // flag antes que los pipes: apagado → 404 con cualquier cuerpo
 export class CourseWorkshopController {
-  constructor(private readonly workshop: CourseWorkshopService, private readonly plan: WorkshopPlanService, private readonly versions: WorkshopApplyService) {}
+  constructor(private readonly workshop: CourseWorkshopService, private readonly plan: WorkshopPlanService, private readonly versions: WorkshopApplyService, private readonly quality: WorkshopQualityService) {}
 
   // POST /api/v1/course-workshop/sessions { filename, sizeBytes } → { session, upload: { method, url?, token?, bucket, storagePath, maxBytes } }
   @Post('sessions')
@@ -80,6 +82,38 @@ export class CourseWorkshopController {
   @Get('sessions/:id/diagnosis')
   diagnosis(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.workshop.getDiagnosis(actorOf(user), id);
+  }
+
+  // ── r107 B8 · diagnóstico de calidad (Q01–Q05) + preguntas puntuales (IA con aprobación y tope, como B5) ──
+
+  // POST /api/v1/course-workshop/sessions/:id/quality {} → 202: la parte DETERMINISTA (gratis) + el estimado por capítulo
+  // de la revisión con IA (no llama a la IA). { chapters: 'all' | [n…], confirmEstimateUsd, capUsd } → 202: aprueba revisar
+  // con IA ese alcance (reserva el tope en FinOps; 409 tope < estimado / estimado distinto / sin saldo / reserva fallida).
+  @Post('sessions/:id/quality')
+  @HttpCode(HttpStatus.ACCEPTED)
+  startQuality(@Param('id') id: string, @Body() body: QualityRunDto, @CurrentUser() user: AuthUser) {
+    return this.quality.startQuality(actorOf(user), id, body);
+  }
+
+  // GET /api/v1/course-workshop/sessions/:id/quality → { status, checks, light, findings (con su arreglo sugerido), ai: { chapters
+  // (estado, estimado, gastado), all (estimado del resto) }, approvals }
+  @Get('sessions/:id/quality')
+  getQuality(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.quality.getQuality(actorOf(user), id);
+  }
+
+  // POST /api/v1/course-workshop/sessions/:id/questions { text } → 202 pregunta `retrieving` (evidencia SIN IA → estimado);
+  // { questionId, confirmEstimateUsd, capUsd } → 202: aprueba responderla con IA (respuesta con citas verificadas)
+  @Post('sessions/:id/questions')
+  @HttpCode(HttpStatus.ACCEPTED)
+  ask(@Param('id') id: string, @Body() body: AskQuestionDto, @CurrentUser() user: AuthUser) {
+    return this.quality.ask(actorOf(user), id, body);
+  }
+
+  // GET /api/v1/course-workshop/sessions/:id/questions → historial de preguntas y respuestas de la sesión
+  @Get('sessions/:id/questions')
+  questions(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.quality.listQuestions(actorOf(user), id);
   }
 
   // ── r107 B5 · pedidos, preguntas y plan (IA con compuerta de saldo; el plan queda `draft`: aprobar y aplicar es B6) ──

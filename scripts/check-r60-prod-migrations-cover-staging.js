@@ -53,6 +53,8 @@ const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
   'migrate-r107-b5-plan.js': { sql: 'supabase-migration-r107-b5-plan.sql' },
   // r107 B6: aplicar + versiones (workshop_versions + columnas / estados de tablas del Taller).
   'migrate-r107-b6-apply.js': { sql: 'supabase-migration-r107-b6-apply.sql' },
+  // r107 B8: diagnóstico de calidad + preguntas puntuales (workshop_quality_runs / _findings / workshop_questions).
+  'migrate-r107-b8-quality.js': { sql: 'supabase-migration-r107-b8-quality.sql' },
 };
 const STAGING_ONLY_REASON = /^r(75|79\.1|81|83|99|107): staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).

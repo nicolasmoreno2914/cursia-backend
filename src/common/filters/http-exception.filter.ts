@@ -89,6 +89,8 @@ export const WORKSHOP_ERROR_DETAIL_KEYS: Readonly<Record<string, 'ids' | 'id' | 
   status: 'text', ledgerCode: 'text', model: 'text', approvalId: 'id', failedItemId: 'id', planHash: 'hash',
   changedItemIds: 'ids', missingItemIds: 'ids', extraItemIds: 'ids', unknownItemIds: 'ids',
   blocking: 'json', later: 'json', items: 'json', warnings: 'json', failure: 'json', estimate: 'json', version: 'json',
+  // r107 B8: capítulos fuera del alcance revisable (400 WORKSHOP_QUALITY_CHAPTERS_INVALID).
+  invalidChapters: 'json',
 });
 const WORKSHOP_CODE_RE = /^(COURSE_)?WORKSHOP_[A-Z0-9_]{1,80}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

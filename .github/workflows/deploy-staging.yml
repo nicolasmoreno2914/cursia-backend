@@ -925,6 +925,12 @@ jobs:
                echo "━━━ [5m] r107 B6: Taller de cursos (aplicar + versiones) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r107-b6-apply.js
 
+               # r107 B8: diagnóstico de calidad + preguntas puntuales (workshop_quality_runs, workshop_quality_findings,
+               # workshop_questions: tablas NUEVAS con RLS + sin anon/authenticated; tipos `quality` / `question` en la tabla
+               # de aprobaciones del Taller). Staging-only (EXCLUDED del plan de producción). Aditiva e idempotente; requiere [5i], [5k], [5l].
+               echo "━━━ [5n] r107 B8: Taller de cursos (calidad + preguntas) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r107-b8-quality.js
+
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
                ensure_pm2_process cursia-content-worker-staging start:content-worker
