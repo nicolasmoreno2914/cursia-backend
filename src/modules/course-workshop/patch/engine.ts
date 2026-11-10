@@ -30,7 +30,7 @@ import { applyExamAdd, applyExamRemove, applyExamReplace } from './op-exam';
 import { applyBrandReplace } from './op-brand';
 import { applyRemoveActivity } from './op-remove';
 import { applyRegenerate } from './op-regenerate';
-import { applyAddChapter } from './op-add-chapter';
+import { applyAddChapter, chapterPieces, templateOf } from './op-add-chapter';
 import { applyAddModule } from './op-add-module';
 import { DiagnosisDelta, OperationReport, PATCH_OPERATIONS, PatchError, PatchFailure, PatchOperation, PatchResult, emptyReport } from './types';
 
@@ -233,17 +233,31 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
     return r;
   }
   // r107 B11: agregar capítulo / módulo — los conteos de capítulos y actividades suben EXACTO lo agregado (ni más ni menos).
-  const adds = input.operations.map((o, i) => ({ o, r: reports[i] })).filter((x) => x.o.op === 'add_chapter' || x.o.op === 'add_module');
+  // P2-3: lo esperado sale de los PARÁMETROS (piezas del molde × capítulos + examen), no de lo que la operación dice que
+  // hizo; P1-2b: las actividades que el plan quita (y los capítulos que quedan vacíos) se descuentan.
+  const adds = input.operations.filter((o) => o.op === 'add_chapter' || o.op === 'add_module');
   if (adds.length) {
-    const wantCh = adds.reduce((n, x) => n + (x.o.op === 'add_chapter' ? 1 : ((x.o as any).produced?.chapters?.length ?? 0)), 0);
-    const wantAct = adds.reduce((n, x) => n + (x.r.idsAssigned.moduleid?.length ?? 0), 0);
     try {
       const invOf = async (p: MbzPackage) => buildWorkshopCourse(await readRawCourse(p, meta), adapterFor(family));
       const b = await invOf(await openMbz(input.original));
       const a = await invOf(await openMbz(bytes));
+      let wantCh = 0; let wantAct = 0;
+      for (const o of adds as any[]) {
+        const per = chapterPieces(templateOf(b, o.templateChapter, o.expect?.templateModuleIds), o.omit ?? []).length;
+        if (o.op === 'add_chapter') { wantCh += 1; wantAct += per; continue; }
+        const n = Array.isArray(o.chapters) ? o.chapters.length : 0;
+        wantCh += n; wantAct += per * n;
+        if (o.templateExamModuleId !== null && o.templateExamModuleId !== undefined) {
+          const ex = b.activities.find((x) => x.moduleId === o.templateExamModuleId);
+          wantAct += 1 + (ex && b.activities.some((x) => x.kind === 'exam_info' && x.unit === ex.unit && x.sectionId === ex.sectionId) ? 1 : 0);
+        }
+      }
+      const removed = new Set(input.operations.filter((o) => o.op === 'remove_activity').map((o) => (o as any).moduleId as number));
+      wantAct -= [...removed].filter((m) => b.activities.some((x) => x.moduleId === m)).length;
+      wantCh -= b.chapters.filter((c) => c.activities.length && c.activities.every((m) => removed.has(m))).length;
       const dCh = a.chapters.length - b.chapters.length;
       const dAct = a.activities.length - b.activities.length;
-      if (dCh !== wantCh || dAct !== wantAct) return fail({ opIndex: null, op: null, code: 'invariant', message: `El paquete nuevo tiene ${dCh} capítulo(s) y ${dAct} actividad(es) más; se agregaron ${wantCh} y ${wantAct}.` }, pkg.container);
+      if (dCh !== wantCh || dAct !== wantAct) return fail({ opIndex: null, op: null, code: 'invariant', message: `El paquete nuevo tiene ${dCh} capítulo(s) y ${dAct} actividad(es) de diferencia; el plan pide ${wantCh} y ${wantAct}.` }, pkg.container);
     } catch (e) {
       return fail({ opIndex: null, op: null, code: 'invariant', message: `No se pudieron contar los capítulos del resultado: ${e instanceof Error ? e.message : String(e)}` }, pkg.container);
     }

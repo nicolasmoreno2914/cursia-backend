@@ -884,6 +884,43 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
 
+    await check('L23 (B11 P1-2 c) dos ítems estructurales en el mismo plan → aprobar la generación de cualquiera = 409 WORKSHOP_STRUCTURAL_COMBINATION ANTES de reservar ni llamar (0 llamadas, sin aprobación abierta); al quitar uno, el otro se aprueba', async () => {
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s3 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l23-v1.mbz', sizeBytes: V1.length });
+      objects.set(s3.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s3.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid3 = s3.session.id;
+      const Q = 'Agrega en el módulo 1 el capítulo «Lenguaje corporal» y en el módulo 3 el capítulo «Encuestas de satisfacción».';
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [
+        { quote: 'Agrega en el módulo 1 el capítulo «Lenguaje corporal»', operation: 'add_chapter', instruction: 'Agregar capítulo', target: { moduleNumber: 1 }, newChapters: [{ title: 'Lenguaje corporal' }], targetEvidence: 'en el módulo 1', changeEvidence: 'Lenguaje corporal' },
+        { quote: 'en el módulo 3 el capítulo «Encuestas de satisfacción»', operation: 'add_chapter', instruction: 'Agregar capítulo', target: { moduleNumber: 3 }, newChapters: [{ title: 'Encuestas de satisfacción' }], targetEvidence: 'en el módulo 3', changeEvidence: 'Encuestas de satisfacción' },
+      ] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false });
+      const p = planFor(client); p.regenProviders = () => sim;
+      const a = await p.createTextIntake({ id: U }, sid3, Q);
+      await p.confirmInterpretation({ id: U }, sid3, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p.whenIdle();
+      const pl = await p.getPlan({ id: U }, sid3);
+      const its = pl.items.filter((i) => i.operation === 'add_chapter' && i.stage === 'estimate');
+      eq(its.length, 2, 'dos ítems estructurales');
+      const before = (await ds.query(`select count(*)::int n from public.workshop_ai_approvals where session_id = $1 and kind = 'generate'`, [sid3]))[0].n;
+      const err = await p.approveGeneration({ id: U }, sid3, pl.planId, { itemIds: [its[0].id], confirmEstimateUsd: Number(its[0].plannedCall.expectedUsd), capUsd: Math.ceil(Number(its[0].plannedCall.regen.totalBoundUsd) * 100) / 100 }).then(() => null, (e) => e);
+      eq(err && (err.getResponse ? err.getResponse().code : err.code), 'WORKSHOP_STRUCTURAL_COMBINATION', '409 por combinación');
+      assert(/dos rondas/.test(err.getResponse().message), err.getResponse().message);
+      eq([sim.calls.anthropic.length, sim.calls.videogen.length, sim.calls.gamma.length], [0, 0, 0], '0 llamadas');
+      eq((await ds.query(`select count(*)::int n from public.workshop_ai_approvals where session_id = $1 and kind = 'generate'`, [sid3]))[0].n, before, 'sin aprobación abierta');
+      await p.setItemStatus({ id: U }, sid3, its[1].id, 'removed');
+      const pl2 = await p.getPlan({ id: U }, sid3);
+      const it0 = pl2.items.find((i) => i.id === its[0].id);
+      const g = await p.approveGeneration({ id: U }, sid3, pl2.planId, { itemIds: [it0.id], confirmEstimateUsd: Number(it0.plannedCall.expectedUsd), capUsd: Math.ceil(Number(it0.plannedCall.regen.totalBoundUsd) * 100) / 100 });
+      await p.whenIdle();
+      eq((await p.getPlan({ id: U }, sid3)).items.find((i) => i.id === it0.id).stage, 'ready', 'con uno solo, se genera');
+      assert(g.approval, 'aprobada');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});

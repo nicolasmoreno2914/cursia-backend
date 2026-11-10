@@ -308,7 +308,9 @@ async function addLibroModuleTocEntry(ctx: OpContext, texts: Texts, M: number, t
   const ne = `files/${nh.slice(0, 2)}/${nh}`;
   ctx.state.write(ne, out);
   ctx.report.entriesAdded.push(ne);
-  await texts.set('files.xml', fx.split(`<contenthash>${h}</contenthash>`).join(`<contenthash>${nh}</contenthash>`).replace(new RegExp(`(<contenthash>${nh}</contenthash>[\\s\\S]*?<filesize>)\\d+(</filesize>)`, 'g'), (_m, a: string, b: string) => `${a}${out.length}${b}`));
+  // P2-4: solo la entrada del Libro (mismo contexto) cambia de blob.
+  await texts.set('files.xml', fx.replace(/<file id="(\d+)">([\s\S]*?)<\/file>/g, (m, id: string, body: string) => (body === blk[1]
+    ? `<file id="${id}">${body.replace(`<contenthash>${h}</contenthash>`, `<contenthash>${nh}</contenthash>`).replace(/<filesize>\d+<\/filesize>/, `<filesize>${out.length}</filesize>`)}</file>` : m)));
   // El blob intermedio (sin la entrada del módulo) ya no lo usa nadie.
-  if (ctx.state.has(be) && !ctx.inv.activities.some((a) => a.files.some((f) => f.contenthash === h))) { ctx.state.remove(be); const k = ctx.report.entriesAdded.indexOf(be); if (k >= 0) ctx.report.entriesAdded.splice(k, 1); }
+  if (ctx.state.has(be) && !ctx.inv.activities.some((a) => a.files.some((f) => f.contenthash === h)) && !(await texts.get('files.xml')).includes(`<contenthash>${h}</contenthash>`)) { ctx.state.remove(be); const k = ctx.report.entriesAdded.indexOf(be); if (k >= 0) ctx.report.entriesAdded.splice(k, 1); }
 }

@@ -32,6 +32,7 @@ import { ModuleRef } from '@nestjs/core';
 import { decideRunSpend } from '../../finops/run-spend-guard';
 import { effectiveOutputRowsSql } from '../../dynamic-generation/item-generations';
 import { PaidCallGate, PaidCallTicket, RegenProviders } from '../regenerate/ports';
+import { STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE, isStructuralOperation, structuralLast } from '../apply/apply-core';
 import { PROVIDER_OVER_BOUND, RegenDeferred, RegenError, RegenExternal, RegenPrior, RegenerateOp, isPaidOperation, isRegenOperation } from '../regenerate/types';
 import { WaitTimeout, gammaFinal, pollUntilFinal, settleGammaGeneration, settleVideogenJob, videogenFinal } from '../regenerate/async-wait';
 import { RegenDbSources } from '../regenerate/sources';
@@ -208,10 +209,13 @@ export function capBelowPaidBound(cap: string | number, bound: number): boolean 
 }
 
 /** r107 B11: clave del destino de lo pagado (moduleid de la actividad que se rehace, o el módulo / curso al agregar). */
-export function regenTargetKey(req: { operation: string | null; target: unknown; details?: { position?: number | null; moduleTitle?: string | null } }): string {
+export function regenTargetKey(req: { operation: string | null; target: unknown; details?: unknown }): string {
   const t = (req.target ?? {}) as Record<string, unknown>;
-  if (req.operation === 'add_chapter') return `module:${t.moduleNumber ?? ''}:pos:${req.details?.position ?? ''}`;
-  if (req.operation === 'add_module') return `course:module:${req.details?.moduleTitle ?? ''}`;
+  // P2-5: lo pagado se reusa solo para el MISMO pedido (módulo, posición, títulos y piezas omitidas).
+  const d = (req.details ?? {}) as { position?: number | null; moduleTitle?: string | null; newChapters?: Array<{ title: string }> | null; omit?: string[] | null };
+  const tail = `titles:${JSON.stringify((d.newChapters ?? []).map((c) => c.title))}:omit:${[...(d.omit ?? [])].sort().join(',')}`;
+  if (req.operation === 'add_chapter') return `module:${t.moduleNumber ?? ''}:pos:${d.position ?? ''}:${tail}`;
+  if (req.operation === 'add_module') return `course:module:${d.moduleTitle ?? ''}:${tail}`;
   return String(t.moduleId ?? '');
 }
 
@@ -781,6 +785,12 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     }
     const items = await this.q<ItemRow[]>(this.dataSource, `select i.* from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
         where i.plan_id = $1 and i.id = any($2::uuid[]) and i.stage = 'estimate' and i.status = 'proposed' and r.status = 'awaiting_generation' order by i.created_at, i.id`, [plan.id, ids]);
+    // r107 B11 (P1-2 c): un solo ítem estructural por plan; si hay más, 409 ANTES de reservar ni llamar a nadie.
+    if (items.some((i) => isStructuralOperation(i.operation))) {
+      const [st] = await this.q<any[]>(this.dataSource, `select count(*)::int as n from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
+          where i.plan_id = $1 and i.status = 'proposed' and r.status <> 'withdrawn' and i.operation in ('add_chapter', 'add_module')`, [plan.id]);
+      if (Number(st?.n ?? 0) > 1) throw new ConflictException({ code: STRUCTURAL_COMBINATION, message: STRUCTURAL_COMBINATION_MESSAGE });
+    }
     if (items.length !== ids.length) throw new ConflictException({ code: PLAN_ERRORS.ITEMS_INVALID, message: 'Algún ítem elegido no está esperando generación (ya se generó, se quitó o es de otro plan).' });
     // r107 B10: una regeneración usa otros proveedores (OpenAI TTS, Gamma, Videogen, YouTube): todos tienen que estar
     // permitidos (kill switch / allow-list) ANTES de reservar nada.
@@ -1658,7 +1668,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     if (!(await this.planEditableNow(s))) return; // r107 B6: la prueba en seco de un plan aplicado / aplicándose queda como estaba
     const planId = await this.planIdOf(s);
     const items = await this.q<ItemRow[]>(this.dataSource, `select i.* from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
-        where i.plan_id = $1 and i.status = 'proposed' and i.stage = 'ready' and i.available and r.status = 'resolved' order by i.created_at, i.id`, [planId]);
+        where i.plan_id = $1 and i.status = 'proposed' and i.stage = 'ready' and i.available and r.status = 'resolved' order by i.created_at, i.id`, [planId]).then((xs) => structuralLast(xs));
     let ops;
     try {
       ops = await Promise.all(items.map((i) => this.resolveRegenParams(s, i.params)));

@@ -177,6 +177,20 @@ export function itemReports(items: Array<Pick<ApplyCandidate, 'id' | 'requestId'
   });
 }
 
+// ── r107 B11: ítems estructurales ──
+
+export const isStructuralOperation = (op: unknown): boolean => op === 'add_chapter' || op === 'add_module';
+/**
+ * P1-2 a: los ítems ESTRUCTURALES (agregar capítulo / módulo) se aplican AL FINAL: todo lo que el plan direcciona por
+ * número de capítulo (Libro, exámenes, quitas) se aplica con la numeración ORIGINAL con la que se armó.
+ */
+export function structuralLast<T extends { operation: string }>(xs: T[]): T[] {
+  return [...xs.filter((x) => !isStructuralOperation(x.operation)), ...xs.filter((x) => isStructuralOperation(x.operation))];
+}
+export const STRUCTURAL_COMBINATION = 'WORKSHOP_STRUCTURAL_COMBINATION';
+/** P1-2 c: un plan admite UN solo cambio estructural (los dos se arman sobre la numeración original). */
+export const STRUCTURAL_COMBINATION_MESSAGE = 'Este plan tiene más de un cambio que agrega capítulos o módulos y no se pueden aplicar juntos. Hay que hacerlo en dos rondas: quita uno de este plan, aplica el otro y, sobre la versión nueva, vuelve a pedir el que quitaste. No se llamó a ningún proveedor.';
+
 // ── validador ──
 
 export interface ApplyValidation {
@@ -266,10 +280,12 @@ export async function runApply(input: ApplyRunInput): Promise<ApplyRunOk | Apply
     return fail('verify_original', 'WORKSHOP_ORIGINAL_CHANGED', 'Los bytes del original no son los de la sesión: no se aplica nada.');
   }
   if (!input.items.length) return fail('engine', 'WORKSHOP_APPLY_EMPTY', 'El plan no tiene ítems para aplicar.');
-  const res = await applyPatchPlan({ original: input.original, filename: input.filename ?? null, operations: input.items.map((i) => i.params), baseline: input.baseline ?? null });
+  if (input.items.filter((i) => isStructuralOperation(i.operation)).length > 1) return fail('engine', STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE);
+  const items = structuralLast(input.items);
+  const res = await applyPatchPlan({ original: input.original, filename: input.filename ?? null, operations: items.map((i) => i.params), baseline: input.baseline ?? null });
   if (!res.ok || !res.package) {
     const f = res.failure;
-    const item = f && f.opIndex !== null ? input.items[f.opIndex] ?? null : null;
+    const item = f && f.opIndex !== null ? items[f.opIndex] ?? null : null;
     const gate = f?.code === 'new_findings';
     return fail(gate ? 'gate' : 'engine', `WORKSHOP_APPLY_${String(f?.code ?? 'failed').toUpperCase()}`,
       gate
@@ -305,7 +321,7 @@ export async function runApply(input: ApplyRunInput): Promise<ApplyRunOk | Apply
   }
   return {
     ok: true, package: out, sha1, sha256: sha('sha256', out), size: out.length, container: res.container,
-    items: itemReports(input.items, res.operations), diagnosis: res.diagnosis as DiagnosisDelta, validation, preservedEntries: res.preservedEntries, restoreCheck,
+    items: itemReports(items, res.operations), diagnosis: res.diagnosis as DiagnosisDelta, validation, preservedEntries: res.preservedEntries, restoreCheck,
   };
 }
 

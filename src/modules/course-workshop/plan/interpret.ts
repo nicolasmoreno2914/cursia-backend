@@ -263,7 +263,10 @@ export function resolveRequest(r: RawAiRequest, course: WorkshopCourse, opts: Re
   }
   if (qs.length) {
     const keep = 'target' in res && !qs.some((q) => q.purpose === 'target') ? res.target : null;
-    return { ...out, status: 'needs_answer', target: keep, details: keep && 'target' in res ? res.details ?? {} : {}, questions: qs.slice(0, PLAN_LIMITS.questionsMax), reason: reasons.join(' ') };
+    // r107 B11 (P1-4): lo que ya se sabe del capítulo / módulo nuevo viaja con la pregunta (la respuesta lo completa).
+    const known: RequestDetails = operation === 'add_chapter' || operation === 'add_module'
+      ? { ...(r.newChapters?.length ? { newChapters: r.newChapters } : {}), ...(r.position ? { position: r.position } : {}), ...(r.moduleTitle ? { moduleTitle: r.moduleTitle } : {}) } : {};
+    return { ...out, status: 'needs_answer', target: keep, details: { ...known, ...(keep && 'target' in res ? res.details ?? {} : {}) }, questions: qs.slice(0, PLAN_LIMITS.questionsMax), reason: reasons.join(' ') };
   }
   return { ...out, status: isLater(operation) ? 'phase_later' : 'resolved', target: (res as { target: ResolvedTarget }).target, details: (res as { details?: RequestDetails }).details ?? {} };
 }
@@ -585,21 +588,32 @@ export function checkAnswers(req: Pick<InterpretedRequest, 'status' | 'questions
 
 export function answerRequest(req: InterpretedRequest, answers: ClarifyAnswer[], course: WorkshopCourse): { resolved: InterpretedRequest } | { reinterpret: Array<{ question: string; answer: string }> } {
   const qa = checkAnswers(req, answers);
-  const deterministic = req.operation !== null && qa.every((x) => x.q.origin === 'server' && ((x.q.purpose === 'target' && x.option && x.option.resolves && !x.text) || (x.q.purpose === 'instruction' && x.text)));
+  // r107 B11: el título del módulo y de sus capítulos en texto libre los ordena la IA (re-interpretar), no el servidor.
+  const deterministic = req.operation !== null && !(req.operation === 'add_module' && qa.some((x) => x.q.purpose === 'instruction')) && qa.every((x) => x.q.origin === 'server' && ((x.q.purpose === 'target' && x.option && x.option.resolves && !x.text) || (x.q.purpose === 'instruction' && x.text)));
   if (!deterministic) return { reinterpret: qa.map(({ question, answer }) => ({ question, answer })) };
   let rawTarget: RawTarget = { ...((req.rawTarget as RawTarget) ?? {}) };
   let instruction = req.instruction;
+  // r107 B11 (P1-4): agregar capítulo — lo ya sabido (req.details) + lo que contesta el docente.
+  let newChapters = req.details.newChapters ?? null;
+  let position = req.details.position ?? null;
+  const moduleTitle = req.details.moduleTitle ?? null;
   for (const x of qa) {
     if (x.q.purpose === 'target') {
       // El destino elegido REEMPLAZA lo que se había nombrado (que no existía o era ambiguo).
       const rs = x.option!.resolves!;
       rawTarget = { ...(rawTarget.chapters && req.operation === 'edit_libro_section' ? { chapters: rawTarget.chapters } : {}), ...rs } as RawTarget;
       if (req.operation === 'edit_libro_section' && rs.chapterNumber !== undefined) rawTarget.chapters = [rs.chapterNumber];
+      // La opción de posición resuelve {moduleNumber, chapterNumber}: el número es la POSICIÓN del capítulo nuevo.
+      if (req.operation === 'add_chapter' && rs.chapterNumber !== undefined) { position = rs.chapterNumber; delete rawTarget.chapterNumber; }
+    } else if (req.operation === 'add_chapter' && !newChapters?.length) {
+      // La respuesta ES el título (literal de lo que escribió el docente; una línea, sin comillas de más).
+      const title = String(x.text).split(/\r?\n/)[0].replace(/^[«"“']+|[»"”'.]+$/g, '').trim().slice(0, 160);
+      if (title) newChapters = [{ title, objective: null }];
     } else instruction = x.text!;
   }
   // Destino resuelto con el que ya se había resuelto (solo faltaba la instrucción).
   if (req.target && !qa.some((x) => x.q.purpose === 'target')) rawTarget = { ...rawTargetOf(req.target), ...rawTarget };
-  const raw: RawAiRequest = { quote: req.quote, operation: req.operation as RawAiRequest['operation'], instruction, target: rawTarget, colors: req.details.colors ?? [], chapters: req.details.chapters ?? null, reason: null, questions: [] };
+  const raw: RawAiRequest = { quote: req.quote, operation: req.operation as RawAiRequest['operation'], instruction, target: rawTarget, colors: req.details.colors ?? [], chapters: req.details.chapters ?? null, newChapters, position, moduleTitle, reason: null, questions: [] };
   // El docente eligió el destino o escribió el cambio (o ya estaban justificados: si no, habría otra pregunta pendiente).
   const next = resolveRequest(raw, course, { trustedTarget: true, trustedChange: true });
   return { resolved: { ...next, details: { ...req.details, ...next.details } } };

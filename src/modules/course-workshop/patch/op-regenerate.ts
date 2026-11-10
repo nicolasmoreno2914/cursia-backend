@@ -186,13 +186,17 @@ export function audioRecountProblems(p: Extract<ProducedRegen, { kind: 'audio' }
 export async function scoIdAllocator(ctx: OpContext): Promise<() => number> {
   const used = new Set<number>();
   let max = 59_999;
+  let general = 0;
   for (const n of ctx.state.names()) {
     if (!/\.xml$/i.test(n)) continue;
     const x = await ctx.state.readText(n);
     for (const m of x.matchAll(/\bid="(\d{1,15})"/g)) used.add(Number(m[1]));
+    for (const m of x.matchAll(/<([a-z_]*id)>(\d{1,15})<\/\1>/g)) used.add(Number(m[2]));
     for (const m of x.matchAll(/<(sco|sco_data|sco_track|seq_[a-z_]+)\s+id="(\d{1,15})"/g)) max = Math.max(max, Number(m[2]));
   }
-  let next = max + 1;
+  for (const v of used) if (v > general) general = v;
+  // r107 B11 (P2-6): sobre max(general, sco / sco_data, 60000).
+  let next = Math.max(max, general) + 1;
   return () => { while (used.has(next)) next++; used.add(next); return next++; };
 }
 

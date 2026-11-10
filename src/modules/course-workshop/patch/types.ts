@@ -43,6 +43,11 @@ export interface LibroChapterInput {
   number: number;
   html: string;
   title?: string;
+  /**
+   * r107 B11 (P1-3 d): título que el capítulo `number` tenía en el Libro al armar el plan. Si otra operación lo
+   * renumeró (agregar un capítulo antes), el capítulo con ese número ya es otro: la operación falla `stale_target`.
+   */
+  expectTitle?: string;
 }
 
 export interface EditLibroSectionOp {

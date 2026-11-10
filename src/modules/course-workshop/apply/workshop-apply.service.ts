@@ -13,7 +13,7 @@ import type { PlanItemView } from '../plan/types';
 import type { PatchOperation } from '../patch/types';
 import {
   APPLY_CODE_VERSION, ApplyApproval, ApplyCandidate, approvalMismatch, itemContentHash, planContentHash, ApplyRunFail, ApplyRunItem, RESTORE_NOT_AVAILABLE_MESSAGE, RestoreChecker, applyMemoryFactor, chainOf, confirmationsMissing,
-  nextVersionNumber, runApply, selectApplyItems, versionStoragePath,
+  nextVersionNumber, runApply, selectApplyItems, versionStoragePath, isStructuralOperation, STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE, structuralLast,
 } from './apply-core';
 import { LibroV3SourceResolver, libroV3ResolverOf, regenerateLibroV3Pdf } from './libro-v3';
 import { ModuleRef } from '@nestjs/core';
@@ -211,6 +211,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     const warnings = await this.planWarningsOf(plan.id);
     const view = (i: ApplyCandidate) => ({ id: i.id, operation: i.operation, summary: i.summary, risk: i.riskLevel, requiresItemConfirm: i.requiresItemConfirm, contentHash: i.contentHash });
     if (sel.blocking.length) throw new ConflictException({ code: APPLY_ERRORS.NOT_READY, message: 'Hay ítems del plan que todavía no se pueden aplicar.', blocking: sel.blocking });
+    if (sel.apply.filter((i) => isStructuralOperation(i.operation)).length > 1) throw new ConflictException({ code: STRUCTURAL_COMBINATION, message: STRUCTURAL_COMBINATION_MESSAGE, items: sel.apply.filter((i) => isStructuralOperation(i.operation)).map(view) });
     if (!sel.apply.length) throw new ConflictException({ code: APPLY_ERRORS.EMPTY, message: 'El plan no tiene ítems para aplicar en esta fase.', later: sel.later.map(view) });
     const applyIds = sel.apply.map((i) => i.id);
     const current = sel.apply.map((i) => ({ id: i.id, contentHash: i.contentHash as string }));
@@ -237,8 +238,10 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     const combined = plan.combined;
     // Fix round 2 (nota): por ids Y por la huella del contenido de cada ítem (si el ítem cambió y la prueba en seco no se
     // rehízo todavía, está vencida).
-    const hashes = sel.apply.map((i) => i.contentHash as string);
-    if (!combined || !Array.isArray(combined.itemIds) || combined.itemIds.join(',') !== applyIds.join(',')
+    // r107 B11: la prueba combinada corre con los estructurales al final (mismo orden que al aplicar).
+    const ordered = structuralLast(sel.apply);
+    const hashes = ordered.map((i) => i.contentHash as string);
+    if (!combined || !Array.isArray(combined.itemIds) || combined.itemIds.join(',') !== ordered.map((i) => i.id).join(',')
       || !Array.isArray(combined.itemHashes) || combined.itemHashes.join(',') !== hashes.join(',')) {
       throw new ConflictException({ code: APPLY_ERRORS.DRY_RUN_STALE, message: 'La prueba en seco del plan todavía no está al día con estos cambios: espera unos segundos y vuelve a intentar.' });
     }

@@ -35,7 +35,7 @@ import { xmlEsc } from './html-edit';
 import { IdAllocator } from './ids';
 import { OpContext, blobPath, noteModified } from './op-context';
 import { libroStructure, recomposeLibro } from './op-libro';
-import { producedProblems, scoIdAllocator } from './op-regenerate';
+import { producedProblems } from './op-regenerate';
 import { PatchError } from './types';
 
 const htmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -48,6 +48,14 @@ const replaceLit = (s: string, from: string, to: string): { out: string; n: numb
 };
 
 /** Firmas de las piezas que el builder V1 arma con PLANTILLA (no con la IA). */
+/** Bloque del video que pide `pHTML` (tipo `vi`): lo reemplaza el empaquetado (16-mbz-patch.js `makeH5PEmbed`). */
+export const SLOT_RE = /<!--\s*CC_VIDEO_SLOT_START\s*-->[\s\S]*?<!--\s*CC_VIDEO_SLOT_END\s*-->/g;
+/** Texto del marcador «video pendiente» que nunca puede quedar en un capítulo entregado. */
+export const VIDEO_PENDING_RE = /Video en preparaci[oó]n|disponible pr[oó]ximamente|CC_VIDEO_SLOT/i;
+/** El reproductor embebido del hvp (el de `makeH5PEmbed`, sin el <script> del resizer: el Taller no agrega scripts). */
+export const hvpEmbedHtml = (mid: number): string => '<div style="position:relative;width:100%;max-width:840px;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:14px;margin:16px auto 20px;background:#08111C;border:1px solid rgba(96,165,250,0.15);box-shadow:0 8px 32px rgba(0,0,0,0.5);">'
+  + `<iframe src="$@HVPEMBEDBYID*${mid}@$" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen="allowfullscreen" title="Video Interactivo"></iframe></div>`;
+
 export const V1_TEMPLATE_SIGNATURES = Object.freeze({
   presentation: 'Presentación del capítulo',
   videoIntro: '📺 Cómo aprovechar este video',
@@ -125,8 +133,12 @@ interface TemplateChapter {
 
 /** Molde: el capítulo pedido, con todas sus actividades en UNA sección, en orden, con rol conocido. */
 export function templateOf(inv: WorkshopCourse, n: number, expectIds?: number[]): TemplateChapter {
-  const ch = inv.chapters.find((c) => c.number === n);
+  // P1-3: con la precondición, el molde se busca por SUS actividades (otra operación del plan pudo renumerarlo).
+  const byIds = expectIds && expectIds.length ? inv.chapters.find((c) => [...c.activities].sort((a, b) => a - b).join(',') === [...expectIds].sort((a, b) => a - b).join(',')) : null;
+  if (expectIds && expectIds.length && !byIds) throw new PatchError('stale_target', `El capítulo molde (actividades ${expectIds.join(', ')}) cambió desde que se armó el plan.`);
+  const ch = byIds ?? inv.chapters.find((c) => c.number === n);
   if (!ch) throw new PatchError('target_not_found', `El capítulo molde ${n} no está en el paquete.`);
+  n = ch.number;
   if (!ch.title) throw new PatchError('unsupported', `El capítulo molde ${n} no tiene título reconocible: no se usa de molde.`);
   const acts = ch.activities.map((id) => inv.activities.find((a) => a.moduleId === id)).filter((a): a is WorkshopActivity => !!a);
   if (acts.length !== ch.activities.length || acts.some((a) => a.missingFolder)) throw new PatchError('unsupported', `El capítulo molde ${n} tiene actividades sin carpeta.`);
@@ -179,6 +191,9 @@ export async function producedChapterProblems(p: ProducedChapter, need: { video:
   for (const [k, v] of [['libro', p.libroMd], ['página del video', p.videoPageHtml], ['página del juego', p.gamePageHtml]] as const) {
     if (v && hasPendingMarker(v)) out.push(`la ${k} trae un marcador «⚠️ Pendiente»`);
     if (v && k !== 'libro' && /<script\b/i.test(v)) out.push(`la ${k} trae <script>`);
+    // P1-5: el bloque del video se resuelve al insertar; fuera de él no puede quedar «Video en preparación».
+    if (v && k !== 'libro' && VIDEO_PENDING_RE.test(v.replace(SLOT_RE, ''))) out.push(`la ${k} trae «Video en preparación» (o el bloque del video sin cerrar)`);
+    if (v && k === 'página del juego' && /CC_VIDEO_SLOT_START/.test(v)) out.push('la página del juego trae un bloque de video');
   }
   if (need.videoPage && !plainText(p.videoPageHtml ?? '', 40)) out.push('falta la página del video del capítulo');
   if (need.gamePage && !plainText(p.gamePageHtml ?? '', 40)) out.push('falta la descripción del juego del capítulo');
@@ -255,14 +270,19 @@ export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: Templa
   if (a.renumber !== false) await renumberChapters(ctx, texts, P, pl);
   const alloc = await ctx.ids();
   await reserveAttributeIds(ctx, alloc);
-  const takeSco = await scoIdAllocator(ctx);
+  const takeSco = () => { const v = alloc.takeSco('sco'); (ctx.report.idsAssigned.sco ||= []).push(v); return v; };
   const libro = ctx.inv.activities.find((x) => x.kind === 'libro' && !x.missingFolder) ?? null;
   // ids nuevos por actividad (antes de escribir, para los tokens entre ellas).
   const plan = pieces.map(({ piece, activity }) => ({ piece, src: activity, mid: alloc.take('moduleid') }));
   const midOf = new Map(plan.map((x) => [x.src.moduleId, x.mid]));
   const scorm = plan.find((x) => x.piece === 'game')!;
   // CTA reescritos igual que el builder (`rewriteCtaLinks`): placeholders del contenido de la IA → tokens reales.
-  const rewrite = (html: string): string => html
+  // P1-5: el bloque del video de la página (CC_VIDEO_SLOT, lo pide pHTML) → el reproductor del hvp NUEVO si el molde
+  // lo embebe así; si no, se quita. Nunca queda «Video en preparación» ni el marcador sin resolver.
+  const hvpNew = plan.find((x) => x.piece === 'video');
+  const templateEmbeds = t.activities.some((x) => x.html.some((h) => /\$@HVPEMBEDBYID\*\d+@\$/.test(h.html)));
+  const slots = (html: string): string => html.replace(SLOT_RE, () => (hvpNew && templateEmbeds ? hvpEmbedHtml(hvpNew.mid) : ''));
+  const rewrite = (html: string): string => slots(html)
     .replace(/#scorm-cap-(\d+)/g, (m, n: string) => (Number(n) === P ? `$@SCORMVIEWBYID*${scorm.mid}@$` : m))
     .replace(/#libro-guia/g, (m) => (libro ? `$@RESOURCEVIEWBYID*${libro.moduleId}@$` : m))
     .replace(/#exam-unit-(\d+)/g, (m, u: string) => { const q = a.unitExams?.get(Number(u)); return q ? `$@QUIZVIEWBYID*${q}@$` : m; });
@@ -372,6 +392,8 @@ export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: Templa
         xml = editTag(xml, 'sectionnumber', () => String(pl.sectionNumber));
         if (!/<availability>\$@NULL@\$<\/availability>|<availability><\/availability>/.test(xml) && /<availability>/.test(xml)) throw new PatchError('unsupported', `${src.dir} tiene condiciones de acceso: no se clona.`);
       }
+      // P2-2: el slug del hvp lleva el número del capítulo (como el builder: interactive-video-N).
+      if (rel === 'hvp.xml') xml = xml.replace(/<slug>interactive-video-\d+<\/slug>/, `<slug>interactive-video-${P}</slug>`);
       if (rel === `${src.modname}.xml`) xml = await rewriteMain(xml, { piece: x.piece, src, content, nameOf: textAsPage(x.piece) ? () => pageName : nameOf, fromTemplate, rewrite, p, P, asPage: textAsPage(x.piece) });
       if (rel === 'grades.xml') xml = editTag(xml, 'itemname', (v) => xmlEsc(nameOf(xmlUnescape(v))), true);
       // Ningún id del molde queda en la carpeta nueva.
@@ -501,6 +523,7 @@ async function rewriteMain(xml: string, a: { piece: ChapterPiece; src: WorkshopA
       throw new PatchError('unsupported', `Pieza «${piece}» fuera del patrón del capítulo.`);
   }
   if (hasPendingMarker(html)) throw new PatchError('invalid_content', 'La actividad nueva trae un «⚠️ Pendiente».');
+  if (VIDEO_PENDING_RE.test(html)) throw new PatchError('invalid_content', 'La actividad nueva trae el marcador «Video en preparación» o el bloque del video sin resolver.');
   const i0 = out.indexOf('<intro>');
   const i1 = out.indexOf('</intro>');
   if (i0 < 0 || i1 < 0) throw new PatchError('unsupported', `${a.src.dir}: sin <intro>.`);
@@ -533,6 +556,7 @@ export async function renumberChapters(ctx: OpContext, texts: Texts, from: numbe
       const main = `${a.dir}/${a.modname}.xml`;
       let mx = await texts.get(main);
       mx = editTag(mx, 'name', (v) => xmlEsc(renumberName(xmlUnescape(v), n, n + 1)));
+      if (a.modname === 'hvp') mx = mx.replace(new RegExp(`<slug>interactive-video-${n}</slug>`), `<slug>interactive-video-${n + 1}</slug>`);
       if (a.modname === 'scorm') mx = mx.replace(/<scoes>[\s\S]*<\/scoes>/, (sc) => editTag(sc, 'title', (v) => xmlEsc(renumberName(xmlUnescape(v), n, n + 1)), true));
       const iA = mx.indexOf('<intro>');
       const iB = mx.indexOf('</intro>');
@@ -615,7 +639,8 @@ export async function insertLibroChapter(ctx: OpContext, texts: Texts, a: { posi
   const nh = sha1Of(outBuf);
   if (!ctx.state.has(blobPath(nh))) { ctx.state.write(blobPath(nh), outBuf); ctx.report.entriesAdded.push(blobPath(nh)); }
   const fixed = fx0.replace(/<file id="(\d+)">([\s\S]*?)<\/file>/g, (m, id: string, body: string) => {
-    if (!body.includes(`<contenthash>${curHash}</contenthash>`)) return m;
+    // P2-4: SOLO la entrada del Libro (otro archivo con el mismo contenido no se toca).
+    if (!mine(body) || !body.includes(`<contenthash>${curHash}</contenthash>`)) return m;
     if (curHash === lf.contenthash) ctx.report.files.push({ fileId: Number(id), filename: lf.filename, component: lf.component, filearea: lf.filearea, before: { contenthash: lf.contenthash, filesize: lf.filesize, mimetype: lf.mimetype }, after: { contenthash: nh, filesize: outBuf.length, mimetype: lf.mimetype } });
     else for (const f of ctx.report.files) if (f.fileId === Number(id)) f.after = { contenthash: nh, filesize: outBuf.length, mimetype: lf.mimetype };
     return `<file id="${id}">${body.replace(`<contenthash>${curHash}</contenthash>`, `<contenthash>${nh}</contenthash>`).replace(/<filesize>\d+<\/filesize>/, `<filesize>${outBuf.length}</filesize>`)}</file>`;

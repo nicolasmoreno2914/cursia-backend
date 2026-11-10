@@ -135,7 +135,10 @@ function simProviders(DIST, opts = {}) {
       } else if (/^Eres desarrollador de e-learning de CampusCloud/.test(req.system)) {
         // r107 B11: página del capítulo (sysH + pHTML). `fault.pagePending` → con «⚠️ Pendiente».
         const body = 'Esta página presenta el capítulo con ejemplos del sector, pasos concretos y una invitación a practicar con la actividad del capítulo para fijar lo aprendido.';
-        text = `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><h2 style="color:#E2E6F3;">Página del capítulo</h2><p style="color:#E2E6F3;">${body} ${body}</p>${fault.pagePending ? '<p>⚠️ Pendiente</p>' : ''}</div>`;
+        // Si el prompt pide el espacio del video (CC_VIDEO_SLOT), la página lo trae como lo arma la IA (con su texto de
+        // espera ADENTRO: el motor lo reemplaza o lo quita). `fault.videoPlaceholder` → «Video en preparación» AFUERA.
+        const slot = /CC_VIDEO_SLOT_START/.test(req.user) ? '<!-- CC_VIDEO_SLOT_START --><div style="padding:20px;color:#E2E6F3;">Video en preparación: disponible próximamente</div><!-- CC_VIDEO_SLOT_END -->' : '';
+        text = `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><h2 style="color:#E2E6F3;">Página del capítulo</h2><p style="color:#E2E6F3;">${body} ${body}</p>${slot}${fault.pagePending ? '<p>⚠️ Pendiente</p>' : ''}${fault.videoPlaceholder ? '<p style="color:#E2E6F3;">🎬 Video en preparación — disponible próximamente.</p>' : ''}</div>`;
       } else if (/^Eres experto en evaluación educativa de CampusCloud\. Generas exámenes GIFT/.test(req.system)) {
         // r107 B11: examen GIFT de unidad (sysG + pGIFT): 15 opción múltiple, 5 V/F, 5 emparejamiento.
         const u = Number(/IDs: U(\d+)-01/.exec(req.user)?.[1] || 1);

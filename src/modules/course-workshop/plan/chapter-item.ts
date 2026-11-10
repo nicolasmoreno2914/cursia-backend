@@ -11,7 +11,7 @@ import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
 import { chapterPieces, pagesNeeded, templateOf } from '../patch/op-add-chapter';
 import { PatchError, PatchOperation } from '../patch/types';
 import { ADD_CHAPTER_FAMILIES, AddChapterOp, AddModuleOp, ChapterPiece, ProducedChapter, ProducedModule, V3_ADD_CHAPTER_UNAVAILABLE } from '../regenerate/chapter-types';
-import { ChapterEstimate, ChapterSpec, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, totals } from '../regenerate/chapter';
+import { ChapterEstimate, ChapterSpec, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, syntheticChapter, syntheticUnitExam, totals } from '../regenerate/chapter';
 import type { PaidCallGate, RegenProviders } from '../regenerate/ports';
 import { RegenError, RegenExternal } from '../regenerate/types';
 import type { BuildCtx, PlannedCall, PreparedItem } from './builder';
@@ -34,6 +34,27 @@ export interface ChapterPlan {
 
 /** Destino + molde + piezas, SIN gastar. `unavailable` = motivo visible (v3, sin Libro HTML, molde inválido…). */
 export async function resolveChapterPlan(ctx: BuildCtx, req: InterpretedRequest): Promise<ChapterPlan | { unavailable: string }> {
+  const plan = await resolveChapterPlanShape(ctx, req);
+  if ('unavailable' in plan) return plan;
+  // P1-1: PRUEBA EN SECO del motor con un capítulo SINTÉTICO de forma válida (sin red, sin IA) ANTES de estimar o de
+  // pagar: todas las precondiciones del motor (Libro con «Capítulo N:», índice, secuencia, plantillas, archivos del molde,
+  // condiciones de acceso, sco, banco del examen) se descubren acá. Si el motor lo rechaza → no disponible, USD 0.
+  const fail = await engineDryRun(ctx, plan);
+  if (fail) return { unavailable: `No se puede agregar ${req.operation === 'add_module' ? 'el módulo' : 'el capítulo'} a este paquete: ${fail.replace(/\.?$/, '.')} No se llamó a ningún proveedor.` };
+  return plan;
+}
+
+/** null = el motor acepta un producido de la forma prevista; si no, su motivo. */
+export async function engineDryRun(ctx: BuildCtx, plan: ChapterPlan): Promise<string | null> {
+  const produced = plan.op.op === 'add_chapter'
+    ? syntheticChapter(plan.specs[0])
+    : { kind: 'module' as const, moduleNumber: plan.op.moduleNumber, title: (plan.op as AddModuleOp).title, chapters: plan.specs.map(syntheticChapter), exam: plan.exam ? syntheticUnitExam(plan.exam.withInfo) : null };
+  const r = await applyPatchPlan({ original: ctx.original, filename: ctx.filename, operations: [{ ...plan.op, produced } as PatchOperation], baseline: ctx.baseline });
+  if (r.ok) return null;
+  return `${r.failure?.message ?? 'el motor lo rechaza'}${r.diagnosis?.introduced?.length ? ` (${r.diagnosis.introduced.slice(0, 3).map((x) => x.title).join(' · ')})` : ''}`;
+}
+
+async function resolveChapterPlanShape(ctx: BuildCtx, req: InterpretedRequest): Promise<ChapterPlan | { unavailable: string }> {
   const c = ctx.course;
   if (!(ADD_CHAPTER_FAMILIES as readonly string[]).includes(ctx.family)) return { unavailable: ctx.family === 'v2-dynamic' ? V3_ADD_CHAPTER_UNAVAILABLE : `Agregar ${req.operation === 'add_module' ? 'módulos' : 'capítulos'} no está disponible en este formato de curso (${ctx.family}).` };
   const libro = c.libro.find((l) => l.format === 'html');

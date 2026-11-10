@@ -15,7 +15,7 @@ import { WorkshopActivity, WorkshopCourse, WorkshopHtmlField, plainText } from '
 import { buildInventory } from '../inventory';
 import { DiagnosisReport, runTechnicalDiagnosis } from '../diagnosis/diagnose';
 import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
-import { libroStructure } from '../patch/op-libro';
+import { libroHeadingTitle, libroStructure } from '../patch/op-libro';
 import type { FieldChange, NewQuestion, PatchOperation, PatchResult } from '../patch/types';
 import { xmlUnescape } from '../../visual-design/preview-extract';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
@@ -381,7 +381,7 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
       if (v.problems.length) return { problems: v.problems };
       const byN = new Map(v.chapters.map((c) => [c.number, c.html]));
       const front = intact ? null : frontFor(ctx, html, st);
-      const op: PatchOperation = { op: 'edit_libro_section', moduleId: a.moduleId, chapters: numbers.map((n) => ({ number: n, html: byN.get(n)!, ...(complete.has(n) ? {} : { title: titleOf(n) }) })), ...(front ? { front: front.front } : {}) };
+      const op: PatchOperation = { op: 'edit_libro_section', moduleId: a.moduleId, chapters: numbers.map((n) => ({ number: n, html: byN.get(n)!, ...(complete.has(n) ? { expectTitle: libroHeadingTitle(html, complete.get(n)!) } : { title: titleOf(n) }) })), ...(front ? { front: front.front } : {}) };
       const changes: FieldChange[] = numbers.map((n) => ({ entry: a.dir, field: `libro:capitulo ${n}`, moduleId: a.moduleId, sectionId: null, before: chapters.find((c) => c.number === n)!.currentHtml ?? '', after: byN.get(n)!, beforeRawSha1: '', afterRawSha1: '' }));
       return { op, changes, before: chapters.map((c) => plainText(c.currentHtml ?? '', 100_000)).join('\n'), after: v.chapters.map((c) => plainText(c.html, 100_000)).join('\n'), contentEstimate: est, notes: front ? [front.note] : [] };
     }
@@ -533,6 +533,8 @@ export async function estimateContent(ctx: BuildCtx, req: InterpretedRequest): P
   if (isRegenOperation(req.operation)) return estimateRegenItem(ctx, req);
   // r107 B11: agregar capítulo / módulo — la vista del estimado se arma acá (necesita el molde del paquete).
   if (isChapterOperation(req.operation)) {
+    // P2-1: la MISMA fuente de la base que la producción (mismos prompts → misma cota).
+    await regenDbOf(ctx);
     const v = await chapterEstimateView(ctx, req);
     if ('unavailable' in v) return v;
     CHAPTER_VIEWS.set(v.plannedCall as PlannedCall, v);

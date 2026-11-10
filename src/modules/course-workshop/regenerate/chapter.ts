@@ -26,6 +26,10 @@ import { hasPendingMarker } from './target';
 import { ProducedRegen, RegenError, RegenExternal, RegenPrior, RegenTarget, SCORM_V2_TEMPLATE_IDS, inlineExternal } from './types';
 import { produceVideo } from './video';
 import { unitExamProblems } from '../patch/op-add-module';
+import { SLOT_RE, VIDEO_PENDING_RE } from '../patch/op-add-chapter';
+import { createExecutorSandbox } from '../../../workers/llm-executor/executor-runtime';
+import { syntheticCoverPng, syntheticPdf } from '../../../package/v3/synthetic-media';
+import * as vm from 'vm';
 import { ChapterPiece, ProducedChapter, ProducedUnitExam } from './chapter-types';
 
 /** Modelo del generador (fijado por Cursia). */
@@ -90,8 +94,9 @@ export function chapterPrompts(spec: ChapterSpec, course: WorkshopCourse, db: Re
   void sizeOnly;
   const c = ex.sandbox.ctx;
   c.D = JSON.parse(JSON.stringify(D2));
-  // pHTML del navegador consulta MEDIA.videos (videos ya subidos): el capítulo nuevo no tiene ninguno.
-  c.MEDIA = { videos: {} };
+  // P1-5: pHTML consulta MEDIA.videos: con la pieza de video, el capítulo TIENE video (el hvp nuevo) y la página reserva
+  // su espacio (CC_VIDEO_SLOT, que el motor reemplaza por el reproductor); sin video, pediría «VIDEO PENDIENTE».
+  c.MEDIA = { videos: spec.pieces.includes('video') ? { [`v${spec.chapterNumber}`]: `hvp-capitulo-${spec.chapterNumber}` } : {} };
   const cap = { n: spec.chapterNumber, t: spec.title };
   const libro = { system: String(c.sysL()), user: String(c.pLibro({ t: 'cap', cn: spec.chapterNumber, cap: spec.title, mi: spec.moduleNumber - 1 }, text)) + (spec.objective ? `\nObjetivo del capítulo: ${spec.objective}` : '') };
   const page = (t: 'vi' | 'sc') => ({ system: String(c.sysH()), user: String(c.pHTML({ t, cap, fn: `cap${cap.n}_${t === 'vi' ? 'video_interactivo' : 'descripcion_actividad'}.html`, n: '', d: '' }, text)) });
@@ -103,6 +108,7 @@ export function cleanPage(raw: string): string {
   const s = String(raw ?? '').replace(/^\s*```(?:html)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
   if (/<(style|script)\b/i.test(s)) throw new RegenError('invalid_result', 'La página generada trae <style> o <script> (Moodle los elimina): no se usa.');
   if (hasPendingMarker(s)) throw new RegenError('invalid_result', 'La página generada trae «⚠️ Pendiente».');
+  if (VIDEO_PENDING_RE.test(s.replace(SLOT_RE, ''))) throw new RegenError('invalid_result', 'La página generada trae «Video en preparación» fuera del espacio del video: no se usa.');
   if (!plainText(s, 200)) throw new RegenError('invalid_result', 'La página generada viene vacía.');
   return s;
 }
@@ -140,7 +146,8 @@ export async function produceChapter(a: { spec: ChapterSpec; course: WorkshopCou
     const ex = sandboxFor({ ...a, what: 'chapter_page', D });
     let html: string;
     try { html = String(await ex.sandbox.ctx.api(pr.system, pr.user, PAGE_MAX_TOKENS)); } catch (e: any) { throw ex.stop ?? new RegenError('internal', String(e?.msg ?? e?.message ?? e)); }
-    rec[k] = cleanPage(html);
+    // Sin video (o en la página del juego) el bloque del video no tiene qué mostrar: se quita.
+    rec[k] = cleanPage(k === 'videoPageHtml' && spec.pieces.includes('video') ? html : html.replace(SLOT_RE, ''));
     await save();
   }
   // 3. Juego.
@@ -290,4 +297,40 @@ export function totals(pieces: ChapterPieceCost[]): ChapterEstimate {
   const expected = sumUsd(...pieces.map((p) => p.expectedUsd));
   const bound = sumUsd(...pieces.map((p) => p.boundUsd));
   return { pieces, providers, expectedUsd: expected, totalBoundUsd: bound, calls: providers.reduce((n, l) => n + l.calls, 0), min: (Number(expected) * 0.7).toFixed(6), max: bound, basis: 'prompts y max_tokens reales del generador; precios del catálogo de FinOps' };
+}
+
+// ─── P1-1: producido SINTÉTICO de forma válida (sin red, sin IA) para la prueba en seco ANTES de gastar ──────────────
+
+let synthCtx: Record<string, any> | null = null;
+function synthSandbox(): Record<string, any> {
+  if (!synthCtx) synthCtx = createExecutorSandbox({ api: async () => { throw { fatal: true, msg: 'prueba en seco: sin IA' }; }, artifactText: async () => null, ownerId: 'dry-run', logger: { log: () => undefined, warn: () => undefined, error: () => undefined } }).ctx;
+  return synthCtx;
+}
+const SYNTH_PARA = 'Este párrafo de la prueba en seco ocupa el lugar del texto que escribirá el generador del Libro para el capítulo nuevo, con ejemplos concretos y pasos ordenados.';
+
+/** Capítulo con la FORMA de lo que se producirá (valida en el motor), para saber si el paquete lo admite sin pagar. */
+export function syntheticChapter(spec: ChapterSpec): ProducedChapter {
+  const c = synthSandbox();
+  const cap = { n: spec.chapterNumber, t: spec.title };
+  const ids = [...SCORM_V2_TEMPLATE_IDS].slice(0, 5);
+  const fixtures = JSON.parse(vm.runInContext('JSON.stringify(SV2_PREVIEW_FIXTURES)', c as vm.Context));
+  const rooms = ids.map((id) => ({ templateId: id, data: fixtures[id] }));
+  const page = (t: string, slot: boolean) => `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><h2 style="color:#E2E6F3;">${t}</h2><p style="color:#E2E6F3;">${SYNTH_PARA}</p>${slot ? '<!-- CC_VIDEO_SLOT_START --><div>espacio del video</div><!-- CC_VIDEO_SLOT_END -->' : ''}</div>`;
+  const yt = 'WsDryRun001';
+  const video = spec.pieces.includes('video') ? { hvpJson: JSON.stringify({ interactiveVideo: { video: { files: [{ path: `https://www.youtube.com/watch?v=${yt}`, mime: 'video/YouTube' }], startScreenOptions: {} }, assets: { interactions: [{ action: { library: 'H5P.MultiChoice 1.16', params: { question: '<p>¿Qué muestra el video?</p>', answers: [{ text: 'El caso del capítulo', correct: true }, { text: 'Otro tema', correct: false }], behaviour: { type: 'auto' } } }, duration: { from: 30, to: 40 } }] } } }), youtubeId: yt, durationSec: 300, interactions: 1, script: 'Prueba en seco.', scenes: 1, videogenJobId: 'dry-run' } : null;
+  return {
+    kind: 'chapter', chapterNumber: spec.chapterNumber, title: spec.title,
+    libroMd: [`# Capítulo ${spec.chapterNumber}: ${spec.title}`, ...[1, 2, 3, 4, 5].map((k) => `## ${spec.chapterNumber}.${k} Sección ${k}\n\n${Array.from({ length: 9 }, () => SYNTH_PARA).join(' ')}`)].join('\n\n'),
+    videoPageHtml: spec.pages.videoPage ? page(`Video del capítulo ${spec.chapterNumber}`, spec.pieces.includes('video')) : null,
+    gamePageHtml: spec.pages.gamePage ? page(`Juego del capítulo ${spec.chapterNumber}`, false) : null,
+    scorm: { html: String(c.buildScormV2Html(cap, ids, rooms)), manifestXml: String(c.defMf(cap)), roomAssignment: ids, rooms: 5 },
+    video,
+    presentation: spec.pieces.includes('presentation') ? { pdf: syntheticPdf(10), cover: syntheticCoverPng(1600, 900, '#0F766E'), slideCount: 10, width: 1600, height: 900, language: 'es-419', generationId: 'dry-run' } : null,
+  };
+}
+
+/** Examen GIFT sintético de la unidad nueva (forma válida para el motor). */
+export function syntheticUnitExam(withInfo: boolean): ProducedUnitExam {
+  const qs = Array.from({ length: 6 }, (_, i) => `::U-${i + 1}::¿Qué conviene revisar en el caso ${i + 1}? {\n  =Los datos del caso\n  ~La opinión de otro\n  ~El resultado de otro año\n  ~Un dato sin fuente\n}`);
+  return { gift: qs.join('\n\n'), infoHtml: withInfo ? `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;"><p style="color:#E2E6F3;">${SYNTH_PARA}</p></div>` : '' };
 }

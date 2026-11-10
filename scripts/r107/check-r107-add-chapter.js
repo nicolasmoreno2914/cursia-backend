@@ -26,6 +26,10 @@ if (process.argv.includes('--bite')) {
     { name: 'numeración sin recalcular', from: 'await renumberChapters(ctx, texts, P, pl);', to: ';' },
     { name: 'blob sin entrada en files.xml', from: 'newFileBlocks.push(`<file id="${fid}">${body}</file>`);', to: 'if (!repl) newFileBlocks.push(`<file id="${fid}">${body}</file>`);' },
     { name: 'token huérfano (sin reescribir al capítulo nuevo)', from: "(midOf.has(Number(id)) ? `$@${k}*${midOf.get(Number(id))}@$` : m)", to: '(m)' },
+    // Ronda de correcciones 1: cada arreglo tiene su mordida.
+    { name: 'sin la prueba en seco del motor antes de pagar (P1-1)', file: 'modules/course-workshop/plan/chapter-item.js', from: 'const fail = await engineDryRun(ctx, plan);', to: 'const fail = null;' },
+    { name: 'estructurales sin ir al final (P1-2 a)', file: 'modules/course-workshop/apply/apply-core.js', from: 'const items = structuralLast(input.items);', to: 'const items = input.items;' },
+    { name: 'bloque del video sin resolver (P1-5)', from: 'const rewrite = (html) => slots(html)', to: 'const rewrite = (html) => (html)' },
   ];
   const tmp = fs.mkdtempSync(path.join(REPO, '.r107-bite-'));
   let code = 0;
@@ -33,7 +37,7 @@ if (process.argv.includes('--bite')) {
     for (const b of bites) {
       fs.rmSync(tmp, { recursive: true, force: true });
       fs.cpSync(DIST, tmp, { recursive: true });
-      const f = path.join(tmp, FILE);
+      const f = path.join(tmp, b.file || FILE);
       const src = fs.readFileSync(f, 'utf8');
       // tsc reescribe las comillas: la mordida se busca tal cual o con comillas dobles.
       const from = src.includes(b.from) ? b.from : b.from.replace(/'/g, '"');
@@ -238,7 +242,7 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     eq(bound, Number(est1.regen.totalBoundUsd), 'Σ cotas del ítem');
     const exp = Number(est1.expectedUsd);
     assert(SVC.capBelowPaidBound((Math.ceil(exp * 110) / 100).toFixed(2), bound), 'tope ≥ esperado pero < Σ cotas → 409');
-    assert(!SVC.capBelowPaidBound(bound.toFixed(6), bound), 'tope = Σ cotas → se aprueba');
+    assert(!SVC.capBelowPaidBound((Math.ceil(bound * 1e6) / 1e6).toFixed(6), bound), 'tope = Σ cotas → se aprueba');
     eq(PL.PLAN_ERRORS ? PL.PLAN_ERRORS.CAP_BELOW_CALL_BOUND : 'WORKSHOP_CAP_BELOW_CALL_BOUND', 'WORKSHOP_CAP_BELOW_CALL_BOUND', 'código');
     // Con un tope por debajo de Σ cotas, la compuerta corta ANTES de la llamada que no entra (nunca supera el tope).
     const r = await produce(V1, addReq(ctx, { module: 2, title: 'Llamadas difíciles' }), { capUsd: Number(est1.regen.pieces[0].boundUsd) + 0.0001 }).catch((e) => ({ err: e }));
@@ -274,8 +278,9 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     const z0 = await JSZip.loadAsync(V1); const z1 = await JSZip.loadAsync(run.package);
     const keep = Object.keys(z0.files).filter((n) => /^activities\/hvp_\d+\/hvp\.xml$/.test(n));
     const same = [];
-    for (const n of keep) if ((await z0.file(n).async('string')).replace(/<name>[^<]*<\/name>/, '') === (await z1.file(n).async('string')).replace(/<name>[^<]*<\/name>/, '')) same.push(n);
-    eq(same.length, keep.length, 'videos existentes: idénticos salvo su nombre renumerado');
+    const strip = (t) => t.replace(/<name>[^<]*<\/name>/, '').replace(/<slug>[^<]*<\/slug>/, '');
+    for (const n of keep) if (strip(await z0.file(n).async('string')) === strip(await z1.file(n).async('string'))) same.push(n);
+    eq(same.length, keep.length, 'videos existentes: idénticos salvo su nombre y su slug renumerados');
     assert(run.items[0].misalignment.some((m) => /audiolibro/.test(m)) && run.items[0].misalignment.some((m) => /examen final/.test(m)), 'avisos D7 en la versión');
     mid = run.package;
   });
@@ -401,6 +406,179 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     try { PL.parseInterpretation({ requests: [{ ...base, newChapters: [{ title: 'Un título inventado' }] }] }, base.quote); } catch (e) { bad = e; }
     assert(bad && /literal/.test(bad.message), `título inventado rechazado: ${bad && bad.message}`);
     eq(PL.omitOf('hazlo sin videos y sin la presentación'), ['video', 'presentation'], 'omisiones');
+  });
+
+  // ── Ronda de correcciones 1 ──
+  const ENGd = ENG; const SVCd = SVC;
+  const libroAs = async (buf, fn) => FX.zipEdit(buf, async (z) => FX.replaceBlob(z, 'libro_guia_completo.html', fn));
+  const itemOf = (id, r, op) => ({ id, requestId: `r${id}`, operation: op, quote: '', summary: '', params: { ...r.prep.view.params, produced: r.prep.produced } });
+
+  await check('R1 (P1-1) precondiciones del motor ANTES de pagar: Libro con «1. …» (sin «Capítulo N:») → no disponible en el estimado y al preparar, con el motivo del motor y 0 llamadas', async () => {
+    const bad = await libroAs(V1, (h) => h.replace(/<h1>Capítulo (\d+): /g, '<h1>$1. ').replace(/<span class="tt">Capítulo (\d+): /g, '<span class="tt">$1. '));
+    const ctx = await ctxOf(bad);
+    const req = addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 });
+    const est = await B.estimateContent(ctx, req);
+    assert(est && est.unavailable && /Capítulo N/.test(est.unavailable) && /No se llamó a ningún proveedor/.test(est.unavailable), `estimado: ${JSON.stringify(est).slice(0, 240)}`);
+    const r = await produce(bad, req);
+    eq([r.prep.status, r.gate.calls.length, Number(r.gate.spent())], ['unavailable', 0, 0], 'preparar: no disponible, 0 llamadas, USD 0');
+  });
+
+  await check('R2 (P1-2 c) dos ítems estructurales en el mismo plan (dos add_chapter, add_chapter + add_module) → WORKSHOP_STRUCTURAL_COMBINATION, mensaje sin voseo; uno solo aplica', async () => {
+    const ctx = await ctxOf(V1);
+    const rA = await produce(V1, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }));
+    const rB = await produce(V1, addReq(ctx, { module: 3, title: 'Encuestas', position: 8 }));
+    const rM = await produce(V1, modReq({ title: 'Digital', chapters: ['Redes'] }));
+    for (const items of [[itemOf('a', rA, 'add_chapter'), itemOf('b', rB, 'add_chapter')], [itemOf('a', rA, 'add_chapter'), itemOf('m', rM, 'add_module')]]) {
+      const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items });
+      eq([run.ok, run.code], [false, A.STRUCTURAL_COMBINATION], 'combinación rechazada');
+      assert(/dos rondas/.test(run.message) && !/\b(aplicá|quitá|pedí|vos|tenés)\b/.test(run.message), `mensaje: ${run.message}`);
+    }
+    eq(A.STRUCTURAL_COMBINATION, 'WORKSHOP_STRUCTURAL_COMBINATION', 'código');
+    const one = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('b', rB, 'add_chapter')] });
+    assert(one.ok, `uno solo: ${one.message}`);
+  });
+
+  await check('R3 (P1-2 a / d) add_chapter en la posición 2 + edit_libro_section del capítulo 5 en el MISMO plan: al aplicar, lo estructural va al final y se edita el capítulo 5 ORIGINAL; el motor solo (en el otro orden) falla stale_target por el título esperado', async () => {
+    const ctx = await ctxOf(V1);
+    const rA = await produce(V1, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }));
+    const libro = ctx.course.activities.find((a) => a.kind === 'libro' && a.modname === 'resource');
+    const body = '<h2>5.1 Reescrito</h2><p>' + 'Texto reescrito del capítulo cinco para la prueba. '.repeat(20) + '</p>';
+    const edit = { op: 'edit_libro_section', moduleId: libro.moduleId, chapters: [{ number: 5, html: body, expectTitle: 'Reclamos por escrito' }] };
+    const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', rA, 'add_chapter'), { id: 'e', requestId: 're', operation: 'edit_libro_section', quote: '', summary: '', params: edit }] });
+    assert(run.ok, `${run.code} ${run.message}`);
+    const z = await JSZip.loadAsync(run.package);
+    const inv = await inventoryOf(run.package);
+    const lb = inv.activities.find((a) => a.kind === 'libro' && a.modname === 'resource');
+    const html = await z.file(lb.files.find((f) => /\.html$/.test(f.filename)).blobEntry).async('string');
+    const i = html.indexOf('5.1 Reescrito');
+    eq([...html.slice(0, i).matchAll(/<h1>([^<]*)<\/h1>/g)].pop()[1], 'Capítulo 6: Reclamos por escrito', 'se editó el capítulo correcto (ahora 6)');
+    eq(run.items.map((x) => x.operation), ['edit_libro_section', 'add_chapter'], 'lo estructural al final');
+    const r = await ENGd.applyPatchPlan({ original: V1, operations: [{ ...rA.prep.view.params, produced: rA.prep.produced }, edit] });
+    eq([r.ok, r.failure && r.failure.code], [false, 'stale_target'], 'en el otro orden, el título esperado lo frena');
+  });
+
+  await check('R4 (P1-2 b / P2-3) remove_activity + add_chapter en el mismo plan aplica: lo esperado sale de los parámetros (piezas × capítulos) menos lo quitado', async () => {
+    const ctx = await ctxOf(V1);
+    const rA = await produce(V1, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }));
+    const forum = ctx.course.activities.find((a) => a.modname === 'forum');
+    const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', rA, 'add_chapter'), { id: 'x', requestId: 'rx', operation: 'remove_activity', quote: '', summary: '', params: { op: 'remove_activity', moduleId: forum.moduleId } }] });
+    assert(run.ok, `${run.code} ${run.message}`);
+    await invariants(run.package);
+    // Quitar una actividad DEL capítulo molde vecino también cuenta (el capítulo sigue existiendo).
+    const cta3 = ctx.course.chapters.find((c) => c.number === 3).activities.map((m) => ctx.course.activities.find((a) => a.moduleId === m)).find((a) => a.role === 'presentation');
+    const run2 = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', rA, 'add_chapter'), { id: 'y', requestId: 'ry', operation: 'remove_activity', quote: '', summary: '', params: { op: 'remove_activity', moduleId: cta3.moduleId } }] });
+    assert(run2.ok, `quitar en un capítulo + agregar: ${run2.code} ${run2.message}`);
+  });
+
+  await check('R5 (P1-3) el molde se busca por sus actividades (expect.templateModuleIds), no por número: con el capítulo molde renumerado por otro ítem el motor lo encuentra; con actividades distintas falla stale_target', async () => {
+    const ctx = await ctxOf(V1);
+    const rB = await produce(V1, addReq(ctx, { module: 3, title: 'Encuestas', position: 8 }));
+    const tpl = OPS.templateOf(ctx.course, 99, rB.prep.view.params.expect.templateModuleIds);
+    eq(tpl.number, rB.prep.view.params.templateChapter, 'por ids aunque el número no exista');
+    let e = null;
+    try { OPS.templateOf(ctx.course, rB.prep.view.params.templateChapter, [1, 2, 3]); } catch (x) { e = x; }
+    eq(e && e.code, 'stale_target', 'actividades distintas');
+  });
+
+  await check('R6 (P1-4) preguntas sin bucle: responder el título resuelve; responder la posición (opción) resuelve con ella y conserva el título', async () => {
+    const ctx = await ctxOf(V1);
+    const base = { quote: 'Agrega un capítulo en el módulo 1.', operation: 'add_chapter', instruction: 'Agregar capítulo', target: { moduleNumber: 1 }, colors: [], chapters: 1, reason: null, questions: [], targetEvidence: 'el módulo 1', changeEvidence: null };
+    const q = PL.resolveRequest({ ...base, newChapters: null }, ctx.course, { requestText: base.quote });
+    eq(q.status, 'needs_answer', 'pregunta el título');
+    const a = PL.answerRequest(q, [{ questionId: q.questions[0].id, text: 'Lenguaje corporal' }], ctx.course);
+    eq([a.resolved.status, a.resolved.details.newChapters], ['resolved', [{ title: 'Lenguaje corporal', objective: null }]], 'título → resuelto');
+    const Q2 = 'Agrega un capítulo «Lenguaje corporal» en el módulo 1.';
+    const far = PL.resolveRequest({ ...base, quote: Q2, newChapters: [{ title: 'Lenguaje corporal', objective: null }], position: 8 }, ctx.course, { requestText: Q2 });
+    eq(far.status, 'needs_answer', 'posición fuera del módulo → pregunta');
+    const b = PL.answerRequest(far, [{ questionId: far.questions[0].id, optionId: far.questions[0].options[1].id }], ctx.course);
+    eq([b.resolved.status, b.resolved.details.position, b.resolved.details.newChapters[0].title], ['resolved', 2, 'Lenguaje corporal'], 'posición → resuelto, título conservado');
+  });
+
+  await check('R7 (P1-5) la página del video no queda «Video en preparación»: con video, el prompt reserva el espacio (no «VIDEO PENDIENTE») y el motor lo resuelve; fuera del espacio → no se aplica; «sin video» → el bloque se quita', async () => {
+    const CH = L('modules/course-workshop/regenerate/chapter.js');
+    const ctx = await ctxOf(V1);
+    const spec = { chapterNumber: 2, title: 'Lenguaje corporal', objective: null, moduleNumber: 1, moduleTitle: 'Fundamentos', pieces: ['presentation', 'text', 'video', 'cta', 'game'], pages: { videoPage: true, gamePage: true } };
+    const pr = CH.chapterPrompts(spec, ctx.course, null);
+    assert(!/VIDEO PENDIENTE/.test(pr.video.user) && /CC_VIDEO_SLOT_START/.test(pr.video.user), 'con video: espacio reservado');
+    const pr2 = CH.chapterPrompts({ ...spec, pieces: ['presentation', 'text', 'cta', 'game'] }, ctx.course, null);
+    assert(/VIDEO PENDIENTE/.test(pr2.video.user), 'sin video: el prompt pide el placeholder (que la producción quita)');
+    for (const [label, req] of [['con video', addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 })], ['sin video', addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2, omit: ['video'] })]]) {
+      const r = await produce(V1, req);
+      eq(r.prep.status, 'resolved', `${label}: ${r.prep.reason}`);
+      const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', r, 'add_chapter')] });
+      assert(run.ok, `${label}: ${run.message}`);
+      const z = await JSZip.loadAsync(run.package);
+      for (const n of Object.keys(z.files).filter((x) => /^activities\/(label|hvp)_\d+\/(label|hvp)\.xml$/.test(x))) {
+        const t = unesc(await z.file(n).async('string'));
+        assert(!/Video en preparación|CC_VIDEO_SLOT/.test(t), `${label}: ${n} quedó con el marcador del video`);
+      }
+    }
+    const bad = await produce(V1, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }), { sim: { fault: { videoPlaceholder: true } } }).catch((e) => ({ err: e }));
+    assert(bad.err || (bad.prep.status === 'failed' && !bad.prep.view), `«Video en preparación» afuera: ${bad.prep ? bad.prep.status : ''}`);
+    const ok1 = (await produce(V1, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }))).prep;
+    const inj = { ...ok1.produced, videoPageHtml: ok1.produced.videoPageHtml + '<p>Video en preparación: disponible próximamente</p>' };
+    const rr = await ENGd.applyPatchPlan({ original: V1, operations: [{ ...ok1.view.params, produced: inj }] });
+    assert(!rr.ok, 'el motor no inserta una página con el marcador');
+  });
+
+  await check('R8 (P2-1) la cota del estimado (misma fuente de la base que la producción) ≥ la suma de las cotas de los tickets reales', async () => {
+    const ctx = await ctxOf(V1);
+    const req = addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 });
+    ctx.regenDbLoader = async () => ({ chapterMd: new Map(), contextPackage: new Map(), courseContext: { sector: 'Comercio', pais: 'Colombia', tono: 'cercano' }, tiedTo: null, unavailable: null });
+    const est = await B.estimateContent(ctx, req);
+    const prov = SIMLIB.simProviders(DIST); const gate = SIMLIB.memGate(DIST, { capUsd: 50 });
+    const prep = await B.prepareRegenItem(ctx, req, { providers: prov, gate, spent: () => gate.spent() });
+    eq(prep.status, 'resolved', prep.reason);
+    const tickets = gate.calls.reduce((a, c) => a + Number(c.boundUsd), 0);
+    assert(tickets <= Number(est.regen.totalBoundUsd) + 1e-9, `tickets ${tickets} ≤ estimado ${est.regen.totalBoundUsd}`);
+  });
+
+  await check('R9 (P2-2 / P2-6) slug del hvp nuevo con su número y los posteriores renumerados (sin repetidos); sco nuevos por encima de TODO id del paquete original', async () => {
+    const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', await produce(V1, addReq(await ctxOf(V1), { module: 2, title: 'Nuevo X', position: 4 })), 'add_chapter')] });
+    assert(run.ok, run.message);
+    const z = await JSZip.loadAsync(run.package);
+    const inv = await inventoryOf(run.package);
+    const slugs = [];
+    for (const c of inv.chapters) for (const m of c.activities) {
+      const a = inv.activities.find((x) => x.moduleId === m);
+      if (a.modname !== 'hvp') continue;
+      const slug = /<slug>([^<]*)<\/slug>/.exec(await z.file(`${a.dir}/hvp.xml`).async('string'))[1];
+      eq(slug, `interactive-video-${c.number}`, `slug del capítulo ${c.number}`);
+      slugs.push(slug);
+    }
+    eq(new Set(slugs).size, slugs.length, 'slugs únicos');
+    const z0 = await JSZip.loadAsync(V1);
+    let maxGeneral = 0;
+    for (const n of Object.keys(z0.files).filter((x) => /\.xml$/.test(x))) for (const m of (await z0.file(n).async('string')).matchAll(/\bid="(\d+)"/g)) maxGeneral = Math.max(maxGeneral, Number(m[1]));
+    const sco = (run.items[0].idsAssigned.sco || []);
+    assert(sco.length === 4 && sco.every((x) => x > maxGeneral && x >= 60000), `sco nuevos ${sco} > ${maxGeneral}`);
+  });
+
+  await check('R10 (P2-4) otro archivo del paquete con el MISMO contenido que el Libro no cambia de blob (solo la entrada del Libro)', async () => {
+    const z = await JSZip.loadAsync(V1);
+    const fx = await z.file('files.xml').async('string');
+    const lib = [...fx.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].find((m) => /libro_guia_completo\.html/.test(m[2]));
+    const welcome = (await inventoryOf(V1)).activities.find((a) => a.kind === 'welcome');
+    const copy = lib[0].replace(`<file id="${lib[1]}">`, '<file id="999991">').replace(/<contextid>\d+<\/contextid>/, `<contextid>${welcome.contextId}</contextid>`).replace(/<component>[^<]*<\/component>/, '<component>mod_label</component>').replace(/<filearea>[^<]*<\/filearea>/, '<filearea>intro</filearea>').replace(/<filename>[^<]*<\/filename>/, '<filename>copia-libro.html</filename>');
+    z.file('files.xml', fx.replace('</files>', `${copy}</files>`));
+    const V1c = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const h0 = /<contenthash>(\w+)/.exec(lib[2])[1];
+    const r = await produce(V1c, addReq(await ctxOf(V1c), { module: 1, title: 'Lenguaje corporal', position: 2 }));
+    eq(r.prep.status, 'resolved', r.prep.reason);
+    const run = await A.runApply({ original: V1c, expectedSha1: sha1(V1c), items: [itemOf('a', r, 'add_chapter')] });
+    assert(run.ok, run.message);
+    const z1 = await JSZip.loadAsync(run.package);
+    const fx1 = await z1.file('files.xml').async('string');
+    const cp = [...fx1.matchAll(/<file id="999991">([\s\S]*?)<\/file>/g)][0][1];
+    eq(/<contenthash>(\w+)/.exec(cp)[1], h0, 'la copia conserva su blob');
+    assert(z1.file(`files/${h0.slice(0, 2)}/${h0}`), 'el blob viejo sigue (lo usa la copia)');
+  });
+
+  await check('R11 (P2-5) lo pagado se ata al pedido exacto: otro título u otras piezas omitidas → otra clave (no se reusa)', async () => {
+    const k = (t, omit) => SVCd.regenTargetKey({ operation: 'add_chapter', target: { kind: 'module', moduleNumber: 1 }, details: { position: 2, newChapters: [{ title: t }], omit } });
+    assert(k('A', []) !== k('B', []) && k('A', []) !== k('A', ['video']) && k('A', ['video', 'presentation']) === k('A', ['presentation', 'video']), 'claves');
+    const m = (t) => SVCd.regenTargetKey({ operation: 'add_module', target: { kind: 'course' }, details: { moduleTitle: 'M', newChapters: t.map((x) => ({ title: x })), omit: [] } });
+    assert(m(['A', 'B']) !== m(['A', 'C']), 'módulo: capítulos');
   });
 
   const total = Object.values(REAL).reduce((a, b) => a + b, 0);
