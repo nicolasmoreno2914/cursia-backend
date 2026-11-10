@@ -269,7 +269,8 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     const fs = require('fs');
     const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : e.name.endsWith('.ts') ? [path.join(d, e.name)] : []));
     // Listas internas de detectores (palabras que se buscan, no texto que se muestra) y el propio módulo de Language QA.
-    const SKIP = [/language-qa[\/]/, /course-shell[\/]exam-bank\.ts$/];
+    // r107 B8: el detector de calidad del Taller nombra «vos» para detectarlo (como language-qa).
+    const SKIP = [/language-qa[\/]/, /course-shell[\/]exam-bank\.ts$/, /course-workshop[\/]quality[\/]deterministic\.ts$/];
     const hits = [];
     for (const f of walk(path.join(REPO, 'src')).filter((x) => !SKIP.some((re) => re.test(x)))) {
       fs.readFileSync(f, 'utf8').split('\n').forEach((line, i) => {
