@@ -5,7 +5,7 @@ import { returningRows } from '../../../common/db/returning-rows';
 import { ArtifactsService } from '../../artifacts/artifacts.service';
 import { isUuid } from '../../authz/schema-probe';
 import { isCourseWorkshopEnabled } from '../../features/course-workshop-flag';
-import { CourseWorkshopService, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession } from '../course-workshop.service';
+import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession } from '../course-workshop.service';
 import { DIAGNOSIS_CODE_VERSION, DiagnosisReport } from '../diagnosis/diagnose';
 import type { Finding } from '../diagnosis/finding';
 import { planWarnings } from '../plan/risk';
@@ -227,7 +227,11 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     }
     // La prueba en seco COMBINADA (sobre el original verificado, la guarda el plan) tiene que estar al día para ESTOS ítems.
     const combined = plan.combined;
-    if (!combined || !Array.isArray(combined.itemIds) || combined.itemIds.join(',') !== applyIds.join(',')) {
+    // Fix round 2 (nota): por ids Y por la huella del contenido de cada ítem (si el ítem cambió y la prueba en seco no se
+    // rehízo todavía, está vencida).
+    const hashes = sel.apply.map((i) => i.contentHash as string);
+    if (!combined || !Array.isArray(combined.itemIds) || combined.itemIds.join(',') !== applyIds.join(',')
+      || !Array.isArray(combined.itemHashes) || combined.itemHashes.join(',') !== hashes.join(',')) {
       throw new ConflictException({ code: APPLY_ERRORS.DRY_RUN_STALE, message: 'La prueba en seco del plan todavía no está al día con estos cambios: espera unos segundos y vuelve a intentar.' });
     }
     if (combined.ok !== true) {
@@ -300,7 +304,14 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
       if (!v || v.claim_id !== job.claimId) return;
       const s = await this.workshop.planSessionById(v.session_id);
       const bytes = Math.ceil(Number(s?.originalSize ?? 0) * applyMemoryFactor(s?.container));
-      const release = await this.workshop.acquireMemory(`apply:${job.versionId}`, bytes);
+      let release: () => void;
+      try {
+        release = await this.workshop.acquireMemory(`apply:${job.versionId}`, bytes);
+      } catch (err) {
+        // Fix round 2 (N1): la espera por memoria venció → la versión falla con el motivo, reintentable.
+        if (err instanceof MemoryWaitTimeoutError) { await this.failVersion(job.versionId, job.claimId, { stage: 'queued', code: err.code, message: err.message, retryable: true }); return; }
+        throw err;
+      }
       try {
         this.maxConcurrent = Math.max(this.maxConcurrent, 1);
         await this.runVersion(job.versionId, job.claimId);

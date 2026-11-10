@@ -87,6 +87,8 @@
 //   Fix round 1 (revisión B6): W66 P2-2 aplicar atado a la huella del contenido revisado · W67 P2-3 reclamos agotados tras
 //   subir → objeto borrado · W68 P2-4 presupuesto de memoria compartido (identificación + diagnóstico + aplicar) · W69 P2-1
 //   barrido de B5 sin abrir la sesión · W62 + P2-5 descarga genérica de archivos del Taller bloqueada
+//   Fix round 2: W70 N1 cola de memoria FIFO (el grande no se queda sin turno) · W71 N1 espera máxima · W57/W66 prueba
+//   en seco vencida por huella de contenido
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -1758,6 +1760,10 @@ function rawZip(entries) {
       const puts0 = storage.puts.length;
       const pT = await plan.getPlan(OWNER, sid); // el contenido cambió en la base: el docente lo ve con su huella nueva
       assert(pT.items[0].contentHash !== it.contentHash, 'la huella cambió con los parámetros');
+      // Fix round 2 (nota): la prueba en seco guardada se hizo con el contenido ANTERIOR → vencida por huella.
+      await rejects(apply.apply(OWNER, sid, pT.planId, AP(pT, [it.id])), 409, 'WORKSHOP_APPLY_DRY_RUN_STALE', 'prueba en seco de otro contenido');
+      // Simula que la prueba en seco se rehízo y pasó (para llegar al trabajo y ver fallar el motor con el contenido vencido).
+      await ds.query(`update public.workshop_plans set combined = jsonb_set(combined, '{itemHashes}', $2::jsonb) where id = $1`, [p.planId, JSON.stringify([pT.items[0].contentHash])]);
       const r = await apply.apply(OWNER, sid, pT.planId, AP(pT, [it.id]));
       await idleA();
       const v = await apply.getVersion(OWNER, sid, r.version.id);
@@ -1767,6 +1773,7 @@ function rawZip(entries) {
       eq((await ds.query(`select count(*)::int n from public.artifacts where type = 'workshop_version' and metadata->>'workshopSessionId' = $1`, [sid]))[0].n, 0, 'sin artifact');
       // (d) corregido → el plan vuelve a borrador al editarlo y se reintenta: la MISMA fila, con la falla anterior en el informe
       await ds.query(`update public.workshop_plan_items set params = $2::jsonb where id = $1`, [it.id, JSON.stringify(goodParams)]);
+      await ds.query(`update public.workshop_plans set combined = $2::jsonb where id = $1`, [p.planId, JSON.stringify(savedCombined)]); // la prueba en seco del contenido bueno
       const r2 = await apply.apply(OWNER, sid, p.planId, AP(p, [it.id]));
       await idleA();
       const v2 = await apply.getVersion(OWNER, sid, r2.version.id);
@@ -1861,6 +1868,9 @@ function rawZip(entries) {
       const c = await rejects(apply2.apply(OWNER, sid, p2.planId, stale), 409, 'WORKSHOP_APPLY_CONFIRM_REQUIRED', 'confirmación con huella vieja');
       eq(c.missingItemIds, [rm.id], 'pide confirmarlo de nuevo');
       eq((await ds.query(`select count(*)::int n from public.workshop_versions where session_id = $1`, [sid]))[0].n, 0, 'ningún 409 crea versión');
+      // Fix round 2 (nota): con las huellas nuevas pero la prueba en seco hecha sobre el contenido anterior → vencida.
+      await rejects(apply2.apply(OWNER, sid, p2.planId, AP(p2, [edit.id, rm.id], [rm.id])), 409, 'WORKSHOP_APPLY_DRY_RUN_STALE', 'prueba en seco del contenido anterior');
+      await ds.query(`update public.workshop_plans set combined = jsonb_set(combined, '{itemHashes}', $2::jsonb) where id = $1`, [p2.planId, JSON.stringify(p2.apply.items.map((x) => x.contentHash))]);
       const r = await apply2.apply(OWNER, sid, p2.planId, AP(p2, [edit.id, rm.id], [rm.id]));
       await apply2.whenIdle();
       const v = await apply2.getVersion(OWNER, sid, r.version.id);
@@ -1922,6 +1932,68 @@ function rawZip(entries) {
       assert(Object.values(need).every((x) => x <= budget), 'cada uno solo entra');
       assert(need.identify + need.diagnosis + need.apply > budget && need.apply + need.identify > budget && need.apply + need.diagnosis > budget, `los tres juntos (${(need.identify + need.diagnosis + need.apply) / MB} MB) o aplicar con otro superan ${budget / MB} MB: el presupuesto compartido los hace esperar`);
       applyM.testHook = null;
+    });
+
+
+    await check('W70 (fix 2, N1) cola de memoria FIFO: un trabajo grande que espera no se queda sin turno ante un goteo de chicos que sí entrarían; se atiende en orden de llegada; el más grande que el presupuesto corre solo en su turno', async () => {
+      const F = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const U = 1024 * 1024; F.memoryBudgetBytes = 10 * U;
+      const relA = await F.acquireMemory('chico-A', 3 * U);
+      const order = [];
+      const big = F.acquireMemory('grande', 10 * U).then((r) => { order.push('grande'); return r; });
+      const smalls = [];
+      for (let i = 1; i <= 5; i++) {
+        await new Promise((x) => setTimeout(x, 10));
+        smalls.push(F.acquireMemory(`chico-${i}`, 2 * U).then((r) => { order.push(`chico-${i}`); return r; }));
+      }
+      await new Promise((x) => setTimeout(x, 30));
+      eq([order, F.memoryWaiting, F.reservedMemoryBytes], [[], 6, 3 * U], 'los chicos NO se adelantan al grande aunque quepan');
+      relA();
+      const relBig = await big;
+      eq([order, F.reservedMemoryBytes], [['grande'], 10 * U], 'el grande arranca en su turno (todo el presupuesto)');
+      relBig();
+      const rels = await Promise.all(smalls);
+      eq(order, ['grande', 'chico-1', 'chico-2', 'chico-3', 'chico-4', 'chico-5'], 'después, los chicos en orden de llegada');
+      assert(F.peakReservedBytes <= 10 * U, `nunca por encima del presupuesto (${F.peakReservedBytes / U})`);
+      rels.forEach((r) => r());
+      eq([F.reservedMemoryBytes, F.memoryWaiting], [0, 0], 'todo suelto');
+      // Más grande que TODO el presupuesto: espera a que no haya nada reservado y corre solo.
+      const r1 = await F.acquireMemory('x', 4 * U);
+      const huge = F.acquireMemory('enorme', 15 * U);
+      const after = F.acquireMemory('detrás', 1 * U);
+      await new Promise((x) => setTimeout(x, 20));
+      eq(F.memoryWaiting, 2, 'el enorme espera (y el de atrás también)');
+      r1(); const rh = await huge; eq(F.reservedMemoryBytes, 15 * U, 'solo, en su turno'); rh(); (await after)();
+    });
+
+    await check('W71 (fix 2, N1) espera máxima por memoria: vence → error visible y reintentable, sale de la cola y los de atrás siguen; en aplicar → versión `failed` WORKSHOP_MEMORY_WAIT_TIMEOUT (reintentable); en el diagnóstico → `failed` reintentable; por env', async () => {
+      const F = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const U = 1024 * 1024; F.memoryBudgetBytes = 10 * U; F.memoryMaxWaitMs = 80;
+      const hold = await F.acquireMemory('lleno', 10 * U);
+      let err = null; try { await F.acquireMemory('espera', 5 * U); } catch (e) { err = e; }
+      assert(err && err.code === 'WORKSHOP_MEMORY_WAIT_TIMEOUT' && /vuelve a intentarlo/.test(err.message), `vence con motivo: ${err && err.message}`);
+      eq([F.memoryWaiting, F.memoryTimeouts], [0, 1], 'salió de la cola');
+      hold();
+      // Aplicar: la versión espera memoria (ocupada) y vence.
+      const q = await readyPlanFor('b6-espera-max.mbz', { remove: false });
+      const svcW = new SVC.CourseWorkshopService(ds, storage, permissions);
+      svcW.memoryMaxWaitMs = 80;
+      const holdW = await svcW.acquireMemory('ocupado', svcW.memoryBudgetBytes);
+      const AW = new APS.WorkshopApplyService(ds, storage, svcW);
+      const r = await AW.apply(OWNER, q.sid, q.p.planId, AP(q.p, [q.p.items[0].id]));
+      await AW.whenIdle();
+      const v = await vrow(r.version.id);
+      eq([v.status, v.error.code, v.error.retryable, v.artifact_id], ['failed', 'WORKSHOP_MEMORY_WAIT_TIMEOUT', true, null], 'aplicar: falla visible, reintentable');
+      eq((await plan.getPlan(OWNER, q.sid)).status, 'failed', 'plan failed');
+      // Diagnóstico: igual.
+      const dg = await newIdentified('b6-espera-dg.mbz');
+      const d0 = await svcW.startDiagnosis(OWNER, dg.session.id);
+      eq(d0.status, 'queued', 'en cola');
+      await Promise.all([...svcW.inFlight.values()]);
+      const d1 = await svcW.getDiagnosis(OWNER, dg.session.id);
+      eq([d1.status, d1.error && d1.error.code, d1.error && d1.error.retryable], ['failed', 'WORKSHOP_MEMORY_WAIT_TIMEOUT', true], 'diagnóstico: falla visible, reintentable');
+      holdW();
+      eq([SVC.workshopMemoryMaxWaitMs({}), SVC.workshopMemoryMaxWaitMs({ COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN: '5' }), SVC.workshopMemoryMaxWaitMs({ COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN: 'x' })], [30 * 60000, 5 * 60000, 30 * 60000], 'plazo por env (30 min por defecto)');
     });
 
     await check('W69 (fix 1, P2-1) BARRIDO de B5 sin abrir la sesión: una aprobación `running` de un proceso muerto (llamada en vuelo) pasa a `ambiguous` con la reserva PENDIENTE (visible para la conciliación); una entrada colgada de otro arranque se marca interrumpida; lo que late no se toca', async () => {

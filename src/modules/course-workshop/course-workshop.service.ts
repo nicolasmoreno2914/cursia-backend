@@ -68,7 +68,26 @@ export const WORKSHOP_ERRORS = Object.freeze({
   DIAGNOSIS_FAILED: 'WORKSHOP_DIAGNOSIS_FAILED',
   DIAGNOSIS_INTERRUPTED: 'WORKSHOP_DIAGNOSIS_INTERRUPTED',
   DIAGNOSIS_TOO_LARGE: 'WORKSHOP_DIAGNOSIS_TOO_LARGE',
+  MEMORY_WAIT_TIMEOUT: 'WORKSHOP_MEMORY_WAIT_TIMEOUT',
 });
+
+/** r107 B6 fix round 2 (N1): una reserva en la cola de memoria. */
+interface MemoryWaiter { ticket: number; key: string; bytes: number; grant: () => void; tick: ReturnType<typeof setInterval> | null; deadline: ReturnType<typeof setTimeout> | null; enqueuedAt: number }
+
+/** La espera por memoria venció (fix round 2, N1): motivo visible, reintentable. */
+export class MemoryWaitTimeoutError extends Error {
+  readonly code = WORKSHOP_ERRORS.MEMORY_WAIT_TIMEOUT;
+  constructor(readonly waitedMs: number, readonly bytes: number, readonly budgetBytes: number) {
+    super(`El servidor estuvo ocupado con otros trabajos del Taller durante ${Math.round(waitedMs / 60000)} min y este no llegó a empezar (necesita ~${Math.round(bytes / 1048576)} MB de ${Math.round(budgetBytes / 1048576)} MB). No se hizo nada: vuelve a intentarlo.`);
+    this.name = 'MemoryWaitTimeoutError';
+  }
+}
+export const WORKSHOP_MEMORY_MAX_WAIT_DEFAULT_MIN = 30;
+export function workshopMemoryMaxWaitMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = (env.COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN ?? '').trim();
+  const min = raw === '' ? WORKSHOP_MEMORY_MAX_WAIT_DEFAULT_MIN : Number(raw);
+  return Number.isFinite(min) && min >= 1 ? Math.floor(min * 60_000) : WORKSHOP_MEMORY_MAX_WAIT_DEFAULT_MIN * 60_000;
+}
 
 /**
  * r107 B3 fix round 2 (N1): cada diagnóstico `queued` / `running` lleva en `claim_id` el ARRANQUE del proceso dueño
@@ -524,7 +543,7 @@ export class CourseWorkshopService {
     // falla (base caída), queda `identifying` y IDENTIFY_STALE_MS la libera al leerla.
     // Fix round 2 (N2): la identificación reserva su estimado de memoria (el diagnóstico solo arranca si entra).
     const p = this.withSlot(() => this.withMemory(`identify:${row.id}`, bytes * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row.id, claimId), () => this.touchIdentifying(row.id, claimId)))
-      .catch((err) => this.logger.error(`workshop ${row.id}: la identificación terminó con error: ${err instanceof Error ? err.message : String(err)}`))
+      .catch((err) => this.identificationEnded(row.id, claimId, err))
       .finally(() => this.inFlight.delete(row.id));
     this.inFlight.set(row.id, p);
     return this.toRecord(claimed[0]);
@@ -575,7 +594,7 @@ export class CourseWorkshopService {
       [row.id, claimId, v.size]));
     if (!claimed) return { session: this.toRecord(row), created: true };
     const p = this.withSlot(() => this.withMemory(`identify:${row!.id}`, v.size * IDENTIFY_MEMORY_FACTOR, () => this.runIdentification(row!.id, claimId), () => this.touchIdentifying(row!.id, claimId)))
-      .catch((err) => this.logger.error(`workshop ${row!.id}: la identificación de la sesión hija terminó con error: ${err instanceof Error ? err.message : String(err)}`))
+      .catch((err) => this.identificationEnded(row!.id, claimId, err))
       .finally(() => this.inFlight.delete(row!.id));
     this.inFlight.set(row.id, p);
     return { session: this.toRecord(claimed), created: true };
@@ -595,6 +614,17 @@ export class CourseWorkshopService {
   }
 
   // ── identificación ──
+
+  /** Una identificación terminó con error: si fue la espera por memoria (fix round 2, N1), queda `failed` reintentable con el motivo. */
+  private async identificationEnded(id: string, claimId: string, err: unknown): Promise<void> {
+    if (err instanceof MemoryWaitTimeoutError) {
+      await this.q(this.dataSource,
+        `update public.workshop_sessions set status = 'failed', error = $3::jsonb, updated_at = now() where id = $1 and status = 'identifying' and identification->'claim'->>'id' = $2`,
+        [id, claimId, JSON.stringify({ code: err.code, message: err.message, retryable: true })]).catch(() => {});
+      return;
+    }
+    this.logger.error(`workshop ${id}: la identificación terminó con error: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   /** Latido de una identificación que espera memoria (fix round 1, P2-4): sigue viva para los demás procesos. */
   private async touchIdentifying(id: string, claimId: string): Promise<void> {
@@ -1045,31 +1075,77 @@ export class CourseWorkshopService {
   }
 
   /**
-   * Reserva que ESPERA lugar. Mientras espera, `onWaitTick` corre cada MEMORY_WAIT_TICK_MS (el latido de quien espera:
-   * su fila sigue viva para los demás procesos). Devuelve la función que la suelta.
+   * Reserva que ESPERA lugar. Fix round 2 (N1): cola FIFO con boletos — se atiende ESTRICTAMENTE en orden de llegada:
+   * mientras haya alguien esperando, un pedido nuevo NO entra aunque quepa (no se adelanta a uno más grande que todavía
+   * no entra); al soltarse memoria se atiende desde la cabeza mientras quepa. Uno más grande que todo el presupuesto
+   * solo arranca cuando no hay nada reservado (le llega su turno en la cabeza). Mientras espera, `onWaitTick` corre cada
+   * MEMORY_WAIT_TICK_MS (latido); pasado `memoryMaxWaitMs` falla con MemoryWaitTimeoutError (motivo visible, reintentable),
+   * nunca espera para siempre. Devuelve la función que la suelta.
    */
   async acquireMemory(key: string, bytes: number, onWaitTick?: () => Promise<void> | void): Promise<() => void> {
     const need = Math.max(0, bytes);
-    let tick: ReturnType<typeof setInterval> | null = null;
-    try {
-      while (this.reservedMemoryBytes > 0 && this.reservedMemoryBytes + need > this.memoryBudgetBytes) {
-        if (!tick && onWaitTick) { tick = setInterval(() => { void Promise.resolve(onWaitTick()).catch(() => {}); }, MEMORY_WAIT_TICK_MS); tick.unref?.(); }
-        this.memoryWaiting++;
-        try { await new Promise<void>((r) => this.memoryWaiters.push(r)); } finally { this.memoryWaiting--; }
-      }
-    } finally {
-      if (tick) clearInterval(tick);
-    }
-    this.reserveNow(key, need);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.memoryReservations.delete(key);
-      this.memoryReleased();
+    const release = () => {
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        this.memoryReservations.delete(key);
+        this.memoryReleased();
+      };
     };
+    if (!this.memoryQueue.length && this.memoryFits(need)) {
+      this.reserveNow(key, need);
+      return release();
+    }
+    await new Promise<void>((resolve, reject) => this.enqueueMemory({ key, bytes: need, grant: resolve, timeout: reject, onWaitTick }));
+    return release();
   }
-  /** Reserva síncrona (sin await entre el chequeo de quien llama y esto) + el pico observado (las pruebas lo leen). */
+
+  /** Entra ya (sin mirar la cola): nada reservado, o cabe en lo que queda. */
+  private memoryFits(bytes: number): boolean {
+    return this.reservedMemoryBytes === 0 || this.reservedMemoryBytes + bytes <= this.memoryBudgetBytes;
+  }
+
+  /** Pone un pedido al final de la cola (con su latido y su plazo máximo). `grant` corre con la reserva YA hecha. */
+  private enqueueMemory(w: { key: string; bytes: number; grant: () => void; timeout: (e: Error) => void; onWaitTick?: () => Promise<void> | void }): void {
+    const entry: MemoryWaiter = { ticket: ++this.memoryTicket, key: w.key, bytes: w.bytes, grant: w.grant, tick: null, deadline: null, enqueuedAt: Date.now() };
+    if (w.onWaitTick) { const f = w.onWaitTick; entry.tick = setInterval(() => { void Promise.resolve(f()).catch(() => {}); }, MEMORY_WAIT_TICK_MS); entry.tick.unref?.(); }
+    const maxWait = this.memoryMaxWaitMs;
+    entry.deadline = setTimeout(() => {
+      const idx = this.memoryQueue.indexOf(entry);
+      if (idx < 0) return;
+      this.memoryQueue.splice(idx, 1);
+      if (entry.tick) clearInterval(entry.tick);
+      this.memoryTimeouts++;
+      w.timeout(new MemoryWaitTimeoutError(maxWait, w.bytes, this.memoryBudgetBytes));
+      this.drainMemoryQueue(); // el que salió podía estar en la cabeza: los de atrás pueden entrar
+    }, maxWait);
+    entry.deadline.unref?.();
+    this.memoryQueue.push(entry);
+    this.drainMemoryQueue();
+  }
+
+  /** Atiende desde la cabeza mientras quepa (FIFO estricto: si la cabeza no entra, nadie de atrás pasa). */
+  private drainMemoryQueue(): void {
+    while (this.memoryQueue.length && this.memoryFits(this.memoryQueue[0].bytes)) {
+      const h = this.memoryQueue.shift()!;
+      if (h.tick) clearInterval(h.tick);
+      if (h.deadline) clearTimeout(h.deadline);
+      this.reserveNow(h.key, h.bytes);
+      this.memoryGrantOrder.push(h.key);
+      if (this.memoryGrantOrder.length > 200) this.memoryGrantOrder.shift();
+      h.grant();
+    }
+  }
+  private readonly memoryQueue: MemoryWaiter[] = [];
+  private memoryTicket = 0;
+  /** Espera máxima por memoria (env COURSE_WORKSHOP_MEMORY_MAX_WAIT_MIN, por defecto 30 min; las pruebas lo cambian). */
+  memoryMaxWaitMs = workshopMemoryMaxWaitMs();
+  /** Orden en que se otorgaron las reservas que esperaron (pruebas). */
+  readonly memoryGrantOrder: string[] = [];
+  /** Esperas que vencieron (pruebas). */
+  memoryTimeouts = 0;
+  /** Reserva síncrona + el pico observado (las pruebas lo leen). */
   private reserveNow(key: string, bytes: number): void {
     this.memoryReservations.set(key, bytes);
     this.peakReservedBytes = Math.max(this.peakReservedBytes, this.reservedMemoryBytes);
@@ -1077,13 +1153,12 @@ export class CourseWorkshopService {
   /** Pico de memoria reservada en este proceso (pruebas). */
   peakReservedBytes = 0;
   /** Trabajos esperando lugar en el presupuesto (pruebas). */
-  memoryWaiting = 0;
-  private readonly memoryWaiters: Array<() => void> = [];
-  /** Al soltarse memoria: despierta a los que esperan (vuelven a mirar) y al diagnóstico en cola. */
+  get memoryWaiting(): number {
+    return this.memoryQueue.length;
+  }
+  /** Al soltarse memoria: se atiende la cola en orden. */
   private memoryReleased(): void {
-    const ws = this.memoryWaiters.splice(0);
-    for (const w of ws) w();
-    this.pumpDiagnosis();
+    this.drainMemoryQueue();
   }
   /** Bytes reservados ahora en este proceso (las pruebas lo leen). */
   get reservedMemoryBytes(): number {
@@ -1197,29 +1272,48 @@ export class CourseWorkshopService {
    * estimado de memoria entra en el presupuesto del proceso (N2); si no, espera a que se suelte una reserva.
    */
   private pumpDiagnosis(): void {
-    if (this.dead || this.diagnosisLane !== null) return;
+    if (this.dead || this.diagnosisLane !== null || this.diagnosisMemoryPending) return;
     const job = this.diagnosisQueue[0];
     if (!job) return;
-    if (this.reservedMemoryBytes > 0 && this.reservedMemoryBytes + job.bytes > this.memoryBudgetBytes) return;
     this.diagnosisQueue.shift();
-    this.diagnosisLane = job.diagnosisId;
-    this.reserveNow(`diagnosis:${job.diagnosisId}`, job.bytes);
-    (async () => {
-      // P2-7: `running` recién ahora; el latido sigue mientras corre.
-      const started = returningRows(await this.q(this.dataSource,
-        `update public.workshop_diagnoses set status = 'running', started_at = now(), updated_at = now()
-          where id = $1 and claim_id = $2 and status = 'queued' returning id`, [job.diagnosisId, job.claimId]));
-      if (started.length) await this.runDiagnosis(job.diagnosisId, job.claimId);
-    })()
-      .catch((err) => this.logger.error(`workshop diagnóstico ${job.diagnosisId}: terminó con error: ${err instanceof Error ? err.message : String(err)}`))
-      .finally(() => {
-        this.memoryReservations.delete(`diagnosis:${job.diagnosisId}`);
-        this.diagnosisLane = null;
-        this.beat(job.claimId, false);
-        job.done();
-        this.memoryReleased();
-      });
+    // Fix round 2 (N1): el diagnóstico pide su memoria en la MISMA cola FIFO que los demás; mientras espera NO toma el
+    // carril (sigue `queued`, con su latido). Uno solo pendiente a la vez (el carril es de 1).
+    const start = () => {
+      this.diagnosisMemoryPending = false;
+      this.diagnosisLane = job.diagnosisId;
+      (async () => {
+        // P2-7: `running` recién ahora; el latido sigue mientras corre.
+        const started = returningRows(await this.q(this.dataSource,
+          `update public.workshop_diagnoses set status = 'running', started_at = now(), updated_at = now()
+            where id = $1 and claim_id = $2 and status = 'queued' returning id`, [job.diagnosisId, job.claimId]));
+        if (started.length) await this.runDiagnosis(job.diagnosisId, job.claimId);
+      })()
+        .catch((err) => this.logger.error(`workshop diagnóstico ${job.diagnosisId}: terminó con error: ${err instanceof Error ? err.message : String(err)}`))
+        .finally(() => {
+          this.diagnosisLane = null;
+          this.beat(job.claimId, false);
+          job.done();
+          this.memoryReservations.delete(`diagnosis:${job.diagnosisId}`);
+          this.memoryReleased();
+          this.pumpDiagnosis();
+        });
+    };
+    const key = `diagnosis:${job.diagnosisId}`;
+    if (!this.memoryQueue.length && this.memoryFits(job.bytes)) { this.reserveNow(key, job.bytes); start(); return; }
+    this.diagnosisMemoryPending = true;
+    this.enqueueMemory({
+      key, bytes: job.bytes, grant: start,
+      timeout: (e) => {
+        this.diagnosisMemoryPending = false;
+        void this.q(this.dataSource,
+          `update public.workshop_diagnoses set status = 'failed', error = $3::jsonb, finished_at = now(), updated_at = now() where id = $1 and claim_id = $2 and status = 'queued'`,
+          [job.diagnosisId, job.claimId, JSON.stringify({ code: WORKSHOP_ERRORS.MEMORY_WAIT_TIMEOUT, message: e.message, retryable: true })])
+          .catch(() => {})
+          .finally(() => { this.beat(job.claimId, false); job.done(); this.pumpDiagnosis(); });
+      },
+    });
   }
+  private diagnosisMemoryPending = false;
 
   /**
    * GET …/sessions/:id/diagnosis — mismas compuertas que GET …/:id (`courses.view`). N1: si el diagnóstico pedido quedó

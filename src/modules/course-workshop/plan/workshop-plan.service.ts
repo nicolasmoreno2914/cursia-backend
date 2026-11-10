@@ -12,7 +12,7 @@ import { loadDryRunPricing } from '../../finops/dry-run-pricing';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import { readDocument, DocumentReadError } from '../../academic-context';
 import { isUuid } from '../../authz/schema-probe';
-import { CourseWorkshopService, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
+import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
 import { DIAGNOSIS_CODE_VERSION, DiagnosisReport } from '../diagnosis/diagnose';
 import type { Finding } from '../diagnosis/finding';
 import type { WorkshopCourse } from '../course-model';
@@ -722,31 +722,37 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     }
     if ('approvalId' in job) await this.q(this.dataSource, `update public.workshop_ai_approvals set status = 'running', updated_at = now() where id = $1 and status = 'reserved'`, [job.approvalId]);
     const bytes = Number(s.originalSize ?? 0) * diagnosisMemoryFactor(s.container);
-    await this.workshop.withMemory(`plan:${job.sessionId}`, bytes, async () => {
-      let ctx: BuildCtx;
-      try {
-        const original = await this.workshop.loadVerifiedOriginal(s.id);
-        ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
-      } catch (err) {
-        const body = (err as { getResponse?: () => any })?.getResponse?.();
-        const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
-        await this.failJob(job, code, String(body?.message ?? 'No se pudo abrir el original de la sesión; vuelve a intentarlo.'), code !== WORKSHOP_ERRORS.ORIGINAL_CHANGED && code !== WORKSHOP_ERRORS.ORIGINAL_MISSING);
-        return;
-      }
-      try {
-        if (job.kind === 'interpret') await this.runInterpret(s, ctx, job.intakeId, job.approvalId);
-        else if (job.kind === 'reinterpret') await this.runReinterpret(s, ctx, job.requestId, job.approvalId);
-        else if (job.kind === 'stage') await this.runStage(s, ctx, job.requestId);
-        else if (job.kind === 'generate') await this.runGenerate(s, ctx, job.approvalId);
-      } catch (err) {
-        if (err instanceof AiUnavailableError) await this.failJob(job, err.code, err.message, true, err.extra);
-        else {
-          this.logger.error(`taller plan ${s.id}: ${job.kind} falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-          await this.failJob(job, PLAN_ERRORS.PREPARE_FAILED, 'No se pudo procesar el pedido; vuelve a intentarlo. Si se repite, avísanos.', true);
+    try {
+      await this.workshop.withMemory(`plan:${job.sessionId}`, bytes, async () => {
+        let ctx: BuildCtx;
+        try {
+          const original = await this.workshop.loadVerifiedOriginal(s.id);
+          ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
+        } catch (err) {
+          const body = (err as { getResponse?: () => any })?.getResponse?.();
+          const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
+          await this.failJob(job, code, String(body?.message ?? 'No se pudo abrir el original de la sesión; vuelve a intentarlo.'), code !== WORKSHOP_ERRORS.ORIGINAL_CHANGED && code !== WORKSHOP_ERRORS.ORIGINAL_MISSING);
+          return;
         }
-      }
-      await this.refreshCombined(s, ctx).catch((err) => this.logger.error(`taller plan ${s.id}: prueba en seco combinada: ${err instanceof Error ? err.message : String(err)}`));
-    });
+        try {
+          if (job.kind === 'interpret') await this.runInterpret(s, ctx, job.intakeId, job.approvalId);
+          else if (job.kind === 'reinterpret') await this.runReinterpret(s, ctx, job.requestId, job.approvalId);
+          else if (job.kind === 'stage') await this.runStage(s, ctx, job.requestId);
+          else if (job.kind === 'generate') await this.runGenerate(s, ctx, job.approvalId);
+        } catch (err) {
+          if (err instanceof AiUnavailableError) await this.failJob(job, err.code, err.message, true, err.extra);
+          else {
+            this.logger.error(`taller plan ${s.id}: ${job.kind} falló: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+            await this.failJob(job, PLAN_ERRORS.PREPARE_FAILED, 'No se pudo procesar el pedido; vuelve a intentarlo. Si se repite, avísanos.', true);
+          }
+        }
+        await this.refreshCombined(s, ctx).catch((err) => this.logger.error(`taller plan ${s.id}: prueba en seco combinada: ${err instanceof Error ? err.message : String(err)}`));
+      });
+    } catch (err) {
+      // r107 B6 fix round 2 (N1): la espera por memoria venció → falla visible y reintentable (nunca espera para siempre).
+      if (err instanceof MemoryWaitTimeoutError) { await this.failJob(job, err.code, err.message, true); return; }
+      throw err;
+    }
   }
 
   private async failJob(job: Job, code: string, message: string, retryable: boolean, extra: Record<string, unknown> = {}): Promise<void> {
@@ -986,7 +992,9 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
         where i.plan_id = $1 and i.status = 'proposed' and i.stage = 'ready' and i.available and r.status = 'resolved' order by i.created_at, i.id`, [planId]);
     const c = await combinedDryRun(ctx, items.map((i) => i.params));
     await this.q(this.dataSource, `update public.workshop_plans set combined = $2::jsonb, updated_at = now() where id = $1`,
-      [planId, JSON.stringify({ ...c, itemIds: items.map((i) => i.id), failedItemId: c.failure && c.failure.opIndex !== null ? items[c.failure.opIndex]?.id ?? null : null, at: new Date().toISOString() })]);
+      [planId, JSON.stringify({ ...c, itemIds: items.map((i) => i.id),
+        // r107 B6 fix round 2 (nota): huella del contenido de cada ítem probado (aplicar compara contra la del ítem actual).
+        itemHashes: items.map((i) => itemContentHash({ operation: i.operation, stage: i.stage, params: i.params ?? null, view: i.view ?? null })), failedItemId: c.failure && c.failure.opIndex !== null ? items[c.failure.opIndex]?.id ?? null : null, at: new Date().toISOString() })]);
   }
 
   private async baselineOf(s: WorkshopPlanSession): Promise<{ originalSha1: string; report: DiagnosisReport } | null> {
