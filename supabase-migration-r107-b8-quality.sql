@@ -87,6 +87,10 @@ create table if not exists public.workshop_questions (
   updated_at     timestamptz not null default now()
 );
 create index if not exists workshop_questions_session_idx on public.workshop_questions (session_id, created_at);
+-- B8fe P2-3: `ambiguous` = la llamada de IA pudo cobrarse; queda así hasta que el admin concilie su aprobación.
+-- (drop + add: idempotente también sobre una tabla creada antes sin ese estado; todavía no aplicada en staging.)
+alter table public.workshop_questions drop constraint if exists workshop_questions_status_check;
+alter table public.workshop_questions add constraint workshop_questions_status_check check (status in ('retrieving', 'awaiting_confirmation', 'answering', 'answered', 'failed', 'ambiguous'));
 
 -- Aprobaciones de gasto de IA (B5): los tipos nuevos de B8, con el mismo protocolo (estimado → tope → reserva → liquidación).
 alter table public.workshop_ai_approvals drop constraint if exists workshop_ai_approvals_kind_check;

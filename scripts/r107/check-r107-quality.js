@@ -386,6 +386,30 @@ async function censusMode(surveyPath) {
     const one = plan.estimateOf([prep.calls[0].call], 'un capítulo');
     await throws(Promise.resolve().then(() => plan.validateConfirmation(one, { confirmEstimateUsd: Number(one.expectedUsd), capUsd: Number(one.expectedUsd) + 0.0001 })), 409, 'WORKSHOP_CAP_BELOW_CALL_BOUND', 'tope < cota de una llamada');
     eq(plan.validateConfirmation(estimate, { confirmEstimateUsd: Number(estimate.expectedUsd), capUsd: Number(estimate.proposedCapUsd) }), Number(estimate.proposedCapUsd).toFixed(6), 'tope propuesto aceptado');
+    // B8fe P1-1 (decisión del controlador): el estimado se confirma al CENTAVO. Subconjuntos de 3 / 5 / 8 capítulos con
+    // estimados de 10 decimales: la suma exacta (BigInt, como addDec) o la suma de cada uno redondeado a 6 decimales (lo que
+    // hacía el navegador) → aceptada; un centavo de diferencia → 409; las reglas del tope no cambian.
+    let seed = 20261110;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const exactSum = (xs) => { const t = xs.reduce((a, x) => a + BigInt(x.replace('.', '')), 0n); const s10 = t.toString().padStart(11, '0'); return `${s10.slice(0, -10)}.${s10.slice(-10)}`; };
+    let trials = 0;
+    for (const k of [3, 5, 8]) for (let t = 0; t < 400; t++) {
+      const cs = Array.from({ length: k }, () => { const e = (Math.floor(rnd() * 5e8) / 1e10).toFixed(10); return { model: 'm', kind: 'quality_review', promptChars: 1, maxTokens: 1, size: { promptChars: 1 }, expectedUsd: e, boundUsd: '0.0010000000' }; });
+      const est = plan.estimateOf(cs, 'subconjunto');
+      const cap = Number(est.proposedCapUsd);
+      plan.validateConfirmation(est, { confirmEstimateUsd: exactSum(cs.map((c) => c.expectedUsd)), capUsd: cap });
+      const six = cs.reduce((a, c) => a + Math.round(Number(c.expectedUsd) * 1e6), 0) / 1e6;
+      plan.validateConfirmation(est, { confirmEstimateUsd: six, capUsd: cap });
+      const cents = PLS.centsHalfUp(est.expectedUsd);
+      await throws(Promise.resolve().then(() => plan.validateConfirmation(est, { confirmEstimateUsd: (cents + 1) / 100, capUsd: cap + 1 })), 409, 'WORKSHOP_ESTIMATE_MISMATCH', 'un centavo de más');
+      if (cents > 0) await throws(Promise.resolve().then(() => plan.validateConfirmation(est, { confirmEstimateUsd: (cents - 1) / 100, capUsd: cap })), 409, 'WORKSHOP_ESTIMATE_MISMATCH', 'un centavo de menos');
+      trials++;
+    }
+    eq(trials, 1200, 'subconjuntos probados');
+    eq([PLS.centsHalfUp('0.0578772000'), PLS.centsHalfUp('0.125'), PLS.centsHalfUp('0.1249999999'), PLS.centsHalfUp(0.005), PLS.centsHalfUp('-1'), PLS.centsHalfUp('x')], [6, 13, 12, 1, null, null], 'half-up exacto');
+    // El tope sigue exacto: confirmar el estimado al centavo no deja aprobar un tope menor que el estimado real.
+    const tight = plan.estimateOf([{ ...prep.calls[0].call, expectedUsd: '0.0549000000', boundUsd: '0.0100000000' }], 'tope');
+    await throws(Promise.resolve().then(() => plan.validateConfirmation(tight, { confirmEstimateUsd: 0.05, capUsd: 0.05 })), 409, 'WORKSHOP_CAP_BELOW_ESTIMATE', 'tope < estimado exacto');
     const s = { id: 's1', ownerId: 'u1', identifiedCourseId: 7 };
     const mk = (id, cap, kind) => { const a = { id, session_id: 's1', created_by: 'u1', kind, cap_usd: cap, spent_usd: '0', ai_calls: 0, calls: {}, status: 'running', reservation_key: `workshop:approval:${id}` }; rows.set(id, a); return a; };
     const p1 = prep.packets[0];

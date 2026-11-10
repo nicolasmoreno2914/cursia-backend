@@ -100,6 +100,7 @@
 //   W82 preguntas puntuales (evidencia sin IA, citas verificadas, cita inventada, sin evidencia, hostil, historial)
 //   W83 compuertas y rutas · W84 reclamo + latido entre procesos (diagnóstico, revisión con IA, pregunta)
 //   W85 (ronda) un error antes del try interno de la revisión / la respuesta cierra y suelta la aprobación
+//   W86 (B8fe P2-3) pregunta / capítulo AMBIGUO no reaprobable hasta la conciliación; capFactor en la vista
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -2462,13 +2463,20 @@ function rawZip(entries) {
       const ap = g.approvals.find((x) => x.id === a.approval.id);
       eq([ap.status, ap.calls.map((c) => c.status)], ['ambiguous', ['ambiguous']], 'ambigua');
       assert(!ledger.settled.some((x) => x.key === `workshop:approval:${a.approval.id}`), 'la reserva NO se libera');
-      eq(g.ai.chapters.map((c) => c.status), ['failed', 'not_reviewed'], 'capítulo fallido, el resto sin revisar');
-      assert(/no se sabe si la llamada se cobró/.test(g.ai.chapters[0].reason), g.ai.chapters[0].reason);
+      eq(g.ai.chapters.map((c) => [c.status, c.errorCode]), [['ambiguous', 'WORKSHOP_AI_CALL_AMBIGUOUS'], ['not_reviewed', null]], 'capítulo AMBIGUO (B8fe P2-3), el resto sin revisar');
+      assert(/no se sabe si la llamada a la IA se cobró/i.test(g.ai.chapters[0].reason), g.ai.chapters[0].reason);
+      eq(g.ai.all.chapters, [2], 'el ambiguo NO se puede volver a aprobar');
+      await rejects(quality.startQuality(OWNER, sid, { chapters: [1], confirmEstimateUsd: Number(g.ai.chapters[0].estimate.expectedUsd), capUsd: 1 }), 400, 'WORKSHOP_QUALITY_CHAPTERS_INVALID', 'reaprobar el ambiguo → 400');
       aiSim.throwNext = new PL.WorkshopAiNotSentError(new Error('falta ANTHROPIC_API_KEY'));
       const b = await confirmAll(sid, g); await qidle();
       g = await quality.getQuality(OWNER, sid);
       eq(g.approvals.find((x) => x.id === b.approval.id).calls.map((c) => c.status), ['not_sent'], 'no enviada');
       assert(ledger.settled.some((x) => x.key === `workshop:approval:${b.approval.id}`), 'not_sent → reserva liberada');
+      eq(g.ai.chapters.map((c) => [c.status, c.errorCode]), [['ambiguous', 'WORKSHOP_AI_CALL_AMBIGUOUS'], ['failed', 'WORKSHOP_AI_UNAVAILABLE']], 'not_sent → fallido reaprobable (no ambiguo)');
+      // El admin concilia la aprobación ambigua → el capítulo vuelve a ser reaprobable.
+      await ds.query(`update public.workshop_ai_approvals set status = 'reconciled' where id = $1`, [a.approval.id]);
+      g = await quality.getQuality(OWNER, sid);
+      eq([g.ai.chapters[0].status, g.ai.chapters[0].errorCode, g.ai.all.chapters], ['failed', null, [1, 2]], 'conciliada → fallido reaprobable');
     });
 
     await check('W81 (B8) «Arreglar esto» con un hallazgo de CALIDAD: mismo camino que uno técnico (pedido con la instrucción del hallazgo, en etapa de estimado: el contenido se genera con su aprobación); idempotente', async () => {
@@ -2570,8 +2578,8 @@ function rawZip(entries) {
       await ds.query(`update public.workshop_quality_runs set chapters = $2::jsonb, ai_claim_id = 'muerto.y', updated_at = now() - interval '40 seconds' where id = $1`, [g2.runId, JSON.stringify(ch)]);
       await ds.query(`update public.workshop_ai_approvals set status = 'running', claim_id = 'muerto.y', calls = jsonb_build_object('c1', jsonb_build_object('id', 'c1', 'kind', 'quality_review', 'attempt', 1, 'boundUsd', '0.06', 'status', 'sent', 'at', 'x')), updated_at = now() - interval '40 seconds' where id = $1`, [ap.id]);
       const g3 = await quality.getQuality(OWNER, sid);
-      eq(g3.ai.chapters.map((c) => c.status), ['failed', 'failed'], 'capítulos fallidos con motivo');
-      assert(/interrumpió/.test(g3.ai.chapters[0].reason), g3.ai.chapters[0].reason);
+      eq(g3.ai.chapters.map((c) => c.status), ['ambiguous', 'failed'], 'el que estaba en revisión (llamada enviada) queda AMBIGUO; el de la cola, fallido');
+      assert(/conciliar|concilie/.test(g3.ai.chapters[0].reason) && /interrumpió/.test(g3.ai.chapters[1].reason), `${g3.ai.chapters[0].reason} / ${g3.ai.chapters[1].reason}`);
       const [ap2] = await ds.query(`select status from public.workshop_ai_approvals where id = $1`, [ap.id]);
       eq([ap2.status, ledger.settled.some((x) => x.key === `workshop:approval:${ap.id}`)], ['ambiguous', false], 'ambigua: la reserva queda pendiente');
       // (c) pregunta colgada con su aprobación.
@@ -2617,6 +2625,22 @@ function rawZip(entries) {
       await ds.query(`update public.workshop_ai_approvals set status = 'running', updated_at = now() - interval '1 second' where id = $1`, [c.approval.id]);
       await plan.sweep();
       eq((await ds.query(`select status from public.workshop_ai_approvals where id = $1`, [c.approval.id]))[0].status, 'failed', 'no quedó tomada por este proceso');
+    });
+
+    await check('W86 (B8fe P2-3) una pregunta cuya llamada quedó AMBIGUA → estado `ambiguous` (WORKSHOP_AI_CALL_AMBIGUOUS, no reintentable, no se puede volver a confirmar); conciliada por el admin → `failed` reintentable; capFactor en la vista de calidad', async () => {
+      const sid = await diagnosed('b8-preg-ambigua.mbz', QV1);
+      const q = await quality.ask(OWNER, sid, { text: '¿El video del capítulo 1 dice bien la velocidad máxima en zona escolar?' }); await qidle();
+      let h = (await quality.listQuestions(OWNER, sid)).questions.find((x) => x.id === q.id);
+      aiSim.throwNext = Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' });
+      const c = await quality.ask(OWNER, sid, { questionId: q.id, confirmEstimateUsd: Number(h.estimate.expectedUsd), capUsd: Number(h.estimate.proposedCapUsd) }); await qidle();
+      h = (await quality.listQuestions(OWNER, sid)).questions.find((x) => x.id === q.id);
+      eq([h.status, h.error.code, h.error.retryable], ['ambiguous', 'WORKSHOP_AI_CALL_AMBIGUOUS', false], 'ambigua');
+      await rejects(quality.ask(OWNER, sid, { questionId: q.id, confirmEstimateUsd: Number(h.estimate.expectedUsd), capUsd: Number(h.estimate.proposedCapUsd) }), 409, 'WORKSHOP_QUESTION_NOT_AWAITING_CONFIRMATION', 'no se vuelve a pagar');
+      await ds.query(`update public.workshop_ai_approvals set status = 'reconciled' where id = $1`, [c.approval.id]);
+      h = (await quality.listQuestions(OWNER, sid)).questions.find((x) => x.id === q.id);
+      eq([h.status, h.error.retryable], ['failed', true], 'conciliada → fallida reintentable');
+      await quality.startQuality(OWNER, sid, {}); await qidle();
+      eq((await quality.getQuality(OWNER, sid)).ai.capFactor, 1.5, 'capFactor del servidor en la vista');
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

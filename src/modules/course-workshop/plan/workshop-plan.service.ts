@@ -111,6 +111,19 @@ interface RequestRow { id: string; session_id: string; intake_id: string; ordina
 interface ItemRow { id: string; plan_id: string; request_id: string; status: 'proposed' | 'removed'; stage: 'estimate' | 'ready'; operation: string; available: boolean; params: any; view: PlanItemView; risk_level: string; spent_usd: string; apply_expected_usd: string; created_at: Date; updated_at: Date }
 export interface ApprovalRow { id: string; session_id: string; created_by: string; kind: 'interpret' | 'reinterpret' | 'generate' | 'quality' | 'question'; intake_id: string | null; request_id: string | null; item_ids: string[]; estimate: any; cap_usd: string; spent_usd: string; ai_calls: number; reservation_key: string | null; calls: Record<string, ApprovalCall>; status: string; stop_reason: string | null; created_at: Date; updated_at: Date }
 
+/**
+ * Centavos de un monto USD redondeado half-up a 0,01, EXACTO sobre el decimal (sin aritmética binaria): «0.0578772000» → 6,
+ * «0.125» → 13. null si no es un monto ≥ 0.
+ */
+export function centsHalfUp(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN;
+  if (!Number.isFinite(n) || n < 0) return null;
+  const str = typeof v === 'string' && /^\d+(?:\.\d+)?$/.test(v.trim()) ? v.trim() : n.toFixed(10);
+  const [i, f = ''] = str.split('.');
+  const frac = (f + '000').slice(0, 3);
+  return Number(i) * 100 + Number(frac.slice(0, 2)) + (Number(frac[2]) >= 5 ? 1 : 0);
+}
+
 /** Estimado de una aprobación (lo que el docente ve y confirma). */
 export interface ApprovalEstimate { calls: PlannedCall[]; expectedUsd: string; boundUsd: string; proposedCapUsd: string; note: string }
 
@@ -293,8 +306,10 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   validateConfirmation(estimate: ApprovalEstimate, input: { confirmEstimateUsd: unknown; capUsd: unknown }): string {
     const cap = Number(input.capUsd);
     if (!Number.isFinite(cap) || cap <= 0 || cap > 1000) throw new BadRequestException({ code: PLAN_ERRORS.CAP_INVALID, message: 'El tope tiene que ser un monto en USD mayor que 0.' });
-    const confirmed = Number(input.confirmEstimateUsd);
-    if (!Number.isFinite(confirmed) || Math.abs(confirmed - Number(estimate.expectedUsd)) > 1e-6) {
+    // r107 B8 (decisión del controlador, B8fe P1-1): el estimado se confirma al CENTAVO (half-up a 0,01 a los dos lados):
+    // el docente ve centavos y el navegador puede sumar estimados por capítulo / ítem; el tope sigue siendo exacto abajo.
+    const confirmedCents = centsHalfUp(input.confirmEstimateUsd);
+    if (confirmedCents === null || confirmedCents !== centsHalfUp(estimate.expectedUsd)) {
       throw new ConflictException({ code: PLAN_ERRORS.ESTIMATE_MISMATCH, message: 'El estimado cambió desde que lo viste: revísalo y vuelve a confirmarlo.', estimate });
     }
     if (cap + 1e-9 < Number(estimate.expectedUsd)) {

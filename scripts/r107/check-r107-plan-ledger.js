@@ -386,10 +386,15 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       const q2 = new QLS.WorkshopQualityService(ds, svc, planFor(qClient('timeout')));
       const r2 = await ask(q2, text);
       const key2 = `workshop:approval:${r2.c.approval.id}`;
-      eq([r2.h.status, r2.h.error && r2.h.error.code], ['failed', 'WORKSHOP_AI_CALL_AMBIGUOUS'], 'ambigua: visible, no se reintenta a ciegas');
+      eq([r2.h.status, r2.h.error && r2.h.error.code], ['ambiguous', 'WORKSHOP_AI_CALL_AMBIGUOUS'], 'ambigua: estado propio (B8fe P2-3), no se reintenta a ciegas');
       eq((await pending(key2)).measurement_status, 'pending', 'reserva PENDIENTE');
       const row = (await ctl.workshopReservations()).reservations.find((x) => x.reservationKey === key2);
       assert(row && row.kind === 'question' && row.approvalStatus === 'ambiguous', `en la conciliación: ${JSON.stringify(row)}`);
+      // La conciliación REAL del admin (`not_charged`) la deja reintentable.
+      await ctl.reconcileWorkshopReservation({ reservationKey: key2, outcome: 'not_charged', reason: 'La consola de Anthropic no muestra la llamada' }, saUser);
+      const after = (await q2.listQuestions({ id: U }, sid)).questions.find((x) => x.id === r2.h.id);
+      eq([after.status, after.error.retryable], ['failed', true], 'conciliada → fallida reintentable');
+      near(await net(key2), 0, 'reserva liberada por la conciliación');
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
   } finally {
