@@ -6,7 +6,7 @@
 //
 //   W1  migración aditiva e idempotente (dos veces, con roles de Supabase): RLS, sin acceso para anon/authenticated;
 //       el script se niega sin MIGRATION_ENV=staging
-//   W2  crear sesión: ruta en la carpeta del dueño, URL firmada; nombre inválido / > 300 MB → 400
+//   W2  crear sesión: ruta en la carpeta del dueño, URL firmada; nombre inválido / > 200 MB → 400 (tope del Taller, B3 N2)
 //   W3  cerrar la subida: sin objeto → 409; con objeto → 202 `identifying` → `identified` (sha1, tamaño, contenedor,
 //       familia, builder, huella → curso del dueño) + artifact `workshop_original` con sha256; re-POST idempotente (no
 //       duplica el artifact)
@@ -30,6 +30,31 @@
 //   W23–W26 fix round 3: 403 con «404» en la ruta = transitorio (status estructurado); un proceso que muere a mitad de
 //       la reconstrucción gasta su intento; carril de 1 estricto entre sondeos concurrentes; una falla determinista se
 //       reintenta UNA vez con otra versión del armado
+//   r107 B3 (diagnóstico técnico):
+//   W27 migración B3 aditiva e idempotente (dos veces): workshop_diagnoses + workshop_findings, RLS, sin anon/authenticated,
+//       FK en cascada, CHECKs; workshop_sessions / courses / artifacts intactas; el script se niega sin MIGRATION_ENV=staging
+//   W28 POST …/diagnosis → 202 queued → running → ready: informe + hallazgos persistidos (uno por fila, en orden), semáforo verde
+//       del sintético sano; GET devuelve lo mismo
+//   W29 idempotente: re-POST (también concurrente) → el mismo diagnóstico, NINGÚN run ni fila nueva; un paquete dañado
+//       → sus hallazgos con su arreglo sugerido
+//   W30 compuertas: ajeno 404 (GET y POST), SuperAdmin ve, miembro solo con RBAC enforce; sin identificar → 409;
+//       sin las tablas → 503 COURSE_WORKSHOP_NOT_MIGRATED
+//   W31 original cambiado → NO diagnostica: 409 WORKSHOP_ORIGINAL_CHANGED (sesión failed), 0 runs, 0 hallazgos; también si
+//       cambia entre el POST y la corrida (el diagnóstico queda failed con ese código)
+//   Fix round 1:
+//   W33 P1-1 carril PROPIO de 1: 5 diagnósticos concurrentes → nunca más de 1 corriendo, ninguno ocupa un lugar de
+//       identificación (una identificación termina mientras el carril está ocupado); P2-7: los que esperan quedan
+//       `queued` y NO vencen aunque pasen 15 min; re-POST de uno en cola no duplica nada; 1 descarga por diagnóstico
+//   W34 P1-1 presupuesto de memoria: un original cuyo estimado lo supera → failed WORKSHOP_DIAGNOSIS_TOO_LARGE, visible,
+//       no reintentable, sin descargarlo
+//   Fix round 2:
+//   W35 N1 pm2 reload: el proceso A muere con un diagnóstico `running` y otro `queued`; el proceso B (otro arranque) no
+//       toca filas que A sigue latiendo y reclama las abandonadas en el re-POST y en el próximo GET → cada una corre
+//       EXACTAMENTE una vez en B; lo que A termine después no escribe nada
+//   W36 N2 presupuesto del proceso: con una reserva viva que no deja lugar, el diagnóstico espera en cola sin tomar el
+//       carril y arranca al soltarse; TOO_LARGE se reintenta si el presupuesto actual es mayor que el del error
+//   W32 un run interrumpido (proceso reiniciado) → GET lo marca fallido reintentable; el POST lo reclama y termina; una
+//       falla determinista del diagnóstico es terminal (no se reintenta sola)
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -237,14 +262,14 @@ function rawZip(entries) {
     await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, checksum_sha256, size_bytes) values ($1, $2, 'dynamic_mbz', $3, $4, $5)`, [OTHER.id, String(foreign.id), `${OTHER.id}/dynamic/x.mbz`, MBZ_SHA256, MBZ.length]);
 
     let s1;
-    await check('W2 crear sesión: ruta en la carpeta del dueño + URL firmada; nombre inválido / > 300 MB → 400', async () => {
+    await check('W2 crear sesión: ruta en la carpeta del dueño + URL firmada; nombre inválido / > 200 MB → 400', async () => {
       const res = await svc.createSession(OWNER, { filename: 'C:\\x\\Mi curso.mbz', sizeBytes: MBZ.length });
       s1 = res.session;
       eq([s1.status, s1.phase, s1.filename, s1.institutionId], ['uploaded', 'awaiting_upload', 'Mi curso.mbz', null], 'sesión (RBAC off: sin institución)');
       eq(res.upload.storagePath, SVC.workshopStoragePath(OWNER.id, s1.id), 'ruta');
-      eq([res.upload.method, res.upload.maxBytes], ['backend', 300 * 1024 * 1024], 'upload');
+      eq([res.upload.method, res.upload.maxBytes], ['backend', 200 * 1024 * 1024], 'upload (tope 200 MB)');
       await rejects(svc.createSession(OWNER, { filename: 'curso.zip', sizeBytes: 10 }), 400, 'WORKSHOP_FILENAME_INVALID', 'extensión');
-      await rejects(svc.createSession(OWNER, { filename: 'c.mbz', sizeBytes: 300 * 1024 * 1024 + 1 }), 400, 'WORKSHOP_FILE_TOO_LARGE', 'tope');
+      await rejects(svc.createSession(OWNER, { filename: 'c.mbz', sizeBytes: 200 * 1024 * 1024 + 1 }), 400, 'WORKSHOP_FILE_TOO_LARGE', 'tope');
     });
 
     await check('W3 cerrar la subida: sin objeto → 409; con objeto → identifying → identified (huella → curso propio) + workshop_original; idempotente', async () => {
@@ -350,7 +375,7 @@ function rawZip(entries) {
       await rejects(svc2.createSession(OWNER, { filename: 'x.mbz', sizeBytes: 10 }), 503, 'COURSE_WORKSHOP_NOT_MIGRATED', 'sin migrar');
     });
 
-    await check('W10 fix P1-1: el objeto se reemplaza entre el HEAD y la descarga — más grande que 300 MB → abort + failed (no reintentable); distinto tamaño → reintentable', async () => {
+    await check('W10 fix P1-1: el objeto se reemplaza entre el HEAD y la descarga — más grande que el tope (200 MB) → abort + failed (no reintentable); distinto tamaño → reintentable', async () => {
       const res = await svc.createSession(OWNER, { filename: 't.mbz', sizeBytes: MBZ.length });
       objects.set(res.upload.storagePath, MBZ);
       await svc.markUploaded(OWNER, res.session.id); // HEAD ve el chico
@@ -759,6 +784,292 @@ function rawZip(entries) {
       await ds.query(`update public.workshop_sessions set identification = jsonb_set(identification, '{inventory}', $2::jsonb) where id = $1`, [sid, JSON.stringify(failInfo('version-vieja'))]);
       const st = await poll(sid, 4);
       eq([st[0], st[st.length - 1], storage.downloads - d0], ['building', 'ready', 1], 'otra versión: una reconstrucción y listo');
+    });
+
+    // ── r107 B3: diagnóstico técnico ──
+    const SQL_B3 = fs.readFileSync(path.join(REPO, 'supabase-migration-r107-b3-diagnosis.sql'), 'utf8');
+    await check('W27 migración B3 aditiva e idempotente: workshop_diagnoses + workshop_findings, RLS, sin anon/authenticated, FK en cascada; nada existente cambia', async () => {
+      await withClient(DB, async (c) => {
+        const colsOf = async () => (await c.query(`select table_name, column_name, data_type from information_schema.columns where table_name in ('courses','artifacts','workshop_sessions') order by 1, 2`)).rows;
+        const before = await colsOf();
+        for (let i = 0; i < 2; i++) { await c.query('begin'); await c.query(SQL_B3); await c.query('commit'); }
+        // Fix round 2 (N4): una tabla creada antes con default 'running' queda con default 'queued' al volver a aplicarla.
+        await c.query(`alter table public.workshop_diagnoses alter column status set default 'running'`);
+        await c.query('begin'); await c.query(SQL_B3); await c.query('commit');
+        eq((await c.query(`select column_default from information_schema.columns where table_name = 'workshop_diagnoses' and column_name = 'status'`)).rows[0].column_default, "'queued'::text", 'default queued');
+        eq((await c.query('show lock_timeout')).rows[0].lock_timeout, '0', 'lock_timeout local a la transacción');
+        eq(await colsOf(), before, 'tablas existentes intactas');
+        const t = await c.query(`select relname, relrowsecurity from pg_class where relname in ('workshop_diagnoses','workshop_findings') order by 1`);
+        eq(t.rows.map((x) => [x.relname, x.relrowsecurity]), [['workshop_diagnoses', true], ['workshop_findings', true]], 'RLS');
+        const g = await c.query(`select has_table_privilege('authenticated', 'public.workshop_findings', 'select') a, has_table_privilege('anon', 'public.workshop_diagnoses', 'insert') b`);
+        eq([g.rows[0].a, g.rows[0].b], [false, false], 'sin acceso para anon/authenticated');
+        const fk = await c.query(`select conrelid::regclass::text t, confrelid::regclass::text r, confdeltype from pg_constraint where contype = 'f' and conrelid::regclass::text in ('workshop_diagnoses','workshop_findings') order by 1`);
+        eq(fk.rows.map((x) => [x.t, x.r, x.confdeltype]), [['workshop_diagnoses', 'workshop_sessions', 'c'], ['workshop_findings', 'workshop_diagnoses', 'c']], 'FK en cascada');
+        let bad = null;
+        try { await c.query(`insert into public.workshop_diagnoses (session_id, original_sha1, code_version, status) values (gen_random_uuid(), 'x', 'v', 'ready')`); } catch (e) { bad = e.code; }
+        assert(bad === '23514' || bad === '23503', `CHECK / FK: ${bad}`);
+      });
+      const res = spawnSync(process.execPath, [path.join(REPO, 'scripts/migrate-r107-b3-diagnosis.js')], { env: { ...cleanEnv(), DB_HOST: '127.0.0.1', DB_PORT: String(port), DB_USER: 'postgres', DB_NAME: DB }, encoding: 'utf8', cwd: os.tmpdir() });
+      assert(res.status !== 0 && /MIGRATION_ENV/.test(res.stderr), `B3 debió negarse: ${res.status} ${res.stderr}`);
+    });
+
+    const DGN = D('modules/course-workshop/diagnosis/diagnose.js');
+    const settleD = (sid) => settle(`diagnosis:${sid}`);
+    let dsid;
+    await check('W28 POST …/diagnosis → 202 queued → running → ready: informe + hallazgos persistidos en orden; GET devuelve lo mismo', async () => {
+      const res = await newIdentified('b3-sano.mbz');
+      dsid = res.session.id;
+      eq((await svc.getDiagnosis(OWNER, dsid)).status, 'not_started', 'antes de pedirlo');
+      const runs0 = svc.diagnosisRuns;
+      const a = await svc.startDiagnosis(OWNER, dsid);
+      eq([a.status, a.codeVersion, a.report], ['queued', DGN.DIAGNOSIS_CODE_VERSION, null], '202 en cola (fix round 1: running recién al tomar el carril)');
+      await settleD(dsid);
+      const g = await svc.getDiagnosis(OWNER, dsid);
+      eq([g.status, g.error, svc.diagnosisRuns - runs0], ['ready', null, 1], 'listo, un run');
+      eq([g.report.light.course, g.report.counts.total.error, g.report.counts.total.warning, g.report.family], ['green', 0, 0, 'v2-dynamic'], 'sintético sano → verde');
+      eq(g.report.checks.find((c) => c.check === 'T12').status, 'deferred', 'T12 diferido');
+      eq(g.report.validator.mode, 'without_expectations', 'validador sin expectativas');
+      assert(g.diagnosedAt && g.originalSha1 === sha('sha1', MBZ), 'fecha y versión del original');
+      const rows = await ds.query(`select f.finding_id, f.check_id, f.severity, f.ordinal from public.workshop_findings f join public.workshop_diagnoses d on d.id = f.diagnosis_id where d.session_id = $1 order by f.ordinal`, [dsid]);
+      eq(rows.map((r) => r.finding_id), g.report.findings.map((x) => x.id), 'filas = hallazgos, en orden');
+      const [d] = await ds.query(`select report from public.workshop_diagnoses where session_id = $1`, [dsid]);
+      assert(d.report && d.report.findings === undefined && d.report.light, 'el informe guardado no duplica los hallazgos');
+      eq(await svc.getDiagnosis(OWNER, dsid), g, 'GET estable');
+    });
+
+    await check('W29 idempotente: re-POST (también concurrente) → el mismo diagnóstico, 0 runs y 0 filas nuevas; un dañado → sus hallazgos con arreglo', async () => {
+      const runs0 = svc.diagnosisRuns;
+      const n0 = (await ds.query(`select count(*)::int n from public.workshop_diagnoses`))[0].n;
+      const f0 = (await ds.query(`select count(*)::int n from public.workshop_findings`))[0].n;
+      const [x, y] = await Promise.all([svc.startDiagnosis(OWNER, dsid), svc.startDiagnosis(OWNER, dsid)]);
+      eq([x.status, y.status, x.diagnosisId === y.diagnosisId], ['ready', 'ready', true], 'el mismo, listo');
+      eq([svc.diagnosisRuns - runs0, (await ds.query(`select count(*)::int n from public.workshop_diagnoses`))[0].n - n0, (await ds.query(`select count(*)::int n from public.workshop_findings`))[0].n - f0], [0, 0, 0], 'nada nuevo');
+      // Dos POST concurrentes sobre una sesión NUEVA: un solo run.
+      const res = await newIdentified('b3-concurrente.mbz');
+      const runs1 = svc.diagnosisRuns;
+      const [p, q] = await Promise.all([svc.startDiagnosis(OWNER, res.session.id), svc.startDiagnosis(OWNER, res.session.id)]);
+      await settleD(res.session.id);
+      eq([p.diagnosisId === q.diagnosisId, svc.diagnosisRuns - runs1], [true, 1], 'concurrentes → un run');
+      // Paquete dañado (pregunta sin respuesta correcta + token huérfano).
+      const BC = require(path.join(REPO, 'scripts/r107/build-corpus.js'));
+      const JSZip = require('jszip');
+      const zip = await JSZip.loadAsync(MBZ);
+      await BC.MUTATIONS['orphan-token'](zip);
+      const bad = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+      const rb = await svc.createSession(OWNER, { filename: 'b3-roto.mbz', sizeBytes: bad.length });
+      objects.set(rb.upload.storagePath, bad);
+      await svc.markUploaded(OWNER, rb.session.id);
+      await settle(rb.session.id);
+      await svc.startDiagnosis(OWNER, rb.session.id);
+      await settleD(rb.session.id);
+      const g = await svc.getDiagnosis(OWNER, rb.session.id);
+      eq(g.report.light.course, 'red', 'rojo');
+      const t04 = g.report.findings.find((f) => f.check === 'T04');
+      eq([t04.code, t04.severity, t04.suggestedFix.operation], ['token_orphan', 'error', 'edit_html'], 'hallazgo con arreglo');
+      const [row] = await ds.query(`select f.activity_dir, f.severity from public.workshop_findings f join public.workshop_diagnoses d on d.id = f.diagnosis_id where d.session_id = $1 and f.check_id = 'T04'`, [rb.session.id]);
+      eq([row.activity_dir, row.severity], [t04.scope.activity.dir, 'error'], 'columnas de la fila');
+    });
+
+    await check('W30 compuertas: ajeno 404 (GET y POST), SuperAdmin ve, miembro solo con RBAC enforce; sin identificar → 409; sin tablas → 503', async () => {
+      await rejects(svc.getDiagnosis(OTHER, dsid), 404, null, 'ajeno GET');
+      await rejects(svc.startDiagnosis(OTHER, dsid), 404, null, 'ajeno POST');
+      await rejects(svc.startDiagnosis(OWNER, 'no-uuid'), 404, null, 'id inválido');
+      eq((await svc.getDiagnosis(ADMIN, dsid)).status, 'ready', 'SA');
+      process.env.CURSIA_RBAC_MODE = 'enforce';
+      let inst;
+      try {
+        inst = await svc.createSession(OWNER, { filename: 'b3-inst.mbz', sizeBytes: MBZ.length }, INST);
+        objects.set(inst.upload.storagePath, MBZ);
+        await svc.markUploaded(OWNER, inst.session.id);
+        await settle(inst.session.id);
+        await svc.startDiagnosis(MEMBER, inst.session.id);
+        await settleD(inst.session.id);
+        eq((await svc.getDiagnosis(MEMBER, inst.session.id)).status, 'ready', 'miembro con permiso (enforce)');
+        await rejects(svc.getDiagnosis(OTHER, inst.session.id), 404, null, 'no miembro');
+      } finally {
+        process.env.CURSIA_RBAC_MODE = 'off';
+      }
+      await rejects(svc.getDiagnosis(MEMBER, inst.session.id), 404, null, 'RBAC off: solo el dueño');
+      const pending = await svc.createSession(OWNER, { filename: 'b3-sin.mbz', sizeBytes: MBZ.length });
+      await rejects(svc.startDiagnosis(OWNER, pending.session.id), 409, 'WORKSHOP_NOT_IDENTIFIED', 'sin identificar (POST)');
+      await rejects(svc.getDiagnosis(OWNER, pending.session.id), 409, 'WORKSHOP_NOT_IDENTIFIED', 'sin identificar (GET)');
+      await withClient(DB, async (c) => { await c.query('alter table public.workshop_diagnoses rename to workshop_diagnoses_x'); });
+      try {
+        await rejects(svc.startDiagnosis(OWNER, dsid), 503, 'COURSE_WORKSHOP_NOT_MIGRATED', 'sin la tabla');
+      } finally {
+        await withClient(DB, async (c) => { await c.query('alter table public.workshop_diagnoses_x rename to workshop_diagnoses'); });
+      }
+    });
+
+    await check('W31 original cambiado → NO diagnostica: 409 WORKSHOP_ORIGINAL_CHANGED, 0 runs, 0 hallazgos; también si cambia entre el POST y la corrida', async () => {
+      const res = await newIdentified('b3-cambiado.mbz');
+      const sid = res.session.id;
+      const tampered = Buffer.from(MBZ); tampered[tampered.length - 30] ^= 0xff;
+      // (a) cambia entre el POST y la corrida: el run verifica el original y falla sin diagnosticar.
+      objects.set(res.upload.storagePath, tampered);
+      const runs0 = svc.diagnosisRuns;
+      eq((await svc.startDiagnosis(OWNER, sid)).status, 'queued', '202');
+      await settleD(sid);
+      eq(svc.diagnosisRuns - runs0, 0, 'no se diagnosticó');
+      const g = await svc.getDiagnosis(OWNER, sid);
+      eq([g.status, g.error.code, g.error.retryable, g.report], ['failed', 'WORKSHOP_ORIGINAL_CHANGED', false, null], 'GET: failed con el código');
+      const n = await ds.query(`select count(*)::int n from public.workshop_findings f join public.workshop_diagnoses d on d.id = f.diagnosis_id where d.session_id = $1`, [sid]);
+      eq(n[0].n, 0, 'sin hallazgos de bytes ajenos');
+      eq((await svc.get(OWNER, sid)).error.code, 'WORKSHOP_ORIGINAL_CHANGED', 'la sesión queda failed');
+      // (b) un POST posterior: 409 directo, sin correr nada.
+      await rejects(svc.startDiagnosis(OWNER, sid), 409, 'WORKSHOP_ORIGINAL_CHANGED', 'POST con el original cambiado');
+      eq(svc.diagnosisRuns - runs0, 0, 'tampoco ahora');
+      // (c) original borrado.
+      const res2 = await newIdentified('b3-borrado.mbz');
+      objects.delete(res2.upload.storagePath);
+      await svc.startDiagnosis(OWNER, res2.session.id);
+      await settleD(res2.session.id);
+      eq((await svc.getDiagnosis(OWNER, res2.session.id)).error.code, 'WORKSHOP_ORIGINAL_MISSING', 'original borrado');
+    });
+
+    await check('W32 run abandonado → el GET lo reclama y termina; falla determinista → terminal', async () => {
+      const res = await newIdentified('b3-interrumpido.mbz');
+      const sid = res.session.id;
+      const [row] = await ds.query(`select original_sha1 from public.workshop_sessions where id = $1`, [sid]);
+      await ds.query(`insert into public.workshop_diagnoses (session_id, original_sha1, code_version, status, claim_id, updated_at) values ($1, $2, $3, 'running', 'muerto', now() - interval '20 minutes')`, [sid, row.original_sha1, DGN.DIAGNOSIS_CODE_VERSION]);
+      // Fix round 2 (N1): el sondeo reclama la fila abandonada (otro arranque, sin latido) y la vuelve a encolar.
+      const g = await svc.getDiagnosis(OWNER, sid);
+      eq(g.status, 'queued', 'el GET la reclama');
+      await settleD(sid);
+      eq((await svc.getDiagnosis(OWNER, sid)).status, 'ready', 'reclamado y listo');
+      // Un run viejo con el reclamo vencido no escribe nada.
+      const [d] = await ds.query(`select id from public.workshop_diagnoses where session_id = $1`, [sid]);
+      await svc.runDiagnosis(d.id, 'muerto');
+      eq((await svc.getDiagnosis(OWNER, sid)).status, 'ready', 'el reclamo viejo no pisa');
+      // Falla determinista: terminal, el re-POST no vuelve a correr.
+      const res2 = await newIdentified('b3-falla.mbz');
+      const real = svc.diagnosisRunner;
+      svc.diagnosisRunner = async () => { throw new Error('diagnóstico roto a propósito'); };
+      try {
+        await svc.startDiagnosis(OWNER, res2.session.id);
+        await settleD(res2.session.id);
+      } finally { svc.diagnosisRunner = real; }
+      const f = await svc.getDiagnosis(OWNER, res2.session.id);
+      eq([f.status, f.error.code, f.error.retryable], ['failed', 'WORKSHOP_DIAGNOSIS_FAILED', false], 'falla visible, no reintentable');
+      const runs0 = svc.diagnosisRuns;
+      eq((await svc.startDiagnosis(OWNER, res2.session.id)).status, 'failed', 're-POST: la misma falla');
+      eq(svc.diagnosisRuns - runs0, 0, 'no se reintenta sola');
+    });
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    await check('W33 P1-1/P2-7 carril propio de 1: 5 concurrentes → máx. 1 corriendo, 0 lugares de identificación; en cola no vence; re-POST no duplica', async () => {
+      const sids = [];
+      for (let i = 0; i < 5; i++) sids.push((await newIdentified(`b3-carril-${i}.mbz`)).session.id);
+      const real = svc.diagnosisRunner;
+      let open = false; let cur = 0; let max = 0; let idSlots = 0;
+      svc.diagnosisRunner = async (input) => {
+        cur++; max = Math.max(max, cur); idSlots = Math.max(idSlots, svc.runningCount);
+        while (!open) await sleep(5);
+        cur--;
+        return real(input);
+      };
+      const d0 = storage.downloads;
+      try {
+        const st = await Promise.all(sids.map((sid) => svc.startDiagnosis(OWNER, sid)));
+        eq([...new Set(st.map((x) => x.status))], ['queued'], 'todos en cola al responder');
+        await sleep(80);
+        eq([svc.diagnosisRunningCount, svc.runningCount], [1, 0], 'uno en el carril, ningún lugar de identificación');
+        // Una identificación corre y TERMINA mientras el carril del diagnóstico está ocupado.
+        const during = await newIdentified('b3-carril-durante.mbz');
+        eq((await svc.get(OWNER, during.session.id)).status, 'identified', 'la identificación no espera al diagnóstico');
+        const rows = await ds.query(`select status, count(*)::int n from public.workshop_diagnoses where session_id = any($1::uuid[]) group by status order by status`, [sids]);
+        eq(rows.map((r) => [r.status, r.n]), [['queued', 4], ['running', 1]], '4 en cola, 1 corriendo');
+        // P2-7: uno en cola desde hace 20 min (más que el plazo de running) NO se da por interrumpido ni se duplica.
+        const [q] = await ds.query(`select d.session_id from public.workshop_diagnoses d where d.session_id = any($1::uuid[]) and d.status = 'queued' limit 1`, [sids]);
+        await ds.query(`update public.workshop_diagnoses set updated_at = now() - interval '20 minutes' where session_id = $1`, [q.session_id]);
+        eq((await svc.getDiagnosis(OWNER, q.session_id)).status, 'queued', 'en cola: no vence a los 15 min');
+        const again = await svc.startDiagnosis(OWNER, q.session_id);
+        eq(again.status, 'queued', 're-POST: el mismo en cola');
+        open = true;
+        for (const sid of sids) await settleD(sid);
+      } finally { svc.diagnosisRunner = real; open = true; }
+      eq([max, idSlots], [1, 0], 'nunca más de 1 a la vez, nunca en un lugar de identificación');
+      for (const sid of sids) eq((await svc.getDiagnosis(OWNER, sid)).status, 'ready', `listo ${sid}`);
+      // 5 diagnósticos + la identificación de «durante» = 6 descargas; el re-POST no agregó ninguna.
+      eq(storage.downloads - d0, 6, 'una descarga por diagnóstico (y la de la identificación)');
+    });
+
+    await check('W34 P1-1 presupuesto de memoria: original demasiado grande → failed WORKSHOP_DIAGNOSIS_TOO_LARGE visible, sin descargarlo', async () => {
+      const res = await newIdentified('b3-grande.mbz');
+      const saved = svc.memoryBudgetBytes;
+      const d0 = storage.downloads; const runs0 = svc.diagnosisRuns;
+      svc.memoryBudgetBytes = MBZ.length * 4; // estimado = 5 × tamaño > presupuesto
+      try {
+        const a = await svc.startDiagnosis(OWNER, res.session.id);
+        eq([a.status, a.error && a.error.code, a.error && a.error.retryable], ['failed', 'WORKSHOP_DIAGNOSIS_TOO_LARGE', false], 'falla visible');
+        assert(/MB/.test(a.error.message), 'motivo con tamaños');
+        await settleD(res.session.id);
+        eq((await svc.getDiagnosis(OWNER, res.session.id)).error.code, 'WORKSHOP_DIAGNOSIS_TOO_LARGE', 'GET igual');
+        eq((await svc.startDiagnosis(OWNER, res.session.id)).status, 'failed', 're-POST: la misma falla');
+        eq([storage.downloads - d0, svc.diagnosisRuns - runs0], [0, 0], 'no se descargó ni corrió');
+      } finally { svc.memoryBudgetBytes = saved; }
+    });
+
+    await check('W35 N1 pm2 reload: running + queued de un proceso muerto → B los reclama (re-POST y GET) y cada uno corre UNA vez', async () => {
+      const A = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const B = new SVC.CourseWorkshopService(ds, storage, permissions);
+      const x = (await newIdentified('b3-reload-x.mbz')).session.id;
+      const y = (await newIdentified('b3-reload-y.mbz')).session.id;
+      const realA = A.diagnosisRunner;
+      let openA = false;
+      A.diagnosisRunner = async (input) => { while (!openA) await sleep(5); return realA(input); };
+      eq((await A.startDiagnosis(OWNER, x)).status, 'queued', 'A: x en cola');
+      eq((await A.startDiagnosis(OWNER, y)).status, 'queued', 'A: y en cola');
+      await sleep(60);
+      const st = async () => (await ds.query(`select session_id::text sid, status, claim_id from public.workshop_diagnoses where session_id = any($1::uuid[]) order by session_id = $2::uuid desc`, [[x, y], x]));
+      eq((await st()).map((r) => [r.status, r.claim_id.split('.')[0] === A.bootId]), [['running', true], ['queued', true]], 'A: x corriendo, y en cola');
+      // A vivo (acaba de latir): B NO reclama sus filas.
+      await A.diagnosisHeartbeat();
+      eq([(await B.getDiagnosis(OWNER, x)).status, (await B.startDiagnosis(OWNER, y)).status], ['running', 'queued'], 'B respeta a A vivo');
+      eq(B.diagnosisRuns, 0, 'B no corrió nada');
+      // pm2 reload: A muere (deja de latir); pasan 3 latidos.
+      A.simulateDeathForTests();
+      await ds.query(`update public.workshop_diagnoses set updated_at = now() - ($2::int * interval '1 millisecond') where session_id = any($1::uuid[])`, [[x, y], SVC.DIAGNOSIS_HEARTBEAT_STALE_MS + 1000]);
+      const d0 = storage.downloads;
+      eq((await B.startDiagnosis(OWNER, x)).status, 'queued', 'B: el re-POST reclama el running abandonado');
+      eq((await B.getDiagnosis(OWNER, y)).status, 'queued', 'B: el GET reclama el queued abandonado');
+      await B.inFlight.get(`diagnosis:${x}`); await B.inFlight.get(`diagnosis:${y}`);
+      eq([B.diagnosisRuns, storage.downloads - d0], [2, 2], 'cada uno corre una vez en B (una descarga cada uno)');
+      eq((await st()).map((r) => [r.status, r.claim_id.split('.')[0] === B.bootId]), [['ready', true], ['ready', true]], 'listos, con el reclamo de B');
+      const cnt = async () => (await ds.query(`select count(*)::int n from public.workshop_findings f join public.workshop_diagnoses d on d.id = f.diagnosis_id where d.session_id = any($1::uuid[])`, [[x, y]]))[0].n;
+      const f0 = await cnt();
+      // A «revive» la corrida colgada: termina, pero ya no es dueño — no escribe nada.
+      openA = true;
+      await sleep(500);
+      eq((await st()).map((r) => [r.status, r.claim_id.split('.')[0] === B.bootId]), [['ready', true], ['ready', true]], 'A no pisa');
+      eq(await cnt(), f0, 'hallazgos intactos');
+    });
+
+    await check('W36 N2 presupuesto del proceso: reserva viva sin lugar → el diagnóstico espera sin tomar el carril; TOO_LARGE se reintenta con más presupuesto', async () => {
+      const saved = svc.memoryBudgetBytes;
+      try {
+        svc.memoryBudgetBytes = MBZ.length * 7;
+        const res = await newIdentified('b3-reserva.mbz');
+        let release;
+        const held = svc.withMemory('identify:simulada', MBZ.length * 3, () => new Promise((r) => { release = r; }));
+        eq(svc.reservedMemoryBytes, MBZ.length * 3, 'reserva viva');
+        eq((await svc.startDiagnosis(OWNER, res.session.id)).status, 'queued', 'en cola');
+        await sleep(60);
+        eq([svc.diagnosisRunningCount, (await svc.getDiagnosis(OWNER, res.session.id)).status], [0, 'queued'], 'no entra: espera sin tomar el carril');
+        release(); await held;
+        await settleD(res.session.id);
+        eq((await svc.getDiagnosis(OWNER, res.session.id)).status, 'ready', 'al soltarse la reserva, corre');
+        eq(svc.reservedMemoryBytes, 0, 'sin reservas colgadas');
+        const big = await newIdentified('b3-reintento.mbz');
+        svc.memoryBudgetBytes = MBZ.length * 4;
+        eq((await svc.startDiagnosis(OWNER, big.session.id)).error.code, 'WORKSHOP_DIAGNOSIS_TOO_LARGE', 'rechazado');
+        svc.memoryBudgetBytes = saved;
+        eq((await svc.startDiagnosis(OWNER, big.session.id)).status, 'queued', 'con más presupuesto se reintenta');
+        await settleD(big.session.id);
+        eq((await svc.getDiagnosis(OWNER, big.session.id)).status, 'ready', 'listo');
+        eq(SVC.workshopMemoryBudgetBytes({ COURSE_WORKSHOP_MEMORY_BUDGET_MB: '3072' }), 3072 * 1024 * 1024, 'presupuesto por env');
+        eq(SVC.workshopMemoryBudgetBytes({ COURSE_WORKSHOP_MEMORY_BUDGET_MB: 'x' }), 2048 * 1024 * 1024, 'env inválido → por defecto');
+      } finally { svc.memoryBudgetBytes = saved; }
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {

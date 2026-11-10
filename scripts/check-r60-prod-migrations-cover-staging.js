@@ -47,6 +47,8 @@ const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
   'migrate-r107-workshop-sessions.js': { sql: 'supabase-migration-r107-workshop-sessions.sql' },
   // r107 B2: inventario + índices de la huella (dos .sql: la columna en transacción, los índices CONCURRENTLY sueltos).
   'migrate-r107-b2-inventory.js': { sql: 'supabase-migration-r107-b2-inventory.sql', extraSql: ['supabase-migration-r107-artifacts-checksum-index.sql'] },
+  // r107 B3: diagnóstico técnico (workshop_diagnoses + workshop_findings).
+  'migrate-r107-b3-diagnosis.js': { sql: 'supabase-migration-r107-b3-diagnosis.sql' },
 };
 const STAGING_ONLY_REASON = /^r(75|79\.1|81|83|99|107): staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).

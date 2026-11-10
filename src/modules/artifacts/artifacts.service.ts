@@ -860,7 +860,7 @@ export class ArtifactsService {
   // ── SIGNED UPLOAD URL ───────────────────────────────────────────────────────
 
   /**
-   * r107 B1 (Taller de cursos): URL firmada de SUBIDA para que el navegador mande un archivo grande (hasta 300 MB)
+   * r107 B1 (Taller de cursos): URL firmada de SUBIDA para que el navegador mande un archivo grande (hasta 200 MB: WORKSHOP_MAX_UPLOAD_BYTES)
    * directo a Storage, sin pasar por la API ni por nginx. Mismo criterio que `getDownloadUrl`:
    *  - solo una ruta de la carpeta del dueño (`assertWritableStoragePath`: la service role ignora RLS, este es el control);
    *  - `x-upsert: false` (nunca pisa un objeto existente);

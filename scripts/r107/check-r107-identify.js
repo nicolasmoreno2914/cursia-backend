@@ -558,7 +558,7 @@ function assertNoForeign(r, foreignIds, m) {
     eq(p, `${OWNER_A}/workshop/${sid}/original.mbz`, 'ruta');
     assert(ART.storagePathOwnedBy(OWNER_A, 'cursia-artifacts', p), 'la ruta es de la carpeta del dueño');
     assert(!ART.storagePathOwnedBy(OWNER_B, 'cursia-artifacts', p), 'no es de otra cuenta');
-    eq(SVC.WORKSHOP_MAX_UPLOAD_BYTES, 300 * 1024 * 1024, 'tope 300 MB');
+    eq(SVC.WORKSHOP_MAX_UPLOAD_BYTES, 200 * 1024 * 1024, 'tope 200 MB (r107 B3 fix round 2, N2)');
     const F = FLAG.isCourseWorkshopAllowedForOwner;
     eq(F(OWNER_A, {}), false, 'off');
     eq(F(OWNER_A, { COURSE_WORKSHOP: 'True', COURSE_WORKSHOP_ALLOWED_OWNERS: OWNER_A }), false, 'solo "true" exacto');
