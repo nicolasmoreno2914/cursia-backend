@@ -23,8 +23,8 @@ export interface WorkshopTool {
 }
 
 export interface WorkshopAiRequest {
-  /** Para qué es la llamada (ledger + pruebas). */
-  purpose: 'interpret' | 'content';
+  /** Para qué es la llamada (ledger + pruebas). r107 B8: + revisión de calidad y pregunta puntual. */
+  purpose: 'interpret' | 'content' | 'quality' | 'question';
   model: string;
   system: string;
   user: string;

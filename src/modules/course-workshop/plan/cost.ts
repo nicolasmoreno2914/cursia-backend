@@ -28,7 +28,8 @@ import type { WorkshopCourse } from '../course-model';
 import type { WorkshopAiUsage } from './ai';
 import type { RequestDetails, RequestOperation } from './types';
 
-export type AiCallKind = 'interpret' | 'content_html' | 'content_libro' | 'content_question';
+/** r107 B8: + `quality_review` (revisión de calidad de UN capítulo) y `question_answer` (pregunta puntual con su evidencia). */
+export type AiCallKind = 'interpret' | 'content_html' | 'content_libro' | 'content_question' | 'quality_review' | 'question_answer';
 
 export const ZERO_MEM: MinExpMax = Object.freeze({ min: normalizeDecimal(0), expected: normalizeDecimal(0), max: normalizeDecimal(0) }) as MinExpMax;
 
@@ -49,6 +50,12 @@ export function aiCallItems(kind: AiCallKind, size: { promptChars: number; outpu
     }
     case 'content_question':
       return [{ itemKey: `${key}:question`, itemType: 'module_intro', usageScale: { input_tokens: clamp(tin / 3000, 0.1, 100), output_tokens: 1 } }];
+    // r107 B8: revisar un capítulo = leer mucho y devolver una lista corta (como interpretar: `activity`, ≈ 7k / 1,45k),
+    // entrada × (prompt / 7000). Responder una pregunta = poca entrada y una respuesta corta (`module_intro`, ≈ 3k / 0,9k).
+    case 'quality_review':
+      return [{ itemKey: `${key}:quality`, itemType: 'activity', usageScale: { input_tokens: clamp(tin / 7000, 0.1, 100), output_tokens: 1 } }];
+    case 'question_answer':
+      return [{ itemKey: `${key}:ask`, itemType: 'module_intro', usageScale: { input_tokens: clamp(tin / 3000, 0.1, 100), output_tokens: 1 } }];
   }
 }
 

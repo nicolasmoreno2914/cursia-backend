@@ -328,6 +328,9 @@ const EXCLUDED = [
   // r107 B6: aplicar + versiones (workshop_versions, sesiones hijas, estados de plan / aprobación). Staging-only.
   { file: 'supabase-migration-r107-b6-apply.sql', reason: 'r107: staging-only hasta aprobación del owner' },
   { file: 'scripts/migrate-r107-b6-apply.js', reason: 'r107: staging-only hasta aprobación del owner' },
+  // r107 B8: diagnóstico de calidad + preguntas puntuales (workshop_quality_runs, workshop_quality_findings, workshop_questions). Staging-only.
+  { file: 'supabase-migration-r107-b8-quality.sql', reason: 'r107: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r107-b8-quality.js', reason: 'r107: staging-only hasta aprobación del owner' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

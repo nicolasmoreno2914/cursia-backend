@@ -14,6 +14,7 @@ import { readDocument, DocumentReadError } from '../../academic-context';
 import { isUuid } from '../../authz/schema-probe';
 import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
 import { DIAGNOSIS_CODE_VERSION, DiagnosisReport } from '../diagnosis/diagnose';
+import { QUALITY_CODE_VERSION } from '../quality/types';
 import type { Finding } from '../diagnosis/finding';
 import type { WorkshopCourse } from '../course-model';
 import { AnthropicWorkshopAiClient, WORKSHOP_AI_CLIENT, WORKSHOP_AI_TIMEOUT_MS, WorkshopAiClient, WorkshopAiResult, workshopModel } from './ai';
@@ -108,7 +109,20 @@ const sha1 = (s: string) => createHash('sha1').update(s).digest('hex');
 interface IntakeRow { id: string; session_id: string; original_sha1: string; created_by: string; source: IntakeSource; status: string; filename: string | null; media_type: string | null; storage_path: string | null; declared_bytes: string | null; text: string | null; error: any; notes: any; estimate: any; approval_id: string | null; spent_usd: string; ai_calls: number; claim_id: string | null; created_at: Date; updated_at: Date }
 interface RequestRow { id: string; session_id: string; intake_id: string; ordinal: number; finding_id: string | null; quote: string; instruction: string; operation: string | null; status: RequestStatus; target: any; raw_target: any; details: any; questions: any; answers: any; rounds: number; reason: string | null; estimate: any; spent_usd: string; ai_calls: number; claim_id: string | null; created_at: Date; updated_at: Date }
 interface ItemRow { id: string; plan_id: string; request_id: string; status: 'proposed' | 'removed'; stage: 'estimate' | 'ready'; operation: string; available: boolean; params: any; view: PlanItemView; risk_level: string; spent_usd: string; apply_expected_usd: string; created_at: Date; updated_at: Date }
-interface ApprovalRow { id: string; session_id: string; created_by: string; kind: 'interpret' | 'reinterpret' | 'generate'; intake_id: string | null; request_id: string | null; item_ids: string[]; estimate: any; cap_usd: string; spent_usd: string; ai_calls: number; reservation_key: string | null; calls: Record<string, ApprovalCall>; status: string; stop_reason: string | null; created_at: Date; updated_at: Date }
+export interface ApprovalRow { id: string; session_id: string; created_by: string; kind: 'interpret' | 'reinterpret' | 'generate' | 'quality' | 'question'; intake_id: string | null; request_id: string | null; item_ids: string[]; estimate: any; cap_usd: string; spent_usd: string; ai_calls: number; reservation_key: string | null; calls: Record<string, ApprovalCall>; status: string; stop_reason: string | null; created_at: Date; updated_at: Date }
+
+/**
+ * Centavos de un monto USD redondeado half-up a 0,01, EXACTO sobre el decimal (sin aritmética binaria): «0.0578772000» → 6,
+ * «0.125» → 13. null si no es un monto ≥ 0.
+ */
+export function centsHalfUp(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN;
+  if (!Number.isFinite(n) || n < 0) return null;
+  const str = typeof v === 'string' && /^\d+(?:\.\d+)?$/.test(v.trim()) ? v.trim() : n.toFixed(10);
+  const [i, f = ''] = str.split('.');
+  const frac = (f + '000').slice(0, 3);
+  return Number(i) * 100 + Number(frac.slice(0, 2)) + (Number(frac[2]) >= 5 ? 1 : 0);
+}
 
 /** Estimado de una aprobación (lo que el docente ve y confirma). */
 export interface ApprovalEstimate { calls: PlannedCall[]; expectedUsd: string; boundUsd: string; proposedCapUsd: string; note: string }
@@ -121,11 +135,16 @@ type Job =
   | { kind: 'generate'; sessionId: string; approvalId: string }
   | { kind: 'combined'; sessionId: string };
 
+/** Operación del ledger de FinOps por propósito de la llamada (r107 B8: + calidad y preguntas puntuales). */
+export const WORKSHOP_CHARGE_OPERATIONS = Object.freeze({
+  interpret: 'llm.workshop_interpret', content: 'llm.workshop_content', quality: 'llm.workshop_quality', question: 'llm.workshop_question',
+} as const);
+
 /** Entrada del ledger de FinOps de una llamada del Taller (pura: la prueba la verifica real y simulada). */
-export function workshopChargeInput(a: { payer: string; courseId: number | null; result: WorkshopAiResult; purpose: 'interpret' | 'content'; metadata: Record<string, unknown> }): RecordChargeInput | null {
+export function workshopChargeInput(a: { payer: string; courseId: number | null; result: WorkshopAiResult; purpose: 'interpret' | 'content' | 'quality' | 'question'; metadata: Record<string, unknown> }): RecordChargeInput | null {
   const base = directAnthropicChargeInput({
     ownerId: a.payer, model: a.result.model, messageId: a.result.messageId, usage: a.result.usage,
-    operation: a.purpose === 'interpret' ? 'llm.workshop_interpret' : 'llm.workshop_content', recordedBy: 'course-workshop',
+    operation: WORKSHOP_CHARGE_OPERATIONS[a.purpose], recordedBy: 'course-workshop',
     courseId: a.courseId, unattributedReason: 'course_workshop', metadata: { kind: 'course_workshop', ...a.metadata },
   });
   if (!base) return null;
@@ -156,7 +175,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
    * Fix round 1 (P2-1): precios + el modelo REAL del Taller (`WORKSHOP_AI_MODEL`, fijado por Cursia). Si el catálogo no
    * tiene precio para ese modelo, falla cerrado: 503 WORKSHOP_MODEL_UNPRICED y no se estima, reserva ni llama.
    */
-  private async pricing(): Promise<WorkshopPricing> {
+  async pricing(): Promise<WorkshopPricing> {
     const p: WorkshopPricing = { ...(await this.pricingLoader()), model: workshopModel() };
     try {
       assertModelPriced(p);
@@ -284,11 +303,13 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   // ── aprobación de gasto + reserva (D8 / D9) ──
 
   /** Valida lo que el docente confirma: el estimado que vio y un tope que alcanza (al menos el estimado y una llamada). */
-  private validateConfirmation(estimate: ApprovalEstimate, input: { confirmEstimateUsd: unknown; capUsd: unknown }): string {
+  validateConfirmation(estimate: ApprovalEstimate, input: { confirmEstimateUsd: unknown; capUsd: unknown }): string {
     const cap = Number(input.capUsd);
     if (!Number.isFinite(cap) || cap <= 0 || cap > 1000) throw new BadRequestException({ code: PLAN_ERRORS.CAP_INVALID, message: 'El tope tiene que ser un monto en USD mayor que 0.' });
-    const confirmed = Number(input.confirmEstimateUsd);
-    if (!Number.isFinite(confirmed) || Math.abs(confirmed - Number(estimate.expectedUsd)) > 1e-6) {
+    // r107 B8 (decisión del controlador, B8fe P1-1): el estimado se confirma al CENTAVO (half-up a 0,01 a los dos lados):
+    // el docente ve centavos y el navegador puede sumar estimados por capítulo / ítem; el tope sigue siendo exacto abajo.
+    const confirmedCents = centsHalfUp(input.confirmEstimateUsd);
+    if (confirmedCents === null || confirmedCents !== centsHalfUp(estimate.expectedUsd)) {
       throw new ConflictException({ code: PLAN_ERRORS.ESTIMATE_MISMATCH, message: 'El estimado cambió desde que lo viste: revísalo y vuelve a confirmarlo.', estimate });
     }
     if (cap + 1e-9 < Number(estimate.expectedUsd)) {
@@ -327,7 +348,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
    * Crea la aprobación y RESERVA su tope en el ledger. Si la reserva no entra (presupuesto del usuario, techo sin
    * atribuir, kill switch) la aprobación queda `failed` con el motivo y se lanza el error: nada se encola ni se llama.
    */
-  private async openApproval(s: WorkshopPlanSession, actor: WorkshopActor, a: { kind: ApprovalRow['kind']; intakeId?: string | null; requestId?: string | null; itemIds?: string[]; estimate: ApprovalEstimate; capUsd: string }): Promise<ApprovalRow> {
+  async openApproval(s: WorkshopPlanSession, actor: WorkshopActor, a: { kind: ApprovalRow['kind']; intakeId?: string | null; requestId?: string | null; itemIds?: string[]; estimate: ApprovalEstimate; capUsd: string }): Promise<ApprovalRow> {
     await this.pricing(); // fix round 1 (P2-1): modelo sin precio → 503, no se reserva
     await this.preflight(actor.id, a.capUsd);
     if (!this.ledger) throw new ServiceUnavailableException({ code: PLAN_ERRORS.FINOPS_UNAVAILABLE, message: 'No se puede reservar el tope (FinOps no está disponible en este proceso): no se llamó a la IA.' });
@@ -360,7 +381,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
    * registrado o un rechazo documentado sin cobro; si alguna quedó en vuelo / ambigua / sin su cargo, la reserva queda
    * PENDIENTE para conciliar y la aprobación pasa a `ambiguous` con el motivo visible (closeReservation).
    */
-  private async closeApproval(id: string, status: 'done' | 'stopped' | 'failed', reason: string | null): Promise<void> {
+  async closeApproval(id: string, status: 'done' | 'stopped' | 'failed', reason: string | null): Promise<void> {
     const [a] = returningRows(await this.q(this.dataSource, `update public.workshop_ai_approvals set status = $2, stop_reason = coalesce($3, stop_reason), updated_at = now() where id = $1 and status in ('reserved', 'running') returning *`, [id, status, reason])) as ApprovalRow[];
     if (!a) return;
     let out;
@@ -383,16 +404,35 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     await this.q(this.dataSource, `update public.workshop_ai_approvals set calls = calls || jsonb_build_object($2::text, $3::jsonb), updated_at = now() where id = $1`, [approvalId, c.id, JSON.stringify(c)]);
   }
 
-  private async approvalOf(id: string): Promise<ApprovalRow | null> {
+  async approvalOf(id: string): Promise<ApprovalRow | null> {
     const [a] = await this.q<ApprovalRow[]>(this.dataSource, `select * from public.workshop_ai_approvals where id = $1`, [id]);
     return a ?? null;
+  }
+
+  /**
+   * r107 B8: un trabajo de OTRO servicio del Taller (diagnóstico de calidad, preguntas puntuales) que corre dentro de una
+   * aprobación de este servicio la «toma»: queda viva para el barrido de B5 (no se da por interrumpida) y este proceso
+   * late su fila con el mismo reclamo `<arranque>.<uuid>`. Si el proceso muere, deja de latir y el barrido la cierra
+   * por el camino de siempre (`closeApproval`: ambigua si una llamada pudo cobrarse).
+   */
+  async holdApproval(approvalId: string, claimId: string): Promise<void> {
+    this.activeIds.add(approvalId);
+    this.beat(claimId, true);
+    await this.q(this.dataSource, `update public.workshop_ai_approvals set claim_id = $2, updated_at = now() where id = $1 and status in ('reserved', 'running')`, [approvalId, claimId]);
+  }
+  releaseApproval(approvalId: string, claimId: string): void {
+    this.activeIds.delete(approvalId);
+    this.beat(claimId, false);
+  }
+  async startApproval(approvalId: string): Promise<void> {
+    await this.q(this.dataSource, `update public.workshop_ai_approvals set status = 'running', updated_at = now() where id = $1 and status = 'reserved'`, [approvalId]);
   }
 
   /**
    * IA DENTRO de una aprobación: antes de cada llamada, gastado + cota ≤ tope aprobado (si no, corta limpio SIN
    * llamar); después, el cargo real al ledger con el `approvalId` y lo gastado a la aprobación.
    */
-  private invokerFor(s: WorkshopPlanSession, approval: ApprovalRow, pricing: DryRunPricing, meta: Record<string, unknown>): AiInvoke {
+  invokerFor(s: WorkshopPlanSession, approval: ApprovalRow, pricing: DryRunPricing, meta: Record<string, unknown>): AiInvoke {
     const payer = approval.created_by;
     const courseId = payer.toLowerCase() === s.ownerId.toLowerCase() ? s.identifiedCourseId : null;
     return async (call: AiCall) => {
@@ -457,7 +497,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   /** Preparación SIN IA (estructural): si algo intentara llamarla, falla visible (nunca se gasta sin aprobación). */
   private readonly noAi: AiInvoke = async () => { throw new AiUnavailableError(PLAN_ERRORS.NOT_AWAITING_CONFIRMATION, 'Este paso no tiene una aprobación de gasto: no se llama a la IA.'); };
 
-  private estimateOf(calls: PlannedCall[], note: string): ApprovalEstimate {
+  estimateOf(calls: PlannedCall[], note: string): ApprovalEstimate {
     const c = proposedCapOf(calls);
     return { calls, expectedUsd: c.expectedUsd, boundUsd: c.boundUsd, proposedCapUsd: c.proposedCapUsd, note };
   }
@@ -686,10 +726,18 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   async fixFinding(actor: WorkshopActor, sessionId: string, findingId: string) {
     const s = await this.workshop.planSessionFor(actor, sessionId, 'courses.edit');
     await this.assertPlanEditable(s);
-    if (typeof findingId !== 'string' || !/^T\d{2}\.[a-z0-9_]+\.[0-9a-f]{12}$/.test(findingId)) throw new NotFoundException({ code: PLAN_ERRORS.FINDING_NOT_FOUND, message: 'Hallazgo no encontrado.' });
-    const [d] = await this.q<any[]>(this.dataSource, `select id, status from public.workshop_diagnoses where session_id = $1 and original_sha1 = $2 and code_version = $3`, [s.id, s.originalSha1, DIAGNOSIS_CODE_VERSION]);
-    if (!d || d.status !== 'ready') throw new ConflictException({ code: PLAN_ERRORS.DIAGNOSIS_NOT_READY, message: 'Primero hay que diagnosticar el paquete (o esperar a que termine el diagnóstico).' });
-    const [f] = await this.q<any[]>(this.dataSource, `select finding from public.workshop_findings where diagnosis_id = $1 and finding_id = $2`, [d.id, findingId]);
+    if (typeof findingId !== 'string' || !/^[TQ]\d{2}\.[a-z0-9_]+\.[0-9a-f]{12}$/.test(findingId)) throw new NotFoundException({ code: PLAN_ERRORS.FINDING_NOT_FOUND, message: 'Hallazgo no encontrado.' });
+    let f: { finding: unknown } | undefined;
+    if (findingId.startsWith('Q')) {
+      // r107 B8: un hallazgo de CALIDAD (Q01–Q05) del diagnóstico de calidad listo de ESTE original: mismo camino que uno técnico.
+      const [r] = await this.q<any[]>(this.dataSource, `select id, status from public.workshop_quality_runs where session_id = $1 and original_sha1 = $2 and code_version = $3`, [s.id, s.originalSha1, QUALITY_CODE_VERSION]);
+      if (!r || r.status !== 'ready') throw new ConflictException({ code: PLAN_ERRORS.DIAGNOSIS_NOT_READY, message: 'Primero hay que correr el diagnóstico de calidad (o esperar a que termine).' });
+      [f] = await this.q<any[]>(this.dataSource, `select finding from public.workshop_quality_findings where run_id = $1 and finding_id = $2`, [r.id, findingId]);
+    } else {
+      const [d] = await this.q<any[]>(this.dataSource, `select id, status from public.workshop_diagnoses where session_id = $1 and original_sha1 = $2 and code_version = $3`, [s.id, s.originalSha1, DIAGNOSIS_CODE_VERSION]);
+      if (!d || d.status !== 'ready') throw new ConflictException({ code: PLAN_ERRORS.DIAGNOSIS_NOT_READY, message: 'Primero hay que diagnosticar el paquete (o esperar a que termine el diagnóstico).' });
+      [f] = await this.q<any[]>(this.dataSource, `select finding from public.workshop_findings where diagnosis_id = $1 and finding_id = $2`, [d.id, findingId]);
+    }
     if (!f) throw new NotFoundException({ code: PLAN_ERRORS.FINDING_NOT_FOUND, message: 'Hallazgo no encontrado en el diagnóstico de este paquete.' });
     const [dup] = await this.q<RequestRow[]>(this.dataSource, `select * from public.workshop_requests where session_id = $1 and finding_id = $2 and status <> 'withdrawn'`, [s.id, findingId]);
     if (dup) return this.requestView(dup);
@@ -1005,6 +1053,11 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async findingOf(s: WorkshopPlanSession, findingId: string): Promise<Finding | null> {
+    if (findingId.startsWith('Q')) {
+      const [q] = await this.q<any[]>(this.dataSource, `select f.finding from public.workshop_quality_findings f join public.workshop_quality_runs r on r.id = f.run_id
+          where r.session_id = $1 and r.original_sha1 = $2 and r.code_version = $3 and r.status = 'ready' and f.finding_id = $4`, [s.id, s.originalSha1, QUALITY_CODE_VERSION, findingId]);
+      return q ? (q.finding as Finding) : null;
+    }
     const [f] = await this.q<any[]>(this.dataSource, `select f.finding from public.workshop_findings f join public.workshop_diagnoses d on d.id = f.diagnosis_id
         where d.session_id = $1 and d.original_sha1 = $2 and d.code_version = $3 and d.status = 'ready' and f.finding_id = $4`, [s.id, s.originalSha1, DIAGNOSIS_CODE_VERSION, findingId]);
     return f ? (f.finding as Finding) : null;

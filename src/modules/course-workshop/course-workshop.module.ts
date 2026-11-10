@@ -6,6 +6,7 @@ import { CourseWorkshopController } from './course-workshop.controller';
 import { CourseWorkshopService } from './course-workshop.service';
 import { WorkshopPlanService } from './plan/workshop-plan.service';
 import { WorkshopApplyService } from './apply/workshop-apply.service';
+import { WorkshopQualityService } from './quality/workshop-quality.service';
 
 /**
  * r107 · «Taller de cursos» (B1: ingesta + identificación … B5: pedidos, preguntas y plan; B6: aplicar + versiones; el cliente real de IA es el
@@ -15,6 +16,6 @@ import { WorkshopApplyService } from './apply/workshop-apply.service';
 @Module({
   imports: [AuthModule, ArtifactsModule, FinopsModule], // B5: ledger + compuertas de presupuesto de cada llamada a la IA
   controllers: [CourseWorkshopController],
-  providers: [CourseWorkshopService, WorkshopPlanService, WorkshopApplyService], // B6: aplicar + versiones (trabajo en el proceso de la API)
+  providers: [CourseWorkshopService, WorkshopPlanService, WorkshopApplyService, WorkshopQualityService], // B6: aplicar + versiones; B8: calidad + preguntas (trabajos en el proceso de la API)
 })
 export class CourseWorkshopModule {}
