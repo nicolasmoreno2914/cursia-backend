@@ -222,6 +222,9 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
         return ART.readBodyCapped(new Response(body), opts.maxBytes, () => {}, opts.onChunk, { sizeHint: opts.sizeHint });
       },
     };
+    // r107 B10: el resultado de una regeneración se sube como artifact del Taller (servidor) en la carpeta del dueño.
+    storage.putStorageObject = async (input) => { ART.assertWritableStoragePath(input.ownerId, input.storageBucket ?? 'cursia-artifacts', input.storagePath); objects.set(input.storagePath, Buffer.from(input.buffer)); return { sizeBytes: input.buffer.length, adopted: false, sha256: null }; };
+    storage.deleteUnreferencedServerObject = async (o, b, p) => { objects.delete(p); return true; };
     const svc = new SVC.CourseWorkshopService(ds, storage, null);
     const sess = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l7.mbz', sizeBytes: MBZ.length });
     objects.set(sess.upload.storagePath, MBZ);
@@ -395,6 +398,61 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       const after = (await q2.listQuestions({ id: U }, sid)).questions.find((x) => x.id === r2.h.id);
       eq([after.status, after.error.retryable], ['failed', true], 'conciliada → fallida reintentable');
       near(await net(key2), 0, 'reserva liberada por la conciliación');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    // ── r107 B10: rehacer actividades contra el ledger REAL (enforce): aprobaciones MULTI-PROVEEDOR, reserva y conciliación.
+    // Proveedores SIMULADOS (sin red); `simulated: false` para que el ledger real valúe los cargos como reales (USD de mentira).
+    const SIMLIB = require(path.join(REPO, 'scripts/r107/lib/r107-regen-sim.js'));
+    const regenClient = (op, moduleId, quote) => ({
+      simulated: false, calls: 0,
+      async call(req) {
+        this.calls++;
+        return { input: { requests: [{ quote, operation: op, instruction: quote, target: { moduleId }, targetEvidence: quote, changeEvidence: quote }] },
+          stopReason: 'tool_use', model: req.model, messageId: `msg_b10_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false };
+      },
+    });
+    const regenPlan = async (op, moduleId, quote, sim) => {
+      const p = planFor(regenClient(op, moduleId, quote));
+      p.regenProviders = () => sim;
+      const r = await approveIntake(p, quote);
+      const plan0 = await p.getPlan({ id: U }, sid);
+      const it = plan0.items.find((i) => i.operation === op && i.stage === 'estimate');
+      assert(it, `ítem en estimado: ${JSON.stringify(plan0.items.map((i) => [i.operation, i.stage]))}`);
+      // Solo ESTE ítem (la sesión trae otros pedidos de L7–L11 esperando): su estimado y un tope que cubre sus cotas.
+      const cap = Math.ceil(Math.max(Number(it.plannedCall.expectedUsd) * 1.5, Number(it.plannedCall.regen.totalBoundUsd)) * 100) / 100;
+      const g = await p.approveGeneration({ id: U }, sid, plan0.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it.plannedCall.expectedUsd), capUsd: cap });
+      await p.whenIdle();
+      return { p, g, it, key: `workshop:approval:${g.approval.id}`, interpId: r.c.approval.id };
+    };
+
+    await check('L12 (B10) rehacer el VIDEO contra el ledger REAL (enforce): aprobación multi-proveedor → reserva `pending` del tope → Videogen (costo informado) + YouTube (USD 0) + Anthropic, cada cargo con approvalId → reserva LIBERADA; disponible = antes − cargos reales', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '6.00', reason: 'QA r107 B10' });
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false });
+      const before = await available();
+      const r = await regenPlan('regenerate_video', 1016, 'Rehace el video interactivo del capítulo 1.', sim);
+      const ap = (await r.p.listRequests({ id: U }, sid)).approvals.find((x) => x.id === r.g.approval.id);
+      eq([ap.status, ap.calls.map((x) => [x.kind.split(':')[0], x.status]).sort()], ['done', [['anthropic', 'charged'], ['videogen', 'charged'], ['youtube', 'charged']]], 'tres proveedores, todos cobrados');
+      const rows = await ds.query(`select provider, operation, amount::text a, measurement_status from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true' order by provider`, [r.g.approval.id]);
+      // (el ledger agrega «.unattributed» cuando la llamada no queda atribuida a un curso: mismo criterio que L11)
+      eq(rows.map((x) => [x.provider, x.operation.replace(/\.unattributed$/, ''), x.measurement_status]), [['anthropic', 'llm.workshop_regenerate', 'final'], ['videogen', 'videogen.workshop_regenerate', 'final']], 'cargos reales por proveedor');
+      near(rows.find((x) => x.provider === 'videogen').a, 0.94, 'Videogen: el costo que informó');
+      near(await net(r.key), 0, 'reserva liberada (neto 0)');
+      const interp = await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [r.interpId]);
+      near(await available(), before - Number(interp[0].t) - rows.reduce((a, x) => a + Number(x.a), 0), 'disponible = antes − cargos reales (interpretar + rehacer)');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    await check('L13 (B10) envío AMBIGUO a Gamma contra el ledger REAL: la reserva del tope queda PENDIENTE (el gasto posible no se pierde), figura en la conciliación del admin con su llamada de Gamma; `charged_partial` con la evidencia → cuenta eso y la aprobación queda conciliada', async () => {
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false, fault: { gammaCreate: 'ambiguous' } });
+      const r = await regenPlan('regenerate_gamma', 1013, 'Rehace la presentación del capítulo 1.', sim);
+      eq(sim.calls.gamma.filter((c) => c.op === 'create').length, 1, 'UN envío (no se reenvía)');
+      eq((await pending(r.key)).measurement_status, 'pending', 'reserva PENDIENTE');
+      const row = (await ctl.workshopReservations()).reservations.find((x) => x.reservationKey === r.key);
+      assert(row && row.kind === 'generate' && row.approvalStatus === 'ambiguous' && row.calls.some((c) => /^gamma:/.test(c.kind) && c.status === 'ambiguous'), `en la conciliación: ${JSON.stringify(row)}`);
+      const out = await ctl.reconcileWorkshopReservation({ reservationKey: r.key, outcome: 'charged_partial', amount: '0.55', reason: 'Gamma confirma la generación (55 créditos)', evidence: { source: 'provider_console', referenceIds: ['gen_sim_1'], observedAmount: '0.55' } }, saUser);
+      eq([out.outcome, out.reconciled], ['charged_partial', true], 'conciliada');
+      near(await net(r.key), 0.55, 'cuenta lo que Gamma cobró');
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
   } finally {

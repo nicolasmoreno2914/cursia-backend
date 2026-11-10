@@ -1,3 +1,5 @@
+import type { RegenerateOp } from '../regenerate/types';
+
 /**
  * r107 B4 · Taller de cursos — motor de parches determinista, Fase 2: tipos de las operaciones y del INFORME DE CAMBIOS.
  *
@@ -128,11 +130,16 @@ export interface RemoveActivityOp {
 
 export type PatchOperation =
   | EditHtmlOp | EditLibroSectionOp | ExamQuestionReplaceOp | ExamQuestionAddOp | ExamQuestionRemoveOp
-  | BrandReplaceOp | RemoveActivityOp;
+  | BrandReplaceOp | RemoveActivityOp | RegenerateOp;
+
+/** r107 B10: Fase 3 (insertar el resultado validado de una regeneración; ver regenerate/types.ts y op-regenerate.ts). */
+export type { RegenerateOp } from '../regenerate/types';
 
 export const PATCH_OPERATIONS_PHASE2 = Object.freeze([
   'edit_html', 'edit_libro_section', 'exam_question_replace', 'exam_question_add', 'exam_question_remove', 'brand_replace', 'remove_activity',
 ] as const);
+/** r107 B10: catálogo completo del motor (Fase 2 + Fase 3). */
+export const PATCH_OPERATIONS = Object.freeze([...PATCH_OPERATIONS_PHASE2, 'regenerate_scorm', 'regenerate_video', 'regenerate_gamma', 'regenerate_audio'] as const);
 
 // ─── Informe de cambios ─────────────────────────────────────────────────────
 

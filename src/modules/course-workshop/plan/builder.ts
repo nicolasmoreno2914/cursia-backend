@@ -34,6 +34,17 @@ import {
 import { requiresItemConfirm, riskOf } from './risk';
 import { activityLabel, activityOf, chapterPlainText, inventorySummary } from './summary';
 import { ClarifyAnswer, InterpretedRequest, MisalignmentWarning, PLAN_LIMITS, PlanItemView, RequestOperation } from './types';
+import { isRegenOperation, ProducedRegen, RegenError, RegenerateOp } from '../regenerate/types';
+import type { PaidCallGate, RegenProviders } from '../regenerate/ports';
+import type { RegenDbSources } from '../regenerate/sources';
+import type { RegenPlannedCall } from '../regenerate/estimate';
+import { OP_ES, beforeFacts, produceRegen, regenEstimate, resolveRegen } from '../regenerate/produce';
+import { producedSummary } from '../regenerate/bundle';
+import { createHash } from 'crypto';
+import { LibroV3Source, regenerateLibroV3Pdf } from '../apply/libro-v3';
+import { buildDynamicMbzV3 } from '../../../package/dynamic-mbz-builder-v3';
+import { libroMdProblems } from './content';
+import { libroMdTool, libroMdUser } from './prompts';
 
 // ─── IA ────────────────────────────────────────────────────────────────────
 
@@ -70,6 +81,25 @@ export interface BuildCtx {
   baseline: { originalSha1: string; report: DiagnosisReport } | null;
   docs: SearchDoc[] | null;
   originalSha1: string;
+  /** r107 B10: fuente de la base para rehacer actividades (curso identificado) y el modelo de voz fijado por Cursia. */
+  regenDb?: RegenDbSources | null;
+  /** Carga perezosa de `regenDb` (el servicio la pone: solo se consulta la base si hay algo que rehacer). */
+  regenDbLoader?: (() => Promise<RegenDbSources | null>) | null;
+  ttsModel?: string;
+  /** r107 B10 · Libro v3 (PDF): la entrada del builder del curso (perezosa; la resuelve el servidor). */
+  libroV3Loader?: (() => Promise<LibroV3Source | { unavailable: string }>) | null;
+  libroV3?: LibroV3Source | { unavailable: string };
+}
+
+async function libroV3Of(ctx: BuildCtx): Promise<LibroV3Source | { unavailable: string }> {
+  if (ctx.libroV3 === undefined) ctx.libroV3 = ctx.libroV3Loader ? await ctx.libroV3Loader() : { unavailable: 'El Libro Guía es un PDF y la fuente del curso (el texto de cada capítulo con el que se armó) no está disponible en este proceso.' };
+  return ctx.libroV3;
+}
+
+/** Fuente de la base para rehacer (perezosa y cacheada en el contexto). */
+export async function regenDbOf(ctx: BuildCtx): Promise<RegenDbSources | null> {
+  if (ctx.regenDb === undefined && ctx.regenDbLoader) ctx.regenDb = await ctx.regenDbLoader();
+  return ctx.regenDb ?? null;
 }
 
 export async function openBuildCtx(original: Buffer, opts: { filename?: string | null; originalSha1: string; pricing: WorkshopPricing; baseline?: { originalSha1: string; report: DiagnosisReport } | null }): Promise<BuildCtx> {
@@ -212,6 +242,8 @@ export async function prepareItem(ctx: BuildCtx, req: InterpretedRequest, ai: Ai
     return { status: 'phase_later', reason: 'Disponible en una fase posterior del Taller.', view, spentUsd: '0', calls: 0 };
   }
   if (req.status !== 'resolved' || !req.operation || !req.target) return { status: req.status === 'needs_answer' ? 'failed' : (req.status as PreparedItem['status']), reason: req.reason, view: null, spentUsd: '0', calls: 0 };
+  // r107 B10: rehacer una actividad se PRODUCE con su aprobación y tope (prepareRegenItem), nunca por este camino.
+  if (isRegenOperation(req.operation)) return { status: 'failed', reason: 'Rehacer una actividad se produce con su aprobación y su tope (etapa de estimado), no al armar el plan.', view: null, spentUsd: '0', calls: 0 };
 
   let spent = '0';
   let calls = 0;
@@ -268,6 +300,8 @@ function summaryOf(req: InterpretedRequest): string {
 }
 
 function needsContent(req: InterpretedRequest): boolean {
+  // r107 B10: rehacer una actividad siempre necesita proveedores pagos (se produce con aprobación y tope).
+  if (isRegenOperation(req.operation)) return true;
   switch (req.operation) {
     case 'edit_html': return !req.details.fixedChange && !req.details.deadLink;
     case 'edit_libro_section': case 'exam_question_replace': case 'exam_question_add': return true;
@@ -312,6 +346,7 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
     }
     case 'edit_libro_section': {
       if (t.kind !== 'libro') return { unavailable: 'destino inválido' };
+      if (t.pdf) return candidateLibroV3(ctx, req, callAi, attempt, retry);
       const a = activityOf(ctx.course, t.moduleId);
       if (!a) return { unavailable: 'El Libro Guía ya no está en el paquete.' };
       const html = await libroHtmlOf(ctx, a);
@@ -390,6 +425,44 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
   }
 }
 
+/**
+ * r107 B10 · Libro v3 (PDF): la IA reescribe el MARKDOWN del capítulo (la fuente del curso); el PDF lo arma el builder
+ * existente con esa fuente — solo si con la fuente sin cambios reproduce byte a byte el PDF del original (regla de B6).
+ */
+async function candidateLibroV3(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: AiCall) => Promise<WorkshopAiResult>, attempt: number, retry: string[] | null): Promise<Candidate | { problems: string[] } | { unavailable: string }> {
+  const t = req.target as Extract<InterpretedRequest['target'], { kind: 'libro' }>;
+  const a = activityOf(ctx.course, t.moduleId);
+  if (!a) return { unavailable: 'El Libro Guía ya no está en el paquete.' };
+  const src = await libroV3Of(ctx);
+  if ('unavailable' in src) return { unavailable: src.unavailable };
+  const numbers = [...t.chapters];
+  const current = new Map<number, string>();
+  for (const n of numbers) {
+    const id = src.chapterIdByNumber.get(n);
+    const md = id ? src.buildInput.contents.contentMd.get(id) : undefined;
+    if (typeof md !== 'string') return { unavailable: `El capítulo ${n} no está en la fuente del curso (¿capítulo de práctica?).` };
+    current.set(n, md);
+  }
+  const titleOf = (n: number) => ctx.course.chapters.find((c) => c.number === n)?.title ?? `Capítulo ${n}`;
+  const user = libroMdUser({ instruction: req.instruction, quote: req.quote, chapters: numbers.map((n) => ({ number: n, title: titleOf(n), md: current.get(n) as string })) }) + retryNote(retry);
+  const size = { promptChars: user.length + CONTENT_SYSTEM.length, chapters: numbers.length };
+  const est = memOf(estimateAiCall('content_libro', size, ctx.pricing));
+  const r = await callAi({ purpose: 'content', kind: 'content_libro', system: CONTENT_SYSTEM, user, tool: libroMdTool(), maxTokens: libroMaxTokens(numbers.length), size, attempt });
+  if (r.stopReason === 'max_tokens') return { problems: ['la respuesta se cortó por longitud'] };
+  if (r.input === null || r.input === undefined) return { problems: ['el modelo no usó la herramienta'] };
+  const v = libroMdProblems(r.input, numbers, current);
+  if (v.problems.length) return { problems: v.problems };
+  const regen = await regenerateLibroV3Pdf(ctx.original, src, v.chapters, (i) => buildDynamicMbzV3(i));
+  if (regen.ok !== true) {
+    const f = regen as { code: string; reason: string };
+    return f.code === 'build_failed' ? { problems: [`el builder no pudo armar el Libro con ese texto: ${f.reason}`] } : { unavailable: f.reason };
+  }
+  const op: PatchOperation = { op: 'edit_libro_section', moduleId: a.moduleId, chapters: numbers.map((n) => ({ number: n, html: '' })), libroV3: { chapters: v.chapters }, pdf: { base64: regen.pdf.toString('base64'), previousSha1: regen.previousSha1 } };
+  const byN = new Map(v.chapters.map((c) => [c.number, c.md]));
+  const changes: FieldChange[] = numbers.map((n) => ({ entry: a.dir, field: `libro:capitulo ${n}`, moduleId: a.moduleId, sectionId: null, before: current.get(n) as string, after: byN.get(n) as string, beforeRawSha1: '', afterRawSha1: '' }));
+  return { op, changes, before: numbers.map((n) => current.get(n)).join('\n'), after: v.chapters.map((c) => c.md).join('\n'), contentEstimate: est, notes: [`El Libro Guía en PDF se arma de nuevo con el builder (capítulo(s) ${numbers.join(', ')}); el Libro en línea (mod_book) no cambia solo.`] };
+}
+
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 /**
@@ -455,6 +528,7 @@ export function estimateReinterpretation(ctx: Pick<BuildCtx, 'course' | 'pricing
  */
 export async function estimateContent(ctx: BuildCtx, req: InterpretedRequest): Promise<PlannedCall | null | { unavailable: string }> {
   if (req.status !== 'resolved' || !needsContent(req)) return null;
+  if (isRegenOperation(req.operation)) return estimateRegenItem(ctx, req);
   try {
     const r = await candidateFor(ctx, req, async (c) => { throw new EstimateOnly(c); }, 1, null);
     if ('unavailable' in r) return { unavailable: r.unavailable };
@@ -467,7 +541,8 @@ export async function estimateContent(ctx: BuildCtx, req: InterpretedRequest): P
 export { needsContent };
 
 /** Vista del ítem en etapa de ESTIMADO: sin contenido generado, con lo que costaría generarlo (D8). */
-export function estimateItemView(ctx: Pick<BuildCtx, 'pricing'>, req: InterpretedRequest, call: PlannedCall, opts: { fromFinding?: boolean } = {}): PlanItemView {
+export function estimateItemView(ctx: Pick<BuildCtx, 'pricing'> & Partial<Pick<BuildCtx, 'course'>>, req: InterpretedRequest, call: PlannedCall, opts: { fromFinding?: boolean } = {}): PlanItemView {
+  if ((call as unknown as RegenPlannedCall).kind === 'regenerate') return regenEstimateView(ctx as BuildCtx, req, call as unknown as RegenPlannedCall, opts);
   const est = memOf(estimateAiCall(call.kind, call.size, ctx.pricing));
   const risk = riskOf({ operation: req.operation!, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding });
   return {
@@ -494,7 +569,8 @@ export function callBoundUsd(promptChars: number, maxTokens: number, pricing: Wo
  */
 export function proposedCapOf(calls: PlannedCall[], capFactor?: number): { expectedUsd: string; boundUsd: string; proposedCapUsd: string } {
   const expected = sumUsd('0', ...calls.map((c) => c.expectedUsd));
-  const bound = sumUsd('0', ...calls.map((c) => c.boundUsd));
+  // r107 B10: una regeneración tiene varias llamadas principales (salas, trozos de voz…): cuenta la suma de sus cotas.
+  const bound = sumUsd('0', ...calls.map((c) => (c as unknown as RegenPlannedCall).regen?.totalBoundUsd ?? c.boundUsd));
   const safety = Number(safetyCapOf(expected, parseSafetyCapFactor(capFactor ?? readSafetyCapFactor())));
   const cap = Math.ceil(Math.max(safety, Number(bound)) * 100 - 1e-9) / 100;
   return { expectedUsd: expected, boundUsd: bound, proposedCapUsd: cap.toFixed(2) };
@@ -514,4 +590,140 @@ export async function combinedDryRun(ctx: BuildCtx, ops: PatchOperation[]): Prom
   if (!ops.length) return { ok: true, failure: null, resolved: 0, operations: 0 };
   const r = await dryRun(ctx, ops);
   return { ok: r.ok, failure: r.failure ? { opIndex: r.failure.opIndex, code: r.failure.code, message: r.failure.message } : null, resolved: r.diagnosis?.resolved.length ?? 0, operations: ops.length };
+}
+
+
+// ─── r107 B10 · Fase 3: rehacer una actividad (proveedores pagos, con aprobación y tope) ────────────────────────────
+
+const regenReader = (ctx: BuildCtx) => (e: string) => read(ctx, e);
+const wid = (...xs: unknown[]) => createHash('sha1').update(JSON.stringify(xs)).digest('hex').slice(0, 16);
+
+/** Estimado por proveedor ANTES de producir (sin gastar): destino + fuente + estimator. */
+async function estimateRegenItem(ctx: BuildCtx, req: InterpretedRequest): Promise<PlannedCall | { unavailable: string }> {
+  const t = req.target;
+  if (!t || t.kind !== 'activity') return { unavailable: 'destino inválido' };
+  const res = await resolveRegen({ course: ctx.course, read: regenReader(ctx), op: req.operation as any, moduleId: t.moduleId, instruction: req.instruction, audioTarget: req.details.audioTarget ?? null, db: await regenDbOf(ctx) });
+  if ('unavailable' in res) return res;
+  let call: RegenPlannedCall;
+  try {
+    call = regenEstimate(res, ctx.course, ctx.pricing, ctx.ttsModel ?? 'gpt-4o-mini-tts-2025-03-20');
+  } catch (e) {
+    return { unavailable: `No se puede estimar el costo (precio faltante en el catálogo de FinOps): ${e instanceof Error ? e.message.slice(0, 200) : String(e)}. No se llama a ningún proveedor.` };
+  }
+  (call.regen as any).before = beforeFacts(res.target);
+  (call.regen as any).notes = res.notes;
+  (call.regen as any).target = { op: res.target.op, moduleId: res.target.moduleId, title: res.target.title };
+  return call as unknown as PlannedCall;
+}
+
+/**
+ * D7: al rehacer el VIDEO, el examen y el Libro del capítulo pueden quedar desalineados con el guion nuevo: se AVISA
+ * (con su costo como pedido aparte); nunca se agregan solos.
+ */
+export function regenWarnings(ctx: Pick<BuildCtx, 'course' | 'pricing'>, op: RequestOperation, moduleId: number): MisalignmentWarning[] {
+  const out: MisalignmentWarning[] = [];
+  const a = activityOf(ctx.course, moduleId);
+  const ch = a && a.placement.scope === 'chapter' ? a.placement.chapterNumber : null;
+  if (op !== 'regenerate_video' || ch === null) return out;
+  const libro = ctx.course.activities.find((x) => x.kind === 'libro' && !x.missingFolder) ?? null;
+  if (libro) {
+    out.push({
+      id: wid('regen_video_libro', moduleId, libro.moduleId), kind: 'same_chapter',
+      activity: { moduleId: libro.moduleId, title: libro.title, modname: libro.modname, chapterNumber: ch }, questionId: null,
+      message: `El video nuevo del capítulo ${ch} tiene otro guion: el capítulo ${ch} del Libro Guía puede quedar desalineado con lo que dice el video. No se cambia solo: agrégalo como un pedido aparte si hace falta.`,
+      terms: [], suggestedOperation: ctx.course.libro.find((l) => l.moduleId === libro.moduleId)?.format === 'html' ? 'edit_libro_section' : null,
+      estimate: memOf(estimateAiCall('content_libro', { promptChars: 12_000, chapters: 1 }, ctx.pricing as WorkshopPricing)),
+    });
+  }
+  const exams = ctx.course.activities.filter((x) => x.exam && !x.missingFolder);
+  let n = 0;
+  for (const ex of exams) {
+    for (const q of ex.exam!.questions) {
+      if (q.chapterNumber !== ch || n >= 5) continue;
+      n++;
+      out.push({
+        id: wid('regen_video_exam', moduleId, ex.moduleId, q.id), kind: 'same_chapter',
+        activity: { moduleId: ex.moduleId, title: ex.title, modname: ex.modname, chapterNumber: ch }, questionId: q.id,
+        message: `La pregunta «${plainText(q.html, 80)}» de «${ex.title}» evalúa el capítulo ${ch}: puede quedar desalineada con el video nuevo. No se cambia sola.`,
+        terms: [], suggestedOperation: 'exam_question_replace', estimate: memOf(estimateAiCall('content_question', { promptChars: 3000 }, ctx.pricing as WorkshopPricing)),
+      });
+    }
+  }
+  if (exams.length && !n) {
+    const ex = exams[0];
+    out.push({
+      id: wid('regen_video_exam_any', moduleId, ex.moduleId), kind: 'same_chapter',
+      activity: { moduleId: ex.moduleId, title: ex.title, modname: ex.modname, chapterNumber: ch }, questionId: null,
+      message: `Los exámenes del curso pueden evaluar lo que decía el video anterior del capítulo ${ch}: revísalos. No se cambian solos.`,
+      terms: [], suggestedOperation: null, estimate: null,
+    });
+  }
+  return out;
+}
+
+function regenEstimateView(ctx: BuildCtx, req: InterpretedRequest, call: RegenPlannedCall, opts: { fromFinding?: boolean }): PlanItemView {
+  const risk = riskOf({ operation: req.operation!, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding });
+  const t = (call.regen as any).target as { title: string; moduleId: number } | undefined;
+  const providers = call.regen.providers.map((l) => `${l.provider} ${l.calls} llamada(s) ≈ USD ${Number(l.expectedUsd).toFixed(2)} (máx. USD ${Number(l.boundUsd).toFixed(2)}): ${l.what}`);
+  return {
+    operation: req.operation!, params: null, available: true, requiresItemConfirm: requiresItemConfirm(risk),
+    summary: `${OP_ES[req.operation as keyof typeof OP_ES] ?? req.operation} — ${t?.title ?? req.target?.title ?? ''}: se produce con los proveedores cuando apruebes su costo.`,
+    changes: [], files: [], entries: { added: [], removed: [], modified: [] }, risk,
+    cost: { spentUsd: '0', apply: ZERO_MEM, contentEstimate: { min: call.regen.min, expected: call.expectedUsd, max: call.regen.max }, basis: `estimado ANTES de producir, por proveedor (${call.regen.basis}); nada corre sin tu aprobación y su tope · ${providers.join(' · ')}` },
+    misalignment: ctx.course && t ? regenWarnings(ctx, req.operation!, t.moduleId) : [],
+    dryRun: null, generated: false, plannedCall: call as unknown as PlannedCall,
+  };
+}
+
+export interface PreparedRegenItem extends PreparedItem {
+  /** El resultado producido (en memoria): el servicio lo sube como artifact y guarda su referencia en `params.result`. */
+  produced: ProducedRegen | null;
+  /** Motivo de una falla: `retry` = puede volver a aprobarse (tope, proveedor, resultado inválido); `final` = no se puede. */
+  failure?: { code: string; retryable: boolean } | null;
+}
+
+/**
+ * Produce (por la compuerta de la aprobación) → resultado validado → operación del motor → PRUEBA EN SECO sobre el
+ * original → vista con antes/después verificable. Una falla nunca deja un ítem «listo» a medias.
+ */
+export async function prepareRegenItem(ctx: BuildCtx, req: InterpretedRequest, deps: { providers: RegenProviders; gate: PaidCallGate; spent: () => string }, opts: { fromFinding?: boolean } = {}): Promise<PreparedRegenItem> {
+  const t = req.target;
+  const fail = (status: PreparedItem['status'], reason: string, code: string, retryable: boolean): PreparedRegenItem => ({ status, reason, view: null, spentUsd: deps.spent(), calls: 0, produced: null, failure: { code, retryable } });
+  if (!t || t.kind !== 'activity' || !isRegenOperation(req.operation)) return fail('unavailable', 'destino inválido', 'unavailable', false);
+  const res = await resolveRegen({ course: ctx.course, read: regenReader(ctx), op: req.operation, moduleId: t.moduleId, instruction: req.instruction, audioTarget: req.details.audioTarget ?? null, db: await regenDbOf(ctx) });
+  if ('unavailable' in res) return fail('unavailable', res.unavailable, 'unavailable', false);
+  let produced: ProducedRegen;
+  try {
+    produced = await produceRegen({ res, course: ctx.course, read: regenReader(ctx), providers: deps.providers, gate: deps.gate, pricing: ctx.pricing, db: await regenDbOf(ctx) });
+  } catch (e) {
+    if (!(e instanceof RegenError)) throw e;
+    if (e.code === 'unavailable') return fail('unavailable', e.message, e.code, false);
+    // tope / ambiguo / no enviado / proveedor sin configurar → el servicio corta la aprobación con el motivo.
+    if (e.code === 'cap_reached' || e.code === 'call_ambiguous' || e.code === 'not_sent' || e.code === 'provider_rejected' || e.code === 'provider_not_ready') throw e;
+    return fail('failed', `La regeneración no produjo un resultado válido: ${e.message} Lo gastado queda registrado; no se aplica nada.`, e.code, true);
+  }
+  const summary = { ...beforeFacts(res.target), before: beforeFacts(res.target), after: producedSummary(produced), ...(res.target.op === 'regenerate_audio' ? { chapters: res.target.chapters } : {}), ...(res.target.op === 'regenerate_video' ? { youtubeIdBefore: res.target.youtubeIdBefore, questionsBefore: res.target.questionsBefore } : {}) };
+  const op: RegenerateOp = { op: req.operation, moduleId: t.moduleId, expect: res.expect, summary, produced };
+  const r = await dryRun(ctx, [op as PatchOperation]);
+  if (!r.ok) {
+    return fail('failed', `El motor de parches no puede insertar el resultado: ${r.failure?.message ?? 'falla del motor'}${r.diagnosis?.introduced?.length ? ` (${r.diagnosis.introduced.slice(0, 3).map((x) => x.title).join(' · ')})` : ''}. No se aplica nada; lo gastado queda registrado.`, r.failure?.code ?? 'engine', true);
+  }
+  const rep = r.operations[0];
+  const warnings = [...regenWarnings(ctx, req.operation, t.moduleId), ...rep.misalignment.map((m, i) => ({ id: wid('regen_engine', t.moduleId, i, m), kind: 'engine' as const, activity: null, questionId: null, message: m, terms: [], suggestedOperation: null, estimate: null }))];
+  const params: RegenerateOp = { op: req.operation, moduleId: t.moduleId, expect: res.expect, summary };
+  const view: PlanItemView = {
+    operation: req.operation, params: params as PatchOperation, available: true,
+    summary: rep.summary || `${OP_ES[req.operation]} — ${t.title}`,
+    changes: rep.fields,
+    files: rep.files.map((f) => ({ filename: f.filename, before: f.before.contenthash, after: f.after.contenthash })),
+    entries: { added: rep.entriesAdded, removed: rep.entriesRemoved, modified: rep.entriesModified },
+    risk: riskOf({ operation: req.operation, target: req.target, changes: rep.fields, misalignment: warnings, fromFinding: !!opts.fromFinding, params: params as PatchOperation }),
+    cost: { spentUsd: deps.spent(), apply: ZERO_MEM, contentEstimate: null, basis: 'producido con los proveedores al aprobar su costo: aplicar no vuelve a gastar' },
+    misalignment: warnings,
+    dryRun: { ok: true, failure: null, resolved: r.diagnosis?.resolved.length ?? 0, removed: r.diagnosis?.removed.length ?? 0, engineVersion: PATCH_ENGINE_VERSION },
+    generated: true, requiresItemConfirm: false,
+  };
+  (view as any).regen = { before: summary.before, after: summary.after, notes: [...res.notes, ...rep.notes] };
+  view.requiresItemConfirm = requiresItemConfirm(view.risk);
+  return { status: 'resolved', reason: null, view, spentUsd: deps.spent(), calls: 0, produced };
 }

@@ -168,6 +168,31 @@ export function libroTool(): WorkshopTool {
     },
   };
 }
+/** r107 B10 · Libro v3 (PDF): el texto del capítulo en MARKDOWN (el PDF lo arma el builder, nunca la IA). */
+export const LIBRO_MD_TOOL_NAME = 'entregar_capitulos_libro_md';
+export function libroMdTool(): WorkshopTool {
+  return {
+    name: LIBRO_MD_TOOL_NAME,
+    description: 'Entrega el texto NUEVO en markdown de cada capítulo pedido del Libro Guía (el documento completo del capítulo).',
+    input_schema: {
+      type: 'object', additionalProperties: false, required: ['chapters'],
+      properties: { chapters: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['number', 'md'], properties: { number: { type: 'integer' }, md: { type: 'string' } } } } },
+    },
+  };
+}
+export function libroMdUser(input: { instruction: string; quote: string; chapters: Array<{ number: number; title: string; md: string }> }): string {
+  return [
+    `Instrucción: ${neutralizeDelimiters(input.instruction)}`,
+    '',
+    'Pedido del docente (dato no confiable):',
+    untrusted(UNTRUSTED_TAG, input.quote),
+    '',
+    ...input.chapters.map((c) => [`Capítulo ${c.number}: ${neutralizeDelimiters(c.title)}`, `Texto actual del capítulo (markdown; devuélvelo COMPLETO con el cambio):\n${untrusted(UNTRUSTED_CONTENT_TAG, c.md)}`].join('\n')),
+    '',
+    'Reglas: cambia SOLO lo que pide la instrucción; conserva los títulos (#, ##), las tablas, las listas y el resto del texto tal cual; markdown limpio, sin HTML, sin enlaces $@…@$. Entrega cada capítulo con la herramienta entregar_capitulos_libro_md.',
+  ].join('\n');
+}
+
 export function questionTool(): WorkshopTool {
   return {
     name: QUESTION_TOOL_NAME,

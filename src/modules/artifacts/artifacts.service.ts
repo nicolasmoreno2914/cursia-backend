@@ -208,7 +208,9 @@ export const ARTIFACT_WORKSHOP_ORIGINAL_IMMUTABLE = 'artifact_workshop_original_
 /** r107 B6: cada versión del Taller tampoco se borra por DELETE /artifacts/:id (D10: el historial es la forma de deshacer). */
 export const WORKSHOP_VERSION_ARTIFACT_TYPE = 'workshop_version';
 export const ARTIFACT_WORKSHOP_VERSION_IMMUTABLE = 'artifact_workshop_version_immutable';
-const WORKSHOP_IMMUTABLE_TYPES: readonly string[] = [WORKSHOP_ORIGINAL_ARTIFACT_TYPE, WORKSHOP_VERSION_ARTIFACT_TYPE];
+/** r107 B10: resultado de una regeneración del Taller (pagado y validado): inmutable y solo por las rutas del Taller. */
+export const WORKSHOP_REGEN_RESULT_ARTIFACT_TYPE = 'workshop_regen_result';
+const WORKSHOP_IMMUTABLE_TYPES: readonly string[] = [WORKSHOP_ORIGINAL_ARTIFACT_TYPE, WORKSHOP_VERSION_ARTIFACT_TYPE, WORKSHOP_REGEN_RESULT_ARTIFACT_TYPE];
 /** r107 B6 fix round 1 (P2-5): descarga de archivos del Taller solo por su endpoint, con URL de a lo sumo 5 min. */
 export const ARTIFACT_WORKSHOP_DOWNLOAD_VIA_WORKSHOP = 'artifact_workshop_download_via_workshop';
 export const WORKSHOP_DOWNLOAD_MAX_SECONDS = 300;
@@ -978,6 +980,10 @@ export class ArtifactsService {
       }
       if (row.type === WORKSHOP_VERSION_ARTIFACT_TYPE) {
         throw new ForbiddenException({ code: ARTIFACT_WORKSHOP_VERSION_IMMUTABLE, message: 'Una versión del Taller de cursos no se puede borrar: es parte del historial del curso (y puede ser la base de otra versión).' });
+      }
+      // r107 B10: el resultado de una regeneración es lo que el docente aprobó y pagó: el plan y la versión lo usan.
+      if (row.type === WORKSHOP_REGEN_RESULT_ARTIFACT_TYPE) {
+        throw new ForbiddenException({ code: ARTIFACT_WORKSHOP_VERSION_IMMUTABLE, message: 'El resultado de rehacer una actividad en el Taller no se puede borrar: el plan aprobado lo usa.' });
       }
       // DoD follow-up (R4): un .mbz QA / degradado NUEVO es solo de SUPER_ADMIN; para el dueño no existe
       // (mismo 404 que GET /artifacts/:id) — nunca se borra la fila ni el objeto `qa-internal/`.

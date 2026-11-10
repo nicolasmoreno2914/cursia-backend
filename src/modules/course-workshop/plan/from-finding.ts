@@ -11,8 +11,10 @@ import { WorkshopCourse } from '../course-model';
 import { RawAiRequest, resolveRequest } from './interpret';
 import { activityOf, editableField } from './summary';
 import { InterpretedRequest, LATER_OPERATIONS, RequestOperation } from './types';
+import { isRegenOperation } from '../regenerate/types';
 
-const isLater = (op: string) => (LATER_OPERATIONS as readonly string[]).includes(op);
+// r107 B10: las regeneraciones (Fase 3) se resuelven igual que las de fase posterior: destino desde el hallazgo, sin IA.
+const isLater = (op: string) => (LATER_OPERATIONS as readonly string[]).includes(op) || isRegenOperation(op);
 
 export function requestFromFinding(f: Finding, course: WorkshopCourse): InterpretedRequest {
   const fx = f.suggestedFix;

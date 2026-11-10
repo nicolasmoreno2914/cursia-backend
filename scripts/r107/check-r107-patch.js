@@ -1143,6 +1143,57 @@ async function moodleSuite() {
       console.log(`   M4 ${v.id}: restaurado (curso ${o.courseid ?? '—'}), ${v.items.map((x) => x.operation).join(', ')} verificados`);
     }
   });
+
+  // r107 B10: Fase 3 — versiones con CADA operación de rehacer aplicada (proveedores SIMULADOS, USD 0) → restauran.
+  const SIMLIB = require(path.join(REPO, 'scripts/r107/lib/r107-regen-sim.js'));
+  const B = require(path.join(DIST, 'modules/course-workshop/plan/builder.js'));
+  const DRY = require(path.join(DIST, 'modules/pedagogy/dry-run.js'));
+  const EXR = require(path.join(DIST, 'workers/llm-executor/executor-runtime.js'));
+  const regenOps = async (buf, specs, db = null) => {
+    const ops = [];
+    for (const [op, mid] of specs) {
+      const ctx = await B.openBuildCtx(buf, { originalSha1: sha1(buf), pricing: DRY.seedPricing() });
+      if (db) ctx.regenDb = db;
+      const a = ctx.course.activities.find((x) => x.moduleId === mid);
+      const req = { quote: 'Rehacer', instruction: 'Rehacer la actividad', operation: op, status: 'resolved', target: { kind: 'activity', moduleId: mid, title: a.title, chapterNumber: a.placement.chapterNumber }, rawTarget: null, details: {}, questions: [], reason: null };
+      const prov = SIMLIB.simProviders(DIST);
+      const gate = SIMLIB.memGate(DIST, { capUsd: 50 });
+      const prep = await B.prepareRegenItem(ctx, req, { providers: prov, gate, spent: gate.spent });
+      assert(prep.status === 'resolved', `${op} ${mid}: ${prep.reason}`);
+      ops.push({ ...prep.view.params, produced: prep.produced });
+    }
+    return ops;
+  };
+  await check('M5 (B10) versiones con cada operación de REHACER aplicada (v3 A-S: práctica H5P, video, Gamma, bienvenida, audiolibro · V1 real: juego SCORM + audiolibro) → restauran en Moodle 4.5 sin errores ni warnings y muestran lo nuevo', async () => {
+    const SIM = await S.simulateCourse(DIST, COURSES.find((c) => c.id === 'A-S'));
+    const sbx = EXR.createExecutorSandbox({ api: async () => { throw { fatal: true, msg: 'no' }; }, artifactText: async () => null, ownerId: 'x', logger: { log() {}, warn() {}, error() {} } });
+    const outline = SIM.input.blueprint.modules.map((m) => ({ id: m.id, title: m.title, objective: null, chapters: m.chapters.map((c) => ({ id: c.id, title: c.title, objective: null })) }));
+    const planC = { modules: Object.fromEntries(outline.map((m) => [m.id, { summary: `Resumen ${m.title}.` }])), chapters: Object.fromEntries(outline.flatMap((m) => m.chapters.map((c) => [c.id, { summary: `Resumen ${c.title}.`, concepts_introduced: [c.title], concepts_assumed: [], key_terms: [c.title] }]))) };
+    const db = { chapterMd: new Map(), contextPackage: new Map(), courseContext: { nombre: invAS.course.title } };
+    for (const ch of invAS.chapters) if (ch.builderUuid) { const md = SIM.input.contents.contentMd.get(ch.builderUuid); if (md) db.chapterMd.set(ch.number, md); db.contextPackage.set(ch.number, sbx.ctx.dynBuildContextPackage({ course: { title: invAS.course.title, objective: null }, modules: outline }, db.courseContext, planC, ch.builderUuid).contextPackage); }
+    const opsAS = await regenOps(AS, [['regenerate_scorm', 1020], ['regenerate_video', 1017], ['regenerate_gamma', 1014], ['regenerate_audio', 1001], ['regenerate_audio', 1010]], db);
+    const { res } = await applyOk(AS, opsAS, 'M5 v3');
+    eq(res.diagnosis.introduced, [], 'M5 v3: sin hallazgos nuevos');
+    const o = restore(res.package, 'r107-b10-v3-regen');
+    clean(o, 'M5 v3');
+    const byName = (re) => o.cms.find((c) => re.test(c.name));
+    assert((byName(/^Video interactivo · Capítulo 1/).intro || '').includes('SimVideo001'), 'M5 v3: el video restaurado apunta al video nuevo');
+    assert((byName(/^Capítulo 1 · Presentación/).intro || '').includes('(PDF, 10 diapositivas)'), 'M5 v3: la presentación nueva');
+    assert(/Duración total: \d+ min/.test(byName(/^Audiolibro$/).intro || ''), 'M5 v3: el audiolibro con su duración');
+    console.log(`   M5 v3: restaurado (curso ${o.courseid}), ${opsAS.map((x) => x.op).join(', ')}`);
+    const realPath = process.env.R107_V1_REAL || path.join(os.homedir(), 'Downloads/Anatomía_y_Fisiología_Animal_moodle (1).mbz');
+    const buf = fs.readFileSync(realPath);
+    const inv = await inventoryOf(buf, path.basename(realPath));
+    const game = inv.activities.find((a) => a.modname === 'scorm' && a.placement.chapterNumber === 1);
+    const book = inv.activities.find((a) => a.kind === 'audiobook');
+    const opsV1 = await regenOps(buf, [['regenerate_scorm', game.moduleId], ['regenerate_audio', book.moduleId]]);
+    const r1 = (await applyOk(buf, opsV1, 'M5 V1', { filename: path.basename(realPath) })).res;
+    eq(r1.diagnosis.introduced, [], 'M5 V1: sin hallazgos nuevos');
+    const o1 = restore(r1.package, 'r107-b10-v1-regen');
+    clean(o1, 'M5 V1');
+    assert(o1.cms.some((c) => c.name === game.title && c.modname === 'scorm'), 'M5 V1: el juego rehecho restaurado');
+    console.log(`   M5 V1: restaurado (curso ${o1.courseid}), juego ${game.moduleId} (5 salas) + audiolibro ${book.moduleId}`);
+  });
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────────────────────────────────────────────

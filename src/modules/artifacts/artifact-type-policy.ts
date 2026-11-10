@@ -12,7 +12,8 @@
  *  - `dynamic_video`                  → dynamic-item-worker (Videogen / YouTube);
  *  - `dynamic_coherence_report_json`  → coherence.service (reporte del motor de coherencia);
  *  - `workshop_original`              → course-workshop.service (r107: el .mbz subido al Taller, verificado);
- *  - `workshop_version`               → workshop-apply.service (r107 B6: cada versión arreglada, verificada).
+ *  - `workshop_version`               → workshop-apply.service (r107 B6: cada versión arreglada, verificada);
+ *  - `workshop_regen_result`          → workshop-plan.service (r107 B10: resultado de rehacer una actividad, validado).
  * El ejecutor del navegador (45-dynamic-generation-executor.js → dynArtifactUpload) sube SOLO los
  * tipos LLM (`dynamic_content_md`, `dynamic_scorm_*`, `dynamic_exam_*`, `dynamic_*_json` de plan,
  * intros, experiencia, H5P, interacciones, aplicación, práctica guiada, contexto, borradores) y el
@@ -35,6 +36,9 @@ export const SERVER_ONLY_ARTIFACT_TYPES: readonly string[] = Object.freeze([
   // r107 B6: cada VERSIÓN arreglada por el Taller (paquete nuevo verificado por el motor + compuerta + validador). La
   // registra solo el trabajo de aplicar; el cliente nunca la declara.
   'workshop_version',
+  // r107 B10: el RESULTADO de rehacer una actividad (juego, video, presentación, audio) con proveedores pagos, validado y
+  // atado a la aprobación que lo pagó. Lo registra solo el trabajo de generar del Taller; el cliente nunca lo declara.
+  'workshop_regen_result',
 ]);
 
 /** 403 de `POST /artifacts` con un tipo que solo crea el servidor (clase: rechazo de cliente, no reintentable). */

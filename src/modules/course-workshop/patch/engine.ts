@@ -29,9 +29,10 @@ import { applyEditLibroSection } from './op-libro';
 import { applyExamAdd, applyExamRemove, applyExamReplace } from './op-exam';
 import { applyBrandReplace } from './op-brand';
 import { applyRemoveActivity } from './op-remove';
-import { DiagnosisDelta, OperationReport, PATCH_OPERATIONS_PHASE2, PatchError, PatchFailure, PatchOperation, PatchResult, emptyReport } from './types';
+import { applyRegenerate } from './op-regenerate';
+import { DiagnosisDelta, OperationReport, PATCH_OPERATIONS, PatchError, PatchFailure, PatchOperation, PatchResult, emptyReport } from './types';
 
-export const PATCH_ENGINE_VERSION = 'b4-r0';
+export const PATCH_ENGINE_VERSION = 'b10-r0';
 
 export interface PatchInput {
   /** Bytes del paquete ORIGINAL verificado (B2 `loadVerifiedOriginal`). No se modifican. */
@@ -136,6 +137,7 @@ async function runOp(ctx: OpContext, op: PatchOperation): Promise<void> {
     case 'exam_question_remove': return applyExamRemove(ctx, op);
     case 'brand_replace': return applyBrandReplace(ctx, op);
     case 'remove_activity': return applyRemoveActivity(ctx, op);
+    case 'regenerate_scorm': case 'regenerate_video': case 'regenerate_gamma': case 'regenerate_audio': return applyRegenerate(ctx, op);
     default: throw new PatchError('invalid_params', `Operación fuera del catálogo de esta fase: «${(op as { op?: string }).op}».`);
   }
 }
@@ -162,7 +164,7 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
   for (let i = 0; i < input.operations.length; i++) {
     const op = input.operations[i];
     const name = op && typeof op === 'object' ? String((op as { op?: string }).op) : String(op);
-    if (!(PATCH_OPERATIONS_PHASE2 as readonly string[]).includes(name)) return fail({ opIndex: i, op: name, code: 'invalid_params', message: `Operación fuera del catálogo de esta fase: «${name}».` }, pkg.container);
+    if (!(PATCH_OPERATIONS as readonly string[]).includes(name)) return fail({ opIndex: i, op: name, code: 'invalid_params', message: `Operación fuera del catálogo de esta fase: «${name}».` }, pkg.container);
     const report = emptyReport(i, op.op);
     try {
       const raw = await readRawCourse(state.asPackage(), meta);

@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException, OnModuleDestroy, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException, OnModuleDestroy, OnModuleInit, ServiceUnavailableException, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../../common/db/returning-rows';
@@ -15,7 +15,10 @@ import {
   APPLY_CODE_VERSION, ApplyApproval, ApplyCandidate, approvalMismatch, itemContentHash, planContentHash, ApplyRunFail, ApplyRunItem, RESTORE_NOT_AVAILABLE_MESSAGE, RestoreChecker, applyMemoryFactor, chainOf, confirmationsMissing,
   nextVersionNumber, runApply, selectApplyItems, versionStoragePath,
 } from './apply-core';
-import { LibroV3SourceResolver, SERVER_LIBRO_V3_RESOLVER, regenerateLibroV3Pdf } from './libro-v3';
+import { LibroV3SourceResolver, libroV3ResolverOf, regenerateLibroV3Pdf } from './libro-v3';
+import { ModuleRef } from '@nestjs/core';
+import { isRegenOperation } from '../regenerate/types';
+import { resolveRegenParams } from '../regenerate/store';
 import { buildDynamicMbzV3 } from '../../../package/dynamic-mbz-builder-v3';
 
 /**
@@ -106,7 +109,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
   /** Verificador de restauración (un Moodle). En staging no hay ninguno: null → `not_available` (ruling B6). */
   restoreChecker: RestoreChecker | null = null;
   /** Fuente del Libro v3 (entrada del builder del curso). En B6 el del servidor responde `unavailable` (ver libro-v3.ts). */
-  libroSource: LibroV3SourceResolver = SERVER_LIBRO_V3_RESOLVER;
+  libroSource: LibroV3SourceResolver;
   /** SOLO pruebas: corre antes de cada etapa (simular una falla o una caída a mitad). */
   testHook: ((stage: 'building' | 'verifying' | 'upload' | 'register', versionId: string) => Promise<void> | void) | null = null;
   now: () => Date = () => new Date();
@@ -115,7 +118,12 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
     private readonly dataSource: DataSource,
     private readonly artifacts: ArtifactsService,
     private readonly workshop: CourseWorkshopService,
-  ) {}
+    @Optional() private readonly moduleRef?: ModuleRef,
+  ) {
+    // r107 B10: el resolvedor del SERVIDOR (entrada del builder v3 desde la base, con la composición compartida con el
+    // dynamic-package-worker); sin los servicios del generador en el proceso, el de B6 (no disponible, con motivo).
+    this.libroSource = { resolve: (s) => libroV3ResolverOf(this.dataSource, this.artifacts, this.moduleRef).resolve(s) };
+  }
 
   onModuleInit(): void {
     if (!isCourseWorkshopEnabledSafe()) return;
@@ -303,7 +311,9 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
       const [v] = await this.q<VersionRow[]>(this.dataSource, `select * from public.workshop_versions where id = $1`, [job.versionId]);
       if (!v || v.claim_id !== job.claimId) return;
       const s = await this.workshop.planSessionById(v.session_id);
-      const bytes = Math.ceil(Number(s?.originalSize ?? 0) * applyMemoryFactor(s?.container));
+      // r107 B10: los resultados de regeneraciones (audiolibro, video, PDF) también se cargan en memoria.
+      const regenBytes = (Array.isArray(v.operations) ? v.operations : []).filter((o: any) => isRegenOperation(o?.op)).reduce((n: number, o: any) => n + 2 * Number(o?.result?.bytes ?? 0), 0);
+      const bytes = Math.ceil(Number(s?.originalSize ?? 0) * applyMemoryFactor(s?.container)) + regenBytes;
       let release: () => void;
       try {
         release = await this.workshop.acquireMemory(`apply:${job.versionId}`, bytes);
@@ -485,6 +495,17 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
         const it = byId.get(id);
         return { id, requestId: it?.requestId ?? '', operation: (v.operations[idx] as PatchOperation).op, quote: it?.quote ?? '', summary: it?.summary ?? '', params: v.operations[idx] };
       });
+      // r107 B10: una regeneración aprobada → su RESULTADO producido (artifact del Taller), con dueño, sesión y sha256
+      // verificados; el motor lo vuelve a validar antes de insertarlo. Sin resultado (o alterado) → falla visible.
+      for (const it of runItems) {
+        if (!isRegenOperation((it.params as { op?: string })?.op) && !((it.params as any)?.op === 'edit_libro_section' && (it.params as any)?.libroV3?.result)) continue;
+        try {
+          it.params = await resolveRegenParams(this.dataSource, this.artifacts, s, it.params);
+        } catch (err) {
+          await fail({ stage: 'engine', code: 'WORKSHOP_APPLY_REGEN_RESULT', message: `No se pudo cargar el resultado producido de «${it.summary || it.operation}»: ${err instanceof Error ? err.message : String(err)}. No se aplica nada.`, retryable: false, failedItemId: it.id });
+          return;
+        }
+      }
       // Libro v3 (PDF): el markdown aprobado → PDF con el builder existente, solo si reproduce el del original.
       for (const it of runItems) {
         const op = it.params as PatchOperation & { libroV3?: { chapters: Array<{ number: number; md: string }> }; pdf?: unknown };

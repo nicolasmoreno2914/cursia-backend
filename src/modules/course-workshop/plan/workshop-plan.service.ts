@@ -28,6 +28,21 @@ import { requestFromFinding } from './from-finding';
 import { AnswerError, checkAnswers, resolveRequest } from './interpret';
 import { planWarnings } from './risk';
 import { itemContentHash, planContentHash, selectApplyItems } from '../apply/apply-core';
+import { ModuleRef } from '@nestjs/core';
+import { decideRunSpend } from '../../finops/run-spend-guard';
+import { PaidCallGate, PaidCallTicket, RegenProviders } from '../regenerate/ports';
+import { RegenError, RegenerateOp, isRegenOperation } from '../regenerate/types';
+import { RegenDbSources } from '../regenerate/sources';
+import { decodeProduced, encodeProduced, sha256Hex } from '../regenerate/bundle';
+import { realRegenProviders } from '../regenerate/real-providers';
+import { prepareRegenItem } from './builder';
+import { resolveTtsModel } from '../../../tts/tts-models';
+import { REGEN_RESULT_TYPE, RegenResultRef, loadRegenResult, resolveRegenParams, storeRegenResult } from '../regenerate/store';
+import { libroV3ResolverOf } from '../apply/libro-v3';
+import { YoutubeService } from '../../../youtube/youtube.service';
+import { YoutubeUploadService } from '../../../youtube/youtube-upload.service';
+import { loadPackagingProfilesV3 } from '../../dynamic-packaging/packaging-v3';
+import { gammaThemeFor } from '../../../package/presentation';
 import {
   ClarifyAnswer, DOCUMENT_EXTENSIONS, InterpretedRequest, IntakeSource, LATER_OPERATIONS, MisalignmentWarning, PLAN_CODE_VERSION, PLAN_LIMITS, PlanItemView, RequestStatus,
 } from './types';
@@ -86,6 +101,10 @@ export const PLAN_ERRORS = Object.freeze({
   USER_BUDGET_INSUFFICIENT: 'USER_BUDGET_INSUFFICIENT',
   PLAN_APPLYING: 'WORKSHOP_PLAN_APPLYING',
   PLAN_APPLIED: 'WORKSHOP_PLAN_APPLIED',
+  /** r107 B10: un proveedor de la regeneración está apagado (kill switch / allow-list): no se reserva ni se llama. */
+  PROVIDER_UNAVAILABLE: 'WORKSHOP_PROVIDER_UNAVAILABLE',
+  /** r107 B10: el resultado producido de una regeneración no está (o no coincide con su huella). */
+  REGEN_RESULT_MISSING: 'WORKSHOP_REGEN_RESULT_MISSING',
 });
 
 /**
@@ -164,6 +183,15 @@ export function approvalReservationInput(a: { approvalId: string; payer: string;
   };
 }
 
+/**
+ * r107 B10: proveedores de la regeneración (Fase 3). Inyectable (las pruebas cablean SIMULADOS); por defecto, los reales
+ * con los clientes existentes (`realRegenProviders`).
+ */
+export const WORKSHOP_REGEN_PROVIDERS = 'WORKSHOP_REGEN_PROVIDERS';
+export type RegenProvidersFactory = (s: WorkshopPlanSession, payer: string) => Promise<RegenProviders> | RegenProviders;
+/** Memoria extra de un trabajo que produce regeneraciones (audiolibro completo, video, PDF de Gamma en memoria). */
+export const REGEN_MEMORY_EXTRA_BYTES = 256 * 1024 * 1024;
+
 @Injectable()
 export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WorkshopPlanService.name);
@@ -204,9 +232,17 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     @Optional() private readonly ledger?: FinopsLedgerService,
     @Optional() private readonly finopsBudget?: FinopsBudgetService,
     @Optional() @Inject(WORKSHOP_AI_CLIENT) client?: WorkshopAiClient,
+    @Optional() @Inject(WORKSHOP_REGEN_PROVIDERS) regenProviders?: RegenProvidersFactory,
+    @Optional() private readonly moduleRef?: ModuleRef,
   ) {
     this.client = client || new AnthropicWorkshopAiClient();
+    this.regenProviders = regenProviders || ((s, payer) => this.defaultRegenProviders(s, payer));
   }
+
+  /** r107 B10: fábrica de proveedores de la regeneración (reemplazable en pruebas). */
+  regenProviders: RegenProvidersFactory;
+  /** r107 B10: llamadas a proveedores hechas por regeneraciones en este proceso (las pruebas lo leen). */
+  readonly providerCalls: Record<string, number> = {};
 
   // ── utilidades ──
 
@@ -674,7 +710,17 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     const items = await this.q<ItemRow[]>(this.dataSource, `select i.* from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
         where i.plan_id = $1 and i.id = any($2::uuid[]) and i.stage = 'estimate' and i.status = 'proposed' and r.status = 'awaiting_generation' order by i.created_at, i.id`, [plan.id, ids]);
     if (items.length !== ids.length) throw new ConflictException({ code: PLAN_ERRORS.ITEMS_INVALID, message: 'Algún ítem elegido no está esperando generación (ya se generó, se quitó o es de otro plan).' });
-    const estimate = this.estimateOf(items.map((i) => i.view.plannedCall as PlannedCall), `Generar el contenido de ${items.length} ítem(s) (1 llamada cada uno; un reintento por validación entra en el margen). La IA no corre hasta que lo apruebes.`);
+    // r107 B10: una regeneración usa otros proveedores (OpenAI TTS, Gamma, Videogen, YouTube): todos tienen que estar
+    // permitidos (kill switch / allow-list) ANTES de reservar nada.
+    const regen = items.filter((i) => isRegenOperation(i.operation));
+    for (const prov of [...new Set(regen.flatMap((i) => ((i.view.plannedCall as any)?.regen?.providers ?? []).map((l: any) => String(l.provider))))]) {
+      try { assertDirectCallAllowed(prov); } catch {
+        throw new ServiceUnavailableException({ code: PLAN_ERRORS.PROVIDER_UNAVAILABLE, message: `El proveedor «${prov}» no está disponible en este momento: no se reservó saldo ni se llamó a nada. Intenta de nuevo más tarde.` });
+      }
+    }
+    const estimate = this.estimateOf(items.map((i) => i.view.plannedCall as PlannedCall), regen.length
+      ? `Generar ${items.length} ítem(s); ${regen.length} rehace(n) una actividad con los proveedores (IA, voz, video, presentación): el costo es por proveedor y nada corre hasta que lo apruebes. Un resultado incompleto no se aplica.`
+      : `Generar el contenido de ${items.length} ítem(s) (1 llamada cada uno; un reintento por validación entra en el margen). La IA no corre hasta que lo apruebes.`);
     const cap = this.validateConfirmation(estimate, input);
     const approval = await this.openApproval(s, actor, { kind: 'generate', itemIds: items.map((i) => i.id), estimate, capUsd: cap });
     const claimed = returningRows(await this.q(this.dataSource, `update public.workshop_requests set status = 'preparing', reason = null, updated_at = now() where id = any($1::uuid[]) and status = 'awaiting_generation' returning id`, [items.map((i) => i.request_id)]));
@@ -769,13 +815,18 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       if (!claimed) { await this.closeApproval(job.approvalId, 'failed', 'La entrada ya no estaba en cola.'); return; }
     }
     if ('approvalId' in job) await this.q(this.dataSource, `update public.workshop_ai_approvals set status = 'running', updated_at = now() where id = $1 and status = 'reserved'`, [job.approvalId]);
-    const bytes = Number(s.originalSize ?? 0) * diagnosisMemoryFactor(s.container);
+    // r107 B10: producir una regeneración (audiolibro, video, PDF) suma lo producido en memoria.
+    const bytes = Number(s.originalSize ?? 0) * diagnosisMemoryFactor(s.container) + (job.kind === 'generate' && (await this.approvalHasRegen(job.approvalId)) ? REGEN_MEMORY_EXTRA_BYTES : 0);
     try {
       await this.workshop.withMemory(`plan:${job.sessionId}`, bytes, async () => {
         let ctx: BuildCtx;
         try {
           const original = await this.workshop.loadVerifiedOriginal(s.id);
           ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
+          ctx.regenDbLoader = () => this.regenDbSources(s, ctx.course);
+          // r107 B10 · Libro v3 (PDF): la entrada del builder del curso, solo si hace falta (perezosa).
+          ctx.libroV3Loader = () => libroV3ResolverOf(this.dataSource, this.artifacts, this.moduleRef).resolve(s);
+          ctx.ttsModel = resolveTtsModel(undefined, process.env).model;
         } catch (err) {
           const body = (err as { getResponse?: () => any })?.getResponse?.();
           const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
@@ -979,6 +1030,11 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       }
       const [intake] = await this.q<IntakeRow[]>(this.dataSource, `select source from public.workshop_intakes where id = $1`, [row.intake_id]);
       const req: InterpretedRequest = { ...this.interpretedOf(row), status: 'resolved' };
+      if (isRegenOperation(req.operation)) {
+        const r = await this.runRegenItem(s, ctx, approval, item, row, req, intake?.source === 'finding');
+        if (r) stop = r;
+        continue;
+      }
       let prep: PreparedItem;
       try {
         prep = await prepareItem(ctx, req, ai, { fromFinding: intake?.source === 'finding' });
@@ -988,9 +1044,198 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
         await this.setRequest(row.id, { status: 'awaiting_generation', reason: `No se generó: ${err.message}` });
         continue;
       }
+      // r107 B10 · Libro v3: el PDF que armó el builder se guarda como resultado del Taller (el plan no lleva los bytes).
+      const lp = prep.view?.params as any;
+      if (prep.status === 'resolved' && lp && lp.op === 'edit_libro_section' && lp.pdf && lp.libroV3) {
+        try {
+          const ref = await storeRegenResult(this.dataSource, this.artifacts, { ownerId: s.ownerId, sessionId: s.id, approvalId: approval.id, itemId: item.id, requestId: row.id, operation: 'edit_libro_section',
+            produced: { kind: 'libro_pdf', moduleId: lp.moduleId, pdf: Buffer.from(String(lp.pdf.base64), 'base64'), previousSha1: lp.pdf.previousSha1, chapters: (lp.libroV3.chapters ?? []).map((c: any) => c.number) } });
+          prep.view!.params = { ...lp, pdf: undefined, libroV3: { ...lp.libroV3, result: ref } };
+        } catch (err) {
+          this.logger.error(`taller libro v3 ${s.id}: no se pudo guardar el PDF de ${item.id}: ${err instanceof Error ? err.message : String(err)}`);
+          await this.setRequest(row.id, { status: 'awaiting_generation', reason: 'No se pudo guardar el Libro regenerado (lo gastado quedó registrado): vuelve a generarlo en unos minutos.', addSpent: prep.spentUsd, addCalls: prep.calls });
+          continue;
+        }
+      }
       await this.saveItem(s, row.id, req, prep);
     }
     await this.closeApproval(approvalId, stop ? (stop.code === PLAN_ERRORS.CAP_REACHED ? 'stopped' : 'failed') : 'done', stop ? stop.message : null);
+  }
+
+  // ── r107 B10: rehacer actividades (Fase 3) ──
+
+  private async approvalHasRegen(approvalId: string): Promise<boolean> {
+    const a = await this.approvalOf(approvalId);
+    if (!a || !Array.isArray(a.item_ids) || !a.item_ids.length) return false;
+    const [r] = await this.q<any[]>(this.dataSource, `select count(*)::int as n from public.workshop_plan_items where id = any($1::uuid[]) and operation like 'regenerate\_%'`, [a.item_ids]);
+    return Number(r?.n ?? 0) > 0;
+  }
+
+  /** Proveedores reales con los clientes existentes; YouTube = la conexión del que paga; tema de Gamma = el del curso. */
+  private async defaultRegenProviders(s: WorkshopPlanSession, payer: string): Promise<RegenProviders> {
+    let youtube = null;
+    try {
+      const yt = this.moduleRef?.get(YoutubeService, { strict: false });
+      const up = this.moduleRef?.get(YoutubeUploadService, { strict: false });
+      if (yt && up) youtube = { connection: () => yt.getConnection(payer) as Promise<any>, upload: (c: unknown, a: { downloadUrl: string; title: string }) => up.uploadFromUrl(c as any, { downloadUrl: a.downloadUrl, title: a.title }) };
+    } catch { youtube = null; }
+    let gammaThemeId: string | null = null;
+    if (s.identifiedCourseId) {
+      try {
+        const p = await loadPackagingProfilesV3(this.dataSource as any, s.identifiedCourseId, false);
+        gammaThemeId = gammaThemeFor(p.theme.input.themeFamily as any, p.theme.input.mode as any);
+      } catch { gammaThemeId = null; }
+    }
+    return realRegenProviders(process.env, { youtube, gammaThemeId });
+  }
+
+  /**
+   * Fuente de la BASE para rehacer (curso identificado, mismo alcance que B2): el markdown de cada capítulo
+   * (`dynamic_content_md`) y su Context Package (`dynamic_context_package_json`) del run que armó el curso. Sin curso
+   * identificado o sin fuente → null (se usa la del paquete; la práctica H5P v3 queda no disponible).
+   */
+  async regenDbSources(s: WorkshopPlanSession, course: WorkshopCourse): Promise<RegenDbSources | null> {
+    if (!s.identifiedCourseId) return null;
+    try {
+      const [c] = await this.q<any[]>(this.dataSource, `select id, owner_id::text as owner_id, institution_id::text as institution_id, metadata->>'courseId' as fe from public.courses where id = $1`, [s.identifiedCourseId]);
+      if (!c) return null;
+      const inScope = s.institutionId ? String(c.institution_id ?? '').toLowerCase() === s.institutionId.toLowerCase() : String(c.owner_id ?? '').toLowerCase() === s.ownerId.toLowerCase();
+      if (!inScope) return null;
+      const refs = [String(c.id), ...(c.fe ? [String(c.fe)] : [])];
+      const rows = await this.q<any[]>(this.dataSource,
+        `select a.id::text as id, a.type, a.chapter_id::text as chapter_id, a.storage_bucket, a.storage_path, a.size_bytes from public.artifacts a
+          where a.owner_id::text = $1 and a.course_id::text = any($2::text[]) and a.type in ('dynamic_content_md', 'dynamic_context_package_json')
+            and a.chapter_id is not null and (a.status is null or a.status <> 'disabled')
+          order by a.created_at desc, a.id desc limit 2000`, [c.owner_id, refs]);
+      const numberOf = new Map(course.chapters.filter((x) => x.builderUuid).map((x) => [String(x.builderUuid).toLowerCase(), x.number]));
+      const out: RegenDbSources = { chapterMd: new Map(), contextPackage: new Map(), courseContext: null };
+      const seen = new Set<string>();
+      for (const r of rows) {
+        const n = numberOf.get(String(r.chapter_id).toLowerCase());
+        const k = `${r.type}:${n}`;
+        if (n === undefined || seen.has(k)) continue;
+        seen.add(k);
+        try {
+          const buf = await this.artifacts.downloadStorageObjectCapped(r.storage_bucket ?? 'cursia-artifacts', r.storage_path, { maxBytes: 4 * 1024 * 1024, timeoutMs: 60_000, sizeHint: r.size_bytes === null ? null : Number(r.size_bytes) });
+          const text = buf.toString('utf8');
+          if (r.type === 'dynamic_content_md') out.chapterMd.set(n, text);
+          else out.contextPackage.set(n, JSON.parse(text));
+        } catch (err) {
+          this.logger.warn(`taller regen ${s.id}: no se pudo leer la fuente ${r.id} (${err instanceof Error ? err.message.slice(0, 120) : String(err)}): se usa la del paquete`);
+        }
+      }
+      return out.chapterMd.size || out.contextPackage.size ? out : null;
+    } catch (err) {
+      if ((err as { code?: string })?.code === '42703') return null; // base sin chapter_id (anterior a r58)
+      throw err;
+    }
+  }
+
+  /**
+   * Compuerta de CADA llamada pagada de una regeneración (D9, B5): tope (gastado + cota ≤ autorizado), kill switch del
+   * proveedor, registro `sent` ANTES de enviar; después, el cargo real al ledger con el `approvalId` (o `ambiguous`:
+   * la cota cuenta como gastada, la reserva queda pendiente y nunca se reenvía sola).
+   */
+  regenGateFor(s: WorkshopPlanSession, approval: ApprovalRow, simulated: boolean): PaidCallGate & { spent(): string } {
+    const payer = approval.created_by;
+    const courseId = payer.toLowerCase() === s.ownerId.toLowerCase() ? s.identifiedCourseId : null;
+    let spentHere = 0;
+    const charge = { payer, courseId, approvalId: approval.id, sessionId: s.id, simulated };
+    return {
+      charge,
+      spent: () => spentHere.toFixed(6),
+      begin: async (spec): Promise<PaidCallTicket> => {
+        const cur = await this.approvalOf(approval.id);
+        if (!cur || (cur.status !== 'running' && cur.status !== 'reserved')) throw new RegenError('cap_reached', 'La aprobación ya no está vigente: no se hizo la llamada.');
+        const d = decideRunSpend({ authorizedBudget: Number(cur.cap_usd), runSpent: Number(cur.spent_usd), nextCost: Number(spec.boundUsd), itemSpent: null, itemExpected: null, itemEstimatedMax: null, runExpected: null, progressExpected: null });
+        if (!d.allow) {
+          throw new RegenError('cap_reached', `Se alcanzó el tope aprobado (USD ${Number(cur.cap_usd).toFixed(2)}; gastado USD ${Number(cur.spent_usd).toFixed(2)}): la siguiente llamada (${spec.provider}) podría costar hasta USD ${Number(spec.boundUsd).toFixed(2)}, así que NO se hizo. Aprueba un tope mayor para seguir.`, { capUsd: usd(cur.cap_usd), spentUsd: usd(cur.spent_usd) });
+        }
+        try { assertDirectCallAllowed(spec.provider); } catch {
+          throw new RegenError('not_sent', `El proveedor «${spec.provider}» no está disponible en este momento: no se hizo la llamada (sin cobro).`);
+        }
+        const rec: ApprovalCall & { provider?: string } = { id: randomUUID(), kind: `${spec.provider}:${spec.kind}`, attempt: spec.attempt, boundUsd: spec.boundUsd, status: 'sent', at: new Date().toISOString(), provider: spec.provider };
+        await this.setCall(approval.id, rec);
+        this.providerCalls[spec.provider] = (this.providerCalls[spec.provider] ?? 0) + 1;
+        return {
+          id: rec.id,
+          accepted: async (ext: string) => { rec.messageId = ext; await this.setCall(approval.id, rec); },
+          charged: async (m) => {
+            await this.q(this.dataSource, `update public.workshop_ai_approvals set spent_usd = spent_usd + $2, ai_calls = ai_calls + 1, updated_at = now() where id = $1`, [approval.id, m.costUsd]);
+            spentHere += Number(m.costUsd);
+            let recorded = !m.charge;
+            let err: string | null = null;
+            if (m.charge) {
+              if (!this.ledger) err = 'sin FinOps en este proceso';
+              else {
+                try { await this.ledger.recordCharge(m.charge); recorded = true; } catch (e) { err = e instanceof Error ? e.message.slice(0, 300) : String(e); }
+              }
+            }
+            if (!recorded) this.logger.error(`FINOPS_NOT_RECORDED: taller regen ${spec.provider}:${spec.kind} (${m.externalId ?? rec.messageId ?? 'sin id'}): ${err}`);
+            await this.setCall(approval.id, { ...rec, status: recorded ? 'charged' : 'charge_unrecorded', messageId: m.externalId ?? rec.messageId ?? null, costUsd: m.costUsd, error: err, charge: recorded ? null : m.charge });
+          },
+          failed: async (e: unknown, outcome) => {
+            const st = (e as { status?: unknown })?.status;
+            const msg = e instanceof Error ? e.message.slice(0, 300) : String(e).slice(0, 300);
+            await this.setCall(approval.id, { ...rec, status: outcome, providerStatus: typeof st === 'number' ? st : null, error: msg });
+            this.logger.error(`taller regen: ${spec.provider} ${spec.kind} falló (${outcome}): ${msg}`);
+            if (outcome === 'ambiguous') {
+              await this.q(this.dataSource, `update public.workshop_ai_approvals set spent_usd = spent_usd + $2, updated_at = now() where id = $1`, [approval.id, spec.boundUsd]);
+              spentHere += Number(spec.boundUsd);
+              return new RegenError('call_ambiguous', `${spec.provider} no confirmó el resultado y no se sabe si la llamada se cobró${rec.messageId ? ` (operación ${rec.messageId})` : ''}: no se reenvía sola y la reserva del tope queda pendiente hasta conciliarla.`, { provider: spec.provider, externalId: rec.messageId ?? null });
+            }
+            if (outcome === 'not_sent') return new RegenError('not_sent', `No se llegó a llamar a ${spec.provider} (no está disponible o falta su configuración): no se cobró nada.`);
+            return new RegenError('provider_rejected', `${spec.provider} rechazó la llamada sin cobrarla${typeof st === 'number' ? ` (HTTP ${st})` : ''}: vuelve a intentarlo más tarde.`);
+          },
+        };
+      },
+    };
+  }
+
+  /** Una regeneración aprobada: producir → guardar el resultado (artifact) → ítem listo con su prueba en seco. */
+  private async runRegenItem(s: WorkshopPlanSession, ctx: BuildCtx, approval: ApprovalRow, item: ItemRow, row: RequestRow, req: InterpretedRequest, fromFinding: boolean): Promise<AiUnavailableError | null> {
+    let providers: RegenProviders;
+    try {
+      providers = await this.regenProviders(s, approval.created_by);
+    } catch (err) {
+      const m = `Los proveedores no están disponibles: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}. No se llamó a nada.`;
+      await this.setRequest(row.id, { status: 'awaiting_generation', reason: `No se generó: ${m}` });
+      return new AiUnavailableError(PLAN_ERRORS.AI_UNAVAILABLE, m);
+    }
+    const gate = this.regenGateFor(s, approval, providers.simulated === true);
+    let prep;
+    try {
+      prep = await prepareRegenItem(ctx, req, { providers, gate, spent: () => gate.spent() }, { fromFinding });
+    } catch (err) {
+      if (!(err instanceof RegenError)) throw err;
+      const code = err.code === 'cap_reached' ? PLAN_ERRORS.CAP_REACHED : err.code === 'call_ambiguous' ? PLAN_ERRORS.CALL_AMBIGUOUS : PLAN_ERRORS.AI_UNAVAILABLE;
+      await this.setRequest(row.id, { status: 'awaiting_generation', reason: `No se generó: ${err.message}`, addSpent: gate.spent() });
+      return new AiUnavailableError(code, err.message, err.extra);
+    }
+    if (prep.status === 'resolved' && prep.produced && prep.view) {
+      let ref: RegenResultRef;
+      try {
+        ref = await storeRegenResult(this.dataSource, this.artifacts, { ownerId: s.ownerId, sessionId: s.id, approvalId: approval.id, itemId: item.id, requestId: row.id, operation: String(req.operation), produced: prep.produced });
+      } catch (err) {
+        this.logger.error(`taller regen ${s.id}: no se pudo guardar el resultado de ${item.id}: ${err instanceof Error ? err.message : String(err)}`);
+        await this.setRequest(row.id, { status: 'awaiting_generation', reason: 'No se pudo guardar el resultado producido (lo gastado quedó registrado): vuelve a generarlo en unos minutos.', addSpent: gate.spent() });
+        return null;
+      }
+      prep.view.params = { ...(prep.view.params as RegenerateOp), result: ref } as any;
+      await this.saveItem(s, row.id, { ...req, details: { ...req.details, regenResult: ref } }, { ...prep, produced: null } as PreparedItem);
+      return null;
+    }
+    if (prep.failure?.retryable) {
+      await this.setRequest(row.id, { status: 'awaiting_generation', reason: prep.reason, addSpent: prep.spentUsd });
+      return null;
+    }
+    await this.saveItem(s, row.id, req, prep);
+    return null;
+  }
+
+  /** Parámetros del motor con el resultado de una regeneración cargado y verificado (los demás, tal cual). */
+  async resolveRegenParams<T>(s: { id: string; ownerId: string }, params: T): Promise<T> {
+    return resolveRegenParams(this.dataSource, this.artifacts, s, params);
   }
 
   private async failIntake(id: string, code: string, message: string, retryable: boolean, extra: Record<string, unknown> = {}): Promise<void> {
@@ -1038,7 +1283,16 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     const planId = await this.planIdOf(s);
     const items = await this.q<ItemRow[]>(this.dataSource, `select i.* from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
         where i.plan_id = $1 and i.status = 'proposed' and i.stage = 'ready' and i.available and r.status = 'resolved' order by i.created_at, i.id`, [planId]);
-    const c = await combinedDryRun(ctx, items.map((i) => i.params));
+    let ops;
+    try {
+      ops = await Promise.all(items.map((i) => this.resolveRegenParams(s, i.params)));
+    } catch (err) {
+      // r107 B10: un resultado de regeneración que falta o no coincide → la prueba en seco combinada falla con motivo.
+      await this.q(this.dataSource, `update public.workshop_plans set combined = $2::jsonb, updated_at = now() where id = $1`,
+        [planId, JSON.stringify({ ok: false, failure: { opIndex: null, code: PLAN_ERRORS.REGEN_RESULT_MISSING, message: err instanceof Error ? err.message : String(err) }, resolved: 0, operations: items.length, itemIds: items.map((i) => i.id), itemHashes: items.map((i) => itemContentHash({ operation: i.operation, stage: i.stage, params: i.params ?? null, view: i.view ?? null })), failedItemId: null, at: new Date().toISOString() })]);
+      return;
+    }
+    const c = await combinedDryRun(ctx, ops);
     await this.q(this.dataSource, `update public.workshop_plans set combined = $2::jsonb, updated_at = now() where id = $1`,
       [planId, JSON.stringify({ ...c, itemIds: items.map((i) => i.id),
         // r107 B6 fix round 2 (nota): huella del contenido de cada ítem probado (aplicar compara contra la del ítem actual).

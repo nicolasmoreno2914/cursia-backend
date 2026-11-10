@@ -280,11 +280,12 @@ function resolveTarget(op: RequestOperation, t: RawTarget, r: RawAiRequest, cour
       if (!libros.length) return { unavailable: 'Este curso no tiene Libro Guía en el paquete.' };
       if (!a || a.kind !== 'libro') return { question: targetQuestion('¿Qué Libro Guía?', libros.map((l) => ({ label: l.title, resolves: { moduleId: l.moduleId } }))), reason: 'El destino no es el Libro Guía.' };
       const fmt = course.libro.find((l) => l.moduleId === a.moduleId)?.format;
-      if (fmt === 'pdf') return { unavailable: 'El Libro Guía de este curso es un PDF: editarlo exige su fuente por capítulo, que llega con la aplicación de arreglos (B6). Mientras tanto se puede cambiar el texto del capítulo en el curso.' };
+      // r107 B10: el Libro v3 (PDF) se edita con la FUENTE del curso (markdown por capítulo) y el builder rearma el PDF;
+      // si esa fuente no está (curso no identificado, otro tema…), el armado del ítem lo deja no disponible con el motivo.
       if (fmt === 'book') return { unavailable: 'El Libro de este curso es un libro en línea: pide el cambio sobre el capítulo (texto de la actividad), no sobre el Libro.' };
       const chapters = (t.chapters ?? (t.chapterNumber !== undefined ? [t.chapterNumber] : [])).filter((n) => chapterExists(n));
       if (!chapters.length) return { question: targetQuestion('¿Qué capítulo del Libro Guía?', course.chapters.map((c) => ({ label: `Capítulo ${c.number}${c.title ? `: ${c.title}` : ''}`, resolves: { moduleId: a.moduleId, chapterNumber: c.number } }))), reason: 'El pedido no dice qué capítulo del Libro.' };
-      return { target: { kind: 'libro', moduleId: a.moduleId, chapters: chapters.sort((x, y) => x - y), title: a.title, recompose: false } };
+      return { target: { kind: 'libro', moduleId: a.moduleId, chapters: chapters.sort((x, y) => x - y), title: a.title, recompose: false, ...(fmt === 'pdf' ? { pdf: true } : {}) } };
     }
     case 'exam_question_replace': case 'exam_question_remove': {
       const exams = examsOf(course);
