@@ -183,7 +183,7 @@ export function audioRecountProblems(p: Extract<ProducedRegen, { kind: 'audio' }
 }
 
 /** sco / sco_data nuevos en su rango (60000+), sin repetir NINGÚN id del paquete. */
-async function scoIdAllocator(ctx: OpContext): Promise<() => number> {
+export async function scoIdAllocator(ctx: OpContext): Promise<() => number> {
   const used = new Set<number>();
   let max = 59_999;
   for (const n of ctx.state.names()) {

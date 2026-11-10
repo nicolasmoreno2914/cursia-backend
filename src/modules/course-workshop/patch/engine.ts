@@ -30,9 +30,11 @@ import { applyExamAdd, applyExamRemove, applyExamReplace } from './op-exam';
 import { applyBrandReplace } from './op-brand';
 import { applyRemoveActivity } from './op-remove';
 import { applyRegenerate } from './op-regenerate';
+import { applyAddChapter } from './op-add-chapter';
+import { applyAddModule } from './op-add-module';
 import { DiagnosisDelta, OperationReport, PATCH_OPERATIONS, PatchError, PatchFailure, PatchOperation, PatchResult, emptyReport } from './types';
 
-export const PATCH_ENGINE_VERSION = 'b10-r0';
+export const PATCH_ENGINE_VERSION = 'b11-r0';
 
 export interface PatchInput {
   /** Bytes del paquete ORIGINAL verificado (B2 `loadVerifiedOriginal`). No se modifican. */
@@ -138,6 +140,8 @@ async function runOp(ctx: OpContext, op: PatchOperation): Promise<void> {
     case 'brand_replace': return applyBrandReplace(ctx, op);
     case 'remove_activity': return applyRemoveActivity(ctx, op);
     case 'regenerate_scorm': case 'regenerate_video': case 'regenerate_gamma': case 'regenerate_audio': return applyRegenerate(ctx, op);
+    case 'add_chapter': return applyAddChapter(ctx, op);
+    case 'add_module': return applyAddModule(ctx, op);
     default: throw new PatchError('invalid_params', `Operación fuera del catálogo de esta fase: «${(op as { op?: string }).op}».`);
   }
 }
@@ -227,6 +231,22 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
     const r = fail({ opIndex: null, op: null, code: 'new_findings', message: `El resultado tiene ${delta.introduced.length} hallazgo(s) nuevo(s): ${delta.introduced.slice(0, 3).map((x) => `[${x.severity}] ${x.title}`).join(' · ')}` }, pkg.container);
     r.diagnosis = delta;
     return r;
+  }
+  // r107 B11: agregar capítulo / módulo — los conteos de capítulos y actividades suben EXACTO lo agregado (ni más ni menos).
+  const adds = input.operations.map((o, i) => ({ o, r: reports[i] })).filter((x) => x.o.op === 'add_chapter' || x.o.op === 'add_module');
+  if (adds.length) {
+    const wantCh = adds.reduce((n, x) => n + (x.o.op === 'add_chapter' ? 1 : ((x.o as any).produced?.chapters?.length ?? 0)), 0);
+    const wantAct = adds.reduce((n, x) => n + (x.r.idsAssigned.moduleid?.length ?? 0), 0);
+    try {
+      const invOf = async (p: MbzPackage) => buildWorkshopCourse(await readRawCourse(p, meta), adapterFor(family));
+      const b = await invOf(await openMbz(input.original));
+      const a = await invOf(await openMbz(bytes));
+      const dCh = a.chapters.length - b.chapters.length;
+      const dAct = a.activities.length - b.activities.length;
+      if (dCh !== wantCh || dAct !== wantAct) return fail({ opIndex: null, op: null, code: 'invariant', message: `El paquete nuevo tiene ${dCh} capítulo(s) y ${dAct} actividad(es) más; se agregaron ${wantCh} y ${wantAct}.` }, pkg.container);
+    } catch (e) {
+      return fail({ opIndex: null, op: null, code: 'invariant', message: `No se pudieron contar los capítulos del resultado: ${e instanceof Error ? e.message : String(e)}` }, pkg.container);
+    }
   }
   return { ok: true, package: bytes, container: pkg.container, sha1: sha1Of(bytes), operations: reports, diagnosis: delta, preservedEntries: preserved, failure: null };
 }

@@ -36,6 +36,11 @@ export class IdAllocator {
     return new IdAllocator(max, used);
   }
 
+  /** r107 B11: marca como usados ids que el escaneo general no ve (atributos `contextid="N"` / `moduleid="N"`). */
+  reserve(ids: Iterable<number>): void {
+    for (const v of ids) this.used.add(v);
+  }
+
   /** Id nuevo para `kind` (solo para el informe: el espacio es uno solo). */
   take(kind: string): number {
     while (this.used.has(this.next)) this.next++;
