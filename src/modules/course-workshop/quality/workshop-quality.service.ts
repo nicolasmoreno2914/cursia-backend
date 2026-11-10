@@ -65,6 +65,23 @@ type Job =
   | { kind: 'answer'; questionId: string; approvalId: string };
 
 const REVIEWABLE: ReadonlySet<ChapterAiStatus> = new Set(['not_reviewed', 'failed', 'stopped']);
+/**
+ * Re-review 2 (P2-R2-1): ¿la llamada de este capítulo PUDO cobrarse? Ambiguo, o fallido con la llamada ambigua / en vuelo.
+ * Regla ÚNICA (alcance, guarda bajo lock y vista): desde que termina la corrida no se puede volver a pagar, aunque la
+ * sincronización a `ambiguous` todavía no haya corrido (o haya fallado: la repara el barrido).
+ */
+export function chapterMayBeCharged(c: { status?: string; errorCode?: string | null; callMayHaveBeenSent?: boolean } | null | undefined): boolean {
+  if (!c) return false;
+  return c.status === 'ambiguous' || (c.status === 'failed' && (c.errorCode === PLAN_ERRORS.CALL_AMBIGUOUS || c.callMayHaveBeenSent === true));
+}
+export function chapterReviewable(c: ChapterState | null | undefined): boolean {
+  return !!c && REVIEWABLE.has(c.status) && !chapterMayBeCharged(c);
+}
+/** Lo mismo para una pregunta (no se puede volver a confirmar, y se muestra como `ambiguous`). */
+export function questionMayBeCharged(r: { status?: string; error?: any } | null | undefined): boolean {
+  if (!r) return false;
+  return r.status === 'ambiguous' || (r.status === 'failed' && (r.error?.code === PLAN_ERRORS.CALL_AMBIGUOUS || r.error?.callMayHaveBeenSent === true));
+}
 const IN_FLIGHT: ReadonlySet<ChapterAiStatus> = new Set(['queued', 'reviewing']);
 
 @Injectable()
@@ -180,7 +197,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
    */
   async expireStale(sessionId: string | null): Promise<void> {
     const runs = await this.q<RunRow[]>(this.dataSource, `select id, status, claim_id, ai_claim_id, chapters, updated_at from public.workshop_quality_runs where ($1::uuid is null or session_id = $1::uuid)
-        and (status in ('queued', 'running') or chapters::text ~ '"status": ?"(queued|reviewing|ambiguous)"' or chapters::text ~ '"callMayHaveBeenSent": ?true')`, [sessionId]);
+        and (status in ('queued', 'running') or chapters::text ~ '"status": ?"(queued|reviewing|ambiguous)"' or chapters::text ~ '"callMayHaveBeenSent": ?true' or chapters::text ~ '"errorCode": ?"WORKSHOP_AI_CALL_AMBIGUOUS"')`, [sessionId]);
     for (const r of runs) {
       if ((r.status === 'queued' || r.status === 'running') && this.abandoned(r.claim_id, r.updated_at, r.id)) {
         await this.q(this.dataSource, `update public.workshop_quality_runs set status = 'failed', claim_id = null, error = $3::jsonb, updated_at = now() where id = $1 and claim_id is not distinct from $2 and status in ('queued', 'running')`,
@@ -195,7 +212,8 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
         }, true);
         for (const a of approvals) await this.plan.closeApproval(a, 'failed', 'Se interrumpió (reinicio del servidor).');
       }
-      await this.syncAmbiguousChapters(r.id);
+      // Re-review 2: una falla acá no es silenciosa y no rompe el barrido; el próximo barrido lo vuelve a intentar.
+      await this.syncAmbiguousChapters(r.id).catch((e) => this.logger.error(`taller calidad: no se pudo sincronizar el estado ambiguo del diagnóstico ${r.id} (se reintenta en el barrido): ${e instanceof Error ? e.message : String(e)}`));
     }
     const qs = await this.q<QuestionRow[]>(this.dataSource, `select id, status, claim_id, approval_id, updated_at from public.workshop_questions where ($1::uuid is null or session_id = $1::uuid) and status in ('retrieving', 'answering')`, [sessionId]);
     for (const x of qs) {
@@ -204,7 +222,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
         [x.id, x.claim_id, JSON.stringify({ code: QUALITY_ERRORS.INTERRUPTED, message: 'La pregunta se interrumpió (reinicio del servidor); vuelve a hacerla.', retryable: true, callMayHaveBeenSent: x.status === 'answering' })])) as any[];
       if (r?.approval_id && x.status === 'answering') await this.plan.closeApproval(r.approval_id, 'failed', 'Se interrumpió (reinicio del servidor).');
     }
-    await this.syncAmbiguousQuestions(sessionId);
+    await this.syncAmbiguousQuestions(sessionId).catch((e) => this.logger.error(`taller calidad: no se pudo sincronizar preguntas ambiguas (se reintenta en el barrido): ${e instanceof Error ? e.message : String(e)}`));
   }
 
   /**
@@ -333,7 +351,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
     const ok = await this.dataSource.transaction(async (m) => {
       const [r] = await this.q<RunRow[]>(m, `select chapters, status from public.workshop_quality_runs where id = $1 for update`, [run!.id]);
       const ch = r.chapters ?? {};
-      if (r.status !== 'ready' || Object.values(ch).some((c) => IN_FLIGHT.has(c.status)) || chapters.some((n) => !REVIEWABLE.has(ch[String(n)]?.status))) return false;
+      if (r.status !== 'ready' || Object.values(ch).some((c) => IN_FLIGHT.has(c.status)) || chapters.some((n) => !chapterReviewable(ch[String(n)]))) return false;
       for (const n of chapters) ch[String(n)] = { ...ch[String(n)], status: 'queued', approvalId: approval.id, reason: null };
       await this.q(m, `update public.workshop_quality_runs set chapters = $2::jsonb, ai_claim_id = $3, updated_at = now() where id = $1`, [run!.id, JSON.stringify(ch), claimId]);
       return true;
@@ -350,7 +368,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
 
   /** Alcance pedido → capítulos a revisar (validados contra lo que se puede revisar). */
   private selectChapters(run: RunRow, raw: unknown): number[] {
-    const reviewable = (run.calls ?? []).filter((c) => c.call && REVIEWABLE.has(run.chapters?.[String(c.chapterNumber)]?.status)).map((c) => c.chapterNumber);
+    const reviewable = (run.calls ?? []).filter((c) => c.call && chapterReviewable(run.chapters?.[String(c.chapterNumber)])).map((c) => c.chapterNumber);
     if (raw === undefined || raw === null || raw === 'all') {
       if (!reviewable.length) throw new ConflictException({ code: QUALITY_ERRORS.NOTHING_TO_REVIEW, message: 'No queda ningún capítulo por revisar con IA.' });
       return reviewable;
@@ -381,15 +399,17 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
       const p = (run.packets ?? []).find((x) => x.chapterNumber === c.chapterNumber);
       return {
         number: c.chapterNumber, title: p?.chapterTitle ?? inv?.chapters.find((x) => x.number === c.chapterNumber)?.title ?? null,
-        status: st?.status ?? 'not_applicable', reason: st?.reason ?? c.reason,
+        status: (chapterMayBeCharged(st) ? 'ambiguous' : st?.status ?? 'not_applicable') as ChapterAiStatus,
+        reason: chapterMayBeCharged(st) && st?.status !== 'ambiguous' ? 'No se sabe si la llamada a la IA se cobró: el capítulo queda en revisión hasta que un administrador lo concilie. No se puede volver a aprobar mientras tanto.' : st?.reason ?? c.reason,
+        reviewable: chapterReviewable(st) && !!c.call,
         estimate: c.call ? { expectedUsd: c.call.expectedUsd, boundUsd: c.call.boundUsd, promptChars: c.promptChars, maxTokens: c.call.maxTokens, model: c.call.model } : null,
         evidence: p ? { blocks: p.docs.length, truncated: p.truncated, omittedBlocks: p.omittedDocs } : null,
-        errorCode: st?.errorCode ?? (st?.status === 'ambiguous' ? PLAN_ERRORS.CALL_AMBIGUOUS : null),
+        errorCode: chapterMayBeCharged(st) ? PLAN_ERRORS.CALL_AMBIGUOUS : st?.errorCode ?? null,
         approvalId: st?.approvalId ?? null, spentUsd: st?.spentUsd ?? '0', aiCalls: st?.aiCalls ?? 0, accepted: st?.accepted ?? 0, rejected: st?.rejected ?? 0, reviewedAt: st?.reviewedAt ?? null,
       };
     });
-    const reviewableCalls = chapters.filter((c) => REVIEWABLE.has(c.status as ChapterAiStatus) && c.estimate).map((c) => (run.calls ?? []).find((x) => x.chapterNumber === c.number)!.call as PlannedCall);
-    const all = reviewableCalls.length ? { chapters: chapters.filter((c) => REVIEWABLE.has(c.status as ChapterAiStatus) && c.estimate).map((c) => c.number), ...this.plan.estimateOf(reviewableCalls, `Revisar con IA los ${reviewableCalls.length} capítulo(s) que faltan (1 llamada por capítulo). La IA no corre hasta que lo apruebes.`) } : null;
+    const reviewableCalls = chapters.filter((c) => c.reviewable && c.estimate).map((c) => (run.calls ?? []).find((x) => x.chapterNumber === c.number)!.call as PlannedCall);
+    const all = reviewableCalls.length ? { chapters: chapters.filter((c) => c.reviewable && c.estimate).map((c) => c.number), ...this.plan.estimateOf(reviewableCalls, `Revisar con IA los ${reviewableCalls.length} capítulo(s) que faltan (1 llamada por capítulo). La IA no corre hasta que lo apruebes.`) } : null;
     const aiDone = (ok: (x: (typeof chapters)[number]) => boolean) => chapters.filter((c) => c.status !== 'not_applicable').every(ok);
     const aiStatus = chapters.every((c) => c.status === 'not_applicable') ? 'not_applicable' : aiDone((c) => c.status === 'reviewed') ? 'done' : chapters.some((c) => c.status === 'reviewed') ? 'partial' : 'pending';
     const approvals = await this.q<any[]>(this.dataSource, `select * from public.workshop_ai_approvals where session_id = $1 and kind = 'quality' order by created_at`, [s.id]);
@@ -437,7 +457,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
 
   private async confirmQuestion(actor: WorkshopActor, s: WorkshopPlanSession, questionId: string, body: { confirmEstimateUsd?: unknown; capUsd?: unknown }) {
     const row = await this.questionOf(s, questionId);
-    if (row.status !== 'awaiting_confirmation' || !row.estimate || !row.evidence?.passages?.length) throw new ConflictException({ code: QUALITY_ERRORS.QUESTION_NOT_AWAITING, message: 'Esta pregunta no está esperando que apruebes su costo.', status: row.status });
+    if (row.status !== 'awaiting_confirmation' || questionMayBeCharged(row) || !row.estimate || !row.evidence?.passages?.length) throw new ConflictException({ code: QUALITY_ERRORS.QUESTION_NOT_AWAITING, message: 'Esta pregunta no está esperando que apruebes su costo.', status: row.status });
     const cap = this.plan.validateConfirmation(row.estimate, { confirmEstimateUsd: body.confirmEstimateUsd, capUsd: body.capUsd });
     const approval = await this.plan.openApproval(s, actor, { kind: 'question', estimate: row.estimate, capUsd: cap });
     const claimId = this.claimOf();
@@ -468,14 +488,14 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
   questionView(r: QuestionRow) {
     const ev = r.evidence;
     return {
-      id: r.id, question: r.question, status: r.status, originalSha1: r.original_sha1,
+      id: r.id, question: r.question, status: questionMayBeCharged(r) ? 'ambiguous' : r.status, originalSha1: r.original_sha1,
       evidence: ev ? {
         scope: ev.scope, truncated: ev.truncated,
         passages: ev.passages.map((p) => ({ id: p.id, moduleId: p.moduleId, questionId: p.questionId, chapterNumber: p.chapterNumber, what: p.what, activityTitle: p.activityTitle, excerpt: p.text.length > 280 ? `${p.text.slice(0, 279)}…` : p.text })),
       } : null,
       estimate: r.estimate ?? null, approvalId: r.approval_id, spentUsd: usd(r.spent_usd), aiCalls: Number(r.ai_calls ?? 0),
       answer: r.answer ?? null,
-      error: r.error && typeof r.error === 'object' ? { code: String(r.error.code), message: String(r.error.message), retryable: r.error.retryable === true } : null,
+      error: r.error && typeof r.error === 'object' ? (questionMayBeCharged(r) ? { code: PLAN_ERRORS.CALL_AMBIGUOUS, message: r.status === 'ambiguous' ? String(r.error.message) : 'No se sabe si la llamada a la IA se cobró: la pregunta queda en revisión hasta que un administrador lo concilie.', retryable: false } : { code: String(r.error.code), message: String(r.error.message), retryable: r.error.retryable === true }) : null,
       createdAt: iso(r.created_at), updatedAt: iso(r.updated_at),
     };
   }
@@ -575,7 +595,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
       await this.plan.closeApproval(job.approvalId, 'failed', msg).catch((e) => this.logger.error(`FINOPS_RESERVATION_NOT_SETTLED: aprobación ${job.approvalId}: ${e instanceof Error ? e.message : String(e)}`));
       this.plan.releaseApproval(job.approvalId, claimId);
       this.activeIds.delete(`ai:${job.runId}`);
-      await this.syncAmbiguousChapters(job.runId).catch((e) => this.logger.warn(`taller calidad: estado ambiguo: ${e instanceof Error ? e.message : String(e)}`));
+      await this.syncAmbiguousChapters(job.runId).catch((e) => this.logger.error(`taller calidad: no se pudo sincronizar el estado ambiguo del diagnóstico ${job.runId} (el capítulo sigue sin poder reaprobarse; lo repara el barrido): ${e instanceof Error ? e.message : String(e)}`));
     }
   }
 
@@ -704,7 +724,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
       await this.plan.closeApproval(job.approvalId, 'failed', msg).catch((e) => this.logger.error(`FINOPS_RESERVATION_NOT_SETTLED: aprobación ${job.approvalId}: ${e instanceof Error ? e.message : String(e)}`));
       this.plan.releaseApproval(job.approvalId, claimId);
       const [qq] = await this.q<any[]>(this.dataSource, `select session_id from public.workshop_questions where id = $1`, [job.questionId]).catch(() => [] as any[]);
-      if (qq) await this.syncAmbiguousQuestions(qq.session_id).catch(() => undefined);
+      if (qq) await this.syncAmbiguousQuestions(qq.session_id).catch((e) => this.logger.error(`taller calidad: no se pudo sincronizar el estado ambiguo de la pregunta ${job.questionId} (lo repara el barrido): ${e instanceof Error ? e.message : String(e)}`));
     }
   }
 

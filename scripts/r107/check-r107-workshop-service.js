@@ -101,6 +101,7 @@
 //   W83 compuertas y rutas · W84 reclamo + latido entre procesos (diagnóstico, revisión con IA, pregunta)
 //   W85 (ronda) un error antes del try interno de la revisión / la respuesta cierra y suelta la aprobación
 //   W86 (B8fe P2-3) pregunta / capítulo AMBIGUO no reaprobable hasta la conciliación; capFactor en la vista
+//   W87 (re-review 2) «pudo cobrarse» no reaprobable desde el fin de la corrida aunque la sincronización falle; el barrido repara
 //
 // Uso: node scripts/r107/check-r107-workshop-service.js [--dist dist]
 'use strict';
@@ -2641,6 +2642,46 @@ function rawZip(entries) {
       eq([h.status, h.error.retryable], ['failed', true], 'conciliada → fallida reintentable');
       await quality.startQuality(OWNER, sid, {}); await qidle();
       eq((await quality.getQuality(OWNER, sid)).ai.capFactor, 1.5, 'capFactor del servidor en la vista');
+    });
+
+    await check('W87 (B8 re-review 2, P2-R2-1) un capítulo cuya llamada PUDO cobrarse es NO reaprobable desde que termina la corrida, aunque la sincronización a `ambiguous` no haya corrido o falle: «todo el curso» lo excluye, pedirlo → 400, la vista lo muestra ambiguo; el barrido lo repara', async () => {
+      const sid = await diagnosed('b8-sync-falla.mbz', QV1);
+      await quality.startQuality(OWNER, sid, {}); await qidle();
+      let g = await quality.getQuality(OWNER, sid);
+      const realSync = quality.syncAmbiguousChapters.bind(quality);
+      let syncCalls = 0;
+      quality.syncAmbiguousChapters = async () => { syncCalls++; throw new Error('base caída (simulada) en la sincronización'); };
+      let a;
+      try {
+        aiSim.throwNext = Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' });
+        a = await quality.startQuality(OWNER, sid, { chapters: [1], confirmEstimateUsd: Number(g.ai.chapters[0].estimate.expectedUsd), capUsd: Number(g.ai.chapters[0].estimate.boundUsd) + 0.01 });
+        await qidle();
+        const [row] = await ds.query(`select chapters from public.workshop_quality_runs where id = $1`, [g.runId]);
+        eq([row.chapters['1'].status, row.chapters['1'].errorCode], ['failed', 'WORKSHOP_AI_CALL_AMBIGUOUS'], 'en la base todavía `failed` (la sincronización falló)');
+        assert(syncCalls >= 1, 'la sincronización se intentó');
+        g = await quality.getQuality(OWNER, sid);
+        eq([g.ai.chapters[0].status, g.ai.chapters[0].errorCode, g.ai.chapters[0].reviewable], ['ambiguous', 'WORKSHOP_AI_CALL_AMBIGUOUS', false], 'la vista lo muestra ambiguo y no reaprobable');
+        eq(g.ai.all.chapters, [2], '«todo el curso» lo excluye');
+        aiSim.calls = [];
+        await rejects(quality.startQuality(OWNER, sid, { chapters: [1], confirmEstimateUsd: Number(g.ai.chapters[0].estimate.expectedUsd), capUsd: 1 }), 400, 'WORKSHOP_QUALITY_CHAPTERS_INVALID', 'pedirlo → 400');
+        const b = await confirmAll(sid, g); await qidle();
+        eq(aiSim.calls.map((c) => /Capítulo 2/.test(c.user)), [true], 'solo se revisó el 2: nunca se volvió a pagar el 1');
+        eq(b.approval.estimate.calls.length, 1, 'el estimado aprobado es de un capítulo');
+      } finally { quality.syncAmbiguousChapters = realSync; }
+      // El barrido lo repara (estado guardado `ambiguous`).
+      await quality.sweep();
+      const [row2] = await ds.query(`select chapters from public.workshop_quality_runs where id = $1`, [g.runId]);
+      eq(row2.chapters['1'].status, 'ambiguous', 'reparado por el barrido');
+      // Pregunta: «fallida con llamada ambigua» se muestra ambigua y no se vuelve a confirmar aunque no se haya sincronizado.
+      const q = await quality.ask(OWNER, sid, { text: '¿El video del capítulo 1 dice bien la velocidad máxima en zona escolar?' }); await qidle();
+      await ds.query(`update public.workshop_questions set status = 'failed', error = '{"code":"WORKSHOP_AI_CALL_AMBIGUOUS","message":"x","retryable":false}'::jsonb where id = $1`, [q.id]);
+      const realQ = quality.syncAmbiguousQuestions.bind(quality);
+      quality.syncAmbiguousQuestions = async () => { throw new Error('caída'); };
+      try {
+        const h = (await quality.listQuestions(OWNER, sid)).questions.find((x) => x.id === q.id);
+        eq([h.status, h.error.code, h.error.retryable], ['ambiguous', 'WORKSHOP_AI_CALL_AMBIGUOUS', false], 'pregunta ambigua en la vista');
+        await rejects(quality.ask(OWNER, sid, { questionId: q.id, confirmEstimateUsd: 0.01, capUsd: 1 }), 409, 'WORKSHOP_QUESTION_NOT_AWAITING_CONFIRMATION', 'no se vuelve a confirmar');
+      } finally { quality.syncAmbiguousQuestions = realQ; }
     });
 
     await check('W9 guard del flag: apagado / fuera de la lista → 404; listado → pasa; lista inválida → 500', async () => {
