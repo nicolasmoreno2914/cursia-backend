@@ -265,14 +265,16 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     ]));
     const { out, items } = await runText(ctxV1, text, ai);
     // r107 B10: rehacer el juego ya no es «fase posterior»: se resuelve y queda en etapa de ESTIMADO por proveedor (Fase 3).
-    eq(out.requests.map((r) => r.status), ['resolved', 'phase_later', 'out_of_scope', 'unavailable'], 'estados');
+    // r107 B11: agregar capítulo ya no es «fase posterior»: sin el TÍTULO del capítulo en el pedido, el servidor pregunta (D6).
+    eq(out.requests.map((r) => r.status), ['resolved', 'needs_answer', 'out_of_scope', 'unavailable'], 'estados');
+    assert(/título/.test(out.requests[1].questions[0].text), 'pregunta el título del capítulo nuevo');
     eq(out.requests[0].target.moduleId, 912, 'el juego del capítulo 1');
     assert(/traducir|idioma/i.test(out.requests[2].reason) && /logo/.test(out.requests[3].reason), 'motivos visibles');
     const regenEst = await PL.estimateContent(ctxV1, out.requests[0]);
     assert(regenEst && regenEst.kind === 'regenerate' && regenEst.regen.providers.some((l) => l.provider === 'anthropic') && Number(regenEst.expectedUsd) > 0, `rehacer el juego: estimado por proveedor ANTES de gastar (${JSON.stringify(regenEst).slice(0, 200)})`);
     eq(items[0].prep.status, 'failed', 'rehacer no se prepara al armar el plan (se produce con su aprobación)');
     const later = items.filter((x) => x.prep && x.prep.status === 'phase_later');
-    eq(later.map((x) => [x.prep.status, x.prep.view.available, x.prep.view.params]), [['phase_later', false, null]], 'en el plan, no disponibles');
+    eq(later.length, 0, 'r107 B11: ya no hay operaciones de fase posterior');
     for (const x of later) {
       const direct = PL.memOf(EST.estimateCost({ items: PL.laterItems(x.req.operation, x.req.details, ctxV1.course), catalog: PRICING.catalog, usageModel: UM.usageModelPriorsV1(), retryPolicy: PRICING.retryPolicy }));
       eq(x.prep.view.cost.apply, direct, `${x.req.operation}: costo = estimator`);
@@ -289,7 +291,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     const pdfEst = await B.estimateContent(ctxAS, pdf.requests[0]);
     assert(pdfEst && /PDF/.test(pdfEst.unavailable || ''), `sin la fuente del curso: no disponible (${JSON.stringify(pdfEst)})`);
     const tot = PL.planTotals({ spent: [out.spentUsd], available: [], later: later.map((x) => x.prep.view.cost.apply) });
-    eq([Number(tot.proposedCapUsd), Number(tot.later.expected) > 0], [0, true], 'tope 0 (nada disponible que aplique con IA); fase posterior visible');
+    eq([Number(tot.proposedCapUsd), Number(tot.later.expected)], [0, 0], 'tope 0 (nada disponible que aplique con IA); r107 B11: sin fase posterior');
   });
 
   await check('C4 documento HOSTIL (DOCX) → leído con el lector existente, dato delimitado; sin efecto fuera del catálogo ni de la sesión', async () => {
@@ -330,7 +332,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     assert(/inventado/.test(it.reason) && /script/.test(it.reason), it.reason);
     const contentCalls = ai.calls.filter((c) => c.purpose === 'content');
     eq(contentCalls.map((c) => c.attempt), [1, 2], 'un reintento de contenido');
-    for (const r of out.requests) assert(r.operation === null || [...PL.PHASE2_OPERATIONS, ...PL.LATER_OPERATIONS].includes(r.operation), 'catálogo cerrado');
+    for (const r of out.requests) assert(r.operation === null || [...PL.PHASE2_OPERATIONS, ...PL.PHASE3_OPERATIONS, ...PL.PHASE4_OPERATIONS].includes(r.operation), 'catálogo cerrado');
     for (const r of out.requests) if (r.target && 'moduleId' in r.target) assert(ctxV1.course.activities.some((a) => a.moduleId === r.target.moduleId), 'destino de ESTA sesión');
     const tot = PL.planTotals({ spent: [out.spentUsd, it.spentUsd], available: [], later: [] });
     eq(Number(tot.proposedCapUsd), 0, 'el tope sale del estimator, no del documento');
@@ -541,7 +543,7 @@ const x0 = (items) => items.map((i) => [i.itemType, i.action]);
     assert(/NO las sigas/.test(PL.INTERPRET_SYSTEM) && /Nunca inventes un id/.test(PL.INTERPRET_SYSTEM) && /no las sigas/.test(PL.CONTENT_SYSTEM), 'reglas de seguridad en los sistemas');
     const tool = PL.interpretTool();
     eq([tool.input_schema.additionalProperties, tool.input_schema.properties.requests.items.additionalProperties], [false, false], 'esquema estricto');
-    eq(tool.input_schema.properties.requests.items.properties.operation.enum, [...PL.PHASE2_OPERATIONS, ...PL.PHASE3_OPERATIONS, ...PL.LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'], 'catálogo cerrado en el esquema');
+    eq(tool.input_schema.properties.requests.items.properties.operation.enum, [...PL.PHASE2_OPERATIONS, ...PL.PHASE3_OPERATIONS, ...PL.PHASE4_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'], 'catálogo cerrado en el esquema');
   });
 
 

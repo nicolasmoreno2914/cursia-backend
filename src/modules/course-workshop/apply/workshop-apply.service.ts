@@ -17,7 +17,7 @@ import {
 } from './apply-core';
 import { LibroV3SourceResolver, libroV3ResolverOf, regenerateLibroV3Pdf } from './libro-v3';
 import { ModuleRef } from '@nestjs/core';
-import { isRegenOperation } from '../regenerate/types';
+import { isPaidOperation } from '../regenerate/types';
 import { resolveRegenParams } from '../regenerate/store';
 import { buildDynamicMbzV3 } from '../../../package/dynamic-mbz-builder-v3';
 
@@ -312,7 +312,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
       if (!v || v.claim_id !== job.claimId) return;
       const s = await this.workshop.planSessionById(v.session_id);
       // r107 B10: los resultados de regeneraciones (audiolibro, video, PDF) también se cargan en memoria.
-      const regenBytes = (Array.isArray(v.operations) ? v.operations : []).filter((o: any) => isRegenOperation(o?.op)).reduce((n: number, o: any) => n + 2 * Number(o?.result?.bytes ?? 0), 0);
+      const regenBytes = (Array.isArray(v.operations) ? v.operations : []).filter((o: any) => isPaidOperation(o?.op)).reduce((n: number, o: any) => n + 2 * Number(o?.result?.bytes ?? 0), 0);
       const bytes = Math.ceil(Number(s?.originalSize ?? 0) * applyMemoryFactor(s?.container)) + regenBytes;
       let release: () => void;
       try {
@@ -498,7 +498,7 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
       // r107 B10: una regeneración aprobada → su RESULTADO producido (artifact del Taller), con dueño, sesión y sha256
       // verificados; el motor lo vuelve a validar antes de insertarlo. Sin resultado (o alterado) → falla visible.
       for (const it of runItems) {
-        if (!isRegenOperation((it.params as { op?: string })?.op) && !((it.params as any)?.op === 'edit_libro_section' && (it.params as any)?.libroV3?.result)) continue;
+        if (!isPaidOperation((it.params as { op?: string })?.op) && !((it.params as any)?.op === 'edit_libro_section' && (it.params as any)?.libroV3?.result)) continue;
         try {
           it.params = await resolveRegenParams(this.dataSource, this.artifacts, s, it.params);
         } catch (err) {

@@ -829,6 +829,61 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq((await A.getPlan({ id: U }, sid)).items.find((i) => i.id === it.id).stage, 'ready', 'ítem listo');
     });
 
+    // ── r107 B11: agregar capítulo contra el ledger REAL (enforce): aprobación MULTIPIEZA, Σ cotas, committedUsd y reuso ──
+    await check('L22 (B11) agregar capítulo (V1 del builder real) contra el ledger REAL: tope < Σ cotas → 409; aprobación multipieza (Anthropic + Videogen + YouTube + Gamma) con cada cargo atado a la aprobación; una pieza que falla (Gamma rechaza) deja el ítem reintentable y el reintento REUSA lo pagado (Libro, páginas, juego, render, video publicado y sus preguntas): solo paga lo que falta', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '40.00', reason: 'QA r107 B11 L22' });
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s2 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l22-v1.mbz', sizeBytes: V1.length });
+      objects.set(s2.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s2.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid2 = s2.session.id;
+      const Q = 'Agrega en el módulo 1 un capítulo nuevo «Lenguaje corporal» como capítulo 2.';
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [{ quote: Q, operation: 'add_chapter', instruction: 'Agregar el capítulo Lenguaje corporal', target: { moduleNumber: 1 }, newChapters: [{ title: 'Lenguaje corporal' }], position: 2, targetEvidence: 'en el módulo 1', changeEvidence: 'Lenguaje corporal' }] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const mk = (sim) => { const p = planFor(client); p.regenProviders = () => sim; return p; };
+      const sim1 = SIMLIB.simProviders(distRoot, { simulated: false, fault: { gammaCreate: 'rejected' }, videogenJobId: 'vg_sim_l22' });
+      const p1 = mk(sim1);
+      const a = await p1.createTextIntake({ id: U }, sid2, Q);
+      await p1.confirmInterpretation({ id: U }, sid2, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p1.whenIdle();
+      const pl = await p1.getPlan({ id: U }, sid2);
+      const it = pl.items.find((i) => i.operation === 'add_chapter' && i.stage === 'estimate');
+      assert(it, `ítem en estimado: ${JSON.stringify(pl.items.map((i) => [i.operation, i.stage, i.requestStatus]))} ${JSON.stringify(pl.pending)}`);
+      eq(it.plannedCall.regen.pieces.map((x) => x.piece), ['libro', 'video_page', 'game_page', 'game', 'video', 'presentation'], 'costo por pieza');
+      const exp = Number(it.plannedCall.expectedUsd);
+      const bound = Number(it.plannedCall.regen.totalBoundUsd);
+      eq(await errCode(p1.approveGeneration({ id: U }, sid2, pl.planId, { itemIds: [it.id], confirmEstimateUsd: exp, capUsd: Math.ceil(exp * 101) / 100 })), 'WORKSHOP_CAP_BELOW_CALL_BOUND', 'tope < Σ cotas → 409');
+      const cap = Math.ceil(bound * 100) / 100;
+      const g1 = await p1.approveGeneration({ id: U }, sid2, pl.planId, { itemIds: [it.id], confirmEstimateUsd: exp, capUsd: cap });
+      await p1.whenIdle();
+      const ap1 = await p1.approvalOf(g1.approval.id);
+      const kinds1 = Object.values(ap1.calls).map((c) => `${c.kind}:${c.status}`);
+      assert(kinds1.includes('anthropic:libro_chapter:charged') && kinds1.includes('videogen:render:charged') && kinds1.includes('youtube:upload:charged') && kinds1.some((k) => /^gamma:generate:/.test(k)), `multipieza: ${kinds1.join(', ')}`);
+      assert(Number(ap1.spent_usd) <= Number(ap1.cap_usd) + 1e-9, 'gastado ≤ tope');
+      const rq1 = (await ds.query(`select r.status, r.details from public.workshop_requests r join public.workshop_plan_items i on i.request_id = r.id where i.id = $1`, [it.id]))[0];
+      eq(rq1.status, 'awaiting_generation', 'la pieza fallida deja el ítem reintentable (nada aplicado)');
+      const paid = rq1.details.regenPaid.chapterPieces['2'];
+      assert(paid.libroMd && paid.videoPageHtml && paid.gamePageHtml && paid.scorm && paid.videogen && paid.videogen.charged && paid.youtube, `lo pagado quedó guardado: ${Object.keys(paid)}`);
+      near(await net(`workshop:approval:${g1.approval.id}`), 0, 'reserva liberada (neto 0): queda lo cobrado');
+      const charged1 = await ds.query(`select provider from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true' order by provider`, [g1.approval.id]);
+      eq([...new Set(charged1.map((x) => x.provider))], ['anthropic', 'videogen'], 'cargos reales atados a la aprobación (YouTube USD 0, Gamma rechazado sin cobro)');
+      // Reintento: solo lo que falta (preguntas del video sobre el render YA pagado + Gamma).
+      const sim2 = SIMLIB.simProviders(distRoot, { simulated: false, videogenJobId: 'vg_sim_l22' });
+      const p2 = mk(sim2);
+      const pl2 = await p2.getPlan({ id: U }, sid2);
+      const it2 = pl2.items.find((i) => i.id === it.id);
+      const g2 = await p2.approveGeneration({ id: U }, sid2, pl2.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it2.plannedCall.expectedUsd), capUsd: cap });
+      await p2.whenIdle();
+      const ap2 = await p2.approvalOf(g2.approval.id);
+      eq(Object.values(ap2.calls).map((c) => c.kind), ['gamma:generate'], 'el reintento solo paga lo que faltaba (Gamma)');
+      eq(sim2.calls.videogen.filter((c) => c.op === 'create').length + sim2.calls.youtube.length, 0, 'sin re-render ni re-subida');
+      const done = (await p2.getPlan({ id: U }, sid2)).items.find((i) => i.id === it.id);
+      eq([done.stage, done.dryRun && done.dryRun.ok, done.requiresItemConfirm, done.params.op], ['ready', true, true, 'add_chapter'], 'ítem listo, prueba en seco ok, confirmación ítem por ítem, sin bytes en params');
+      assert(!('produced' in done.params) && done.params.result && done.params.result.artifactId, 'resultado guardado como artifact del Taller');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});

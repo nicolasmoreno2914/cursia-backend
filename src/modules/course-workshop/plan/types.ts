@@ -35,14 +35,21 @@ export type Phase2Operation = (typeof PHASE2_OPERATIONS)[number];
 export { PHASE3_OPERATIONS } from '../regenerate/types';
 export type Phase3Operation = (typeof PHASE3_OPERATIONS)[number];
 
-/** Operaciones de fases posteriores: visibles en el plan como «no disponible todavía», con su costo (D8). */
-export const LATER_OPERATIONS = Object.freeze(['add_chapter', 'add_module'] as const);
-export type LaterOperation = (typeof LATER_OPERATIONS)[number];
+/**
+ * r107 B11: operaciones de la Fase 4 (agregar capítulo / módulo): como las de la Fase 3, su contenido se PRODUCE con
+ * aprobación y tope antes de aplicar (etapa de estimado → `…/plans/:id/generate`).
+ */
+export const PHASE4_OPERATIONS = Object.freeze(['add_chapter', 'add_module'] as const);
+export type Phase4Operation = (typeof PHASE4_OPERATIONS)[number];
 
-export type RequestOperation = Phase2Operation | Phase3Operation | LaterOperation;
+/** Operaciones de fases posteriores (r107 B11: ya ninguna; se conserva el estado `phase_later` por compatibilidad). */
+export const LATER_OPERATIONS = Object.freeze([] as const);
+export type LaterOperation = never;
+
+export type RequestOperation = Phase2Operation | Phase3Operation | Phase4Operation;
 
 /** Lo que la IA puede responder en `operation` (catálogo cerrado + las dos salidas sin operación). */
-export const AI_OPERATION_VALUES = Object.freeze([...PHASE2_OPERATIONS, ...PHASE3_OPERATIONS, ...LATER_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'] as const);
+export const AI_OPERATION_VALUES = Object.freeze([...PHASE2_OPERATIONS, ...PHASE3_OPERATIONS, ...PHASE4_OPERATIONS, 'fuera_de_alcance', 'necesita_respuesta'] as const);
 
 /**
  * Ronda de decisiones: `awaiting_confirmation` = la re-interpretación (IA) espera que el docente apruebe su costo;
@@ -119,6 +126,11 @@ export interface RequestDetails {
   regenResult?: { artifactId: string; sha256: string; bytes: number } | null;
   /** Agregar capítulos / módulo: cuántos (para el costo). */
   chapters?: number | null;
+  /** r107 B11: capítulos nuevos (título y objetivo, del pedido), posición (número del capítulo nuevo), módulo nuevo y piezas omitidas. */
+  newChapters?: Array<{ title: string; objective: string | null }> | null;
+  position?: number | null;
+  moduleTitle?: string | null;
+  omit?: Array<'presentation' | 'video'> | null;
   /** Enlace muerto (`href="#"`) de un hallazgo: se reemplaza el enlace por su texto (sin IA). */
   deadLink?: { entry: string; fieldRawOffset: number; rawByteOffset: number; rawBytes: number } | null;
   /** Hallazgo de B3 de donde salió («Arreglar esto»). */

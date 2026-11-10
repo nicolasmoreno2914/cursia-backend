@@ -7,20 +7,45 @@
 import JSZip = require('jszip');
 import { createHash } from 'crypto';
 import { ProducedRegen } from './types';
+import type { ProducedChapter, ProducedModule } from './chapter-types';
 
 const BIN_FIELDS = ['h5p', 'pdf', 'cover', 'mp3'] as const;
 const DATE = new Date(Date.UTC(2026, 0, 1));
 export const REGEN_BUNDLE_VERSION = 1;
 export const sha256Hex = (b: Buffer) => createHash('sha256').update(b).digest('hex');
 
-export async function encodeProduced(p: ProducedRegen): Promise<Buffer> {
+/** r107 B11: binarios ANIDADOS (capítulo / módulo producido: `chapters.0.presentation.pdf`) → `bin/<ruta>`. */
+function stripBins(v: unknown, path: string, z: JSZip): unknown {
+  if (Buffer.isBuffer(v)) {
+    z.file(`bin/${path}`, v, { date: DATE, createFolders: false, binary: true });
+    return { bin: path, bytes: v.length, sha256: sha256Hex(v) };
+  }
+  if (Array.isArray(v)) return v.map((x, i) => stripBins(x, `${path}.${i}`, z));
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, stripBins(x, `${path}.${k}`, z)]));
+  return v;
+}
+async function restoreBins(v: unknown, z: JSZip): Promise<unknown> {
+  if (v && typeof v === 'object' && !Array.isArray(v) && typeof (v as any).bin === 'string' && typeof (v as any).sha256 === 'string' && Object.keys(v as object).length === 3) {
+    const f = z.file(`bin/${(v as any).bin}`);
+    if (!f) throw new Error(`falta el binario ${(v as any).bin}`);
+    const b = await f.async('nodebuffer');
+    if (sha256Hex(b) !== (v as any).sha256) throw new Error(`el binario ${(v as any).bin} no coincide con su huella`);
+    return b;
+  }
+  if (Array.isArray(v)) return Promise.all(v.map((x) => restoreBins(x, z)));
+  if (v && typeof v === 'object') return Object.fromEntries(await Promise.all(Object.entries(v as Record<string, unknown>).map(async ([k, x]) => [k, await restoreBins(x, z)])));
+  return v;
+}
+
+export async function encodeProduced(p: ProducedRegen | ProducedChapter | ProducedModule): Promise<Buffer> {
   const z = new JSZip();
   const meta: Record<string, unknown> = { bundleVersion: REGEN_BUNDLE_VERSION };
   for (const [k, v] of Object.entries(p)) {
     if ((BIN_FIELDS as readonly string[]).includes(k) && Buffer.isBuffer(v)) {
       z.file(`bin/${k}`, v, { date: DATE, createFolders: false, binary: true });
       meta[k] = { bin: k, bytes: v.length, sha256: sha256Hex(v) };
-    } else meta[k] = v;
+    } else if (v && typeof v === 'object' && !Buffer.isBuffer(v)) meta[k] = stripBins(v, k, z);
+    else meta[k] = v;
   }
   z.file('result.json', JSON.stringify(meta), { date: DATE, createFolders: false });
   return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
@@ -41,13 +66,17 @@ export async function decodeProduced(buf: Buffer): Promise<ProducedRegen> {
       const b = await f.async('nodebuffer');
       if (sha256Hex(b) !== (v as any).sha256) throw new Error(`el binario ${k} no coincide con su huella`);
       out[k] = b;
-    } else out[k] = v;
+    } else out[k] = v && typeof v === 'object' ? await restoreBins(v, z) : v;
   }
   return out as unknown as ProducedRegen;
 }
 
 /** Lo verificable del resultado (sin binarios): va a la vista del ítem y a su huella. */
-export function producedSummary(p: ProducedRegen): Record<string, unknown> {
+const chapterSummary = (c: ProducedChapter) => ({ number: c.chapterNumber, title: c.title, libroWords: (c.libroMd.match(/[\p{L}\p{N}]+/gu) || []).length, scorm: { rooms: c.scorm.rooms, mechanics: c.scorm.roomAssignment }, video: c.video ? { youtubeId: c.video.youtubeId, interactions: c.video.interactions, durationSec: c.video.durationSec } : null, presentation: c.presentation ? { slideCount: c.presentation.slideCount, pdfSha256: sha256Hex(c.presentation.pdf) } : null, pages: { video: !!c.videoPageHtml, game: !!c.gamePageHtml } });
+
+export function producedSummary(p: ProducedRegen | ProducedChapter | ProducedModule): Record<string, unknown> {
+  if (p.kind === 'chapter') return { kind: p.kind, ...chapterSummary(p) };
+  if (p.kind === 'module') return { kind: p.kind, moduleNumber: p.moduleNumber, title: p.title, chapters: p.chapters.map(chapterSummary), exam: p.exam ? { giftSha256: sha256Hex(Buffer.from(p.exam.gift)) } : null };
   switch (p.kind) {
     case 'scorm_v2': return { kind: p.kind, rooms: p.rooms, mechanics: p.roomAssignment, htmlSha256: sha256Hex(Buffer.from(p.html)), manifestSha256: sha256Hex(Buffer.from(p.manifestXml)) };
     case 'h5p_practice': return { kind: p.kind, h5pType: p.h5pType, mainLibrary: p.mainLibrary, questions: p.questions, h5pSha256: sha256Hex(p.h5p) };

@@ -273,6 +273,11 @@ jobs:
       - name: Check r107 Taller de cursos — rehacer actividades (proveedores simulados)
         run: node scripts/r107/check-r107-regenerate.js --ci
 
+      # r107 B11 · Taller de cursos — Fase 4: agregar capítulo / módulo (proveedores simulados, USD 0; el check falla si
+      # algo intenta salir). Fixture V1 armado con el builder real.
+      - name: Check r107 Taller de cursos — agregar capítulo / módulo (proveedores simulados)
+        run: node scripts/r107/check-r107-add-chapter.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

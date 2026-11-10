@@ -34,7 +34,9 @@ import {
 import { requiresItemConfirm, riskOf } from './risk';
 import { activityLabel, activityOf, chapterPlainText, inventorySummary } from './summary';
 import { ClarifyAnswer, InterpretedRequest, MisalignmentWarning, PLAN_LIMITS, PlanItemView, RequestOperation } from './types';
-import { isRegenOperation, ProducedRegen, RegenError, RegenExternal, RegenerateOp } from '../regenerate/types';
+import { isPaidOperation, isRegenOperation, ProducedRegen, RegenError, RegenExternal, RegenerateOp } from '../regenerate/types';
+import { isChapterOperation } from '../regenerate/chapter-types';
+import { chapterEstimateView, prepareChapterItem } from './chapter-item';
 import type { PaidCallGate, RegenProviders } from '../regenerate/ports';
 import type { RegenDbSources } from '../regenerate/sources';
 import type { RegenPlannedCall } from '../regenerate/estimate';
@@ -243,7 +245,7 @@ export async function prepareItem(ctx: BuildCtx, req: InterpretedRequest, ai: Ai
   }
   if (req.status !== 'resolved' || !req.operation || !req.target) return { status: req.status === 'needs_answer' ? 'failed' : (req.status as PreparedItem['status']), reason: req.reason, view: null, spentUsd: '0', calls: 0 };
   // r107 B10: rehacer una actividad se PRODUCE con su aprobación y tope (prepareRegenItem), nunca por este camino.
-  if (isRegenOperation(req.operation)) return { status: 'failed', reason: 'Rehacer una actividad se produce con su aprobación y su tope (etapa de estimado), no al armar el plan.', view: null, spentUsd: '0', calls: 0 };
+  if (isPaidOperation(req.operation)) return { status: 'failed', reason: 'Rehacer una actividad o agregar un capítulo se produce con su aprobación y su tope (etapa de estimado), no al armar el plan.', view: null, spentUsd: '0', calls: 0 };
 
   let spent = '0';
   let calls = 0;
@@ -301,7 +303,7 @@ function summaryOf(req: InterpretedRequest): string {
 
 function needsContent(req: InterpretedRequest): boolean {
   // r107 B10: rehacer una actividad siempre necesita proveedores pagos (se produce con aprobación y tope).
-  if (isRegenOperation(req.operation)) return true;
+  if (isPaidOperation(req.operation)) return true;
   switch (req.operation) {
     case 'edit_html': return !req.details.fixedChange && !req.details.deadLink;
     case 'edit_libro_section': case 'exam_question_replace': case 'exam_question_add': return true;
@@ -529,6 +531,13 @@ export function estimateReinterpretation(ctx: Pick<BuildCtx, 'course' | 'pricing
 export async function estimateContent(ctx: BuildCtx, req: InterpretedRequest): Promise<PlannedCall | null | { unavailable: string }> {
   if (req.status !== 'resolved' || !needsContent(req)) return null;
   if (isRegenOperation(req.operation)) return estimateRegenItem(ctx, req);
+  // r107 B11: agregar capítulo / módulo — la vista del estimado se arma acá (necesita el molde del paquete).
+  if (isChapterOperation(req.operation)) {
+    const v = await chapterEstimateView(ctx, req);
+    if ('unavailable' in v) return v;
+    CHAPTER_VIEWS.set(v.plannedCall as PlannedCall, v);
+    return v.plannedCall as PlannedCall;
+  }
   try {
     const r = await candidateFor(ctx, req, async (c) => { throw new EstimateOnly(c); }, 1, null);
     if ('unavailable' in r) return { unavailable: r.unavailable };
@@ -541,7 +550,12 @@ export async function estimateContent(ctx: BuildCtx, req: InterpretedRequest): P
 export { needsContent };
 
 /** Vista del ítem en etapa de ESTIMADO: sin contenido generado, con lo que costaría generarlo (D8). */
+/** r107 B11: vistas de estimado de agregar capítulo / módulo (las arma `estimateContent`). */
+const CHAPTER_VIEWS = new WeakMap<PlannedCall, PlanItemView>();
+
 export function estimateItemView(ctx: Pick<BuildCtx, 'pricing'> & Partial<Pick<BuildCtx, 'course'>>, req: InterpretedRequest, call: PlannedCall, opts: { fromFinding?: boolean } = {}): PlanItemView {
+  const cv = CHAPTER_VIEWS.get(call);
+  if (cv) return cv;
   if ((call as unknown as RegenPlannedCall).kind === 'regenerate') return regenEstimateView(ctx as BuildCtx, req, call as unknown as RegenPlannedCall, opts);
   const est = memOf(estimateAiCall(call.kind, call.size, ctx.pricing));
   const risk = riskOf({ operation: req.operation!, target: req.target, changes: [], misalignment: [], fromFinding: !!opts.fromFinding });
@@ -689,6 +703,8 @@ export interface PreparedRegenItem extends PreparedItem {
  * original → vista con antes/después verificable. Una falla nunca deja un ítem «listo» a medias.
  */
 export async function prepareRegenItem(ctx: BuildCtx, req: InterpretedRequest, deps: { providers: RegenProviders; gate: PaidCallGate; spent: () => string; ext?: RegenExternal }, opts: { fromFinding?: boolean } = {}): Promise<PreparedRegenItem> {
+  // r107 B11: agregar capítulo / módulo (misma compuerta, mismo resultado guardado, misma prueba en seco).
+  if (isChapterOperation(req.operation)) { await regenDbOf(ctx); return prepareChapterItem(ctx, req, deps, opts) as unknown as PreparedRegenItem; }
   const t = req.target;
   const fail = (status: PreparedItem['status'], reason: string, code: string, retryable: boolean): PreparedRegenItem => ({ status, reason, view: null, spentUsd: deps.spent(), calls: 0, produced: null, failure: { code, retryable } });
   if (!t || t.kind !== 'activity' || !isRegenOperation(req.operation)) return fail('unavailable', 'destino inválido', 'unavailable', false);

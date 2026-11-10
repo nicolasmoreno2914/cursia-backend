@@ -1194,6 +1194,43 @@ async function moodleSuite() {
     assert(o1.cms.some((c) => c.name === game.title && c.modname === 'scorm'), 'M5 V1: el juego rehecho restaurado');
     console.log(`   M5 V1: restaurado (curso ${o1.courseid}), juego ${game.moduleId} (5 salas) + audiolibro ${book.moduleId}`);
   });
+  await check('M6 (B11) agregar capítulo EN MEDIO y agregar módulo (2 capítulos + examen) — V1 real «Anatomía» y V1 del builder real (con Gamma; el Moodle local no tiene mod_hvp) — producción simulada → restauran en Moodle 4.5 sin errores ni warnings, con las actividades nuevas, sus nombres renumerados y el examen nuevo', async () => {
+    const B = require(path.join(DIST, 'modules/course-workshop/plan/builder.js'));
+    const AC = require(path.join(DIST, 'modules/course-workshop/apply/apply-core.js'));
+    const DRY = require(path.join(DIST, 'modules/pedagogy/dry-run.js'));
+    const SIMLIB = require(path.join(REPO, 'scripts/r107/lib/r107-regen-sim.js'));
+    const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+    const sha = (b) => crypto.createHash('sha1').update(b).digest('hex');
+    const realPath = process.env.R107_V1_REAL || path.join(os.homedir(), 'Downloads/Anatomía_y_Fisiología_Animal_moodle (1).mbz');
+    const cases = [
+      ['anatomia', fs.readFileSync(realPath), { module: 2, position: 5, title: 'Sistema excretor y equilibrio hídrico' }, { title: 'Genética y reproducción', chapters: ['Genética básica', 'Reproducción animal'] }],
+      ['builder-v1', await CF.v1BuilderCourse(DIST, { hvp: false }), { module: 1, position: 2, title: 'Lenguaje corporal' }, { title: 'Servicio digital', chapters: ['Redes sociales', 'Correo electrónico'] }],
+    ];
+    for (const [tag, buf, ch, md] of cases) {
+      for (const kind of ['chapter', 'module']) {
+        const ctx = await B.openBuildCtx(buf, { originalSha1: sha(buf), pricing: DRY.seedPricing() });
+        const req = kind === 'chapter'
+          ? { quote: 'x', instruction: 'x', operation: 'add_chapter', status: 'resolved', target: { kind: 'module', moduleNumber: ch.module, title: '' }, rawTarget: null, details: { chapters: 1, newChapters: [{ title: ch.title, objective: null }], position: ch.position, omit: [] }, questions: [], reason: null }
+          : { quote: 'x', instruction: 'x', operation: 'add_module', status: 'resolved', target: { kind: 'course', title: '' }, rawTarget: null, details: { chapters: 2, newChapters: md.chapters.map((t) => ({ title: t, objective: null })), moduleTitle: md.title, omit: [] }, questions: [], reason: null };
+        const prov = SIMLIB.simProviders(DIST); const gate = SIMLIB.memGate(DIST, { capUsd: 80 });
+        const prep = await B.prepareRegenItem(ctx, req, { providers: prov, gate, spent: () => gate.spent() });
+        eq(prep.status, 'resolved', `M6 ${tag} ${kind}: ${prep.reason}`);
+        const run = await AC.runApply({ original: buf, expectedSha1: sha(buf), items: [{ id: 'i', requestId: 'r', operation: req.operation, quote: 'x', summary: '', params: { ...prep.view.params, produced: prep.produced } }] });
+        assert(run.ok, `M6 ${tag} ${kind}: ${run.code} ${run.message}`);
+        eq(run.diagnosis.introduced, [], `M6 ${tag} ${kind}: sin hallazgos nuevos`);
+        const o = restore(run.package, `r107-b11-${tag}-${kind}`);
+        clean(o, `M6 ${tag} ${kind}`);
+        if (kind === 'chapter') {
+          assert(o.cms.some((c) => c.modname === 'scorm' && c.name.includes(`Cap ${ch.position} — ${ch.title}`)), `M6 ${tag}: el juego nuevo restaurado`);
+          assert(o.cms.some((c) => c.modname === 'scorm' && new RegExp(`Cap ${ch.position + 1} — `).test(c.name)), `M6 ${tag}: el siguiente renumerado`);
+        } else {
+          assert(o.cms.some((c) => c.modname === 'quiz' && /Examen Unidad 4/.test(c.name)), `M6 ${tag}: el examen de la unidad nueva restaurado`);
+          assert(o.cms.filter((c) => c.modname === 'scorm' && md.chapters.some((t) => c.name.includes(t))).length === 2, `M6 ${tag}: los 2 juegos nuevos`);
+        }
+        console.log(`   M6 ${tag} ${kind}: restaurado (curso ${o.courseid}), ${o.cms.length} actividades, ${o.sections.length} secciones`);
+      }
+    }
+  });
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────────────────────────────────────────────

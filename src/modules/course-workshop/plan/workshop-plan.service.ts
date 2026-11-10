@@ -32,7 +32,7 @@ import { ModuleRef } from '@nestjs/core';
 import { decideRunSpend } from '../../finops/run-spend-guard';
 import { effectiveOutputRowsSql } from '../../dynamic-generation/item-generations';
 import { PaidCallGate, PaidCallTicket, RegenProviders } from '../regenerate/ports';
-import { PROVIDER_OVER_BOUND, RegenDeferred, RegenError, RegenExternal, RegenPrior, RegenerateOp, isRegenOperation } from '../regenerate/types';
+import { PROVIDER_OVER_BOUND, RegenDeferred, RegenError, RegenExternal, RegenPrior, RegenerateOp, isPaidOperation, isRegenOperation } from '../regenerate/types';
 import { WaitTimeout, gammaFinal, pollUntilFinal, settleGammaGeneration, settleVideogenJob, videogenFinal } from '../regenerate/async-wait';
 import { RegenDbSources } from '../regenerate/sources';
 import { decodeProduced, encodeProduced, sha256Hex } from '../regenerate/bundle';
@@ -196,6 +196,25 @@ export function approvalReservationInput(a: { approvalId: string; payer: string;
  * con los clientes existentes (`realRegenProviders`).
  */
 export const WORKSHOP_REGEN_PROVIDERS = 'WORKSHOP_REGEN_PROVIDERS';
+/**
+ * P1-2a (B10) / B11: un ítem pagado (rehacer una actividad, agregar capítulo / módulo) se aprueba solo con tope ≥ Σ cotas
+ * de TODAS sus llamadas (no ≥ el esperado). Puro: lo usan `approveGeneration` y los checks.
+ */
+export function paidBoundSum(calls: Array<unknown>): number {
+  return calls.reduce<number>((acc, c) => acc + Number((c as any)?.regen?.totalBoundUsd ?? 0), 0);
+}
+export function capBelowPaidBound(cap: string | number, bound: number): boolean {
+  return Number(cap) + 1e-9 < bound;
+}
+
+/** r107 B11: clave del destino de lo pagado (moduleid de la actividad que se rehace, o el módulo / curso al agregar). */
+export function regenTargetKey(req: { operation: string | null; target: unknown; details?: { position?: number | null; moduleTitle?: string | null } }): string {
+  const t = (req.target ?? {}) as Record<string, unknown>;
+  if (req.operation === 'add_chapter') return `module:${t.moduleNumber ?? ''}:pos:${req.details?.position ?? ''}`;
+  if (req.operation === 'add_module') return `course:module:${req.details?.moduleTitle ?? ''}`;
+  return String(t.moduleId ?? '');
+}
+
 export type RegenProvidersFactory = (s: WorkshopPlanSession, payer: string) => Promise<RegenProviders> | RegenProviders;
 /** Memoria extra de un trabajo que produce regeneraciones (audiolibro completo, video, PDF de Gamma en memoria). */
 export const REGEN_MEMORY_EXTRA_BYTES = 256 * 1024 * 1024;
@@ -765,7 +784,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     if (items.length !== ids.length) throw new ConflictException({ code: PLAN_ERRORS.ITEMS_INVALID, message: 'Algún ítem elegido no está esperando generación (ya se generó, se quitó o es de otro plan).' });
     // r107 B10: una regeneración usa otros proveedores (OpenAI TTS, Gamma, Videogen, YouTube): todos tienen que estar
     // permitidos (kill switch / allow-list) ANTES de reservar nada.
-    const regen = items.filter((i) => isRegenOperation(i.operation));
+    const regen = items.filter((i) => isPaidOperation(i.operation));
     for (const prov of [...new Set(regen.flatMap((i) => ((i.view.plannedCall as any)?.regen?.providers ?? []).map((l: any) => String(l.provider))))]) {
       try { assertDirectCallAllowed(prov); } catch {
         throw new ServiceUnavailableException({ code: PLAN_ERRORS.PROVIDER_UNAVAILABLE, message: `El proveedor «${prov}» no está disponible en este momento: no se reservó saldo ni se llamó a nada. Intenta de nuevo más tarde.` });
@@ -776,8 +795,8 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       : `Generar el contenido de ${items.length} ítem(s) (1 llamada cada uno; un reintento por validación entra en el margen). La IA no corre hasta que lo apruebes.`);
     const cap = this.validateConfirmation(estimate, input);
     // P1-2a: una regeneración exige que el tope cubra la SUMA de las cotas de todas sus llamadas (no solo la primera).
-    const regenBound = regen.reduce((acc, i) => acc + Number((i.view.plannedCall as any)?.regen?.totalBoundUsd ?? 0), 0);
-    if (regen.length && Number(cap) + 1e-9 < regenBound) {
+    const regenBound = paidBoundSum(regen.map((i) => i.view.plannedCall));
+    if (regen.length && capBelowPaidBound(cap, regenBound)) {
       throw new ConflictException({ code: PLAN_ERRORS.CAP_BELOW_CALL_BOUND, message: `El tope (USD ${Number(cap).toFixed(2)}) no cubre el costo máximo de todas las llamadas de la regeneración (USD ${regenBound.toFixed(2)}). Tope propuesto: USD ${estimate.proposedCapUsd}.`, estimate, requiredUsd: regenBound.toFixed(6) });
     }
     const approval = await this.openApproval(s, actor, { kind: 'generate', itemIds: items.map((i) => i.id), estimate, capUsd: cap });
@@ -1100,7 +1119,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       }
       const [intake] = await this.q<IntakeRow[]>(this.dataSource, `select source from public.workshop_intakes where id = $1`, [row.intake_id]);
       const req: InterpretedRequest = { ...this.interpretedOf(row), status: 'resolved' };
-      if (isRegenOperation(req.operation)) {
+      if (isPaidOperation(req.operation)) {
         const r = await this.runRegenItem(s, ctx, approval, item, row, req, intake?.source === 'finding');
         if (r instanceof AiUnavailableError) stop = r;
         continue;
@@ -1161,8 +1180,20 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
    */
   private async priorOf(s: WorkshopPlanSession, row: RequestRow, req: InterpretedRequest): Promise<RegenPrior> {
     const p = row.details?.regenPaid;
-    if (!p || p.originalSha1 !== s.originalSha1 || p.operation !== req.operation || Number(p.moduleId) !== Number((req.target as any)?.moduleId)) return {};
+    if (!p || p.originalSha1 !== s.originalSha1 || p.operation !== req.operation || String(p.moduleId) !== String(regenTargetKey(req))) return {};
     const out: RegenPrior = { videogen: p.videogen ?? null, youtube: p.youtube ?? null, gamma: p.gamma ?? null };
+    // r107 B11: piezas ya producidas de cada capítulo nuevo (se reusan) y el examen de la unidad nueva.
+    if (p.chapterPieces && typeof p.chapterPieces === 'object') out.chapterPieces = p.chapterPieces;
+    if (p.chapterCurrent !== undefined) out.chapterCurrent = p.chapterCurrent;
+    if (p.unitExam && typeof p.unitExam === 'object') out.unitExam = p.unitExam;
+    // Lo externo de un capítulo YA terminado que quedó sin liquidar: misma regla que las ranuras de arriba.
+    for (const [k, rec] of Object.entries(out.chapterPieces ?? {})) {
+      for (const prov of ['videogen', 'gamma'] as const) {
+        const e = (rec as any)?.[prov];
+        if (!e || e.charged || k === out.chapterCurrent) continue;
+        throw new RegenError('call_ambiguous', `${prov} aceptó el pedido del capítulo ${k} y no quedó liquidado: queda pendiente de conciliación (no se reenvía).`, { provider: prov, externalId: e.jobId ?? e.generationId ?? null, approvalId: e.approvalId ?? null });
+      }
+    }
     for (const prov of ['videogen', 'gamma'] as const) {
       const e = out[prov] as any;
       if (!e || e.charged) continue;
@@ -1180,7 +1211,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   private async approvalHasRegen(approvalId: string): Promise<boolean> {
     const a = await this.approvalOf(approvalId);
     if (!a || !Array.isArray(a.item_ids) || !a.item_ids.length) return false;
-    const [r] = await this.q<any[]>(this.dataSource, `select count(*)::int as n from public.workshop_plan_items where id = any($1::uuid[]) and operation like 'regenerate\_%'`, [a.item_ids]);
+    const [r] = await this.q<any[]>(this.dataSource, `select count(*)::int as n from public.workshop_plan_items where id = any($1::uuid[]) and (operation like 'regenerate\_%' or operation in ('add_chapter', 'add_module'))`, [a.item_ids]);
     return Number(r?.n ?? 0) > 0;
   }
 
@@ -1370,7 +1401,7 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       return new AiUnavailableError(PLAN_ERRORS.AI_UNAVAILABLE, m);
     }
     const gate = this.regenGateFor(s, approval, providers.simulated === true);
-    const tag = { originalSha1: s.originalSha1, operation: req.operation, moduleId: (req.target as any)?.moduleId ?? null };
+    const tag = { originalSha1: s.originalSha1, operation: req.operation, moduleId: regenTargetKey(req) };
     let prior: RegenPrior;
     try {
       prior = await this.priorOf(s, row, req);

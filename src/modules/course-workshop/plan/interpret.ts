@@ -34,6 +34,10 @@ export interface RawAiRequest {
   target: RawTarget | null;
   colors: Array<{ from: string; to: string }>;
   chapters: number | null;
+  /** r107 B11: capítulos nuevos que pide el docente (títulos LITERALES del pedido), posición y título del módulo nuevo. */
+  newChapters?: Array<{ title: string; objective: string | null }> | null;
+  position?: number | null;
+  moduleTitle?: string | null;
   reason: string | null;
   questions: Array<{ text: string; options: Array<{ id: string; label: string; target: RawTarget | null }> }>;
   /** Fix round 1 (P2-3): fragmentos LITERALES del pedido que justifican el destino y el cambio. */
@@ -43,7 +47,7 @@ export interface RawAiRequest {
 export interface RawTarget { moduleId?: number; field?: string; chapterNumber?: number; chapters?: number[]; questionId?: number; quizModuleId?: number; moduleNumber?: number }
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
-const REQ_KEYS = new Set(['quote', 'operation', 'instruction', 'target', 'colors', 'chapters', 'reason', 'questions', 'targetEvidence', 'changeEvidence']);
+const REQ_KEYS = new Set(['quote', 'operation', 'instruction', 'target', 'colors', 'chapters', 'reason', 'questions', 'targetEvidence', 'changeEvidence', 'newChapters', 'position', 'moduleTitle']);
 const TARGET_KEYS = new Set(['moduleId', 'field', 'chapterNumber', 'chapters', 'questionId', 'quizModuleId', 'moduleNumber']);
 const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
 
@@ -109,6 +113,30 @@ export function parseInterpretation(raw: unknown, requestText: string, opts: { s
     }
     let chapters: number | null = null;
     if (r.chapters !== undefined) { if (!Number.isInteger(r.chapters) || (r.chapters as number) < 1 || (r.chapters as number) > 20) problems.push(`${where}: chapters inválido`); else chapters = r.chapters as number; }
+    // r107 B11 (D6): los títulos de los capítulos nuevos y el del módulo tienen que estar LITERALES en el pedido (o en
+    // las respuestas del docente): la IA no los inventa. Sin título → el servidor pregunta.
+    let newChapters: RawAiRequest['newChapters'] = null;
+    if (r.newChapters !== undefined && r.newChapters !== null) {
+      if (!Array.isArray(r.newChapters) || r.newChapters.length < 1 || r.newChapters.length > 12) problems.push(`${where}: newChapters inválido`);
+      else {
+        newChapters = [];
+        for (const c of r.newChapters) {
+          const title = isObj(c) ? str(c.title, 160) : null;
+          const objective = isObj(c) && c.objective !== undefined && c.objective !== null ? str(c.objective, 400) : null;
+          if (!isObj(c) || Object.keys(c).some((k) => k !== 'title' && k !== 'objective') || !title) { problems.push(`${where}: capítulo nuevo inválido`); continue; }
+          if (!evText.includes(normalizeQuote(title))) { problems.push(`${where}: el título «${title.slice(0, 60)}» no es un fragmento literal del pedido`); continue; }
+          newChapters.push({ title, objective });
+        }
+      }
+    }
+    let position: number | null = null;
+    if (r.position !== undefined && r.position !== null) { if (!Number.isInteger(r.position) || (r.position as number) < 1 || (r.position as number) > 999) problems.push(`${where}: position inválido`); else position = r.position as number; }
+    let moduleTitle: string | null = null;
+    if (r.moduleTitle !== undefined && r.moduleTitle !== null) {
+      moduleTitle = str(r.moduleTitle, 160);
+      if (!moduleTitle) problems.push(`${where}: moduleTitle inválido`);
+      else if (!evText.includes(normalizeQuote(moduleTitle))) { problems.push(`${where}: el título del módulo no es un fragmento literal del pedido`); moduleTitle = null; }
+    }
     const reason = r.reason === undefined ? null : str(r.reason, 500);
     if (r.reason !== undefined && reason === null) problems.push(`${where}: reason inválido`);
     const questions: RawAiRequest['questions'] = [];
@@ -146,7 +174,7 @@ export function parseInterpretation(raw: unknown, requestText: string, opts: { s
     const changeEvidence = evid('changeEvidence');
     if (op === 'necesita_respuesta' && !questions.length && !reason) problems.push(`${where}: necesita_respuesta sin preguntas`);
     if (op === 'fuera_de_alcance' && !reason) problems.push(`${where}: fuera_de_alcance sin motivo`);
-    out.push({ quote: quote ?? '', operation: op as RawAiRequest['operation'], instruction: instruction ?? '', target, colors, chapters, reason, questions, targetEvidence, changeEvidence });
+    out.push({ quote: quote ?? '', operation: op as RawAiRequest['operation'], instruction: instruction ?? '', target, colors, chapters, newChapters, position, moduleTitle, reason, questions, targetEvidence, changeEvidence });
   });
   if (problems.length) throw new InterpretationOutputError(problems);
   return out;
@@ -360,15 +388,32 @@ function resolveTarget(op: RequestOperation, t: RawTarget, r: RawAiRequest, cour
     case 'add_chapter': {
       const mod = t.moduleNumber !== undefined ? course.modules.find((m) => m.number === t.moduleNumber) : course.modules.length === 1 ? course.modules[0] : undefined;
       if (!mod) return { question: targetQuestion('¿En qué módulo va el capítulo nuevo?', course.modules.map((m) => ({ label: `Módulo ${m.number}${m.title ? `: ${m.title}` : ''}`, resolves: { moduleNumber: m.number } }))), reason: 'El pedido no dice en qué módulo.' };
-      return { target: { kind: 'module', moduleNumber: mod.number, title: `Módulo ${mod.number}${mod.title ? `: ${mod.title}` : ''}` }, details: { chapters: r.chapters ?? 1 } };
+      const chs = r.newChapters ?? [];
+      if (!chs.length) return { question: instructionQuestion('¿Qué título lleva el capítulo nuevo y de qué trata? (por ejemplo: «Lenguaje corporal: cómo leer las señales del cliente»)'), reason: 'El pedido no dice el título del capítulo nuevo.' };
+      if (chs.length > 1) return { question: instructionQuestion(`Pediste ${chs.length} capítulos: el Taller agrega uno por pedido. ¿Cuál agrego primero? (los demás, como pedidos aparte)`), reason: 'Un pedido agrega un solo capítulo.' };
+      const nums = mod.chapterNumbers.length ? [...mod.chapterNumbers].sort((a, b) => a - b) : [];
+      const end = nums.length ? nums[nums.length - 1] + 1 : 1 + Math.max(0, ...course.chapters.filter((c) => (c.moduleNumber ?? 0) < mod.number).map((c) => c.number));
+      const position = r.position ?? end;
+      if (nums.length && (position < nums[0] || position > end)) return { question: targetQuestion(`En el módulo ${mod.number} el capítulo nuevo puede ir del ${nums[0]} al ${end}. ¿En qué posición va?`, Array.from({ length: end - nums[0] + 1 }, (_, k) => ({ label: `Como capítulo ${nums[0] + k}`, resolves: { moduleNumber: mod.number, chapterNumber: nums[0] + k } }))), reason: `La posición ${position} no está en el módulo ${mod.number}.` };
+      return { target: { kind: 'module', moduleNumber: mod.number, title: `Módulo ${mod.number}${mod.title ? `: ${mod.title}` : ''}` }, details: { chapters: 1, newChapters: chs, position, omit: omitOf(`${r.quote} ${r.instruction}`) } };
     }
     case 'add_module': {
-      const per = course.modules.length ? Math.max(1, Math.round(course.chapters.length / course.modules.length)) : 2;
-      return { target: { kind: 'course', title: 'Módulo nuevo' }, details: { chapters: r.chapters ?? per } };
+      const chs = r.newChapters ?? [];
+      if (!r.moduleTitle || !chs.length) return { question: instructionQuestion('¿Qué título lleva el módulo nuevo y cuáles son sus capítulos (título de cada uno)?'), reason: 'El pedido no dice el título del módulo nuevo o de sus capítulos.' };
+      return { target: { kind: 'course', title: `Módulo nuevo: ${r.moduleTitle}` }, details: { chapters: chs.length, newChapters: chs, moduleTitle: r.moduleTitle, omit: omitOf(`${r.quote} ${r.instruction}`) } };
     }
     default:
       return { unavailable: 'Operación fuera del catálogo.' };
   }
+}
+
+/** «sin video», «sin Gamma» / «sin presentación» en el pedido (determinista: no lo decide la IA). */
+export function omitOf(text: string): Array<'presentation' | 'video'> {
+  const t = fold(text);
+  const out: Array<'presentation' | 'video'> = [];
+  if (/\bsin (el |los )?videos?\b/.test(t)) out.push('video');
+  if (/\bsin (la |las )?(gamma|presentacion(es)?|diapositivas)\b/.test(t)) out.push('presentation');
+  return out;
 }
 
 function allTextOptions(course: WorkshopCourse, chapter?: number) {
