@@ -902,6 +902,12 @@ jobs:
                echo "━━━ [5k] r107 B3: Taller de cursos (diagnóstico técnico) — migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-r107-b3-diagnosis.js
 
+               # r107 B5: pedidos, preguntas y plan (workshop_intakes, workshop_requests, workshop_plans, workshop_plan_items:
+               # tablas NUEVAS, RLS + sin anon/authenticated). Staging-only (EXCLUDED del plan de producción). Aditiva e
+               # idempotente; requiere [5i].
+               echo "━━━ [5l] r107 B5: Taller de cursos (pedidos y plan) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r107-b5-plan.js
+
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
                ensure_pm2_process cursia-content-worker-staging start:content-worker

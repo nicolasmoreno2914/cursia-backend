@@ -49,6 +49,8 @@ const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
   'migrate-r107-b2-inventory.js': { sql: 'supabase-migration-r107-b2-inventory.sql', extraSql: ['supabase-migration-r107-artifacts-checksum-index.sql'] },
   // r107 B3: diagnóstico técnico (workshop_diagnoses + workshop_findings).
   'migrate-r107-b3-diagnosis.js': { sql: 'supabase-migration-r107-b3-diagnosis.sql' },
+  // r107 B5: pedidos, preguntas y plan (workshop_intakes / _requests / _plans / _plan_items).
+  'migrate-r107-b5-plan.js': { sql: 'supabase-migration-r107-b5-plan.sql' },
 };
 const STAGING_ONLY_REASON = /^r(75|79\.1|81|83|99|107): staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).
