@@ -383,9 +383,13 @@ export function discardPolicy(code: string | null | undefined, message: string):
   return { pieces: [], contentFailure: false };
 }
 
-/** Costo de rehacer lo descartado, con las cotas del estimado. Del video solo se paga de nuevo la IA. */
+/**
+ * Ronda 3 (P2-G): costo de rehacer lo descartado, con las cotas del estimado. Del video solo se paga de nuevo la IA (el
+ * render y el video publicado se reusan). Con `alsoExam` (módulo, todo descartado) suma el examen y su página.
+ */
 export function retryCostOf(est: { pieces: Array<{ piece: string; expectedUsd: string; boundUsd: string; providers: Array<{ provider: string; expectedUsd: string; boundUsd: string }> }> }, pieces: readonly TextPiece[], alsoExam: boolean): { pieces: string[]; expectedUsd: number; boundUsd: number } {
   const want = new Set<string>(pieces.map((p) => PIECE_OF[p]));
+  if (alsoExam) { want.add('exam'); want.add('exam_page'); }
   const redo = est.pieces.filter((p) => want.has(p.piece.replace(/^cap\d+:/, '')));
   const part = (p: (typeof redo)[number], k: 'expectedUsd' | 'boundUsd') => (p.piece.replace(/^cap\d+:/, '') === 'video' ? p.providers.filter((l) => l.provider === 'anthropic').reduce((x, l) => x + Number(l[k]), 0) : Number(p[k]));
   return { pieces: [...want], expectedUsd: redo.reduce((a, p) => a + part(p, 'expectedUsd'), 0), boundUsd: redo.reduce((a, p) => a + part(p, 'boundUsd'), 0) };

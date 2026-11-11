@@ -11,7 +11,7 @@ import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
 import { chapterPieces, pagesNeeded, templateOf } from '../patch/op-add-chapter';
 import { PatchError, PatchOperation } from '../patch/types';
 import { ADD_CHAPTER_FAMILIES, AddChapterOp, AddModuleOp, ChapterPiece, ProducedChapter, ProducedModule, V3_ADD_CHAPTER_UNAVAILABLE } from '../regenerate/chapter-types';
-import { ChapterEstimate, ChapterSpec, discardPieces, discardPolicy, retryCostOf, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, syntheticChapter, syntheticUnitExam, totals } from '../regenerate/chapter';
+import { ChapterEstimate, ChapterSpec, TEXT_PIECES, discardPieces, discardPolicy, retryCostOf, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, syntheticChapter, syntheticUnitExam, totals } from '../regenerate/chapter';
 import type { PaidCallGate, RegenProviders } from '../regenerate/ports';
 import { RegenError, RegenExternal } from '../regenerate/types';
 import type { BuildCtx, PlannedCall, PreparedItem } from './builder';
@@ -226,7 +226,8 @@ export async function prepareChapterItem(ctx: BuildCtx, req: InterpretedRequest,
     if (deps.ext && policy.pieces.length) {
       const pieces = policy.pieces;
       const nums = plan.specs.map((s) => s.chapterNumber);
-      const alsoExam = pieces.length > 1 && plan.op.op === 'add_module';
+      // P2-G: el examen de la unidad nueva se rehace solo si se descarta TODO (no se sabe qué pieza falló).
+      const alsoExam = plan.op.op === 'add_module' && !!plan.exam && pieces.length === TEXT_PIECES.length;
       const next = discardPieces(deps.ext.prior, nums, pieces, alsoExam);
       Object.assign(deps.ext.prior, next);
       await deps.ext.onPaid(next);

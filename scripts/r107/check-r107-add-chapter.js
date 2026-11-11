@@ -669,6 +669,21 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     eq([r2.prep.status, r2.gate.calls.length], ['resolved', 0], 'el reintento no paga nada (todo se reusa)');
   });
 
+  await check('R17 (ronda 3, P2-G) add_module: si se descarta TODO, el costo del reintento suma el examen y su página', async () => {
+    const CH = L('modules/course-workshop/regenerate/chapter.js');
+    const ctx = await ctxOf(V1);
+    const est = await B.estimateContent(ctx, modReq({ title: 'Servicio digital', chapters: ['Redes sociales', 'Correo electrónico'] }));
+    const all = CH.retryCostOf(est.regen, CH.TEXT_PIECES, true);
+    const noExam = CH.retryCostOf(est.regen, CH.TEXT_PIECES, false);
+    assert(all.pieces.includes('exam') && all.pieces.includes('exam_page') && !noExam.pieces.includes('exam'), `piezas: ${all.pieces}`);
+    const exam = est.regen.pieces.filter((p) => p.piece === 'exam' || p.piece === 'exam_page');
+    eq(exam.length, 2, 'el estimado del módulo trae examen y página');
+    const add = (k) => exam.reduce((a, p) => a + Number(p[k]), 0);
+    assert(Math.abs(all.expectedUsd - noExam.expectedUsd - add('expectedUsd')) < 1e-9 && Math.abs(all.boundUsd - noExam.boundUsd - add('boundUsd')) < 1e-9, 'suma exacta del examen');
+    const pages = CH.retryCostOf(est.regen, ['videoPageHtml', 'gamePageHtml'], false);
+    eq(pages.pieces, ['video_page', 'game_page'], 'descartar solo páginas no rehace el examen');
+  });
+
   const total = Object.values(REAL).reduce((a, b) => a + b, 0);
   await check('C12 cero llamadas reales (anthropic, openai, fetch, undici, http, net, binarios)', async () => eq(total, 0, JSON.stringify(REAL)));
   if (process.env.R107_ADD_CHAPTER_OUT && mid) fs.writeFileSync(process.env.R107_ADD_CHAPTER_OUT, mid);
