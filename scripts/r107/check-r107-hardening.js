@@ -22,6 +22,8 @@
 //      seco), plan (openBuildCtx), compuerta del motor (edit_html + remove sobre la entrada) y aplicar: < 2 s cada uno.
 //   K5 (B12 ronda 2) el HTML que reemplaza un enlace muerto (se ESCRIBE al paquete) respeta las comillas:
 //      `<a href="#" title="x < y">Libro Guía</a>` → «Libro Guía» (helper y de punta a punta: diagnóstico → motor).
+//   K6 (B12 ronda 2) 400 KB que llegan a defectKey (hallazgo con 400 K espacios antes de «—», por la compuerta del
+//      motor) y al desenlace de un token (`<a` sin `>` × 400 KB): < 2 s cada uno.
 //   K3 (D3 P1) «Preguntar» sobre cobertura de examen: examen de 40 preguntas con las del capítulo 9 al final → llegan
 //      las 40 (enunciado corto), ANTES del texto del capítulo, sin recorte; examen enorme (200) → recortado: el prompt
 //      lo dice y un «no» baja a «parcial» con el aviso.
@@ -53,6 +55,8 @@ if (has('--bite')) {
     { id: 'K2', file: 'modules/course-workshop/mbz-reader.js', find: /const checkTotalRatio = \(total\) => \{/, repl: 'const checkTotalRatio = (total) => { return;' },
     { id: 'K4', file: 'modules/course-workshop/diagnosis/checks.js', find: /const deadLinks = \(html\) => \{/, repl: 'const deadLinks = (html) => (0, xml_scan_1.allBlocks)(html, /<a\\b[^<>]*\\bhref\\s*=\\s*(["\'])\\s*(#?|javascript:[^"\'<>]*)\\s*\\1[^<>]*>/i, /<\\/a>/i).map((b) => Object.assign([b.whole, b.open[1], b.open[2], b.inner], { index: b.start }));\nconst __b12_unused = (html) => {' },
     { id: 'K5', file: 'modules/course-workshop/plan/builder.js', find: /function unwrapLinkHtml\(rawLink\) \{/, repl: 'function unwrapLinkHtml(rawLink) { return (0, preview_extract_1.xmlUnescape)(rawLink).replace(/<[^<>]*>/g, "");' },
+    { id: 'K6', label: 'K6 defectKey', file: 'modules/course-workshop/patch/engine.js', find: /beforeSpacedDash\(f\.detail\)/, repl: "f.detail.replace(/\\s+—[\\s\\S]*$/, '')" },
+    { id: 'K6', label: 'K6 OPEN_A', file: 'modules/course-workshop/patch/html-edit.js', find: /for \(const a of \(0, xml_scan_1\.openTags\)\(html, \/<a\\b\/i\)\) \{/, repl: 'for (const a of [...html.matchAll(/<a\\b(?:[^>"\']|"[^"]*"|\'[^\']*\')*>/gi)].map((m) => ({ start: m.index, end: m.index + m[0].length, attrs: (0, xml_scan_1.parseAttrs)(m[0], 2) }))) {' },
     { id: 'K3', file: 'modules/course-workshop/quality/ask.js', find: /if \(truncated && o\.verdict === 'no'\)/, repl: 'if (false)' },
   ];
   let bad = 0;
@@ -410,6 +414,34 @@ async function timed(fn) {
     const res = await EN.applyPatchPlan({ original: buf, filename: 'x.mbz', operations: [{ op: 'edit_html', target: { moduleId, field: 'intro' }, expectRawSha1: p.fieldRawSha1, change: { kind: 'range', rawByteOffset: p.linkRawByteOffset, rawBytes: p.linkRawBytes, html } }] });
     assert(res.ok, `el motor aplica: ${res.failure && res.failure.message}`);
     eq(await introOf(res.package, entry), '<p>Antes</p>Libro Guía<p>Después</p>', 'el paquete queda con el texto, sin restos de la etiqueta');
+  });
+
+  await check('K6', '400 KB que llegan a defectKey (por la compuerta del motor) y al desenlace de un token (`<a` sin `>`) → < 2 s', async () => {
+    const EN = L('modules/course-workshop/patch/engine.js');
+    // a) hallazgo dead_link cuyo detalle trae 400 K espacios ANTES del «—» (el destino conserva los espacios del medio).
+    const a = await withLabelHtml(3, `<p>x</p><a href="javascript:${' '.repeat(400_000)}x">b</a>`);
+    let t0 = Date.now();
+    const r1 = await EN.applyPatchPlan({ original: a.buf, filename: 'x.mbz', operations: [{ op: 'edit_html', target: { moduleId: a.moduleId, field: 'intro' }, change: { kind: 'replace', html: '<p>Otro texto</p>' } }] });
+    const ms1 = Date.now() - t0;
+    const pkg1 = await R.openMbz(a.buf);
+    const rep = await DX.runTechnicalDiagnosis({ pkg: pkg1, packageBytes: a.buf, family: 'v1-legacy-hvp', builderLine: 'legacy-v1', builderVersion: null, expectations: null, expectationsReason: 'check' }, { prevalidateFixes: false });
+    const big = rep.findings.find((x) => x.code === 'dead_link' && x.detail.length > 400_000);
+    assert(big, 'el diagnóstico arma el hallazgo con el detalle de 400 K');
+    t0 = Date.now();
+    const k = EN.defectKey(big);
+    const ms1b = Date.now() - t0;
+    assert(!k.includes('—'), 'la clave corta en el «—»');
+    console.log(`   defectKey: compuerta ${ms1} ms (ok=${r1.ok}), directo ${ms1b} ms`);
+    assert(ms1 < 2000 && ms1b < 2000, `defectKey ≥ 2 s (compuerta ${ms1} ms, directo ${ms1b} ms)`);
+    // b) quitar el enlace de un token con 400 KB de `<a ` sin `>` después.
+    const TOKEN = '$@RESOURCEVIEWBYID*961@$';
+    const b = await withLabelHtml(3, `<p><a href="${TOKEN}">Descargar</a></p>`, xmlEsc('<a '.repeat(133_000)));
+    t0 = Date.now();
+    const r2 = await EN.applyPatchPlan({ original: b.buf, filename: 'x.mbz', operations: [{ op: 'edit_html', target: { moduleId: b.moduleId, field: 'intro' }, change: { kind: 'token', token: TOKEN, action: 'unlink' } }] });
+    const ms2 = Date.now() - t0;
+    console.log(`   desenlace del token: ${ms2} ms (ok=${r2.ok}${r2.ok ? '' : `, ${r2.failure && r2.failure.code}`})`);
+    assert(r2.ok || (r2.failure && r2.failure.code === 'invalid_content'), `el desenlace llegó al escaneo de enlaces: ${r2.failure && r2.failure.code} ${r2.failure && r2.failure.message}`);
+    assert(ms2 < 2000, `desenlace ≥ 2 s (${ms2} ms)`);
   });
 
   // ── K3 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
