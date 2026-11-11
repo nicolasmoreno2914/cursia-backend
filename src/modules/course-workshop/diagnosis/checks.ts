@@ -15,7 +15,7 @@ import { WorkshopActivity, WorkshopToken, plainText, tokenKindShape } from '../c
 import { EXAM_OPTION_FORBIDDEN_RE, normalizeExamText } from '../../course-shell/exam-bank';
 import { VIDEO_MC_LONGEST_MAX_SHARE, videoMcLengthBias } from '../../quality/answer-length-bias';
 import { DiagnosisContext, blobVerified } from './context';
-import { allBlocks, firstBlock, replaceBlocks } from '../xml-scan';
+import { allBlocks, attrOf, firstBlock, openTags, replaceBlocks } from '../xml-scan';
 import { CheckId, Finding, FindingActivityRef, FindingInput, FindingScope, SuggestedFix, makeFinding } from './finding';
 
 export interface CheckDef {
@@ -107,8 +107,11 @@ function regenerateFixFor(a: WorkshopActivity | null): SuggestedFix | null {
 /** Texto visible del enlace que usa `token` en el HTML (para nombrar el botón), o null. */
 function linkTextOf(html: string, token: string): string | null {
   const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const m = firstBlock(html, new RegExp(`<a\\b[^<>]*href=["'][^"'<>]*${esc}[^"'<>]*["'][^<>]*>`, 'i'), /<\/a>/i);
-  const t = m ? plainText(m.inner, 80) : '';
+  void esc;
+  // B12 ronda 1: la primera `<a>` cuyo href (entre comillas) lleva el token, con el escáner lineal de etiquetas.
+  const tag = openTags(html, /<a\b/i).find((x) => { const h = attrOf(x, 'href'); return !!h && h.quote !== '' && (h.value ?? '').includes(token); });
+  const m = tag ? firstBlock(html, '', /<\/a>/i, tag.end) : null;
+  const t = tag && m ? plainText(html.slice(tag.end, m.innerEnd), 80) : '';
   return t || null;
 }
 
@@ -357,9 +360,27 @@ export function rawLinkRef(ctx: DiagnosisContext, h: { entry: string; field: str
 
 // B12 (H1): apertura sin cuerpo perezoso + cierre con indexOf (lineal). Devuelve [entero, comilla, destino, texto] + index.
 const stripScripts = (s: string): string => replaceBlocks(s, /<script\b/i, /<\/script>/i, () => '');
-const DEAD_LINK_OPEN = /<a\b[^<>]*\bhref\s*=\s*(["'])\s*(#?|javascript:[^"'<>]*)\s*\1[^<>]*>/i;
-const deadLinks = (html: string): Array<string[] & { index: number }> =>
-  allBlocks(html, DEAD_LINK_OPEN, /<\/a>/i).map((b) => Object.assign([b.whole, b.open![1], b.open![2], b.inner], { index: b.start }));
+// B12 ronda 1 (P0): sin regex de atributos (`\s*(["'])\s*(…)\s*\1` era cuadrática con una comilla sin cerrar): las
+// etiquetas `<a …>` salen del escáner lineal y el destino se valida en código (vacío, «#» o «javascript:…», con trim).
+const isDeadHref = (v: string): boolean => { const t = v.trim(); return t === '' || t === '#' || /^javascript:/i.test(t); };
+const deadLinks = (html: string): Array<string[] & { index: number }> => {
+  const out: Array<string[] & { index: number }> = [];
+  const close = /<\/a>/gi;
+  const tags = openTags(html, /<a\b/i);
+  let cur = 0;
+  for (const t of tags) {
+    if (t.start < cur) continue; // dentro del enlace anterior (no se solapan, como matchAll)
+    const h0 = attrOf(t, 'href');
+    if (!h0 || h0.quote === '' || h0.value === null || !isDeadHref(h0.value)) continue;
+    close.lastIndex = t.end;
+    const c = close.exec(html);
+    if (!c) break; // sin </a> después: ninguno posterior tiene cierre
+    const h = attrOf(t, 'href')!;
+    out.push(Object.assign([html.slice(t.start, c.index + c[0].length), h.quote, (h.value as string).trim(), html.slice(t.end, c.index)], { index: t.start }));
+    cur = c.index + c[0].length;
+  }
+  return out;
+};
 
 function t04(ctx: DiagnosisContext): Finding[] {
   const out: Finding[] = [];

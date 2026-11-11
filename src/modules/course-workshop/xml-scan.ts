@@ -168,3 +168,123 @@ export const reEsc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\
 export function matchBlocks(text: string, open: ScanOpen, close: ScanClose, from = 0): Array<string[] & { index: number }> {
   return allBlocks(text, open, close, from).map((b) => Object.assign([b.whole, ...(b.open ? b.open.slice(1) : []), b.inner], { index: b.start }));
 }
+
+// ─── Etiquetas de apertura HTML (B12 ronda 1) ──────────────────────────────
+
+export interface HtmlAttr { name: string; value: string | null; quote: '"' | "'" | '' }
+export interface OpenTag {
+  /** Índice del `<`. */
+  start: number;
+  /** Índice tras el `>`. */
+  end: number;
+  /** La etiqueta entera (`<a …>`). */
+  text: string;
+  attrs: HtmlAttr[];
+}
+
+/**
+ * Fin (índice tras el `>`) de una etiqueta que empieza antes de `from`: el primer `>` fuera de comillas. -1 si no cierra
+ * (una comilla o la etiqueta abierta hasta el final: según HTML, todo lo que sigue es parte de esa etiqueta).
+ */
+function tagEnd(html: string, from: number): number {
+  let q = '';
+  for (let k = from; k < html.length; k++) {
+    const c = html[k];
+    if (q) { if (c === q) q = ''; } else if (c === '"' || c === "'") q = c; else if (c === '>') return k + 1;
+  }
+  return -1;
+}
+
+/** Atributos de una etiqueta de apertura, en una pasada (nombre, valor entre comillas o suelto). */
+export function parseAttrs(tag: string, from: number): HtmlAttr[] {
+  const out: HtmlAttr[] = [];
+  const n = tag.length;
+  const ws = (c: string) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+  let i = from;
+  while (i < n) {
+    while (i < n && (ws(tag[i]) || tag[i] === '/')) i++;
+    if (i >= n || tag[i] === '>') break;
+    const s = i;
+    while (i < n && !ws(tag[i]) && tag[i] !== '=' && tag[i] !== '>' && !(tag[i] === '/' && tag[i + 1] === '>')) i++;
+    const name = tag.slice(s, i).toLowerCase();
+    if (i === s) { i++; continue; }
+    let j = i;
+    while (j < n && ws(tag[j])) j++;
+    if (tag[j] !== '=') { out.push({ name, value: null, quote: '' }); i = j; continue; }
+    j++;
+    while (j < n && ws(tag[j])) j++;
+    const c = tag[j];
+    if (c === '"' || c === "'") {
+      let e = tag.indexOf(c, j + 1);
+      if (e < 0) e = n;
+      out.push({ name, value: tag.slice(j + 1, e), quote: c });
+      i = e + 1;
+    } else {
+      let e = j;
+      while (e < n && !ws(tag[e]) && tag[e] !== '>') e++;
+      out.push({ name, value: tag.slice(j, e), quote: '' });
+      i = e;
+    }
+  }
+  return out;
+}
+
+/**
+ * Etiquetas de apertura que empiezan con `opener` (p. ej. `/<a\b/i`), en orden y LINEAL: cada una termina en su primer
+ * `>` fuera de comillas; una que no termina corta la lista (lo que sigue es parte de ella). `from` = desde dónde buscar.
+ */
+export function openTags(html: string, opener: RegExp, from = 0): OpenTag[] {
+  const re = globalOf(opener);
+  const out: OpenTag[] = [];
+  let cur = from;
+  for (;;) {
+    re.lastIndex = cur;
+    const m = re.exec(html);
+    if (!m) break;
+    const body = m.index + m[0].length;
+    const end = tagEnd(html, body);
+    if (end < 0) break;
+    const text = html.slice(m.index, end);
+    out.push({ start: m.index, end, text, attrs: parseAttrs(text, m[0].length) });
+    cur = end;
+  }
+  return out;
+}
+
+/** Valor del primer atributo `name` (en minúsculas) de una etiqueta, o null. */
+export const attrOf = (t: OpenTag, name: string): HtmlAttr | null => t.attrs.find((a) => a.name === name) ?? null;
+
+/** Quita del final una cerca de código ``` (con los espacios de alrededor), sin regex (`\s*```\s*$` era cuadrática). */
+export function stripTrailingFence(s: string): string {
+  const t = s.trimEnd();
+  return t.endsWith('```') ? t.slice(0, -3).trimEnd() : s;
+}
+
+/** Primer `ch` con espacios antes → sin esos espacios (equivale a `.replace(/\s+ch/, ch)`, lineal). */
+export function dropWsBefore(s: string, ch: string): string {
+  for (let i = s.indexOf(ch); i >= 0; i = s.indexOf(ch, i + 1)) {
+    const k = wsStart(s, i);
+    if (k < i) return s.slice(0, k) + s.slice(i);
+  }
+  return s;
+}
+
+/** Tokens de todos los atributos `class="…"` de un HTML (lineal; una comilla sin cerrar corta la búsqueda). */
+export function classTokens(html: string): Set<string> {
+  const out = new Set<string>();
+  for (let i = html.indexOf('class="'); i >= 0; ) {
+    const v = i + 7;
+    const e = html.indexOf('"', v);
+    if (e < 0) break;
+    for (const t of html.slice(v, e).split(/\s+/)) if (t) out.add(t);
+    i = html.indexOf('class="', e + 1);
+  }
+  return out;
+}
+
+/** Quita del final cualquier carácter de `chars` (lineal; `/[…]+$/` es cuadrática con una corrida que no llega al final). */
+export function trimEndChars(s: string, chars: string): string {
+  let k = s.length;
+  while (k > 0 && chars.includes(s[k - 1])) k--;
+  return s.slice(0, k);
+}

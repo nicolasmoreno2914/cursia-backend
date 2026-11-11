@@ -33,7 +33,19 @@ import { applyRegenerate } from './op-regenerate';
 import { applyAddChapter, chapterPieces, templateOf } from './op-add-chapter';
 import { applyAddModule } from './op-add-module';
 import { DiagnosisDelta, OperationReport, PATCH_OPERATIONS, PatchError, PatchFailure, PatchOperation, PatchResult, emptyReport } from './types';
-import { allBlocks } from '../xml-scan';
+import { allBlocks, wsStart } from '../xml-scan';
+
+/**
+ * B12 ronda 1: `s.replace(/\s+—[\s\S]*$/, '')` sin regex (era cuadrática con corridas de espacios): corta en el primer
+ * «—» que tenga espacio antes, junto con esos espacios.
+ */
+export function beforeSpacedDash(s: string): string {
+  for (let i = s.indexOf('—'); i >= 0; i = s.indexOf('—', i + 1)) {
+    const k = wsStart(s, i);
+    if (k < i) return s.slice(0, k);
+  }
+  return s;
+}
 
 export const PATCH_ENGINE_VERSION = 'b11-r0';
 
@@ -98,7 +110,7 @@ export function occurrenceKey(f: Finding, t: PlanTouch): string {
 export function defectKey(f: Finding): string {
   // Enlace muerto: campo + destino (detalle hasta el «—») + texto del botón (el primer «…» del título; el resto del título
   // nombra la actividad por el comienzo de su texto, que una edición puede cambiar).
-  if (f.code === 'dead_link') return `${f.detail.replace(/\s+—[\s\S]*$/, '')}|${/^El botón «([^»]*)»/.exec(f.title)?.[1] ?? ''}`;
+  if (f.code === 'dead_link') return `${beforeSpacedDash(f.detail)}|${/^El botón «([^»]*)»/.exec(f.title)?.[1] ?? ''}`;
   const ex = f.evidence.excerpt ?? '';
   if (!/<[a-zA-Z]/.test(ex)) return ex;
   return ex.replace(/\s(?:style|class|on[a-z]+)\s*=\s*(?:"[^"]*"?|'[^']*'?|[^\s>]*)/gi, '').replace(/\s+/g, ' ').trim();

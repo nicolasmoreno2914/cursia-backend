@@ -16,7 +16,7 @@ import { xmlUnescape } from '../../visual-design/preview-extract';
 import { TokenContext, WorkshopActivity, WorkshopCourse, WorkshopHtmlField, extractTokens, pluginfileRefs, tokenKindShape } from '../course-model';
 import { PatchState, sha1Of } from './container';
 import { PatchError } from './types';
-import { matchBlocks } from '../xml-scan';
+import { matchBlocks, openTags } from '../xml-scan';
 
 export { xmlEsc };
 
@@ -189,13 +189,14 @@ export function editToken(raw: string, token: string, action: 'unlink' | 'retarg
   } else {
     // Fix round 1 (P2-8): etiqueta de apertura con atributos entre comillas (pueden traer «>»), cierre `</a >` /
     // `</A\n>` incluidos; un `<a` antes del cierre (enlace anidado o sin cerrar) → falla, nunca deja un enlace abierto.
-    const OPEN_A = /<a\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
+    // B12 ronda 1: etiquetas `<a …>` con el escáner LINEAL (la regex `(?:[^>"']|"[^"]*"|'[^']*')*` era cuadrática
+    // con muchos `<a` sin `>`); mismo criterio: comillas que pueden traer «>», el primer `>` fuera de comillas cierra.
     const covered = new Set<number>();
-    for (const a of html.matchAll(OPEN_A)) {
-      const s = a.index ?? 0;
-      const hrefs = [...a[0].matchAll(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)].map((h) => h[1] ?? h[2] ?? h[3] ?? '');
+    for (const a of openTags(html, /<a\b/i)) {
+      const s = a.start;
+      const hrefs = a.attrs.filter((x) => x.name === 'href').map((x) => x.value ?? '');
       if (!hrefs.some((h) => h.includes(token))) continue;
-      const after = s + a[0].length;
+      const after = a.end;
       const closeRe = /<\/a\s*>/gi; closeRe.lastIndex = after;
       const cm = closeRe.exec(html);
       if (!cm) throw new PatchError('invalid_content', `El enlace con ${token} no cierra (</a>): no se puede quitar sin romper el HTML.`);
