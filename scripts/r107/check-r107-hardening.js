@@ -14,6 +14,12 @@
 //      (min(1 GB, max(64 MB, tamaño × 4))) corta la lectura (read_budget_exceeded) sin pasar de 300 MB; la reserva FIFO
 //      del servicio se agranda a max(comprimido × factor, min(total, presupuesto) × 2) después de abrir; una expansión
 //      mayor que el presupuesto entero → PackageExpansionError (zip_bomb, no reintentable).
+//   K4 (B12 ronda 1) fuzz HOSTIL: 8 variantes malformadas (comilla sin cerrar en un atributo; muchos `<a`/`<img`/
+//      `<iframe`/`<h1-6`/`<script`/`<style` sin `>`; 100 K espacios + «—»; 100 K espacios + `"`; `$@` sin cierre;
+//      `href="javascript:` + espacios, con y sin la comilla de cierre) × 10 lugares que el Taller lee (moodle_backup,
+//      files, section (XML y su resumen HTML), module, label.xml (XML y su HTML), questions (XML y un enunciado) y el
+//      HTML del Libro Guía) sobre un V1 del builder real → identificar, inventario, diagnóstico técnico (con prueba en
+//      seco), plan (openBuildCtx), compuerta del motor (edit_html + remove sobre la entrada) y aplicar: < 2 s cada uno.
 //   K3 (D3 P1) «Preguntar» sobre cobertura de examen: examen de 40 preguntas con las del capítulo 9 al final → llegan
 //      las 40 (enunciado corto), ANTES del texto del capítulo, sin recorte; examen enorme (200) → recortado: el prompt
 //      lo dice y un «no» baja a «parcial» con el aviso.
@@ -43,19 +49,22 @@ if (has('--bite')) {
   const bites = [
     { id: 'K1', file: 'modules/course-workshop/xml-scan.js', find: /function tagInner\(text, name, from = 0\) \{/, repl: 'function tagInner(text, name, from = 0) { const __m = new RegExp(`<${name}>([\\\\s\\\\S]*?)</${name}>`).exec(text.slice(from)); return __m ? __m[1] : null;' },
     { id: 'K2', file: 'modules/course-workshop/mbz-reader.js', find: /const checkTotalRatio = \(total\) => \{/, repl: 'const checkTotalRatio = (total) => { return;' },
+    { id: 'K4', file: 'modules/course-workshop/diagnosis/checks.js', find: /const deadLinks = \(html\) => \{/, repl: 'const deadLinks = (html) => (0, xml_scan_1.allBlocks)(html, /<a\\b[^<>]*\\bhref\\s*=\\s*(["\'])\\s*(#?|javascript:[^"\'<>]*)\\s*\\1[^<>]*>/i, /<\\/a>/i).map((b) => Object.assign([b.whole, b.open[1], b.open[2], b.inner], { index: b.start }));\nconst __b12_unused = (html) => {' },
     { id: 'K3', file: 'modules/course-workshop/quality/ask.js', find: /if \(truncated && o\.verdict === 'no'\)/, repl: 'if (false)' },
   ];
   let bad = 0;
   for (const b of bites) {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'r107-b12-bite-'));
+    const tmp = fs.mkdtempSync(path.join(REPO, '.r107-b12-bite-')); // dentro del repo: resuelve node_modules
     try {
       fs.cpSync(DIST, tmp, { recursive: true });
       const f = path.join(tmp, b.file);
       const src = fs.readFileSync(f, 'utf8');
       if (!b.find.test(src)) { console.log(`❌ bite ${b.id}: no encontré la guarda en ${b.file}`); bad++; continue; }
       fs.writeFileSync(f, src.replace(b.find, b.repl));
-      const r = spawnSync(process.execPath, [__filename, '--ci', '--dist', tmp, '--only', b.id], { encoding: 'utf8', timeout: 300_000 });
-      const failed = r.status !== 0;
+      const r = spawnSync(process.execPath, [__filename, '--ci', '--dist', tmp, '--only', b.id, ...(b.id === 'K4' ? ['--k4-small'] : [])], { encoding: 'utf8', timeout: 300_000 });
+      if (r.status !== 0 && !/❌ /.test(r.stdout || '')) console.log(`   (bite ${b.id}: terminó sin informe: ${r.signal || r.status}) ${(r.stderr || "").slice(0, 600)}`);
+      // Cuenta solo una falla DE LA PRUEBA (❌ <id>), no un error de carga.
+      const failed = r.status !== 0 && new RegExp(`❌ ${b.id} `).test(r.stdout || '');
       console.log(`${failed ? '✅' : '❌'} bite ${b.id}: ${failed ? 'la prueba falla con la defensa rota' : 'la prueba NO detectó la ruptura'}`);
       if (!failed) bad++;
     } finally {
@@ -272,6 +281,96 @@ async function timed(fn) {
     // sin reserva previa con esa clave (quien llama no reservó) → no toma nada
     await svc.reserveForPackage('nadie', zip([['a', Buffer.from('x')]]), 3);
     eq(svc.reservedMemoryBytes, 0, 'sin clave previa no reserva');
+  });
+
+
+  // ── K4 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  await check('K4', 'fuzz hostil: 8 variantes × 10 lugares del paquete → identificar, inventario, diagnóstico, plan, motor y aplicar < 2 s cada uno', async () => {
+    const JSZip = require(path.join(REPO, 'node_modules/jszip'));
+    const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+    const B = L('modules/course-workshop/plan/builder.js');
+    const EN = L('modules/course-workshop/patch/engine.js');
+    const AC = L('modules/course-workshop/apply/apply-core.js');
+    const DRY = L('modules/pedagogy/dry-run.js');
+    const PRICING = DRY.seedPricing();
+    const sha1 = (b) => crypto.createHash('sha1').update(b).digest('hex');
+    const xesc = (h) => h.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    // --k4-small (solo la mordida): 25 K espacios, para que la versión cuadrática falle en segundos y no en minutos.
+    const S = ' '.repeat(has('--k4-small') ? 25_000 : 100_000);
+    const VARIANTS = {
+      'comilla sin cerrar': `<p>x</p><a href="${S}>b</a><img alt='${S.slice(0, 20000)}><div class="${S.slice(0, 20000)}`,
+      'aperturas sin >': ['<a ', '<img ', '<iframe ', '<h1 ', '<h2 ', '<h3 ', '<h4 ', '<h5 ', '<h6 ', '<script ', '<style '].join('').repeat(1500),
+      'espacios + —': `x${S}—y`,
+      'espacios + "': `x${S}"`,
+      '$@ sin cierre': `${'$@'.repeat(20000)}${'$@PAGEVIEWBYID*'.repeat(2000)}`,
+      'javascript: + espacios': `<a href="javascript:${S}">b</a>`,
+      'javascript: sin comilla': `<a href="javascript:${S}>b`,
+      'mezcla': `<h2 ${S.slice(0, 30000)}<a href="#${S.slice(0, 30000)}<script>${'<style>'.repeat(3000)}`,
+    };
+    const base = await CF.v1BuilderCourse(DIST, {});
+    const z0 = await JSZip.loadAsync(base);
+    const names = Object.keys(z0.files).filter((n) => !z0.files[n].dir);
+    const labels = names.filter((n) => /^activities\/label_\d+\/label\.xml$/.test(n));
+    const target = labels[1], victim = labels[2];
+    const targetMid = Number(/label_(\d+)/.exec(target)[1]), victimMid = Number(/label_(\d+)/.exec(victim)[1]);
+    const section = names.find((n) => /^sections\/section_\d+\/section\.xml$/.test(n));
+    const filesXml = await z0.file('files.xml').async('string');
+    const libroBlk = XS.matchBlocks(filesXml, /<file id="(\d+)">/, '</file>').find((m) => /<component>mod_resource<\/component>/.test(m[2]) && /<filename>[^<]*\.html<\/filename>/.test(m[2]));
+    assert(libroBlk, 'el fixture trae el Libro Guía HTML');
+    const libroHash = /<contenthash>([0-9a-f]{40})<\/contenthash>/.exec(libroBlk[2])[1];
+    const insertAfterOpen = (xml, h) => { const k = xml.indexOf('>', xml.indexOf('<', xml.indexOf('?>') + 2)) + 1; return xml.slice(0, k) + h + xml.slice(k); };
+    const PLACES = {
+      'moodle_backup.xml (XML)': async (z, h) => z.file('moodle_backup.xml', (await z.file('moodle_backup.xml').async('string')).replace('<information>', `<information>${h}`)),
+      'files.xml (XML)': async (z, h) => z.file('files.xml', insertAfterOpen(await z.file('files.xml').async('string'), h)),
+      'section.xml (XML)': async (z, h) => z.file(section, insertAfterOpen(await z.file(section).async('string'), h)),
+      'section.xml (resumen HTML)': async (z, h) => z.file(section, (await z.file(section).async('string')).replace(/<summary>/, `<summary>${xesc(h)}`)),
+      'module.xml (XML)': async (z, h) => { const m = target.replace('label.xml', 'module.xml'); z.file(m, insertAfterOpen(await z.file(m).async('string'), h)); },
+      'label.xml (XML)': async (z, h) => z.file(target, insertAfterOpen(await z.file(target).async('string'), h)),
+      'label.xml (HTML)': async (z, h) => z.file(target, (await z.file(target).async('string')).replace('<intro>', `<intro>${xesc(h)}`)),
+      'questions.xml (XML)': async (z, h) => z.file('questions.xml', insertAfterOpen(await z.file('questions.xml').async('string'), h)),
+      'questions.xml (enunciado)': async (z, h) => z.file('questions.xml', (await z.file('questions.xml').async('string')).replace('<questiontext>', `<questiontext>${xesc(h)}`)),
+      'Libro Guía (HTML)': async (z, h) => {
+        const old = `files/${libroHash.slice(0, 2)}/${libroHash}`;
+        const html = (await z.file(old).async('string')).replace('</body>', `${h}</body>`);
+        const buf = Buffer.from(html, 'utf8');
+        const nh = sha1(buf);
+        z.remove(old);
+        z.file(`files/${nh.slice(0, 2)}/${nh}`, buf);
+        z.file('files.xml', (await z.file('files.xml').async('string')).split(libroHash).join(nh).replace(new RegExp(`(<contenthash>${nh}</contenthash>[\\s\\S]{0,400}?<filesize>)\\d+`), (_m, a) => `${a}${buf.length}`));
+      },
+    };
+    const ops = [{ op: 'edit_html', target: { moduleId: targetMid, field: 'intro' }, change: { kind: 'replace', html: '<p>Texto nuevo</p>' } }, { op: 'remove_activity', moduleId: victimMid }];
+    const slow = [];
+    let cases = 0;
+    let worst = { ms: 0, what: '' };
+    for (const [vName, h] of Object.entries(VARIANTS)) {
+      for (const [pName, put] of Object.entries(PLACES)) {
+        const z = await JSZip.loadAsync(base);
+        await put(z, h);
+        const buf = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+        const steps = {
+          identificar: async () => { const pkg = await R.openMbz(buf); await ID.readPackageFacts(pkg, 'x.mbz'); },
+          inventario: async () => { const pkg = await R.openMbz(buf); await INV.buildInventory(pkg, { family: 'v1-legacy-hvp', builderLine: 'legacy-v1', builderVersion: null }); },
+          diagnóstico: async () => { const pkg = await R.openMbz(buf); await DX.runTechnicalDiagnosis({ pkg, packageBytes: buf, family: 'v1-legacy-hvp', builderLine: 'legacy-v1', builderVersion: null, expectations: null, expectationsReason: 'check' }); },
+          plan: async () => { await B.openBuildCtx(buf, { originalSha1: sha1(buf), pricing: PRICING }); },
+          motor: async () => { await EN.applyPatchPlan({ original: buf, filename: 'x.mbz', operations: ops }); },
+          aplicar: async () => { await AC.runApply({ original: buf, expectedSha1: sha1(buf), items: ops.map((o, i) => ({ id: `i${i}`, requestId: `r${i}`, operation: o.op, quote: '', summary: '', params: o })) }); },
+        };
+        for (const [sName, fn] of Object.entries(steps)) {
+          const t0 = Date.now();
+          try { await fn(); } catch (e) { /* una falla limpia vale: lo que se mide es el tiempo */ }
+          const ms = Date.now() - t0;
+          cases++;
+          if (ms > worst.ms) worst = { ms, what: `${vName} · ${pName} · ${sName}` };
+          if (ms >= 2000) slow.push(`${vName} · ${pName} · ${sName}: ${ms} ms`);
+          if (slow.length) break;
+        }
+        if (slow.length) break;
+      }
+      if (slow.length) break;
+    }
+    console.log(`   ${cases} casos; el más lento: ${worst.ms} ms (${worst.what})`);
+    assert(!slow.length, `≥ 2 s: ${slow.join('; ')}`);
   });
 
   // ── K3 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
