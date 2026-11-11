@@ -42,6 +42,12 @@ export interface MbzReaderLimits {
    * 2 GB declarados (p. ej. miles de entradas chicas que no llegan al umbral de la razón).
    */
   maxReadBytes: number;
+  /**
+   * r107 B12 (H2): razón TOTAL máxima (suma descomprimida declarada / bytes del paquete). Se exige desde
+   * `totalRatioMinBytes` descomprimidos: un paquete chico de XML puede comprimir mucho, legítimamente.
+   */
+  maxTotalRatio: number;
+  totalRatioMinBytes: number;
 }
 
 /**
@@ -57,7 +63,19 @@ export const MBZ_READER_LIMITS: Readonly<MbzReaderLimits> = Object.freeze({
   ratioMinBytes: 8 * 1024 * 1024,
   maxNameLength: 1024,
   maxReadBytes: 1024 * 1024 * 1024,
+  maxTotalRatio: 200,
+  totalRatioMinBytes: 64 * 1024 * 1024,
 });
+
+/**
+ * r107 B12 (H2): presupuesto de lectura PROPORCIONAL al paquete: `min(1 GB, max(64 MB, tamaño × 4))`. Un curso real
+ * del corpus se expande ≤ ~2× (medios ya comprimidos); un paquete de 1 MB no puede materializar 1 GB de XML.
+ */
+export const READ_BUDGET_FLOOR_BYTES = 64 * 1024 * 1024;
+export const READ_BUDGET_PACKAGE_FACTOR = 4;
+export function readBudgetFor(packageBytes: number, cap = MBZ_READER_LIMITS.maxReadBytes): number {
+  return Math.min(cap, Math.max(READ_BUDGET_FLOOR_BYTES, Math.max(0, packageBytes) * READ_BUDGET_PACKAGE_FACTOR));
+}
 
 export type MbzReaderErrorCode =
   | 'not_mbz'
@@ -99,6 +117,8 @@ export interface MbzPackage {
   entries: readonly MbzEntry[];
   /** Suma de los tamaños declarados de los archivos. */
   totalUncompressedBytes: number;
+  /** r107 B12 (H2): bytes descomprimidos que se pueden leer de este paquete abierto (presupuesto acumulado). */
+  readBudgetBytes: number;
   has(name: string): boolean;
   entry(name: string): MbzEntry | null;
   /** Bytes de UNA entrada. Falla con `entry_not_found` si no existe. */
@@ -576,14 +596,25 @@ export async function asReaderError<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function openMbzInner(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): Promise<MbzPackage> {
-  const limits = resolveLimits(limitsIn);
+  // B12 (H2): sin un tope explícito, el presupuesto de lectura es proporcional al tamaño del paquete.
+  const limits = resolveLimits({ ...(limitsIn ?? {}), maxReadBytes: limitsIn?.maxReadBytes ?? readBudgetFor(Buffer.isBuffer(buf) ? buf.length : 0) });
+  const checkTotalRatio = (total: number) => {
+    if (total >= limits.totalRatioMinBytes && total / Math.max(1, buf.length) > limits.maxTotalRatio) {
+      throw new MbzReaderError('zip_bomb', `El paquete parece una «bomba» de compresión: sus ${MB(buf.length)} se expanden ${Math.round(total / Math.max(1, buf.length))} veces (${MB(total)} en total). No se abre.`);
+    }
+  };
   // Fix P2-5: presupuesto acumulado de lectura de ESTE paquete abierto.
+  // B12 (H2): cada entrada DISTINTA se cobra una sola vez (el diagnóstico de un tar.gz relee todo para la prueba en
+  // seco): lo que se cuenta es cuánto del paquete se materializa, que es lo que la reserva de memoria cubre.
   let readSoFar = 0;
+  const charged = new Set<string>();
   const charge = (name: string, size: number) => {
+    if (charged.has(name)) return;
     if (readSoFar + size > limits.maxReadBytes) {
       throw new MbzReaderError('read_budget_exceeded', `Leer ${JSON.stringify(name.slice(0, 120))} superaría los ${MB(limits.maxReadBytes)} que se pueden descomprimir de un paquete. No se continúa.`, name);
     }
     readSoFar += size;
+    charged.add(name);
   };
   if (!Buffer.isBuffer(buf) || buf.length === 0) throw new MbzReaderError('not_mbz', 'El archivo está vacío.');
   if (buf.length > limits.maxPackageBytes) {
@@ -597,6 +628,7 @@ async function openMbzInner(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): P
     const byName = new Map(list.map((e) => [e.name, e]));
     const pub: MbzEntry[] = list.map((e) => ({ name: e.name, size: e.size, compressedSize: e.compressedSize }));
     const totalUncompressedBytes = list.reduce((s, e) => s + e.size, 0);
+    checkTotalRatio(totalUncompressedBytes);
     const read = (name: string, opts?: ReadEntryOptions): Promise<Buffer> => asReaderError(async () => {
       const e = byName.get(name);
       if (!e) throw new MbzReaderError('entry_not_found', `El paquete no tiene ${JSON.stringify(name.slice(0, 120))}.`, name);
@@ -608,6 +640,7 @@ async function openMbzInner(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): P
       container,
       entries: pub,
       totalUncompressedBytes,
+      readBudgetBytes: limits.maxReadBytes,
       has: (n) => byName.has(n),
       entry: (n) => {
         const e = byName.get(n);
@@ -627,6 +660,7 @@ async function openMbzInner(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): P
   const byName = new Map(list.map((e) => [e.name, e]));
   const pub: MbzEntry[] = list.map((e) => ({ name: e.name, size: e.size, compressedSize: null }));
   const totalUncompressedBytes = list.reduce((s, e) => s + e.size, 0);
+  checkTotalRatio(totalUncompressedBytes);
   const readMany = async (names: readonly string[], opts?: ReadEntryOptions): Promise<Map<string, Buffer>> => {
     const want = new Set<string>();
     for (const n of names) {
@@ -642,6 +676,7 @@ async function openMbzInner(buf: Buffer, limitsIn?: Partial<MbzReaderLimits>): P
     container,
     entries: pub,
     totalUncompressedBytes,
+    readBudgetBytes: limits.maxReadBytes,
     has: (n) => byName.has(n),
     entry: (n) => {
       const e = byName.get(n);

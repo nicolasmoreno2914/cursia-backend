@@ -6,7 +6,7 @@ import { isCourseWorkshopEnabled } from '../../features/course-workshop-flag';
 import { isUuid } from '../../authz/schema-probe';
 import { parseSafetyCapFactor, readSafetyCapFactor } from '../../finops/safety-cap';
 import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
-import { openMbz } from '../mbz-reader';
+import { isMbzReaderError, openMbz } from '../mbz-reader';
 import { builderLineOf, familyOf, readPackageFacts } from '../identify';
 import { buildDiagnosisContext, DiagnosisContext } from '../diagnosis/context';
 import { DIAGNOSIS_CODE_VERSION } from '../diagnosis/diagnose';
@@ -514,14 +514,18 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Abre el original VERIFICADO de la sesión y arma el contexto del diagnóstico (el mismo lector que B3). */
-  private async contextOf(s: WorkshopPlanSession) {
+  private async contextOf(s: WorkshopPlanSession, memoryKey: string) {
     const original = await this.workshop.loadVerifiedOriginal(s.id);
+    // B12 (H2): la reserva `memoryKey` pasa a lo que el paquete ABIERTO puede ocupar (memoryFor es solo lo comprimido).
+    await this.workshop.reserveForPackage(memoryKey, original.buffer, diagnosisMemoryFactor(s.container));
     const { ctx, pkg } = await this.contextBuilder(original.buffer);
     return { ctx, pkg, buffer: original.buffer };
   }
 
   private errorOf(err: unknown): { code: string; message: string; retryable: boolean } {
     if (err instanceof MemoryWaitTimeoutError) return { code: err.code, message: err.message, retryable: true };
+    // B12 (H2): un paquete que se expande más de lo procesable (bomba) es terminal: con los mismos bytes falla igual.
+    if (isMbzReaderError(err)) return { code: `WORKSHOP_${err.code.toUpperCase()}`, message: err.message, retryable: false };
     const body = (err as { getResponse?: () => any })?.getResponse?.();
     if (body?.code) return { code: String(body.code), message: String(body.message ?? 'No se pudo abrir el original de la sesión.'), retryable: body.code !== WORKSHOP_ERRORS.ORIGINAL_CHANGED && body.code !== WORKSHOP_ERRORS.ORIGINAL_MISSING };
     this.logger.error(`taller calidad: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
@@ -544,7 +548,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
     if (!s || s.status !== 'identified' || s.originalSha1 !== run.original_sha1) { await fail({ code: WORKSHOP_ERRORS.ORIGINAL_CHANGED, message: 'El original de la sesión cambió: vuelve a diagnosticarlo.', retryable: false }); return; }
     try {
       await this.workshop.withMemory(`quality:${runId}`, this.memoryFor(s), async () => {
-        const { ctx, pkg, buffer } = await this.contextOf(s);
+        const { ctx, pkg, buffer } = await this.contextOf(s, `quality:${runId}`);
         const { pricing, reason } = await this.pricingOrNull();
         const p = await prepareQuality(ctx, pkg, buffer, pricing, reason);
         const calls = p.calls;
@@ -617,7 +621,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
     let stop: AiUnavailableError | null = null;
     try {
       await this.workshop.withMemory(`quality-ai:${job.runId}`, this.memoryFor(s), async () => {
-        const { ctx, pkg, buffer } = await this.contextOf(s);
+        const { ctx, pkg, buffer } = await this.contextOf(s, `quality-ai:${job.runId}`);
         const docs = qualityDocs(ctx);
         const pricing = await this.plan.pricing();
         const approval = await this.plan.approvalOf(job.approvalId);
@@ -690,7 +694,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
     }
     try {
       await this.workshop.withMemory(`question:${questionId}`, this.memoryFor(s), async () => {
-        const { ctx } = await this.contextOf(s);
+        const { ctx } = await this.contextOf(s, `question:${questionId}`);
         const docs = qualityDocs(ctx);
         const ev = retrieveEvidence(ctx.course, docs, row.question);
         const evidence = { ...ev, courseTitle: ctx.course.course.title };

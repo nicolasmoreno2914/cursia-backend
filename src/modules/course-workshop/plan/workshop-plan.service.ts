@@ -12,6 +12,7 @@ import { loadDryRunPricing } from '../../finops/dry-run-pricing';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import { readDocument, DocumentReadError } from '../../academic-context';
 import { isUuid } from '../../authz/schema-probe';
+import { isMbzReaderError } from '../mbz-reader';
 import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
 import { DIAGNOSIS_CODE_VERSION, DiagnosisReport } from '../diagnosis/diagnose';
 import { QUALITY_CODE_VERSION } from '../quality/types';
@@ -921,12 +922,17 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
         let ctx: BuildCtx;
         try {
           const original = await this.workshop.loadVerifiedOriginal(s.id);
+          // B12 (H2): la reserva pasa a lo que el paquete ABIERTO puede ocupar (+ lo producido que el trabajo carga).
+          await this.workshop.reserveForPackage(`plan:${job.sessionId}`, original.buffer, diagnosisMemoryFactor(s.container), Math.max(0, bytes - Number(s.originalSize ?? 0) * diagnosisMemoryFactor(s.container)));
           ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
           ctx.regenDbLoader = () => this.regenDbSources(s, ctx.course);
           // r107 B10 · Libro v3 (PDF): la entrada del builder del curso, solo si hace falta (perezosa).
           ctx.libroV3Loader = () => libroV3ResolverOf(this.dataSource, this.artifacts, this.moduleRef).resolve(s);
           ctx.ttsModel = resolveTtsModel(undefined, process.env).model;
         } catch (err) {
+          if (err instanceof MemoryWaitTimeoutError) throw err;
+          // B12 (H2): paquete que se expande más de lo procesable → terminal (con los mismos bytes falla igual).
+          if (isMbzReaderError(err)) { await this.failJob(job, `WORKSHOP_${err.code.toUpperCase()}`, err.message, false); return; }
           const body = (err as { getResponse?: () => any })?.getResponse?.();
           const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
           await this.failJob(job, code, String(body?.message ?? 'No se pudo abrir el original de la sesión; vuelve a intentarlo.'), code !== WORKSHOP_ERRORS.ORIGINAL_CHANGED && code !== WORKSHOP_ERRORS.ORIGINAL_MISSING);

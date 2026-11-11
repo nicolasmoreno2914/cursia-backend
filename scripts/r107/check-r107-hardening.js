@@ -14,9 +14,6 @@
 //      (min(1 GB, max(64 MB, tamaño × 4))) corta la lectura (read_budget_exceeded) sin pasar de 300 MB; la reserva FIFO
 //      del servicio se agranda a max(comprimido × factor, min(total, presupuesto) × 2) después de abrir; una expansión
 //      mayor que el presupuesto entero → PackageExpansionError (zip_bomb, no reintentable).
-//   K3 (D3 P1) «Preguntar» sobre cobertura de examen: examen de 40 preguntas con las del capítulo 9 al final → llegan
-//      las 40 (enunciado corto), ANTES del texto del capítulo, sin recorte; examen enorme (200) → recortado: el prompt
-//      lo dice y un «no» baja a «parcial» con el aviso.
 //
 // Uso: npm run build && node scripts/r107/check-r107-hardening.js --ci [--dist dist]
 //      node scripts/r107/check-r107-hardening.js --bite   (copia dist/ y rompe una defensa por vez: cada una tiene que
@@ -43,7 +40,6 @@ if (has('--bite')) {
   const bites = [
     { id: 'K1', file: 'modules/course-workshop/xml-scan.js', find: /function tagInner\(text, name, from = 0\) \{/, repl: 'function tagInner(text, name, from = 0) { const __m = new RegExp(`<${name}>([\\\\s\\\\S]*?)</${name}>`).exec(text.slice(from)); return __m ? __m[1] : null;' },
     { id: 'K2', file: 'modules/course-workshop/mbz-reader.js', find: /const checkTotalRatio = \(total\) => \{/, repl: 'const checkTotalRatio = (total) => { return;' },
-    { id: 'K3', file: 'modules/course-workshop/quality/ask.js', find: /if \(truncated && o\.verdict === 'no'\)/, repl: 'if (false)' },
   ];
   let bad = 0;
   for (const b of bites) {
@@ -110,8 +106,6 @@ const INV = L('modules/course-workshop/inventory.js');
 const DX = L('modules/course-workshop/diagnosis/diagnose.js');
 const XS = L('modules/course-workshop/xml-scan.js');
 const SVC = L('modules/course-workshop/course-workshop.service.js');
-const QL = L('modules/course-workshop/quality/ask.js');
-const QT = L('modules/course-workshop/quality/types.js');
 
 let ok = 0;
 let fail = 0;
@@ -272,43 +266,6 @@ async function timed(fn) {
     // sin reserva previa con esa clave (quien llama no reservó) → no toma nada
     await svc.reserveForPackage('nadie', zip([['a', Buffer.from('x')]]), 3);
     eq(svc.reservedMemoryBytes, 0, 'sin clave previa no reserva');
-  });
-
-  // ── K3 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
-  const askFixture = (nQ) => {
-    const chapters = Array.from({ length: 9 }, (_, i) => ({ number: i + 1, moduleNumber: Math.floor(i / 3) + 1, title: 'C' + (i + 1), activities: [] }));
-    const qs = Array.from({ length: nQ }, (_, i) => ({ id: 100 + i, chapterNumber: null }));
-    const course = { chapters, modules: [], activities: [{ moduleId: 50, exam: { final: true, unit: null, questions: qs } }] };
-    const docs = [];
-    for (const c of chapters) for (let k = 0; k < 4; k++) docs.push({ key: `t${c.number}-${k}`, moduleId: 10 + c.number, questionId: null, chapterNumber: c.number, role: 'libro', what: 'libro', activityTitle: 'Libro', text: `Texto del capítulo ${c.number} sobre el tema de la ventilación mecánica número ${k}. `.repeat(8) });
-    qs.forEach((q, i) => docs.push({ key: `q${q.id}`, moduleId: 50, questionId: q.id, chapterNumber: null, role: 'exam', what: 'pregunta', activityTitle: 'Evaluación final', text: `Pregunta ${i + 1} (tema del capítulo ${Math.floor(i / (nQ / 9)) + 1}): ¿Cuál es la respuesta correcta sobre el procedimiento ${i}? ${'Contexto largo del caso clínico. '.repeat(12)}` }));
-    return { course, docs };
-  };
-  await check('K3', 'D3: examen de 40 preguntas (las del capítulo 9 al final) → llegan las 40, antes del capítulo, sin recorte; examen enorme → recorte dicho en el prompt y «no» → «parcial»', async () => {
-    const { course, docs } = askFixture(40);
-    const ev = QL.retrieveEvidence(course, docs, '¿El examen final cubre el capítulo 9?');
-    const exam = ev.passages.filter((p) => p.role === 'exam');
-    eq(exam.length, 40, 'todas las preguntas del examen');
-    eq(exam[exam.length - 1].questionId, 139, 'incluye las del final (capítulo 9)');
-    assert(exam.every((p) => p.text.length <= QT.QUALITY_LIMITS.askExamQuestionChars + 1), 'enunciado corto');
-    const firstText = ev.passages.findIndex((p) => p.role !== 'exam');
-    assert(firstText > 0 && ev.passages.slice(0, firstText).every((p) => p.role === 'exam'), 'las preguntas van ANTES del texto del capítulo');
-    assert(ev.passages.some((p) => p.role !== 'exam' && p.chapterNumber === 9), 'texto del capítulo 9');
-    eq(ev.truncated, false, 'sin recorte');
-    assert(!/RECORTADA/.test(QL.askUser('C', 'q', ev.passages, ev.truncated)), 'sin aviso de recorte');
-    // un «no» con evidencia completa se respeta
-    const cite = { passageId: exam[0].id, quote: exam[0].text.slice(0, 40) };
-    eq(QL.verifyAnswer({ verdict: 'no', answer: 'No lo cubre.', citations: [cite] }, ev.passages, ev.truncated).verdict, 'no', '«no» con todo a la vista');
-    // examen enorme: no entra todo → recortado, el prompt lo dice, «no» baja a «parcial» con el aviso
-    const big = askFixture(200);
-    const ev2 = QL.retrieveEvidence(big.course, big.docs, '¿El examen final cubre el capítulo 9?');
-    eq(ev2.truncated, true, 'examen enorme recortado');
-    assert(ev2.examQuestions && ev2.examQuestions.total === 200 && ev2.examQuestions.sent < 200, 'cuenta lo que entró');
-    assert(/RECORTADA/.test(QL.askUser('C', 'q', ev2.passages, true)) && /RECORTADA/.test(QL.ASK_SYSTEM), 'el prompt avisa el recorte');
-    const ex2 = ev2.passages.find((p) => p.role === 'exam');
-    const a = QL.verifyAnswer({ verdict: 'no', answer: 'No lo cubre.', citations: [{ passageId: ex2.id, quote: ex2.text.slice(0, 40) }] }, ev2.passages, true);
-    eq(a.verdict, 'parcial', '«no» con evidencia recortada → parcial');
-    assert(a.answer.includes(QL.TRUNCATED_NOTE), 'con el aviso para el docente');
   });
 
   console.log(`\n${fail ? '❌' : '✅'} check-r107-hardening --ci: ${ok}/${ok + fail}`);

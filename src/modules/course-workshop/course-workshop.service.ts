@@ -11,7 +11,7 @@ import { rbacMode } from '../authz/authz-flags';
 import { PermissionService } from '../authz/permission.service';
 import type { Permission } from '../authz/permissions';
 import { isUuid } from '../authz/schema-probe';
-import { MbzPackage, isMbzReaderError, openMbz } from './mbz-reader';
+import { MbzPackage, MbzReaderError, isMbzReaderError, openMbz } from './mbz-reader';
 import { WORKSHOP_MAX_UPLOAD_BYTES } from './workshop-limits';
 import {
   BuilderLine, CatalogCourse, IdentificationResult, IdentifyScope, PackageFactsError, WorkshopFamily, builderVersionColumn, identifyPackage, readPackageFacts,
@@ -124,6 +124,22 @@ export function diagnosisMemoryFactor(container: string | null | undefined): num
   return container === 'tar.gz' ? DIAGNOSIS_MEMORY_FACTOR_TGZ : DIAGNOSIS_MEMORY_FACTOR;
 }
 export const IDENTIFY_MEMORY_FACTOR = 3;
+/**
+ * r107 B12 (H2): lo DESCOMPRIMIDO que se puede leer de un paquete abierto ocupa ~2× en memoria (Buffer + string UTF-16
+ * de los XML). La reserva real de un trabajo es `max(comprimido × factor, min(total declarado, presupuesto de lectura) × 2)`
+ * — calculada DESPUÉS de abrir el índice (openMbz): un paquete de 1 MB que declara 1 GB ya no reserva 3 MB.
+ */
+export const EXPANDED_MEMORY_FACTOR = 2;
+export function packageMemoryBytes(pkg: Pick<MbzPackage, 'totalUncompressedBytes' | 'readBudgetBytes'>, compressedBytes: number, factor: number): number {
+  return Math.ceil(Math.max(compressedBytes * factor, Math.min(pkg.totalUncompressedBytes, pkg.readBudgetBytes) * EXPANDED_MEMORY_FACTOR));
+}
+/** B12 (H2): la expansión del paquete no entra NUNCA en el presupuesto del Taller → falla NO reintentable (mismo código que una bomba). */
+export class PackageExpansionError extends MbzReaderError {
+  constructor(readonly needBytes: number, readonly budgetBytes: number) {
+    super('zip_bomb', `El paquete se expande a más de lo que el Taller puede procesar (~${Math.round(needBytes / 1048576)} MB de ${Math.round(budgetBytes / 1048576)} MB disponibles). No se abre.`);
+    this.name = 'PackageExpansionError';
+  }
+}
 /** Latido de quien espera lugar en el presupuesto de memoria (fix round 1 de B6, P2-4). */
 export const MEMORY_WAIT_TICK_MS = 10_000;
 export const WORKSHOP_MEMORY_BUDGET_DEFAULT_MB = 2048;
@@ -783,9 +799,11 @@ export class CourseWorkshopService {
     let pkg: MbzPackage;
     let facts;
     try {
-      pkg = await openMbz(buf);
+      // B12 (H2): la reserva pasa a lo que el paquete ABIERTO puede ocupar (no solo lo comprimido).
+      pkg = await this.reserveForPackage(`identify:${id}`, buf, IDENTIFY_MEMORY_FACTOR, 0, () => this.touchIdentifying(id, claimId));
       facts = await readPackageFacts(pkg, row.identification?.upload?.filename ?? null);
     } catch (err) {
+      if (err instanceof MemoryWaitTimeoutError) throw err; // B12 (H2): la espera por la reserva agrandada → reintentable (identificationEnded)
       if (isMbzReaderError(err) || err instanceof PackageFactsError) {
         await fail(`WORKSHOP_${err.code.toUpperCase()}`, err.message, false, { sha1, size });
       } else {
@@ -1138,8 +1156,9 @@ export class CourseWorkshopService {
     }
     let pkg: MbzPackage;
     try {
-      pkg = await openMbz(original.buffer);
-    } catch {
+      pkg = await this.reserveForPackage(`rebuild:${id}`, original.buffer, IDENTIFY_MEMORY_FACTOR);
+    } catch (err) {
+      if (err instanceof MemoryWaitTimeoutError) throw err;
       await saveInfo({ builtAt: this.now().toISOString(), error: { code: WORKSHOP_ERRORS.INVENTORY_FAILED, message: 'El original verificado no se pudo abrir para armar el inventario; avísanos.', retryable: false } }, null);
       return;
     }
@@ -1193,6 +1212,42 @@ export class CourseWorkshopService {
     }
     await new Promise<void>((resolve, reject) => this.enqueueMemory({ key, bytes: need, grant: resolve, timeout: reject, onWaitTick }));
     return release();
+  }
+
+  /**
+   * r107 B12 (H2): agranda la reserva `key` (tomada antes de abrir, sobre lo comprimido) a `bytes` (lo que el paquete
+   * ABIERTO puede ocupar). Suelta la reserva y vuelve a la cola FIFO por el total (sin retener memoria mientras espera:
+   * nunca un abrazo mortal con la cabeza de la cola). La expansión sola por encima del presupuesto → PackageExpansionError
+   * (no reintentable). Quien tomó `key` la suelta al terminar como siempre (la clave es la misma).
+   */
+  async ensureMemory(key: string, bytes: number, expansionBytes = bytes, onWaitTick?: () => Promise<void> | void): Promise<void> {
+    if (expansionBytes > this.memoryBudgetBytes) throw new PackageExpansionError(expansionBytes, this.memoryBudgetBytes);
+    // Sin reserva previa con esa clave (quien llama no pasó por withMemory/acquireMemory): no se toma nada que nadie suelte.
+    if (!this.memoryReservations.has(key)) return;
+    const held = this.memoryReservations.get(key) ?? 0;
+    if (bytes <= held) return;
+    this.memoryReservations.delete(key);
+    this.memoryReleased();
+    await this.acquireMemory(key, bytes, onWaitTick);
+    this.memoryExpansions++;
+  }
+  /** Veces que una reserva se agrandó tras abrir el paquete (para los checks). */
+  memoryExpansions = 0;
+
+  /**
+   * B12 (H2): abre el índice del paquete y agranda la reserva `key` a lo que puede ocupar abierto (ver packageMemoryBytes).
+   * `extraBytes` = lo que el trabajo suma aparte (resultados producidos). Devuelve el paquete abierto.
+   */
+  async reserveForPackage(key: string, buf: Buffer, factor: number, extraBytes = 0, onWaitTick?: () => Promise<void> | void): Promise<MbzPackage> {
+    const pkg = await openMbz(buf);
+    const expansion = Math.min(pkg.totalUncompressedBytes, pkg.readBudgetBytes) * EXPANDED_MEMORY_FACTOR;
+    await this.ensureMemory(key, packageMemoryBytes(pkg, buf.length, factor) + Math.max(0, extraBytes), expansion, onWaitTick);
+    return pkg;
+  }
+
+  /** Reserva vigente de `key` (0 si no hay). */
+  reservedFor(key: string): number {
+    return this.memoryReservations.get(key) ?? 0;
   }
 
   /** Entra ya (sin mirar la cola): nada reservado, o cabe en lo que queda. */

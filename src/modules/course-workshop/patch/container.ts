@@ -129,6 +129,7 @@ export class PatchState {
       container: this.container,
       entries,
       totalUncompressedBytes: entries.reduce((s, e) => s + e.size, 0),
+      readBudgetBytes: this.original.readBudgetBytes,
       has: (n) => byName.has(n),
       entry: (n) => byName.get(n) ?? null,
       readEntry: async (n) => { if (!byName.has(n)) throw new Error(`El paquete no tiene ${n}`); return this.read(n); },
