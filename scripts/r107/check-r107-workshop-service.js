@@ -1098,12 +1098,13 @@ function rawZip(entries) {
       const saved = svc.memoryBudgetBytes;
       try {
         const t = await newIdentified('b4-tgz.mbz');
+        // B12 (H2): la identificación reserva lo DESCOMPRIMIDO (× 2); las sesiones se identifican ANTES de bajar el presupuesto.
+        const z = await newIdentified('b4-zip.mbz');
         await ds.query(`update public.workshop_sessions set container = 'tar.gz' where id = $1`, [t.session.id]);
         svc.memoryBudgetBytes = MBZ.length * 6; // zip (5,5×) entra, tar.gz (7×) no
         const a = await svc.startDiagnosis(OWNER, t.session.id);
         eq([a.status, a.error && a.error.code], ['failed', 'WORKSHOP_DIAGNOSIS_TOO_LARGE'], 'tar.gz: 7× no entra');
         assert(/tar\.gz/.test(a.error.message) && /7×/.test(a.error.message), `motivo: ${a.error.message}`);
-        const z = await newIdentified('b4-zip.mbz');
         eq((await svc.startDiagnosis(OWNER, z.session.id)).status, 'queued', 'zip: 5,5× entra');
         await settleD(z.session.id);
       } finally { svc.memoryBudgetBytes = saved; }
