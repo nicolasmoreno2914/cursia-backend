@@ -288,3 +288,23 @@ export function trimEndChars(s: string, chars: string): string {
   while (k > 0 && chars.includes(s[k - 1])) k--;
   return s.slice(0, k);
 }
+
+/**
+ * Quita las etiquetas de un HTML respetando las comillas de los atributos (`title="x < y"` no corta la etiqueta), en
+ * tiempo lineal. `<` seguido de algo que no abre una etiqueta (espacio, número…) es texto y queda. Una etiqueta que no
+ * termina (sin `>` fuera de comillas) queda tal cual, con todo lo que sigue. Para HTML que se ESCRIBE al paquete.
+ */
+export function stripTagsQuoted(html: string): string {
+  let out = '';
+  let cur = 0;
+  for (let i = html.indexOf('<'); i >= 0; i = html.indexOf('<', cur)) {
+    const c = html[i + 1] ?? '';
+    if (!/[A-Za-z\/!?]/.test(c)) { out += html.slice(cur, i + 1); cur = i + 1; continue; }
+    const e = tagEnd(html, i + 1);
+    if (e < 0) break;
+    out += html.slice(cur, i);
+    cur = e;
+  }
+  return out + html.slice(cur);
+}
+

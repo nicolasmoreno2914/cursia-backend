@@ -20,6 +20,8 @@
 //      files, section (XML y su resumen HTML), module, label.xml (XML y su HTML), questions (XML y un enunciado) y el
 //      HTML del Libro Guía) sobre un V1 del builder real → identificar, inventario, diagnóstico técnico (con prueba en
 //      seco), plan (openBuildCtx), compuerta del motor (edit_html + remove sobre la entrada) y aplicar: < 2 s cada uno.
+//   K5 (B12 ronda 2) el HTML que reemplaza un enlace muerto (se ESCRIBE al paquete) respeta las comillas:
+//      `<a href="#" title="x < y">Libro Guía</a>` → «Libro Guía» (helper y de punta a punta: diagnóstico → motor).
 //   K3 (D3 P1) «Preguntar» sobre cobertura de examen: examen de 40 preguntas con las del capítulo 9 al final → llegan
 //      las 40 (enunciado corto), ANTES del texto del capítulo, sin recorte; examen enorme (200) → recortado: el prompt
 //      lo dice y un «no» baja a «parcial» con el aviso.
@@ -50,6 +52,7 @@ if (has('--bite')) {
     { id: 'K1', file: 'modules/course-workshop/xml-scan.js', find: /function tagInner\(text, name, from = 0\) \{/, repl: 'function tagInner(text, name, from = 0) { const __m = new RegExp(`<${name}>([\\\\s\\\\S]*?)</${name}>`).exec(text.slice(from)); return __m ? __m[1] : null;' },
     { id: 'K2', file: 'modules/course-workshop/mbz-reader.js', find: /const checkTotalRatio = \(total\) => \{/, repl: 'const checkTotalRatio = (total) => { return;' },
     { id: 'K4', file: 'modules/course-workshop/diagnosis/checks.js', find: /const deadLinks = \(html\) => \{/, repl: 'const deadLinks = (html) => (0, xml_scan_1.allBlocks)(html, /<a\\b[^<>]*\\bhref\\s*=\\s*(["\'])\\s*(#?|javascript:[^"\'<>]*)\\s*\\1[^<>]*>/i, /<\\/a>/i).map((b) => Object.assign([b.whole, b.open[1], b.open[2], b.inner], { index: b.start }));\nconst __b12_unused = (html) => {' },
+    { id: 'K5', file: 'modules/course-workshop/plan/builder.js', find: /function unwrapLinkHtml\(rawLink\) \{/, repl: 'function unwrapLinkHtml(rawLink) { return (0, preview_extract_1.xmlUnescape)(rawLink).replace(/<[^<>]*>/g, "");' },
     { id: 'K3', file: 'modules/course-workshop/quality/ask.js', find: /if \(truncated && o\.verdict === 'no'\)/, repl: 'if (false)' },
   ];
   let bad = 0;
@@ -65,7 +68,7 @@ if (has('--bite')) {
       if (r.status !== 0 && !/❌ /.test(r.stdout || '')) console.log(`   (bite ${b.id}: terminó sin informe: ${r.signal || r.status}) ${(r.stderr || "").slice(0, 600)}`);
       // Cuenta solo una falla DE LA PRUEBA (❌ <id>), no un error de carga.
       const failed = r.status !== 0 && new RegExp(`❌ ${b.id} `).test(r.stdout || '');
-      console.log(`${failed ? '✅' : '❌'} bite ${b.id}: ${failed ? 'la prueba falla con la defensa rota' : 'la prueba NO detectó la ruptura'}`);
+      console.log(`${failed ? '✅' : '❌'} bite ${b.label || b.id}: ${failed ? 'la prueba falla con la defensa rota' : 'la prueba NO detectó la ruptura'}`);
       if (!failed) bad++;
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -371,6 +374,42 @@ async function timed(fn) {
     }
     console.log(`   ${cases} casos; el más lento: ${worst.ms} ms (${worst.what})`);
     assert(!slow.length, `≥ 2 s: ${slow.join('; ')}`);
+  });
+
+
+  // ── K5–K7 (B12 ronda 2) ────────────────────────────────────────────────────────────────────────────────────────
+  const JSZ = require(path.join(REPO, 'node_modules/jszip'));
+  const CFX = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+  const xmlEsc = (h) => h.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const withLabelHtml = async (labelNo, html, labelHtmlTail = '') => {
+    const z = await JSZ.loadAsync(await CFX.v1BuilderCourse(DIST, {}));
+    const labels = Object.keys(z.files).filter((n) => /^activities\/label_\d+\/label\.xml$/.test(n));
+    const entry = labels[labelNo];
+    const x = await z.file(entry).async('string');
+    z.file(entry, x.replace(/<intro>[^<]*<\/intro>/, () => `<intro>${xmlEsc(html)}${labelHtmlTail}</intro>`)); // función: `$&` del token no es un patrón
+    return { buf: await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), entry, moduleId: Number(/label_(\d+)/.exec(entry)[1]) };
+  };
+  const introOf = async (buf, entry) => { const z = await JSZ.loadAsync(buf); const x = await z.file(entry).async('string'); return x.slice(x.indexOf('<intro>') + 7, x.indexOf('</intro>')).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&'); };
+
+  await check('K5', 'enlace muerto con `title="x < y"`: el HTML que se escribe es «Libro Guía» (helper y diagnóstico → motor)', async () => {
+    const B = L('modules/course-workshop/plan/builder.js');
+    const EN = L('modules/course-workshop/patch/engine.js');
+    const LINK = '<a href="#" title="x < y">Libro Guía</a>';
+    eq(B.unwrapLinkHtml(xmlEsc(LINK)), 'Libro Guía', 'helper');
+    eq(B.unwrapLinkHtml(xmlEsc('<a href="#" data-x=\'a>b\'>Ver <b>más</b></a>')), 'Ver más', 'comillas simples con «>»');
+    const { buf, entry, moduleId } = await withLabelHtml(3, `<p>Antes</p>${LINK}<p>Después</p>`);
+    const pkg = await R.openMbz(buf);
+    const rep = await DX.runTechnicalDiagnosis({ pkg, packageBytes: buf, family: 'v1-legacy-hvp', builderLine: 'legacy-v1', builderVersion: null, expectations: null, expectationsReason: 'check' }, { prevalidateFixes: false });
+    const f = rep.findings.find((x) => x.code === 'dead_link' && x.suggestedFix && x.suggestedFix.params.moduleId === moduleId);
+    assert(f, `el diagnóstico ve el enlace muerto: ${rep.findings.map((x) => x.code).join(', ')}`);
+    const p = f.suggestedFix.params;
+    const z = await JSZ.loadAsync(buf);
+    const raw = Buffer.from(await z.file(p.entry).async('uint8array')).subarray(p.fieldRawOffset + p.linkRawByteOffset, p.fieldRawOffset + p.linkRawByteOffset + p.linkRawBytes).toString('utf8');
+    const html = B.unwrapLinkHtml(raw);
+    eq(html, 'Libro Guía', 'el reemplazo que arma el plan');
+    const res = await EN.applyPatchPlan({ original: buf, filename: 'x.mbz', operations: [{ op: 'edit_html', target: { moduleId, field: 'intro' }, expectRawSha1: p.fieldRawSha1, change: { kind: 'range', rawByteOffset: p.linkRawByteOffset, rawBytes: p.linkRawBytes, html } }] });
+    assert(res.ok, `el motor aplica: ${res.failure && res.failure.message}`);
+    eq(await introOf(res.package, entry), '<p>Antes</p>Libro Guía<p>Después</p>', 'el paquete queda con el texto, sin restos de la etiqueta');
   });
 
   // ── K3 ─────────────────────────────────────────────────────────────────────────────────────────────────────────

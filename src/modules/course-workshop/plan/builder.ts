@@ -18,7 +18,7 @@ import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
 import { libroHeadingTitle, libroStructure } from '../patch/op-libro';
 import type { FieldChange, NewQuestion, PatchOperation, PatchResult } from '../patch/types';
 import { xmlUnescape } from '../../visual-design/preview-extract';
-import { firstBlock } from '../xml-scan';
+import { firstBlock, stripTagsQuoted } from '../xml-scan';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import type { WorkshopAiResult, WorkshopTool } from './ai';
 import { WORKSHOP_INTERPRET_MAX_TOKENS, WORKSHOP_QUESTION_MAX_TOKENS, htmlMaxTokens, libroMaxTokens } from './ai';
@@ -103,6 +103,14 @@ async function libroV3Of(ctx: BuildCtx): Promise<LibroV3Source | { unavailable: 
 export async function regenDbOf(ctx: BuildCtx): Promise<RegenDbSources | null> {
   if (ctx.regenDb === undefined && ctx.regenDbLoader) ctx.regenDb = await ctx.regenDbLoader();
   return ctx.regenDb ?? null;
+}
+
+/**
+ * B12 ronda 2: el HTML que reemplaza un enlace muerto (se ESCRIBE al paquete): su texto sin las etiquetas, respetando
+ * las comillas de los atributos (`<a href="#" title="x < y">Libro Guía</a>` → «Libro Guía»), en tiempo lineal.
+ */
+export function unwrapLinkHtml(rawLink: string): string {
+  return stripTagsQuoted(xmlUnescape(rawLink));
 }
 
 export async function openBuildCtx(original: Buffer, opts: { filename?: string | null; originalSha1: string; pricing: WorkshopPricing; baseline?: { originalSha1: string; report: DiagnosisReport } | null }): Promise<BuildCtx> {
@@ -330,7 +338,7 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
         const b = await read(ctx, d.entry);
         if (!b) return { unavailable: 'El campo ya no está en el paquete.' };
         const rawLink = b.subarray(d.fieldRawOffset + d.rawByteOffset, d.fieldRawOffset + d.rawByteOffset + d.rawBytes).toString('utf8');
-        const text = xmlUnescape(rawLink).replace(/<[^<>]*>/g, ''); // B12 ronda 1: `[^<>]` (lineal con muchos `<` sin `>`)
+        const text = unwrapLinkHtml(rawLink);
         return { op: { op: 'edit_html', target, expectRawSha1: expect, change: { kind: 'range', rawByteOffset: d.rawByteOffset, rawBytes: d.rawBytes, html: text } }, before: '', after: '', contentEstimate: null };
       }
       const where = loc.activity ? activityLabel(loc.activity) : 'presentación de una sección';
