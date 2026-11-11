@@ -31,6 +31,7 @@ import { createExecutorSandbox } from '../../../workers/llm-executor/executor-ru
 import { syntheticCoverPng, syntheticPdf } from '../../../package/v3/synthetic-media';
 import * as vm from 'vm';
 import { ChapterPiece, ProducedChapter, ProducedUnitExam } from './chapter-types';
+import { stripTrailingFence } from '../xml-scan';
 
 /** Modelo del generador (fijado por Cursia). */
 export const CHAPTER_LLM_MODEL = 'claude-sonnet-4-6';
@@ -112,7 +113,7 @@ export function libroExtraChapterHeadings(md: string): string[] {
 
 /** Limpieza mínima de una página generada (cercos de código); `<style>`/`<script>` hace fallar (Moodle los borra). */
 export function cleanPage(raw: string): string {
-  const s = String(raw ?? '').replace(/^\s*```(?:html)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+  const s = stripTrailingFence(String(raw ?? '').replace(/^\s*```(?:html)?\s*/i, '')).trim();
   if (/<(style|script)\b/i.test(s)) throw new RegenError('invalid_result', 'La página generada trae <style> o <script> (Moodle los elimina): no se usa.');
   if (hasPendingMarker(s)) throw new RegenError('invalid_result', 'La página generada trae «⚠️ Pendiente».');
   if (VIDEO_PENDING_RE.test(replaceSlots(s, () => ''))) throw new RegenError('invalid_result', 'La página generada trae «Video en preparación» fuera del espacio del video: no se usa.');
@@ -139,7 +140,7 @@ export async function produceChapter(a: { spec: ChapterSpec; course: WorkshopCou
     const ex = sandboxFor({ ...a, what: 'libro_chapter', D });
     let md: string;
     try {
-      md = String(await ex.sandbox.ctx.api(prompts.libro.system, prompts.libro.user, LIBRO_MAX_TOKENS)).replace(/^\s*```markdown\s*/i, '').replace(/\s*```\s*$/, '');
+      md = stripTrailingFence(String(await ex.sandbox.ctx.api(prompts.libro.system, prompts.libro.user, LIBRO_MAX_TOKENS)).replace(/^\s*```markdown\s*/i, ''));
     } catch (e: any) { throw ex.stop ?? new RegenError('internal', String(e?.msg ?? e?.message ?? e)); }
     if (words(md) < LIBRO_CHAPTER_MIN_WORDS) throw new RegenError('invalid_result', `El capítulo del Libro salió con ${words(md)} palabras (mínimo ${LIBRO_CHAPTER_MIN_WORDS}): no se agrega un capítulo cortado.`);
     if (hasPendingMarker(md)) throw new RegenError('invalid_result', 'El capítulo del Libro trae «⚠️ Pendiente».');

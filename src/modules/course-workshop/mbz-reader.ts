@@ -155,7 +155,7 @@ export function normalizeEntryName(raw: string, maxLen = MBZ_READER_LIMITS.maxNa
   if (/^[A-Za-z]:/.test(s)) return { problem: 'ruta con letra de unidad' };
   while (s.startsWith('./')) s = s.slice(2);
   const dir = s.endsWith('/');
-  if (dir) s = s.replace(/\/+$/, '');
+  if (dir) { let k = s.length; while (k > 0 && s[k - 1] === '/') k--; s = s.slice(0, k); } // B12 ronda 1: sin `/\/+$/`
   if (s === '' || s === '.') return { name: '', dir: true }; // la raíz misma («./» del tar)
   const segs = s.split('/');
   if (segs.some((x) => x === '..')) return { problem: 'ruta con «..»' };

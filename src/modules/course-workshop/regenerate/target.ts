@@ -9,7 +9,7 @@ import JSZip = require('jszip');
 import { createHash } from 'crypto';
 import { WorkshopActivity, WorkshopCourse, WorkshopFile } from '../course-model';
 import { xmlUnescape } from '../../visual-design/preview-extract';
-import { tagInner } from '../xml-scan';
+import { classTokens, tagInner } from '../xml-scan';
 import { mp3DurationSeconds } from '../../../package/audio';
 import { pdfPageCount } from '../../../package/presentation';
 import { RegenOperation, RegenTarget, SCORM_V2_ROOMS, SCORM_V2_TEMPLATE_IDS } from './types';
@@ -39,10 +39,13 @@ export function scormV2Rooms(html: string): Array<string | null> {
   for (let i = 0; i < marks.length; i++) {
     const start = marks[i].index ?? 0;
     // La última sala termina donde empieza el informe (o el script): el CSS y el JS del SCO no cuentan.
-    const tail = [html.indexOf('id="sv2-report"', start), html.indexOf('<script', start)].filter((x) => x > start);
+    // B12 ronda 1: el final del informe / script se busca solo para la ÚLTIMA sala (antes, por sala: O(salas × largo)).
+    const tail = i + 1 < marks.length ? [] : [html.indexOf('id="sv2-report"', start), html.indexOf('<script', start)].filter((x) => x > start);
     const end = i + 1 < marks.length ? marks[i + 1].index ?? html.length : tail.length ? Math.min(...tail) : html.length;
     const seg = html.slice(start, end);
-    const hits = Object.entries(SCORM_V2_ROOM_MARKERS).filter(([, cls]) => new RegExp(`class="(?:[^"]*\\s)?${cls}(?:\\s[^"]*)?"`).test(seg)).map(([id]) => id);
+    // B12 ronda 1: tokens de class="…" en una pasada (la regex `class="(?:[^"]*\s)?X…"` era cuadrática con comillas sin cerrar).
+    const tokens = classTokens(seg);
+    const hits = Object.entries(SCORM_V2_ROOM_MARKERS).filter(([, cls]) => tokens.has(cls)).map(([id]) => id);
     rooms.push(hits.length === 1 ? hits[0] : null);
   }
   return rooms;

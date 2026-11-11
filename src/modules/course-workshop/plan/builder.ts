@@ -330,7 +330,7 @@ async function candidateFor(ctx: BuildCtx, req: InterpretedRequest, callAi: (c: 
         const b = await read(ctx, d.entry);
         if (!b) return { unavailable: 'El campo ya no está en el paquete.' };
         const rawLink = b.subarray(d.fieldRawOffset + d.rawByteOffset, d.fieldRawOffset + d.rawByteOffset + d.rawBytes).toString('utf8');
-        const text = xmlUnescape(rawLink).replace(/<[^>]+>/g, '');
+        const text = xmlUnescape(rawLink).replace(/<[^<>]*>/g, ''); // B12 ronda 1: `[^<>]` (lineal con muchos `<` sin `>`)
         return { op: { op: 'edit_html', target, expectRawSha1: expect, change: { kind: 'range', rawByteOffset: d.rawByteOffset, rawBytes: d.rawBytes, html: text } }, before: '', after: '', contentEstimate: null };
       }
       const where = loc.activity ? activityLabel(loc.activity) : 'presentación de una sección';

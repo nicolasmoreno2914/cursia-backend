@@ -36,7 +36,7 @@ import { OpContext, blobPath, noteModified } from './op-context';
 import { libroStructure, recomposeLibro } from './op-libro';
 import { producedProblems } from './op-regenerate';
 import { PatchError } from './types';
-import { allBlocks, firstBlock, outerBlock, replaceBlocks, spliceBlock, tagInner, wsStart } from '../xml-scan';
+import { allBlocks, firstBlock, outerBlock, replaceBlocks, spliceBlock, stripTrailingFence, tagInner, wsStart } from '../xml-scan';
 
 const htmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -603,7 +603,7 @@ export async function renumberChapters(ctx: OpContext, texts: Texts, from: numbe
 
 /** Cuerpo HTML del capítulo a partir del markdown del generador del Libro (sin su título: lo pone el motor). */
 export function libroBodyOf(md: string): string {
-  const html = mdToHtmlBasic(md.replace(/^\s*```(?:markdown)?\s*/i, '').replace(/\s*```\s*$/, ''));
+  const html = mdToHtmlBasic(stripTrailingFence(md.replace(/^\s*```(?:markdown)?\s*/i, ''))); // B12 ronda 1: sin `\s*```\s*$` (cuadrática)
   return html.replace(/^\s*<h[1-3]>\s*Cap[ií]tulo\s+\d+[^<]*<\/h[1-3]>\s*/i, '');
 }
 

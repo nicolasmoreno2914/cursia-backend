@@ -60,7 +60,7 @@ export function decodeEntities(s: string): string {
   });
 }
 export function blockText(html: string, max = BIG): string {
-  return decodeEntities(plainText(String(html).replace(BLOCK_END, (m) => `${m}\uE000`), max * 2)).replace(/[^\S\n\uE000]+/g, ' ').replace(/\s*\uE000\s*/g, '\n').replace(/\n{2,}/g, '\n').trim().slice(0, max);
+  return decodeEntities(plainText(String(html).replace(BLOCK_END, (m) => `${m}\uE000`), max * 2)).replace(/[^\S\n\uE000]+/g, ' ').replace(/ ?\uE000 ?/g, '\n') /* B12 ronda 1: plainText ya colapsó los espacios (`\s*\uE000\s*` era cuadrática aislada) */.replace(/\n{2,}/g, '\n').trim().slice(0, max);
 }
 
 /** Número de capítulo que declara un texto al empezar («Capítulo 3: …» / «Capítulo 3 · …»). */
@@ -81,7 +81,7 @@ export function qualityDocs(ctx: DiagnosisContext): QualityDoc[] {
   };
   const moduleOfChapter = (n: number | null) => (n === null ? null : ctx.course.chapters.find((c) => c.number === n)?.moduleNumber ?? null);
   const push = (a: WorkshopActivity, d: Omit<QualityDoc, 'moduleId' | 'activityTitle' | 'what' | 'moduleNumber'> & { moduleNumber?: number | null }) => {
-    const text = d.text.replace(/[^\S\n]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{2,}/g, '\n').trim();
+    const text = d.text.replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n') /* B12 ronda 1: tras colapsar, a lo sumo un espacio a cada lado (` *\n *` era cuadrática aislada) */.replace(/\n{2,}/g, '\n').trim();
     if (text.length < 3) return;
     out.push({ ...d, text, moduleId: a.moduleId, activityTitle: humanName(a), what: whatOf(a, d.role), moduleNumber: d.moduleNumber ?? moduleOfChapter(d.chapterNumber) ?? a.unit ?? null });
   };
