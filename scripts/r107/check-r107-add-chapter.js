@@ -581,6 +581,17 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     assert(m(['A', 'B']) !== m(['A', 'C']), 'módulo: capítulos');
   });
 
+  await check('R12 (ronda 2, P2-C) el marcador es solo «Video en preparación» y CC_VIDEO_SLOT: «disponible próximamente» en el contenido es legítimo', async () => {
+    const CH = L('modules/course-workshop/regenerate/chapter.js');
+    const txt = 'texto largo de la página del capítulo con ejemplos y pasos. '.repeat(6);
+    const ok = `<div><p>${txt}La guía ampliada estará disponible próximamente en la biblioteca.</p></div>`;
+    eq(CH.cleanPage(ok), ok, 'frase legítima aceptada');
+    assert(!OPS.VIDEO_PENDING_RE.test(ok), 'no es el marcador');
+    let e = null; try { CH.cleanPage(`<div><p>${txt}</p><p>Video en preparación</p></div>`); } catch (x) { e = x; }
+    assert(e && /Video en preparación/.test(e.message), 'el marcador se rechaza');
+    assert(OPS.VIDEO_PENDING_RE.test('<!-- CC_VIDEO_SLOT_START -->'), 'el bloque sin resolver se rechaza');
+  });
+
   const total = Object.values(REAL).reduce((a, b) => a + b, 0);
   await check('C12 cero llamadas reales (anthropic, openai, fetch, undici, http, net, binarios)', async () => eq(total, 0, JSON.stringify(REAL)));
   if (process.env.R107_ADD_CHAPTER_OUT && mid) fs.writeFileSync(process.env.R107_ADD_CHAPTER_OUT, mid);

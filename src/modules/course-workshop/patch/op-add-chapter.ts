@@ -50,8 +50,11 @@ const replaceLit = (s: string, from: string, to: string): { out: string; n: numb
 /** Firmas de las piezas que el builder V1 arma con PLANTILLA (no con la IA). */
 /** Bloque del video que pide `pHTML` (tipo `vi`): lo reemplaza el empaquetado (16-mbz-patch.js `makeH5PEmbed`). */
 export const SLOT_RE = /<!--\s*CC_VIDEO_SLOT_START\s*-->[\s\S]*?<!--\s*CC_VIDEO_SLOT_END\s*-->/g;
-/** Texto del marcador «video pendiente» que nunca puede quedar en un capítulo entregado. */
-export const VIDEO_PENDING_RE = /Video en preparaci[oó]n|disponible pr[oó]ximamente|CC_VIDEO_SLOT/i;
+/**
+ * Texto del marcador «video pendiente» que nunca puede quedar en un capítulo entregado. Ronda 2 (P2-C): solo «Video en
+ * preparación» y el bloque CC_VIDEO_SLOT; «disponible próximamente» es una frase legítima del contenido.
+ */
+export const VIDEO_PENDING_RE = /Video en preparaci[oó]n|CC_VIDEO_SLOT/i;
 /** El reproductor embebido del hvp (el de `makeH5PEmbed`, sin el <script> del resizer: el Taller no agrega scripts). */
 export const hvpEmbedHtml = (mid: number): string => '<div style="position:relative;width:100%;max-width:840px;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:14px;margin:16px auto 20px;background:#08111C;border:1px solid rgba(96,165,250,0.15);box-shadow:0 8px 32px rgba(0,0,0,0.5);">'
   + `<iframe src="$@HVPEMBEDBYID*${mid}@$" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen="allowfullscreen" title="Video Interactivo"></iframe></div>`;
