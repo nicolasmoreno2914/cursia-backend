@@ -30,6 +30,7 @@ if (process.argv.includes('--bite')) {
     { name: 'sin la prueba en seco del motor antes de pagar (P1-1)', file: 'modules/course-workshop/plan/chapter-item.js', from: 'const fail = await engineDryRun(ctx, plan);', to: 'const fail = null;' },
     { name: 'estructurales sin ir al final (P1-2 a)', file: 'modules/course-workshop/apply/apply-core.js', from: 'const items = structuralLast(input.items);', to: 'const items = input.items;' },
     { name: 'bloque del video sin resolver (P1-5)', from: 'const rewrite = (html) => slots(html)', to: 'const rewrite = (html) => (html)' },
+    { name: 'orden de <activities> sin seguir la secuencia (M1)', from: 'const prevMid = added.length ? added[added.length - 1] :', to: 'const prevMid = added.length ? null :' },
   ];
   const tmp = fs.mkdtempSync(path.join(REPO, '.r107-bite-'));
   let code = 0;
@@ -155,6 +156,12 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     for (const a of acts) {
       const html = unesc(await txt(`${a.dir}/${a.mod}.xml`));
       for (const m of html.matchAll(/\$@([A-Z]+)VIEWBYID\*(\d+)@\$/g)) if (kind[m[1]]) eq(byMid.get(Number(m[2])), kind[m[1]], `${a.dir}: token ${m[0]}`);
+    }
+    // Ronda 4 (M1): por sección, el orden de <activities> (filtrado por sectionid) = su <sequence> (Moodle restaura así).
+    const secList = [...mb.matchAll(/<section>\s*<sectionid>(\d+)<\/sectionid>[\s\S]*?<directory>([^<]*)<\/directory>/g)].map((m) => [Number(m[1]), m[2]]);
+    for (const [sid, dir] of secList) {
+      const want = ((/<sequence>([^<]*)<\/sequence>/.exec(await txt(`${dir}/section.xml`)) || [])[1] || '').split(',').filter(Boolean).map(Number);
+      eq(acts.filter((a) => a.sec === sid).map((a) => a.mid), want, `orden de moodle_backup.xml en la sección ${sid}`);
     }
     // section.xml ↔ moodle_backup: cada actividad en una secuencia, una sola vez.
     const seqs = [];
@@ -682,6 +689,62 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     assert(Math.abs(all.expectedUsd - noExam.expectedUsd - add('expectedUsd')) < 1e-9 && Math.abs(all.boundUsd - noExam.boundUsd - add('boundUsd')) < 1e-9, 'suma exacta del examen');
     const pages = CH.retryCostOf(est.regen, ['videoPageHtml', 'gamePageHtml'], false);
     eq(pages.pieces, ['video_page', 'game_page'], 'descartar solo páginas no rehace el examen');
+  });
+
+  await check('R18 (ronda 4, M1) add_chapter como PRIMER capítulo de un módulo (cap 4 del módulo 2) y como capítulo 1 del curso: <activities> en el orden de la secuencia; el motor rechaza un orden roto', async () => {
+    for (const [m, pos] of [[2, 4], [1, 1]]) {
+      const r = await produce(V1, addReq(await ctxOf(V1), { module: m, title: 'Nuevo primero', position: pos }));
+      eq(r.prep.status, 'resolved', r.prep.reason);
+      const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', r, 'add_chapter')] });
+      assert(run.ok, run.message);
+      await invariants(run.package, { titles: { [pos]: 'Nuevo primero' } });
+    }
+    // Un paquete cuyo orden de <activities> ya NO es el de la secuencia: es delta (no se empeora), no un fallo.
+    const z = await JSZip.loadAsync(V1);
+    let mb = await z.file('moodle_backup.xml').async('string');
+    const bl = [...mb.matchAll(/\s*<activity>\s*<moduleid>(\d+)<\/moduleid>[\s\S]*?<\/activity>/g)];
+    const [x1, x2] = [bl[1], bl[2]];
+    mb = mb.slice(0, x1.index) + x2[0] + x1[0] + mb.slice(x2.index + x2[0].length);
+    z.file('moodle_backup.xml', mb);
+    const odd = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    eq((await ENGd.sectionOrderMismatches(await R.openMbz(odd))).size, 1, 'el original trae una sección fuera de orden');
+    const ro = await ENGd.applyPatchPlan({ original: odd, operations: [{ op: 'edit_html', target: { moduleId: (await inventoryOf(odd)).activities.find((a) => a.kind === 'welcome').moduleId, field: 'intro' }, change: { kind: 'replace', html: '<p>Bienvenidos.</p>' } }] });
+    assert(ro.ok, `delta, no fallo: ${ro.failure && ro.failure.message}`);
+  });
+
+  await check('R19 (ronda 4, D1) add_chapter con 2 títulos → pregunta CERRADA (una opción por título); elegir una → resuelto con ese solo capítulo (sin bucle)', async () => {
+    const ctx = await ctxOf(V1);
+    const Q = 'Agrega al módulo 1 los capítulos «Lenguaje corporal» y «Atención por chat».';
+    const q = PL.resolveRequest({ quote: Q, operation: 'add_chapter', instruction: 'Agregar capítulos', target: { moduleNumber: 1 }, colors: [], chapters: 2, newChapters: [{ title: 'Lenguaje corporal', objective: null }, { title: 'Atención por chat', objective: null }], position: null, moduleTitle: null, reason: null, questions: [], targetEvidence: 'al módulo 1', changeEvidence: 'Lenguaje corporal' }, ctx.course, { requestText: Q });
+    eq([q.status, q.questions[0].allowText, q.questions[0].options.map((o) => o.label)], ['needs_answer', false, ['Lenguaje corporal', 'Atención por chat']], 'pregunta cerrada');
+    assert(/otra ronda/.test(q.questions[0].text), 'dice que el otro se pide en otra ronda');
+    const a = PL.answerRequest(q, [{ questionId: q.questions[0].id, optionId: q.questions[0].options[1].id }], ctx.course);
+    eq([a.resolved.status, a.resolved.details.newChapters.map((c) => c.title)], ['resolved', ['Atención por chat']], 'queda uno');
+    assert(PL.isDeterministicAnswer('add_chapter', [{ q: q.questions[0], option: q.questions[0].options[0], text: null }]), 'sin IA');
+    assert(!PL.isDeterministicAnswer('add_module', [{ q: { origin: 'server', purpose: 'instruction' }, option: null, text: 'Ventas' }]), 'add_module con texto → re-interpretar (predicado único)');
+  });
+
+  await check('R20 (ronda 4, M-P2-1) los ids que solo viven en atributos (contextid="N") se reservan en el escaneo: add_module no los repite (sección, examen, contextos)', async () => {
+    const z = await JSZip.loadAsync(V1);
+    let maxG = 0;
+    for (const n of Object.keys(z.files).filter((x) => /\.xml$/.test(x))) for (const m of (await z.file(n).async('string')).matchAll(/\bid="(\d+)"|<[a-z_]*id>(\d+)<\/[a-z_]*id>/g)) maxG = Math.max(maxG, Number(m[1] || m[2]));
+    // Una etiqueta sin archivos cuyo contextid (solo en el atributo) está justo por encima del máximo general.
+    const lab = (await inventoryOf(V1)).activities.find((a) => a.kind === 'welcome');
+    const f = `${lab.dir}/label.xml`;
+    z.file(f, (await z.file(f).async('string')).replace(/contextid="\d+"/, `contextid="${maxG + 1}"`));
+    const bufX = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const r = await produce(bufX, modReq({ title: 'Servicio digital', chapters: ['Redes sociales'] }), { capUsd: 80 });
+    eq(r.prep.status, 'resolved', r.prep.reason);
+    const run = await A.runApply({ original: bufX, expectedSha1: sha1(bufX), items: [itemOf('m', r, 'add_module')] });
+    assert(run.ok, run.message);
+    const z1 = await JSZip.loadAsync(run.package);
+    const v = maxG + 1;
+    let uses = 0;
+    for (const n of Object.keys(z1.files).filter((x) => /\.xml$/.test(x))) {
+      const t = await z1.file(n).async('string');
+      uses += [...t.matchAll(new RegExp(`\\bid="${v}"|(?:contextid|moduleid)="${v}"|<[a-z_]*id>${v}</[a-z_]*id>`, 'g'))].length;
+    }
+    eq(uses, 1, `el id ${v} (contextid que solo vive en un atributo) aparece una sola vez: la etiqueta original`);
   });
 
   const total = Object.values(REAL).reduce((a, b) => a + b, 0);

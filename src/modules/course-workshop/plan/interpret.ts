@@ -187,6 +187,9 @@ const isLater = (op: string): op is (typeof LATER_OPERATIONS)[number] => (LATER_
 /** Operaciones que cambian contenido y necesitan saber QUÉ cambiar. */
 const NEEDS_INSTRUCTION = new Set(['edit_html', 'edit_libro_section', 'exam_question_replace', 'exam_question_add']);
 
+/** Ronda 4 (D1): id de la pregunta «¿cuál de los capítulos nuevos agrego ahora?» (su opción elegida deja uno). */
+export const NEW_CHAPTER_QUESTION_ID = 'new_chapter';
+
 function optionsFrom(list: Array<{ label: string; resolves: ClarifyOption['resolves'] }>): ClarifyOption[] {
   return list.slice(0, PLAN_LIMITS.optionsMax).map((o, i) => ({ id: `o${i + 1}`, label: short(o.label, 200), resolves: o.resolves }));
 }
@@ -393,7 +396,8 @@ function resolveTarget(op: RequestOperation, t: RawTarget, r: RawAiRequest, cour
       if (!mod) return { question: targetQuestion('¿En qué módulo va el capítulo nuevo?', course.modules.map((m) => ({ label: `Módulo ${m.number}${m.title ? `: ${m.title}` : ''}`, resolves: { moduleNumber: m.number } }))), reason: 'El pedido no dice en qué módulo.' };
       const chs = r.newChapters ?? [];
       if (!chs.length) return { question: instructionQuestion('¿Qué título lleva el capítulo nuevo y de qué trata? (por ejemplo: «Lenguaje corporal: cómo leer las señales del cliente»)'), reason: 'El pedido no dice el título del capítulo nuevo.' };
-      if (chs.length > 1) return { question: instructionQuestion(`Pediste ${chs.length} capítulos: el Taller agrega uno por pedido. ¿Cuál agrego primero? (los demás, como pedidos aparte)`), reason: 'Un pedido agrega un solo capítulo.' };
+      // Ronda 4 (D1): pregunta CERRADA, una opción por título; la respuesta deja UNO (los otros se piden en otra ronda).
+      if (chs.length > 1) return { question: { id: NEW_CHAPTER_QUESTION_ID, text: `Pediste ${chs.length} capítulos y el Taller agrega uno por ronda. ¿Cuál agrego ahora? Los otros se piden en otra ronda, sobre la versión nueva.`, options: optionsFrom(chs.map((c) => ({ label: c.title, resolves: { moduleNumber: mod.number } }))), allowText: false, origin: 'server', purpose: 'target' }, reason: 'Un pedido agrega un solo capítulo.' };
       const nums = mod.chapterNumbers.length ? [...mod.chapterNumbers].sort((a, b) => a - b) : [];
       const end = nums.length ? nums[nums.length - 1] + 1 : 1 + Math.max(0, ...course.chapters.filter((c) => (c.moduleNumber ?? 0) < mod.number).map((c) => c.number));
       const position = r.position ?? end;
@@ -586,10 +590,20 @@ export function checkAnswers(req: Pick<InterpretedRequest, 'status' | 'questions
   return qa;
 }
 
+/**
+ * ¿Las respuestas se resuelven SIN IA? Predicado ÚNICO: lo usan `answerRequest` y el servicio (`answer`) para decidir
+ * entre resolver en el servidor o pedir la re-interpretación con su costo (ronda 4, D2). El título del módulo y de sus
+ * capítulos escritos en texto libre los ordena la IA (re-interpretar), no el servidor.
+ */
+export function isDeterministicAnswer(operation: string | null, qa: Array<{ q: ClarifyQuestion; option: ClarifyOption | null; text: string | null }>): boolean {
+  if (operation === null) return false;
+  if (operation === 'add_module' && qa.some((x) => x.q.purpose === 'instruction')) return false;
+  return qa.every((x) => x.q.origin === 'server' && ((x.q.purpose === 'target' && !!x.option && !!x.option.resolves && !x.text) || (x.q.purpose === 'instruction' && !!x.text)));
+}
+
 export function answerRequest(req: InterpretedRequest, answers: ClarifyAnswer[], course: WorkshopCourse): { resolved: InterpretedRequest } | { reinterpret: Array<{ question: string; answer: string }> } {
   const qa = checkAnswers(req, answers);
-  // r107 B11: el título del módulo y de sus capítulos en texto libre los ordena la IA (re-interpretar), no el servidor.
-  const deterministic = req.operation !== null && !(req.operation === 'add_module' && qa.some((x) => x.q.purpose === 'instruction')) && qa.every((x) => x.q.origin === 'server' && ((x.q.purpose === 'target' && x.option && x.option.resolves && !x.text) || (x.q.purpose === 'instruction' && x.text)));
+  const deterministic = isDeterministicAnswer(req.operation, qa);
   if (!deterministic) return { reinterpret: qa.map(({ question, answer }) => ({ question, answer })) };
   let rawTarget: RawTarget = { ...((req.rawTarget as RawTarget) ?? {}) };
   let instruction = req.instruction;
@@ -605,6 +619,11 @@ export function answerRequest(req: InterpretedRequest, answers: ClarifyAnswer[],
       if (req.operation === 'edit_libro_section' && rs.chapterNumber !== undefined) rawTarget.chapters = [rs.chapterNumber];
       // La opción de posición resuelve {moduleNumber, chapterNumber}: el número es la POSICIÓN del capítulo nuevo.
       if (req.operation === 'add_chapter' && rs.chapterNumber !== undefined) { position = rs.chapterNumber; delete rawTarget.chapterNumber; }
+      // Ronda 4 (D1): «¿cuál agrego ahora?» → queda SOLO el capítulo elegido (su título, literal del pedido).
+      if (req.operation === 'add_chapter' && x.q.id === NEW_CHAPTER_QUESTION_ID) {
+        const pick = (newChapters ?? []).find((c) => c.title === x.option!.label) ?? (newChapters ?? [])[Number(String(x.option!.id).replace(/^o/, '')) - 1];
+        if (pick) newChapters = [pick];
+      }
     } else if (req.operation === 'add_chapter' && !newChapters?.length) {
       // La respuesta ES el título (literal de lo que escribió el docente; una línea, sin comillas de más).
       const title = String(x.text).split(/\r?\n/)[0].replace(/^[«"“']+|[»"”'.]+$/g, '').trim().slice(0, 160);

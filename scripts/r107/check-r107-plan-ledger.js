@@ -956,6 +956,33 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
 
+    await check('L25 (B11 ronda 4, D2) add_module sin título → pregunta; responder con texto libre deja el pedido `awaiting_confirmation` con el estimado de la re-interpretación (predicado único con answerRequest), nunca `failed`', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '5.00', reason: 'QA r107 B11 L25' });
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s5 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l25-v1.mbz', sizeBytes: V1.length });
+      objects.set(s5.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s5.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid5 = s5.session.id;
+      const Q = 'Agrega un módulo nuevo sobre ventas.';
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [{ quote: Q, operation: 'add_module', instruction: 'Agregar un módulo de ventas' }] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const p = planFor(client);
+      const a = await p.createTextIntake({ id: U }, sid5, Q);
+      await p.confirmInterpretation({ id: U }, sid5, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p.whenIdle();
+      const row = (await p.listRequests({ id: U }, sid5)).requests.find((r) => r.operation === 'add_module');
+      eq(row && row.status, 'needs_answer', 'pregunta el título');
+      const q = row.questions[0];
+      const r = await p.answer({ id: U }, sid5, row.id, [{ questionId: q.id, text: 'Ventas consultivas, con los capítulos Prospección y Cierre' }]);
+      await p.whenIdle();
+      eq(r.status, 'awaiting_confirmation', 'respuesta → espera aprobar la re-interpretación');
+      const after = (await p.listRequests({ id: U }, sid5)).requests.find((x) => x.id === row.id);
+      eq(after.status, 'awaiting_confirmation', 'no queda en failed');
+      assert(after.estimate && Number(after.estimate.expectedUsd) > 0, `con su estimado: ${JSON.stringify(after.estimate).slice(0, 160)}`);
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});

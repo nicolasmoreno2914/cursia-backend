@@ -25,7 +25,7 @@ import {
 import { ModelUnpricedError, WorkshopPricing, assertModelPriced, modelOf, planTotals, priceMeasured } from './cost';
 import { ApprovalCall, callErrorOutcome, closeReservation, committedUsd } from './approval-ledger';
 import { requestFromFinding } from './from-finding';
-import { AnswerError, checkAnswers, resolveRequest } from './interpret';
+import { AnswerError, checkAnswers, isDeterministicAnswer, resolveRequest } from './interpret';
 import { planWarnings } from './risk';
 import { itemContentHash, planContentHash, selectApplyItems } from '../apply/apply-core';
 import { ModuleRef } from '@nestjs/core';
@@ -709,7 +709,8 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       if (e instanceof AnswerError) throw new BadRequestException({ code: e.code, message: e.message });
       throw e;
     }
-    const deterministic = row.operation !== null && qa.every((x) => x.q.origin === 'server' && ((x.q.purpose === 'target' && x.option?.resolves && !x.text) || (x.q.purpose === 'instruction' && x.text)));
+    // Ronda 4 (D2): el MISMO predicado que answerRequest (si difieren, un pedido «sin IA» termina pidiendo IA y falla).
+    const deterministic = isDeterministicAnswer(row.operation, qa);
     const log = JSON.stringify([{ at: new Date().toISOString(), by: actor.id, answers }]);
     if (deterministic) {
       const [r] = returningRows(await this.q(this.dataSource,
