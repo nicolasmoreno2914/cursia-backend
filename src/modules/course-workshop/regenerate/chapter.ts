@@ -103,6 +103,13 @@ export function chapterPrompts(spec: ChapterSpec, course: WorkshopCourse, db: Re
   return { libro, video: spec.pages.videoPage ? page('vi') : null, game: spec.pages.gamePage ? page('sc') : null };
 }
 
+/** Títulos «Capítulo K:» DENTRO del markdown (además del título inicial del capítulo). */
+export function libroExtraChapterHeadings(md: string): string[] {
+  const hs = [...String(md ?? '').matchAll(/^\s{0,3}#{1,3}\s*(Cap[ií]tulo\s+\d{1,3}\s*[:—–-][^\n]*)$/gim)].map((m) => m[1].trim());
+  const first = /^\s*#{1,3}\s*Cap[ií]tulo\s+\d{1,3}\s*[:—–-]/i.test(String(md ?? '').trimStart());
+  return first ? hs.slice(1) : hs;
+}
+
 /** Limpieza mínima de una página generada (cercos de código); `<style>`/`<script>` hace fallar (Moodle los borra). */
 export function cleanPage(raw: string): string {
   const s = String(raw ?? '').replace(/^\s*```(?:html)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
@@ -136,6 +143,9 @@ export async function produceChapter(a: { spec: ChapterSpec; course: WorkshopCou
     } catch (e: any) { throw ex.stop ?? new RegenError('internal', String(e?.msg ?? e?.message ?? e)); }
     if (words(md) < LIBRO_CHAPTER_MIN_WORDS) throw new RegenError('invalid_result', `El capítulo del Libro salió con ${words(md)} palabras (mínimo ${LIBRO_CHAPTER_MIN_WORDS}): no se agrega un capítulo cortado.`);
     if (hasPendingMarker(md)) throw new RegenError('invalid_result', 'El capítulo del Libro trae «⚠️ Pendiente».');
+    // Ronda 2 (P2-B): lo que la prueba en seco con el sintético NO cubre se valida ANTES de guardar la pieza pagada.
+    const extra = libroExtraChapterHeadings(md);
+    if (extra.length) throw new RegenError('invalid_result', `El capítulo del Libro trae otros títulos de capítulo adentro (${extra.slice(0, 2).join(' · ')}): rompería la numeración del Libro. No se guarda.`);
     if (!/<h[1-3]>/.test(mdToHtmlBasic(md))) throw new RegenError('invalid_result', 'El capítulo del Libro no tiene títulos de sección.');
     rec.libroMd = md;
     await save();
@@ -333,4 +343,35 @@ export function syntheticChapter(spec: ChapterSpec): ProducedChapter {
 export function syntheticUnitExam(withInfo: boolean): ProducedUnitExam {
   const qs = Array.from({ length: 6 }, (_, i) => `::U-${i + 1}::¿Qué conviene revisar en el caso ${i + 1}? {\n  =Los datos del caso\n  ~La opinión de otro\n  ~El resultado de otro año\n  ~Un dato sin fuente\n}`);
   return { gift: qs.join('\n\n'), infoHtml: withInfo ? `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;"><p style="color:#E2E6F3;">${SYNTH_PARA}</p></div>` : '' };
+}
+
+// ─── Ronda 2 (P2-B): pieza descartable si el motor rechaza el contenido REAL ─────────────────────────────────────────
+
+/** Piezas de texto de un capítulo producido (lo externo pagado —render, video publicado, Gamma— se conserva). */
+export const TEXT_PIECES = Object.freeze(['libroMd', 'videoPageHtml', 'gamePageHtml', 'scorm', 'video'] as const);
+export type TextPiece = (typeof TEXT_PIECES)[number];
+/** Pieza del estimado (`estimateChapter`) que rehace cada pieza guardada. */
+export const PIECE_OF: Record<TextPiece, string> = { libroMd: 'libro', videoPageHtml: 'video_page', gamePageHtml: 'game_page', scorm: 'game', video: 'video' };
+
+/**
+ * Cuál pieza culpar por el rechazo del motor (`new_findings` / `invariant`): la que nombra el mensaje; si no se puede
+ * saber, TODAS las de texto del ítem.
+ */
+export function culpritPieces(message: string): TextPiece[] {
+  const m = String(message ?? '');
+  if (/Libro/i.test(m) && !/juego|SCORM|video|página|enlace|bot[oó]n/i.test(m)) return ['libroMd'];
+  if (/SCORM|juego|sala/i.test(m) && !/Libro|video|página|enlace/i.test(m)) return ['scorm'];
+  if (/(enlace|bot[oó]n|página|dead_link|href)/i.test(m) && !/Libro|SCORM|juego/i.test(m)) return ['videoPageHtml', 'gamePageHtml'];
+  return [...TEXT_PIECES];
+}
+
+/** Quita esas piezas de lo pagado guardado (el reintento las rehace en vez de reusarlas). */
+export function discardPieces(prior: RegenPrior, chapterNumbers: number[], pieces: readonly TextPiece[], alsoExam: boolean): RegenPrior {
+  const out: RegenPrior = JSON.parse(JSON.stringify(prior ?? {}));
+  for (const n of chapterNumbers) {
+    const rec = out.chapterPieces?.[String(n)] as Record<string, unknown> | undefined;
+    if (rec) for (const p of pieces) delete rec[p];
+  }
+  if (alsoExam && out.unitExam) out.unitExam = {};
+  return out;
 }

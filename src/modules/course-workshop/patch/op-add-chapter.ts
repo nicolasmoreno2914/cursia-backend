@@ -191,6 +191,8 @@ export async function producedChapterProblems(p: ProducedChapter, need: { video:
   if (!p || p.kind !== 'chapter') return ['no es un capítulo producido'];
   if (!plainText(p.title ?? '', 20)) out.push('el capítulo no tiene título');
   if (!p.libroMd || plainText(mdToHtmlBasic(p.libroMd), 400).length < 200) out.push('el capítulo del Libro está vacío o es demasiado corto');
+  // Ronda 2 (P2-B): otro «Capítulo K:» dentro del cuerpo rompería la secuencia del Libro.
+  if (p.libroMd && /<h[1-3]>\s*Cap[ií]tulo\s+\d{1,3}\s*[:—–-]/i.test(libroBodyOf(p.libroMd))) out.push('el capítulo del Libro trae otros títulos «Capítulo K:» adentro');
   for (const [k, v] of [['libro', p.libroMd], ['página del video', p.videoPageHtml], ['página del juego', p.gamePageHtml]] as const) {
     if (v && hasPendingMarker(v)) out.push(`la ${k} trae un marcador «⚠️ Pendiente»`);
     if (v && k !== 'libro' && /<script\b/i.test(v)) out.push(`la ${k} trae <script>`);

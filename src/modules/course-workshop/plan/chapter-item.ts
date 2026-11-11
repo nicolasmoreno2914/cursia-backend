@@ -11,7 +11,7 @@ import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
 import { chapterPieces, pagesNeeded, templateOf } from '../patch/op-add-chapter';
 import { PatchError, PatchOperation } from '../patch/types';
 import { ADD_CHAPTER_FAMILIES, AddChapterOp, AddModuleOp, ChapterPiece, ProducedChapter, ProducedModule, V3_ADD_CHAPTER_UNAVAILABLE } from '../regenerate/chapter-types';
-import { ChapterEstimate, ChapterSpec, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, syntheticChapter, syntheticUnitExam, totals } from '../regenerate/chapter';
+import { ChapterEstimate, ChapterSpec, PIECE_OF, culpritPieces, discardPieces, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, syntheticChapter, syntheticUnitExam, totals } from '../regenerate/chapter';
 import type { PaidCallGate, RegenProviders } from '../regenerate/ports';
 import { RegenError, RegenExternal } from '../regenerate/types';
 import type { BuildCtx, PlannedCall, PreparedItem } from './builder';
@@ -212,7 +212,27 @@ export async function prepareChapterItem(ctx: BuildCtx, req: InterpretedRequest,
   }
   const op = { ...plan.op, produced } as PatchOperation;
   const r = await applyPatchPlan({ original: ctx.original, filename: ctx.filename, operations: [op], baseline: ctx.baseline });
-  if (!r.ok) return fail('failed', `El motor de parches no puede insertar el capítulo: ${r.failure?.message ?? 'falla del motor'}${r.diagnosis?.introduced?.length ? ` (${r.diagnosis.introduced.slice(0, 3).map((x) => x.title).join(' · ')})` : ''}. No se aplica nada; lo gastado queda registrado.`, r.failure?.code ?? 'engine', true);
+  if (!r.ok) {
+    const why = `${r.failure?.message ?? 'falla del motor'}${r.diagnosis?.introduced?.length ? ` (${r.diagnosis.introduced.slice(0, 3).map((x) => `${x.title} [${x.signature.split('|')[1] ?? ''}]`).join(' · ')})` : ''}`;
+    // Ronda 2 (P2-B): el contenido REAL no entró (hallazgos nuevos / invariante): la pieza culpable (o todas las de texto,
+    // si no se sabe cuál) se DESCARTA de lo pagado guardado; el reintento la rehace en vez de reusar lo mismo.
+    let retry = '';
+    if ((r.failure?.code === 'new_findings' || r.failure?.code === 'invariant') && deps.ext) {
+      const pieces = culpritPieces(why);
+      const nums = plan.specs.map((s) => s.chapterNumber);
+      const next = discardPieces(deps.ext.prior, nums, pieces, pieces.length > 1 && plan.op.op === 'add_module');
+      Object.assign(deps.ext.prior, next);
+      await deps.ext.onPaid(next);
+      const est = chapterPlanEstimate(ctx, plan);
+      const want = new Set(pieces.map((p) => PIECE_OF[p]));
+      const redo = est.pieces.filter((p) => want.has(p.piece.replace(/^cap\d+:/, '')));
+      const exp = redo.reduce((a, p) => a + Number(p.piece.endsWith('video') ? p.providers.filter((l) => l.provider === 'anthropic').reduce((x, l) => x + Number(l.expectedUsd), 0) : p.expectedUsd), 0);
+      const max = redo.reduce((a, p) => a + Number(p.piece.endsWith('video') ? p.providers.filter((l) => l.provider === 'anthropic').reduce((x, l) => x + Number(l.boundUsd), 0) : p.boundUsd), 0);
+      retry = ` El reintento rehace ${[...want].map((p) => PIECE_ES[p] ?? p).join(', ')} (≈ USD ${exp.toFixed(2)}, máx. USD ${max.toFixed(2)}); lo demás ya pagado se reusa.`;
+      (deps as any).retryCost = { pieces: [...want], expectedUsd: exp.toFixed(6), boundUsd: max.toFixed(6) };
+    }
+    return fail('failed', `El motor de parches no puede insertar el capítulo: ${why}. No se aplica nada; lo gastado queda registrado.${retry}`, r.failure?.code ?? 'engine', true);
+  }
   const rep = r.operations[0];
   const warnings = [...chapterWarnings(ctx, plan), ...rep.misalignment.filter((m) => !/audiolibro|examen final|pasan a ser/i.test(m)).map((m, i) => ({ id: wid('chapter_engine', i, m), kind: 'engine' as const, activity: null, questionId: null, message: m, terms: [], suggestedOperation: null, estimate: null }))];
   const params = { ...plan.op, summary: { chapters: plan.specs.map((s) => ({ number: s.chapterNumber, title: s.title })), pieces: plan.pieces, ids: rep.idsAssigned } };

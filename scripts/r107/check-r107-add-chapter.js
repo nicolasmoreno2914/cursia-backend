@@ -604,6 +604,41 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     eq([run.ok, run.code], [false, A.STRUCTURAL_COMBINATION], 'aplicar también lo frena');
   });
 
+  await check('R14 (ronda 2, P2-B) lo que el sintético no cubre se valida ANTES de guardar la pieza: un Libro con otro «Capítulo K:» adentro se rechaza y NO queda guardado (el reintento lo rehace); el motor también lo rechaza', async () => {
+    const ctx = await ctxOf(V1);
+    const req = addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 });
+    const prior = {};
+    const ext = { mode: 'inline', prior, onPaid: async (p) => { Object.assign(prior, JSON.parse(JSON.stringify(p))); } };
+    const r = await produce(V1, req, { sim: { fault: { libroExtraHeading: true } }, ext }).catch((e) => ({ err: e }));
+    assert(r.err ? r.err.code === 'invalid_result' : r.prep.status === 'failed', `rechazado: ${r.err ? r.err.message : r.prep.reason}`);
+    assert(!(prior.chapterPieces && prior.chapterPieces['2'] && prior.chapterPieces['2'].libroMd), 'el Libro inválido no quedó guardado');
+    const CH = L('modules/course-workshop/regenerate/chapter.js');
+    eq(CH.libroExtraChapterHeadings('# Capítulo 2: A\n\n## 2.1 x\n\n## Capítulo 3: B'), ['Capítulo 3: B'], 'detector');
+    const good = (await produce(V1, req)).prep;
+    const bad = { ...good.produced, libroMd: `${good.produced.libroMd}\n\n## Capítulo 3: Otro tema\n\nTexto.` };
+    const rr = await ENGd.applyPatchPlan({ original: V1, operations: [{ ...good.view.params, produced: bad }] });
+    assert(!rr.ok && /Capítulo K/.test(rr.failure.message), `motor: ${rr.failure && rr.failure.message}`);
+  });
+
+  await check('R15 (ronda 2, P2-B) el motor rechaza el contenido REAL por un hallazgo nuevo (enlace muerto en la página) → la pieza culpable se DESCARTA de lo pagado, el ítem dice el costo del reintento, y el reintento la rehace (pagando solo eso) y aplica', async () => {
+    const ctx = await ctxOf(V1);
+    const req = addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 });
+    const prior = {};
+    const ext = { mode: 'inline', prior, onPaid: async (p) => { for (const k of Object.keys(prior)) delete prior[k]; Object.assign(prior, JSON.parse(JSON.stringify(p))); } };
+    const r1 = await produce(V1, req, { sim: { fault: { pageDeadLink: true } }, ext });
+    eq(r1.prep.status, 'failed', 'el motor lo rechaza');
+    assert(/El reintento rehace/.test(r1.prep.reason) && /USD \d+\.\d{2}\b/.test(r1.prep.reason) && !/USD \d+\.\d{3,}/.test(r1.prep.reason), `costo del reintento visible: ${r1.prep.reason}`);
+    const rec = prior.chapterPieces['2'];
+    assert(!rec.videoPageHtml && !rec.gamePageHtml, 'páginas descartadas');
+    assert(rec.libroMd && rec.scorm && rec.videogen && rec.videogen.charged, 'lo demás pagado se conserva');
+    const ext2 = { mode: 'inline', prior, onPaid: async (p) => { for (const k of Object.keys(prior)) delete prior[k]; Object.assign(prior, JSON.parse(JSON.stringify(p))); } };
+    const r2 = await produce(V1, req, { ext: ext2 });
+    eq(r2.prep.status, 'resolved', r2.prep.reason);
+    eq(r2.gate.calls.map((c) => c.kind), ['anthropic:chapter_page', 'anthropic:chapter_page'], 'el reintento solo rehace las páginas (sin render ni Gamma nuevos)');
+    const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', r2, 'add_chapter')] });
+    assert(run.ok, run.message);
+  });
+
   const total = Object.values(REAL).reduce((a, b) => a + b, 0);
   await check('C12 cero llamadas reales (anthropic, openai, fetch, undici, http, net, binarios)', async () => eq(total, 0, JSON.stringify(REAL)));
   if (process.env.R107_ADD_CHAPTER_OUT && mid) fs.writeFileSync(process.env.R107_ADD_CHAPTER_OUT, mid);

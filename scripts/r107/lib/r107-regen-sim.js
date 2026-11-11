@@ -131,14 +131,15 @@ function simProviders(DIST, opts = {}) {
         const title = /COMPLETO: "([^"]*)"/.exec(req.user)?.[1] || 'Capítulo';
         const para = 'En el trabajo diario del sector conviene revisar cada caso con datos concretos, comparar alternativas y anotar lo que se aprende para aplicarlo en la siguiente situación con el equipo.';
         const sec = (k) => `## ${cn}.${k} Tema ${k} del capítulo\n\n${Array.from({ length: 5 }, () => para).join(' ')}\n\n${Array.from({ length: 4 }, () => para).join(' ')}`;
-        text = fault.libroShort ? `# Capítulo ${cn}: ${title}\n\nCorto.` : [`# Capítulo ${cn}: ${title}`, ...[1, 2, 3, 4, 5].map(sec), '| Opción | Ventaja |\n|---|---|\n| A | Rápida |\n| B | Segura |', `## Glosario del Capítulo\n\n- **Término**: definición breve.`].join('\n\n');
+        // `fault.libroExtraHeading` → el capítulo trae OTRO «Capítulo K:» adentro (rompería la secuencia del Libro).
+        text = fault.libroShort ? `# Capítulo ${cn}: ${title}\n\nCorto.` : [`# Capítulo ${cn}: ${title}`, ...(fault.libroExtraHeading ? [`## Capítulo ${cn + 1}: Otro tema`] : []), ...[1, 2, 3, 4, 5].map(sec), '| Opción | Ventaja |\n|---|---|\n| A | Rápida |\n| B | Segura |', `## Glosario del Capítulo\n\n- **Término**: definición breve.`].join('\n\n');
       } else if (/^Eres desarrollador de e-learning de CampusCloud/.test(req.system)) {
         // r107 B11: página del capítulo (sysH + pHTML). `fault.pagePending` → con «⚠️ Pendiente».
         const body = 'Esta página presenta el capítulo con ejemplos del sector, pasos concretos y una invitación a practicar con la actividad del capítulo para fijar lo aprendido.';
         // Si el prompt pide el espacio del video (CC_VIDEO_SLOT), la página lo trae como lo arma la IA (con su texto de
         // espera ADENTRO: el motor lo reemplaza o lo quita). `fault.videoPlaceholder` → «Video en preparación» AFUERA.
         const slot = /CC_VIDEO_SLOT_START/.test(req.user) ? '<!-- CC_VIDEO_SLOT_START --><div style="padding:20px;color:#E2E6F3;">Video en preparación: disponible próximamente</div><!-- CC_VIDEO_SLOT_END -->' : '';
-        text = `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><h2 style="color:#E2E6F3;">Página del capítulo</h2><p style="color:#E2E6F3;">${body} ${body}</p>${slot}${fault.pagePending ? '<p>⚠️ Pendiente</p>' : ''}${fault.videoPlaceholder ? '<p style="color:#E2E6F3;">🎬 Video en preparación — disponible próximamente.</p>' : ''}</div>`;
+        text = `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><h2 style="color:#E2E6F3;">Página del capítulo</h2><p style="color:#E2E6F3;">${body} ${body}</p>${slot}${fault.pagePending ? '<p>⚠️ Pendiente</p>' : ''}${fault.videoPlaceholder ? '<p style="color:#E2E6F3;">🎬 Video en preparación — disponible próximamente.</p>' : ''}${fault.pageDeadLink ? '<p><a href="#" style="color:#E2E6F3;">Ver más</a></p>' : ''}</div>`;
       } else if (/^Eres experto en evaluación educativa de CampusCloud\. Generas exámenes GIFT/.test(req.system)) {
         // r107 B11: examen GIFT de unidad (sysG + pGIFT): 15 opción múltiple, 5 V/F, 5 emparejamiento.
         const u = Number(/IDs: U(\d+)-01/.exec(req.user)?.[1] || 1);
