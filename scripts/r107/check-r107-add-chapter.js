@@ -642,6 +642,33 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     assert(run.ok, run.message);
   });
 
+  await check('R16 (ronda 3, P2-F) solo una falla de CONTENIDO descarta piezas: un invariant de conteo (u otro determinista) → 0 piezas descartadas, falla no reintentable con motivo visible y el reintento no paga nada', async () => {
+    const CH = L('modules/course-workshop/regenerate/chapter.js');
+    eq(CH.discardPolicy('invariant', 'El paquete nuevo tiene 0 capítulo(s) y 4 actividad(es) de diferencia; el plan pide 1 y 5.'), { pieces: [], contentFailure: false }, 'conteo');
+    eq(CH.discardPolicy('invariant', 'El paquete nuevo no abre: x'), { pieces: [], contentFailure: false }, 'no abre');
+    eq(CH.discardPolicy('invariant', 'El Libro resultante no quedó con sus capítulos en orden.').pieces, ['libroMd'], 'invariante de contenido');
+    assert(CH.discardPolicy('new_findings', 'El botón «Ver más» [dead_link]').pieces.length > 0, 'hallazgo nuevo');
+    const ctx = await ctxOf(V1);
+    const req = addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 });
+    const prior = {};
+    const ext = { mode: 'inline', prior, onPaid: async (p) => { for (const k of Object.keys(prior)) delete prior[k]; Object.assign(prior, JSON.parse(JSON.stringify(p))); } };
+    const real = ENGd.applyPatchPlan;
+    ENGd.applyPatchPlan = async (inp) => {
+      const p = inp.operations[0] && inp.operations[0].produced;
+      if (p && p.kind === 'chapter' && p.video && p.video.videogenJobId !== 'dry-run') return { ok: false, package: null, container: 'zip', sha1: null, operations: [], diagnosis: null, preservedEntries: 0, failure: { opIndex: null, op: null, code: 'invariant', message: 'El paquete nuevo tiene 0 capítulo(s) y 4 actividad(es) de diferencia; el plan pide 1 y 5.' } };
+      return real(inp);
+    };
+    let r1;
+    try { r1 = await produce(V1, req, { ext }); } finally { ENGd.applyPatchPlan = real; }
+    eq([r1.prep.status, r1.prep.failure && r1.prep.failure.retryable], ['failed', false], 'falla no reintentable');
+    assert(/reintentar no la arregla/.test(r1.prep.reason) && !/El reintento rehace/.test(r1.prep.reason), `motivo: ${r1.prep.reason}`);
+    const rec = prior.chapterPieces['2'];
+    assert(rec.libroMd && rec.videoPageHtml && rec.gamePageHtml && rec.scorm && rec.video, `0 piezas descartadas: ${Object.keys(rec)}`);
+    const ext2 = { mode: 'inline', prior, onPaid: async (p) => { for (const k of Object.keys(prior)) delete prior[k]; Object.assign(prior, JSON.parse(JSON.stringify(p))); } };
+    const r2 = await produce(V1, req, { ext: ext2 });
+    eq([r2.prep.status, r2.gate.calls.length], ['resolved', 0], 'el reintento no paga nada (todo se reusa)');
+  });
+
   const total = Object.values(REAL).reduce((a, b) => a + b, 0);
   await check('C12 cero llamadas reales (anthropic, openai, fetch, undici, http, net, binarios)', async () => eq(total, 0, JSON.stringify(REAL)));
   if (process.env.R107_ADD_CHAPTER_OUT && mid) fs.writeFileSync(process.env.R107_ADD_CHAPTER_OUT, mid);

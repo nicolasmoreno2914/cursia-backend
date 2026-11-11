@@ -11,7 +11,7 @@ import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
 import { chapterPieces, pagesNeeded, templateOf } from '../patch/op-add-chapter';
 import { PatchError, PatchOperation } from '../patch/types';
 import { ADD_CHAPTER_FAMILIES, AddChapterOp, AddModuleOp, ChapterPiece, ProducedChapter, ProducedModule, V3_ADD_CHAPTER_UNAVAILABLE } from '../regenerate/chapter-types';
-import { ChapterEstimate, ChapterSpec, PIECE_OF, culpritPieces, discardPieces, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, syntheticChapter, syntheticUnitExam, totals } from '../regenerate/chapter';
+import { ChapterEstimate, ChapterSpec, discardPieces, discardPolicy, retryCostOf, estimateChapter, estimateUnitExam, produceChapter, produceUnitExam, syntheticChapter, syntheticUnitExam, totals } from '../regenerate/chapter';
 import type { PaidCallGate, RegenProviders } from '../regenerate/ports';
 import { RegenError, RegenExternal } from '../regenerate/types';
 import type { BuildCtx, PlannedCall, PreparedItem } from './builder';
@@ -216,20 +216,22 @@ export async function prepareChapterItem(ctx: BuildCtx, req: InterpretedRequest,
     const why = `${r.failure?.message ?? 'falla del motor'}${r.diagnosis?.introduced?.length ? ` (${r.diagnosis.introduced.slice(0, 3).map((x) => `${x.title} [${x.signature.split('|')[1] ?? ''}]`).join(' · ')})` : ''}`;
     // Ronda 2 (P2-B): el contenido REAL no entró (hallazgos nuevos / invariante): la pieza culpable (o todas las de texto,
     // si no se sabe cuál) se DESCARTA de lo pagado guardado; el reintento la rehace en vez de reusar lo mismo.
+    // Ronda 3 (P2-F): solo una falla de CONTENIDO (hallazgos nuevos o un invariante de contenido de la lista) descarta
+    // piezas. Otra falla del motor es determinista: no se descarta nada y el motivo dice que reintentar no la arregla.
+    const policy = discardPolicy(r.failure?.code, why);
+    if (!policy.contentFailure) {
+      return fail('failed', `El motor de parches no puede insertar el capítulo: ${why}. Esta falla no depende del contenido generado: reintentar no la arregla (y no se vuelve a cobrar nada; lo ya pagado queda guardado). No se aplica nada.`, r.failure?.code ?? 'engine', false);
+    }
     let retry = '';
-    if ((r.failure?.code === 'new_findings' || r.failure?.code === 'invariant') && deps.ext) {
-      const pieces = culpritPieces(why);
+    if (deps.ext && policy.pieces.length) {
+      const pieces = policy.pieces;
       const nums = plan.specs.map((s) => s.chapterNumber);
-      const next = discardPieces(deps.ext.prior, nums, pieces, pieces.length > 1 && plan.op.op === 'add_module');
+      const alsoExam = pieces.length > 1 && plan.op.op === 'add_module';
+      const next = discardPieces(deps.ext.prior, nums, pieces, alsoExam);
       Object.assign(deps.ext.prior, next);
       await deps.ext.onPaid(next);
-      const est = chapterPlanEstimate(ctx, plan);
-      const want = new Set(pieces.map((p) => PIECE_OF[p]));
-      const redo = est.pieces.filter((p) => want.has(p.piece.replace(/^cap\d+:/, '')));
-      const exp = redo.reduce((a, p) => a + Number(p.piece.endsWith('video') ? p.providers.filter((l) => l.provider === 'anthropic').reduce((x, l) => x + Number(l.expectedUsd), 0) : p.expectedUsd), 0);
-      const max = redo.reduce((a, p) => a + Number(p.piece.endsWith('video') ? p.providers.filter((l) => l.provider === 'anthropic').reduce((x, l) => x + Number(l.boundUsd), 0) : p.boundUsd), 0);
-      retry = ` El reintento rehace ${[...want].map((p) => PIECE_ES[p] ?? p).join(', ')} (≈ USD ${exp.toFixed(2)}, máx. USD ${max.toFixed(2)}); lo demás ya pagado se reusa.`;
-      (deps as any).retryCost = { pieces: [...want], expectedUsd: exp.toFixed(6), boundUsd: max.toFixed(6) };
+      const cost = retryCostOf(chapterPlanEstimate(ctx, plan), pieces, alsoExam);
+      retry = ` El reintento rehace ${cost.pieces.map((p) => PIECE_ES[p] ?? p).join(', ')} (≈ USD ${cost.expectedUsd.toFixed(2)}, máx. USD ${cost.boundUsd.toFixed(2)}); lo demás ya pagado se reusa.`;
     }
     return fail('failed', `El motor de parches no puede insertar el capítulo: ${why}. No se aplica nada; lo gastado queda registrado.${retry}`, r.failure?.code ?? 'engine', true);
   }

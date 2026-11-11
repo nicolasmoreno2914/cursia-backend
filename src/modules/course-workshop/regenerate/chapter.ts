@@ -365,6 +365,32 @@ export function culpritPieces(message: string): TextPiece[] {
   return [...TEXT_PIECES];
 }
 
+/**
+ * Ronda 3 (P2-F): invariantes del motor que dependen del CONTENIDO generado (el Libro producido no queda en orden, no
+ * nombra el capítulo o no cierra). Cualquier otro `invariant` (el paquete no abre, conteos, ids…) no lo arregla
+ * rehacer el contenido: no se descarta nada y el reintento no se ofrece.
+ */
+export const CONTENT_INVARIANTS: readonly RegExp[] = Object.freeze([
+  /El Libro resultante no quedó con sus capítulos en orden/i,
+  /El Libro resultante no nombra/i,
+  /El Libro recompuesto no cierra/i,
+]);
+
+/** Qué hacer ante un rechazo del motor del contenido producido. */
+export function discardPolicy(code: string | null | undefined, message: string): { pieces: TextPiece[]; contentFailure: boolean } {
+  if (code === 'new_findings') return { pieces: culpritPieces(message), contentFailure: true };
+  if (code === 'invariant' && CONTENT_INVARIANTS.some((re) => re.test(message))) return { pieces: culpritPieces(message), contentFailure: true };
+  return { pieces: [], contentFailure: false };
+}
+
+/** Costo de rehacer lo descartado, con las cotas del estimado. Del video solo se paga de nuevo la IA. */
+export function retryCostOf(est: { pieces: Array<{ piece: string; expectedUsd: string; boundUsd: string; providers: Array<{ provider: string; expectedUsd: string; boundUsd: string }> }> }, pieces: readonly TextPiece[], alsoExam: boolean): { pieces: string[]; expectedUsd: number; boundUsd: number } {
+  const want = new Set<string>(pieces.map((p) => PIECE_OF[p]));
+  const redo = est.pieces.filter((p) => want.has(p.piece.replace(/^cap\d+:/, '')));
+  const part = (p: (typeof redo)[number], k: 'expectedUsd' | 'boundUsd') => (p.piece.replace(/^cap\d+:/, '') === 'video' ? p.providers.filter((l) => l.provider === 'anthropic').reduce((x, l) => x + Number(l[k]), 0) : Number(p[k]));
+  return { pieces: [...want], expectedUsd: redo.reduce((a, p) => a + part(p, 'expectedUsd'), 0), boundUsd: redo.reduce((a, p) => a + part(p, 'boundUsd'), 0) };
+}
+
 /** Quita esas piezas de lo pagado guardado (el reintento las rehace en vez de reusarlas). */
 export function discardPieces(prior: RegenPrior, chapterNumbers: number[], pieces: readonly TextPiece[], alsoExam: boolean): RegenPrior {
   const out: RegenPrior = JSON.parse(JSON.stringify(prior ?? {}));
