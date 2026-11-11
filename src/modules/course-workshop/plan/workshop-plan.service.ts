@@ -788,7 +788,9 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     // r107 B11 (P1-2 c): un solo ítem estructural por plan; si hay más, 409 ANTES de reservar ni llamar a nadie.
     if (items.some((i) => isStructuralOperation(i.operation))) {
       const [st] = await this.q<any[]>(this.dataSource, `select count(*)::int as n from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
-          where i.plan_id = $1 and i.status = 'proposed' and r.status <> 'withdrawn' and i.operation in ('add_chapter', 'add_module')`, [plan.id]);
+          where i.plan_id = $1 and i.status = 'proposed' and i.available and r.status not in ('withdrawn', 'failed', 'unavailable', 'out_of_scope')
+            and i.operation in ('add_chapter', 'add_module')`, [plan.id]);
+      // Ronda 2 (P2-D): un estructural no disponible o fallido no bloquea al otro (no se va a aplicar).
       if (Number(st?.n ?? 0) > 1) throw new ConflictException({ code: STRUCTURAL_COMBINATION, message: STRUCTURAL_COMBINATION_MESSAGE });
     }
     if (items.length !== ids.length) throw new ConflictException({ code: PLAN_ERRORS.ITEMS_INVALID, message: 'Algún ítem elegido no está esperando generación (ya se generó, se quitó o es de otro plan).' });

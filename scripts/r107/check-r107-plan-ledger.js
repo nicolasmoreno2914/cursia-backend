@@ -884,7 +884,8 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
 
-    await check('L23 (B11 P1-2 c) dos ítems estructurales en el mismo plan → aprobar la generación de cualquiera = 409 WORKSHOP_STRUCTURAL_COMBINATION ANTES de reservar ni llamar (0 llamadas, sin aprobación abierta); al quitar uno, el otro se aprueba', async () => {
+    await check('L23 (B11 P1-2 c) dos ítems estructurales en el mismo plan → aprobar la generación de cualquiera = 409 WORKSHOP_STRUCTURAL_COMBINATION ANTES de reservar ni llamar (0 llamadas, sin aprobación abierta); un estructural FALLIDO no cuenta (P2-D) y el otro se aprueba', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '20.00', reason: 'QA r107 B11 L23' });
       const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
       const V1 = await CF.v1BuilderCourse(distRoot, {});
       const s3 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l23-v1.mbz', sizeBytes: V1.length });
@@ -911,12 +912,13 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       assert(/dos rondas/.test(err.getResponse().message), err.getResponse().message);
       eq([sim.calls.anthropic.length, sim.calls.videogen.length, sim.calls.gamma.length], [0, 0, 0], '0 llamadas');
       eq((await ds.query(`select count(*)::int n from public.workshop_ai_approvals where session_id = $1 and kind = 'generate'`, [sid3]))[0].n, before, 'sin aprobación abierta');
-      await p.setItemStatus({ id: U }, sid3, its[1].id, 'removed');
+      // Ronda 2 (P2-D): el otro estructural FALLIDO (o no disponible) no cuenta para la combinación.
+      await ds.query(`update public.workshop_requests set status = 'failed', reason = 'L23' where id = (select request_id from public.workshop_plan_items where id = $1)`, [its[1].id]);
       const pl2 = await p.getPlan({ id: U }, sid3);
       const it0 = pl2.items.find((i) => i.id === its[0].id);
       const g = await p.approveGeneration({ id: U }, sid3, pl2.planId, { itemIds: [it0.id], confirmEstimateUsd: Number(it0.plannedCall.expectedUsd), capUsd: Math.ceil(Number(it0.plannedCall.regen.totalBoundUsd) * 100) / 100 });
       await p.whenIdle();
-      eq((await p.getPlan({ id: U }, sid3)).items.find((i) => i.id === it0.id).stage, 'ready', 'con uno solo, se genera');
+      eq((await p.getPlan({ id: U }, sid3)).items.find((i) => i.id === it0.id).stage, 'ready', 'con el otro fallido, se genera');
       assert(g.approval, 'aprobada');
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
