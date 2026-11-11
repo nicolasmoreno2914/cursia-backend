@@ -33,6 +33,7 @@ import { applyRegenerate } from './op-regenerate';
 import { applyAddChapter, chapterPieces, templateOf } from './op-add-chapter';
 import { applyAddModule } from './op-add-module';
 import { DiagnosisDelta, OperationReport, PATCH_OPERATIONS, PatchError, PatchFailure, PatchOperation, PatchResult, emptyReport } from './types';
+import { allBlocks } from '../xml-scan';
 
 export const PATCH_ENGINE_VERSION = 'b11-r0';
 
@@ -134,7 +135,7 @@ export async function sectionOrderMismatches(pkg: MbzPackage): Promise<Set<numbe
   const mb = await pkg.readText('moodle_backup.xml');
   if (!mb) return out;
   const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>(\d+)<\/sectionid>/g)].map((m) => [Number(m[1]), Number(m[2])] as const);
-  const secs = [...mb.matchAll(/<section>\s*<sectionid>(\d+)<\/sectionid>[\s\S]*?<directory>([^<]*)<\/directory>/g)].map((m) => [Number(m[1]), m[2]] as const);
+  const secs = allBlocks(mb, /<section>\s*<sectionid>(\d+)<\/sectionid>/, /<directory>([^<]*)<\/directory>/).map((b) => [Number(b.open![1]), b.close![1]] as const);
   for (const [id, dir] of secs) {
     const sx = await pkg.readText(`${dir}/section.xml`);
     if (!sx) continue;

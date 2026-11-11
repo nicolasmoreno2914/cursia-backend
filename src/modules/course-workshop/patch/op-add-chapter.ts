@@ -36,6 +36,7 @@ import { OpContext, blobPath, noteModified } from './op-context';
 import { libroStructure, recomposeLibro } from './op-libro';
 import { producedProblems } from './op-regenerate';
 import { PatchError } from './types';
+import { allBlocks, firstBlock, outerBlock, replaceBlocks, spliceBlock, tagInner, wsStart } from '../xml-scan';
 
 const htmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -48,7 +49,10 @@ const replaceLit = (s: string, from: string, to: string): { out: string; n: numb
 
 /** Firmas de las piezas que el builder V1 arma con PLANTILLA (no con la IA). */
 /** Bloque del video que pide `pHTML` (tipo `vi`): lo reemplaza el empaquetado (16-mbz-patch.js `makeH5PEmbed`). */
-export const SLOT_RE = /<!--\s*CC_VIDEO_SLOT_START\s*-->[\s\S]*?<!--\s*CC_VIDEO_SLOT_END\s*-->/g;
+/** B12 (H1): reemplaza cada bloque `<!-- CC_VIDEO_SLOT_START --> … <!-- CC_VIDEO_SLOT_END -->` con escaneo lineal. */
+export function replaceSlots(html: string, fn: () => string): string {
+  return replaceBlocks(html, /<!--\s*CC_VIDEO_SLOT_START\s*-->/, /<!--\s*CC_VIDEO_SLOT_END\s*-->/, fn);
+}
 /**
  * Texto del marcador «video pendiente» que nunca puede quedar en un capítulo entregado. Ronda 2 (P2-C): solo «Video en
  * preparación» y el bloque CC_VIDEO_SLOT; «disponible próximamente» es una frase legítima del contenido.
@@ -108,8 +112,7 @@ class Texts {
 
 /** Edita el contenido de la PRIMERA (o todas) `<tag>…</tag>` con `fn`. */
 function editTag(xml: string, tag: string, fn: (inner: string) => string, all = false): string {
-  const re = new RegExp(`(<${tag}>)([\\s\\S]*?)(</${tag}>)`, all ? 'g' : '');
-  return xml.replace(re, (_m, a: string, inner: string, c: string) => `${a}${fn(inner)}${c}`);
+  return replaceBlocks(xml, `<${tag}>`, `</${tag}>`, (b) => `<${tag}>${fn(b.inner)}</${tag}>`, !all);
 }
 
 // ─── Contexto del capítulo nuevo ────────────────────────────────────────────
@@ -196,7 +199,7 @@ export async function producedChapterProblems(p: ProducedChapter, need: { video:
     if (v && hasPendingMarker(v)) out.push(`la ${k} trae un marcador «⚠️ Pendiente»`);
     if (v && k !== 'libro' && /<script\b/i.test(v)) out.push(`la ${k} trae <script>`);
     // P1-5: el bloque del video se resuelve al insertar; fuera de él no puede quedar «Video en preparación».
-    if (v && k !== 'libro' && VIDEO_PENDING_RE.test(v.replace(SLOT_RE, ''))) out.push(`la ${k} trae «Video en preparación» (o el bloque del video sin cerrar)`);
+    if (v && k !== 'libro' && VIDEO_PENDING_RE.test(replaceSlots(v, () => ''))) out.push(`la ${k} trae «Video en preparación» (o el bloque del video sin cerrar)`);
     if (v && k === 'página del juego' && /CC_VIDEO_SLOT_START/.test(v)) out.push('la página del juego trae un bloque de video');
   }
   if (need.videoPage && !plainText(p.videoPageHtml ?? '', 40)) out.push('falta la página del video del capítulo');
@@ -284,7 +287,7 @@ export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: Templa
   // lo embebe así; si no, se quita. Nunca queda «Video en preparación» ni el marcador sin resolver.
   const hvpNew = plan.find((x) => x.piece === 'video');
   const templateEmbeds = t.activities.some((x) => x.html.some((h) => /\$@HVPEMBEDBYID\*\d+@\$/.test(h.html)));
-  const slots = (html: string): string => html.replace(SLOT_RE, () => (hvpNew && templateEmbeds ? hvpEmbedHtml(hvpNew.mid) : ''));
+  const slots = (html: string): string => replaceSlots(html, () => (hvpNew && templateEmbeds ? hvpEmbedHtml(hvpNew.mid) : ''));
   const rewrite = (html: string): string => slots(html)
     .replace(/#scorm-cap-(\d+)/g, (m, n: string) => (Number(n) === P ? `$@SCORMVIEWBYID*${scorm.mid}@$` : m))
     .replace(/#libro-guia/g, (m) => (libro ? `$@RESOURCEVIEWBYID*${libro.moduleId}@$` : m))
@@ -357,7 +360,7 @@ export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: Templa
     }
     // files.xml: las entradas del contexto del molde → entradas nuevas (contenido nuevo donde corresponde).
     const fileMap = new Map<number, number>();
-    const srcFiles = src.contextId === null ? [] : [...files.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].filter((m) => m[2].includes(`<contextid>${src.contextId}</contextid>`));
+    const srcFiles = src.contextId === null ? [] : allBlocks(files, /<file id="(\d+)">/, '</file>').map((b) => [b.whole, b.open![1], b.inner]).filter((m) => m[2].includes(`<contextid>${src.contextId}</contextid>`));
     const content = await contentFor(ctx, x.piece, src, p, t.number, P);
     for (const m of srcFiles) {
       const fid = alloc.take('file');
@@ -407,19 +410,20 @@ export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: Templa
     }
     for (const [k, v] of [['moduleid', x.mid], ['contextid', newCtx]] as const) (ctx.report.idsAssigned[k] ||= []).includes(v) || ctx.report.idsAssigned[k].push(v);
     // moodle_backup.xml: <activity> y sus <setting>.
-    const blk = new RegExp(`(\\s*)<activity>\\s*<moduleid>${src.moduleId}</moduleid>[\\s\\S]*?</activity>`).exec(backup);
+    const blk0 = firstBlock(backup, new RegExp(`<activity>\\s*<moduleid>${src.moduleId}</moduleid>`), '</activity>');
+    const blk = blk0 ? [backup.slice(wsStart(backup, blk0.start), blk0.end)] : null;
     if (!blk) throw new PatchError('invariant', `moodle_backup.xml no lista ${src.dir}.`);
     const newName = textAsPage(x.piece) ? pageName : nameOf(src.title);
     const nb = blk[0]
       .replace(`<moduleid>${src.moduleId}</moduleid>`, `<moduleid>${x.mid}</moduleid>`)
       .replace(/<sectionid>\d+<\/sectionid>/, `<sectionid>${pl.sectionId}</sectionid>`)
-      .replace(/<title>[\s\S]*?<\/title>/, `<title>${xmlEsc(newName)}</title>`)
+      .replace(/<title>[^<]*<\/title>/, `<title>${xmlEsc(newName)}</title>`)
       .replace(`<directory>${src.dir}</directory>`, `<directory>${dir}</directory>`);
     // Ronda 4 (M1): orden de <activities> = la secuencia FINAL de la sección (Moodle arma la secuencia restaurada en el
     // orden de moodle_backup.xml): después de la actividad anterior de la sección; si no hay, ANTES de la siguiente; en
     // una sección nueva (add_module), encadenada después de `afterMid` (lo último que agregó el capítulo anterior).
     const secNow = ctx.inv.sections.find((z) => z.id === pl.sectionId);
-    const blockOf = (mid: number) => new RegExp(`<activity>\\s*<moduleid>${mid}</moduleid>[\\s\\S]*?</activity>`).exec(backup);
+    const blockOf = (mid: number) => { const b = firstBlock(backup, new RegExp(`<activity>\\s*<moduleid>${mid}</moduleid>`), '</activity>'); return b ? Object.assign([b.whole], { index: b.start }) : null; };
     const prevMid = added.length ? added[added.length - 1] : secNow && pl.sequenceIndex > 0 ? secNow.sequence[pl.sequenceIndex - 1] : (!secNow ? a.afterMid ?? null : null);
     const nextMid = !added.length && secNow && pl.sequenceIndex < secNow.sequence.length ? secNow.sequence[pl.sequenceIndex] : null;
     let at: number;
@@ -429,15 +433,15 @@ export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: Templa
     else if (nextBlk) at = nextBlk.index ?? 0;
     else {
       // Sección nueva sin nada antes: al final de la lista de actividades.
-      const last = [...backup.matchAll(/<activity>\s*<moduleid>\d+<\/moduleid>[\s\S]*?<\/activity>/g)].pop();
+      const last = allBlocks(backup, /<activity>\s*<moduleid>\d+<\/moduleid>/, '</activity>').pop();
       if (!last) throw new PatchError('invariant', 'moodle_backup.xml no lista actividades.');
-      at = (last.index ?? 0) + last[0].length;
+      at = last.end;
     }
     const lead = /^\s*/.exec(blk[0])![0];
     const nb2 = nextBlk ? `${nb.replace(/^\s*/, '')}${lead}` : nb;
     backup = backup.slice(0, at) + nb2 + backup.slice(at);
     const key = `${src.modname}_${src.moduleId}`;
-    const sets = [...backup.matchAll(new RegExp(`(\\s*)<setting>\\s*<level>activity</level>\\s*<activity>${key}</activity>[\\s\\S]*?</setting>`, 'g'))];
+    const sets = allBlocks(backup, new RegExp(`<setting>\\s*<level>activity</level>\\s*<activity>${key}</activity>`), '</setting>').map((b) => { const st = wsStart(backup, b.start); return Object.assign([backup.slice(st, b.end)], { index: st }); });
     if (sets.length) {
       const last = sets[sets.length - 1];
       const ins2 = sets.map((m) => m[0].split(`>${key}<`).join(`>${src.modname}_${x.mid}<`).split(`>${key}_`).join(`>${src.modname}_${x.mid}_`)).join('');
@@ -500,7 +504,7 @@ async function contentFor(ctx: OpContext, piece: ChapterPiece, src: WorkshopActi
 async function rewriteMain(xml: string, a: { piece: ChapterPiece; src: WorkshopActivity; content: PieceContent; nameOf: (n: string) => string; fromTemplate: (h: string, w: string) => string; rewrite: (h: string) => string; p: ProducedChapter; P: number; asPage?: boolean }): Promise<string> {
   const { piece, p } = a;
   let out = editTag(xml, 'name', (v) => xmlEsc(a.nameOf(xmlUnescape(v))));
-  const intro = xmlUnescape(/<intro>([\s\S]*?)<\/intro>/.exec(xml)?.[1] ?? '');
+  const intro = xmlUnescape(tagInner(xml, 'intro') ?? '');
   let html: string;
   switch (piece) {
     case 'presentation':
@@ -526,15 +530,16 @@ async function rewriteMain(xml: string, a: { piece: ChapterPiece; src: WorkshopA
       const ids = a.content.manifestIds!;
       out = editTag(out, 'reference', () => xmlEsc(a.content.scormZipName!));
       if (/<sha1hash>[0-9a-f]*<\/sha1hash>/.test(out)) out = editTag(out, 'sha1hash', () => a.content.zipHash!);
-      const name = xmlUnescape(/<name>([\s\S]*?)<\/name>/.exec(out)?.[1] ?? '');
-      out = out.replace(/<scoes>[\s\S]*<\/scoes>/, (sc) => {
-        const blocks = [...sc.matchAll(/<sco id="\d+">[\s\S]*?<\/sco>/g)];
+      const name = xmlUnescape(tagInner(out, 'name') ?? '');
+      const scoesBlk = outerBlock(out, '<scoes>', '</scoes>');
+      if (scoesBlk) out = spliceBlock(out, scoesBlk, ((sc: string) => {
+        const blocks = allBlocks(sc, /<sco id="\d+">/, '</sco>').map((b) => [b.whole]);
         if (blocks.length !== 2) throw new PatchError('unsupported', `El juego molde tiene ${blocks.length} sco (se esperaban 2).`);
         const set = (blk: string, kv: Record<string, string>) => Object.entries(kv).reduce((acc, [k, v]) => editTag(acc, k, () => xmlEsc(v)), blk);
         const org = set(blocks[0][0], { manifest: ids.manifest, identifier: ids.organization, title: name });
         const item = set(blocks[1][0], { manifest: ids.manifest, organization: ids.organization, parent: ids.organization, identifier: ids.item, launch: ids.launch, title: name });
         return sc.replace(blocks[1][0], () => item).replace(blocks[0][0], () => org);
-      });
+      })(scoesBlk.whole));
       break;
     }
     default:
@@ -559,12 +564,14 @@ export async function renumberChapters(ctx: OpContext, texts: Texts, from: numbe
     for (const id of ch.activities) {
       const a = ctx.inv.activities.find((x) => x.moduleId === id);
       if (!a || a.missingFolder) continue;
-      backup = backup.replace(new RegExp(`(<activity>\\s*<moduleid>${id}</moduleid>[\\s\\S]*?<title>)([\\s\\S]*?)(</title>)`), (_m, x: string, v: string, y: string) => `${x}${xmlEsc(renumberName(xmlUnescape(v), n, n + 1))}${y}`);
+      { const ab = firstBlock(backup, new RegExp(`<activity>\\s*<moduleid>${id}</moduleid>`), '<title>');
+        const tb = ab ? firstBlock(backup, '<title>', '</title>', ab.innerEnd) : null;
+        if (tb) backup = spliceBlock(backup, tb, `<title>${xmlEsc(renumberName(xmlUnescape(tb.inner), n, n + 1))}</title>`); }
       const main = `${a.dir}/${a.modname}.xml`;
       let mx = await texts.get(main);
       mx = editTag(mx, 'name', (v) => xmlEsc(renumberName(xmlUnescape(v), n, n + 1)));
       if (a.modname === 'hvp') mx = mx.replace(new RegExp(`<slug>interactive-video-${n}</slug>`), `<slug>interactive-video-${n + 1}</slug>`);
-      if (a.modname === 'scorm') mx = mx.replace(/<scoes>[\s\S]*<\/scoes>/, (sc) => editTag(sc, 'title', (v) => xmlEsc(renumberName(xmlUnescape(v), n, n + 1)), true));
+      if (a.modname === 'scorm') { const sb = outerBlock(mx, '<scoes>', '</scoes>'); if (sb) mx = spliceBlock(mx, sb, editTag(sb.whole, 'title', (v) => xmlEsc(renumberName(xmlUnescape(v), n, n + 1)), true)); }
       const iA = mx.indexOf('<intro>');
       const iB = mx.indexOf('</intro>');
       if (iA >= 0 && iB > iA) {
@@ -607,13 +614,14 @@ export function insertIntoLibroHtml(html: string, a: { position: number; title: 
   const st0 = libroStructure(html);
   if (!st0.chapters.length) throw new PatchError('unavailable', 'El Libro Guía no tiene títulos de capítulo con el formato del builder («Capítulo N: …»): no se puede insertar el capítulo nuevo con certeza.');
   const bump = (n: number) => (n >= P ? n + 1 : n);
-  let out = html.replace(/<h([1-3])\b([^>]*)>(\s*Cap[ií]tulo\s+)(\d{1,3})(\s*[:—–-])/gi, (_m, l: string, at: string, pre: string, n: string, post: string) => `<h${l}${at}>${pre}${bump(Number(n))}${post}`);
+  let out = html.replace(/<h([1-3])\b([^<>]*)>(\s*Cap[ií]tulo\s+)(\d{1,3})(\s*[:—–-])/gi, (_m, l: string, at: string, pre: string, n: string, post: string) => `<h${l}${at}>${pre}${bump(Number(n))}${post}`);
   let toc = 0;
   out = out.replace(/(<span class="tt">Cap[ií]tulo )(\d{1,3})(:)/g, (_m, pre: string, n: string, post: string) => { toc++; return `${pre}${bump(Number(n))}${post}`; });
   const notes: string[] = [];
   if (toc) {
     const entry = `<div class="te tc"><span class="tt">Capítulo ${P}: ${htmlEsc(a.title)}</span><span class="td"></span></div>`;
-    const prev = new RegExp(`<div class="te tc"><span class="tt">Capítulo ${P - 1}:[\\s\\S]*?</div>`).exec(out);
+    const prevB = firstBlock(out, `<div class="te tc"><span class="tt">Capítulo ${P - 1}:`, '</div>');
+    const prev = prevB ? Object.assign([prevB.whole], { index: prevB.start }) : null;
     const next = new RegExp(`<div class="te tc"><span class="tt">Capítulo ${P + 1}:`).exec(out);
     const at = prev && (a.moduleOf(P - 1) === a.moduleNumber || !next) ? (prev.index ?? 0) + prev[0].length : next ? next.index ?? 0 : -1;
     if (at < 0) throw new PatchError('unsupported', 'No se encontró dónde va el capítulo en el índice del Libro.');
@@ -636,7 +644,7 @@ export async function insertLibroChapter(ctx: OpContext, texts: Texts, a: { posi
   // El blob ACTUAL del Libro (otra inserción de este mismo plan / módulo pudo cambiarlo): el de files.xml.
   const fx0 = await texts.get('files.xml');
   const mine = (body: string) => libro.contextId !== null && body.includes(`<contextid>${libro.contextId}</contextid>`) && body.includes(`<filename>${xmlEsc(lf.filename)}</filename>`) && body.includes(`<filearea>${lf.filearea}</filearea>`);
-  const cur = [...fx0.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].find((m) => mine(m[2]));
+  const cur = allBlocks(fx0, /<file id="(\d+)">/, '</file>').map((b) => [b.whole, b.open![1], b.inner]).find((m) => mine(m[2]));
   const curHash = cur ? /<contenthash>([0-9a-f]{40})<\/contenthash>/.exec(cur[2])?.[1] ?? null : null;
   if (!curHash || !ctx.state.has(blobPath(curHash))) throw new PatchError('target_not_found', 'El archivo del Libro no viene en el paquete.');
   const buf = await ctx.state.read(blobPath(curHash));
@@ -645,7 +653,7 @@ export async function insertLibroChapter(ctx: OpContext, texts: Texts, a: { posi
   const outBuf = Buffer.from(res.html, 'utf8');
   const nh = sha1Of(outBuf);
   if (!ctx.state.has(blobPath(nh))) { ctx.state.write(blobPath(nh), outBuf); ctx.report.entriesAdded.push(blobPath(nh)); }
-  const fixed = fx0.replace(/<file id="(\d+)">([\s\S]*?)<\/file>/g, (m, id: string, body: string) => {
+  const fixed = replaceBlocks(fx0, /<file id="(\d+)">/, '</file>', ({ whole: m, open, inner: body }) => { const id = open![1];
     // P2-4: SOLO la entrada del Libro (otro archivo con el mismo contenido no se toca).
     if (!mine(body) || !body.includes(`<contenthash>${curHash}</contenthash>`)) return m;
     if (curHash === lf.contenthash) ctx.report.files.push({ fileId: Number(id), filename: lf.filename, component: lf.component, filearea: lf.filearea, before: { contenthash: lf.contenthash, filesize: lf.filesize, mimetype: lf.mimetype }, after: { contenthash: nh, filesize: outBuf.length, mimetype: lf.mimetype } });

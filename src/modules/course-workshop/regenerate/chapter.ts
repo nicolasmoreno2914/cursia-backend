@@ -26,7 +26,7 @@ import { hasPendingMarker } from './target';
 import { ProducedRegen, RegenError, RegenExternal, RegenPrior, RegenTarget, SCORM_V2_TEMPLATE_IDS, inlineExternal } from './types';
 import { produceVideo } from './video';
 import { unitExamProblems } from '../patch/op-add-module';
-import { SLOT_RE, VIDEO_PENDING_RE } from '../patch/op-add-chapter';
+import { VIDEO_PENDING_RE, replaceSlots } from '../patch/op-add-chapter';
 import { createExecutorSandbox } from '../../../workers/llm-executor/executor-runtime';
 import { syntheticCoverPng, syntheticPdf } from '../../../package/v3/synthetic-media';
 import * as vm from 'vm';
@@ -115,7 +115,7 @@ export function cleanPage(raw: string): string {
   const s = String(raw ?? '').replace(/^\s*```(?:html)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
   if (/<(style|script)\b/i.test(s)) throw new RegenError('invalid_result', 'La página generada trae <style> o <script> (Moodle los elimina): no se usa.');
   if (hasPendingMarker(s)) throw new RegenError('invalid_result', 'La página generada trae «⚠️ Pendiente».');
-  if (VIDEO_PENDING_RE.test(s.replace(SLOT_RE, ''))) throw new RegenError('invalid_result', 'La página generada trae «Video en preparación» fuera del espacio del video: no se usa.');
+  if (VIDEO_PENDING_RE.test(replaceSlots(s, () => ''))) throw new RegenError('invalid_result', 'La página generada trae «Video en preparación» fuera del espacio del video: no se usa.');
   if (!plainText(s, 200)) throw new RegenError('invalid_result', 'La página generada viene vacía.');
   return s;
 }
@@ -157,7 +157,7 @@ export async function produceChapter(a: { spec: ChapterSpec; course: WorkshopCou
     let html: string;
     try { html = String(await ex.sandbox.ctx.api(pr.system, pr.user, PAGE_MAX_TOKENS)); } catch (e: any) { throw ex.stop ?? new RegenError('internal', String(e?.msg ?? e?.message ?? e)); }
     // Sin video (o en la página del juego) el bloque del video no tiene qué mostrar: se quita.
-    rec[k] = cleanPage(k === 'videoPageHtml' && spec.pieces.includes('video') ? html : html.replace(SLOT_RE, ''));
+    rec[k] = cleanPage(k === 'videoPageHtml' && spec.pieces.includes('video') ? html : replaceSlots(html, () => ''));
     await save();
   }
   // 3. Juego.

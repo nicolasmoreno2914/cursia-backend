@@ -18,6 +18,7 @@ import { applyPatchPlan, PATCH_ENGINE_VERSION } from '../patch/engine';
 import { libroHeadingTitle, libroStructure } from '../patch/op-libro';
 import type { FieldChange, NewQuestion, PatchOperation, PatchResult } from '../patch/types';
 import { xmlUnescape } from '../../visual-design/preview-extract';
+import { firstBlock } from '../xml-scan';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import type { WorkshopAiResult, WorkshopTool } from './ai';
 import { WORKSHOP_INTERPRET_MAX_TOKENS, WORKSHOP_QUESTION_MAX_TOKENS, htmlMaxTokens, libroMaxTokens } from './ai';
@@ -475,9 +476,9 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 function frontFor(ctx: BuildCtx, html: string, st: ReturnType<typeof libroStructure>): { front: { headHtml: string; coverHtml: string }; note: string } | null {
   const first = st.chapters[0];
   const head = first ? html.slice(0, first.blockStart) : html;
-  if (first && /<\/head\s*>/i.test(head) && /<body\b[^>]*>/i.test(head)) return null;
+  if (first && /<\/head\s*>/i.test(head) && /<body\b[^<>]*>/i.test(head)) return null;
   const title = ctx.course.course.title ?? 'Curso';
-  const origHead = /<head\b[^>]*>([\s\S]*?)<\/head\s*>/i.exec(html)?.[1];
+  const origHead = firstBlock(html, /<head\b[^<>]*>/i, /<\/head\s*>/i)?.inner;
   const headHtml = origHead && !/<script\b/i.test(origHead) ? origHead : `<meta charset="utf-8"><title>${esc(title)} — Libro Guía</title>`;
   const coverHtml = `<div style="text-align:center;padding:48px 16px"><h1>Libro Guía</h1><h2>${esc(title)}</h2></div>`;
   return { front: { headHtml, coverHtml }, note: 'La portada original del Libro Guía se perdió en el corte: se rehace una portada simple con el título del curso (sin el logo ni el índice originales). Revísala antes de aplicar.' };

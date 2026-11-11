@@ -16,6 +16,7 @@ import { xmlUnescape } from '../../visual-design/preview-extract';
 import { TokenContext, WorkshopActivity, WorkshopCourse, WorkshopHtmlField, extractTokens, pluginfileRefs, tokenKindShape } from '../course-model';
 import { PatchState, sha1Of } from './container';
 import { PatchError } from './types';
+import { matchBlocks } from '../xml-scan';
 
 export { xmlEsc };
 
@@ -64,7 +65,8 @@ export function writeField(state: PatchState, loc: LocatedField, newRaw: string)
 
 // ─── Validación del contenido nuevo ─────────────────────────────────────────
 
-const BLOCKS = /<(style|script)\b[\s\S]*?<\/\1\s*>/gi;
+// B12 (H1): bloques <style>/<script> con escaneo lineal (antes `[\s\S]*?` con referencia hacia atrás).
+const blocksIn = (h: string): string[][] => matchBlocks(h, /<(style|script)\b/i, (o) => new RegExp(`</${o![1]}\\s*>`, 'i'));
 const OPEN_BLOCK = /<(style|script)\b/gi;
 
 export interface HtmlValidationCtx {
@@ -118,12 +120,12 @@ export function validateNewHtml(fragment: string, full: string, v: HtmlValidatio
   }
   const count = (h: string) => badTokens(h, v.tokenCtx).reduce((s, t) => s + t.count, 0);
   if (count(full) > count(v.oldHtml)) throw new PatchError('invalid_content', `El cambio en ${v.where} rompe un token $@…@$ existente.`);
-  const oldBlocks = new Set([...v.oldHtml.matchAll(BLOCKS)].map((m) => m[0]));
-  for (const m of full.matchAll(BLOCKS)) {
+  const oldBlocks = new Set(blocksIn(v.oldHtml).map((m) => m[0]));
+  for (const m of blocksIn(full)) {
     if (!oldBlocks.has(m[0])) throw new PatchError('invalid_content', `El HTML nuevo de ${v.where} trae un bloque <${m[1].toLowerCase()}>: Moodle lo elimina (forceclean). Los estilos van inline (style="…").`);
   }
   const opens = (h: string) => (h.match(OPEN_BLOCK) || []).length;
-  const closed = (h: string) => [...h.matchAll(BLOCKS)].length;
+  const closed = (h: string) => blocksIn(h).length;
   if (opens(full) - closed(full) > opens(v.oldHtml) - closed(v.oldHtml)) throw new PatchError('invalid_content', `El HTML nuevo de ${v.where} abre un <style>/<script> sin cerrarlo.`);
   const okFiles = new Set([...pluginfileRefs(v.oldHtml), ...v.files]);
   for (const f of pluginfileRefs(fragment)) {

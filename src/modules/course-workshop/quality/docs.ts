@@ -50,7 +50,7 @@ export function h5pText(content: unknown): string {
  * Texto plano que CONSERVA los cortes de bloque (párrafos, títulos, celdas, listas) como saltos de línea: una «oración»
  * nunca junta el encabezado de una etiqueta con su primer párrafo (las reglas por oración dependen de eso).
  */
-const BLOCK_END = /<\/(?:p|div|h[1-6]|li|tr|td|th|section|article|header|footer|blockquote|figcaption|dt|dd)\s*>|<br\s*\/?>|<hr\b[^>]*>/gi;
+const BLOCK_END = /<\/(?:p|div|h[1-6]|li|tr|td|th|section|article|header|footer|blockquote|figcaption|dt|dd)\s*>|<br\s*\/?>|<hr\b[^<>]*>/gi;
 const ENTITIES: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'", nbsp: ' ', aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ', Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Ntilde: 'Ñ', uuml: 'ü', iexcl: '¡', iquest: '¿', laquo: '«', raquo: '»', ndash: '–', mdash: '—', hellip: '…' };
 /** Entidades HTML → caracteres (el texto que ve el estudiante; lo que parezca una etiqueta lo neutraliza el prompt). */
 export function decodeEntities(s: string): string {

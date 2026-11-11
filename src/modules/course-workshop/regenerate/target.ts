@@ -9,6 +9,7 @@ import JSZip = require('jszip');
 import { createHash } from 'crypto';
 import { WorkshopActivity, WorkshopCourse, WorkshopFile } from '../course-model';
 import { xmlUnescape } from '../../visual-design/preview-extract';
+import { tagInner } from '../xml-scan';
 import { mp3DurationSeconds } from '../../../package/audio';
 import { pdfPageCount } from '../../../package/presentation';
 import { RegenOperation, RegenTarget, SCORM_V2_ROOMS, SCORM_V2_TEMPLATE_IDS } from './types';
@@ -153,15 +154,15 @@ export async function regenTargetOf(i: RegenTargetInput): Promise<RegenTargetRes
       }
       if (a.modname === 'hvp') {
         const x = await i.read(`${a.dir}/hvp.xml`);
-        const m = x ? /<json_content>([\s\S]*?)<\/json_content>/.exec(x.toString('utf8')) : null;
+        const m = x ? tagInner(x.toString('utf8'), 'json_content') : null;
         let j: any = null;
-        try { j = m ? JSON.parse(xmlUnescape(m[1])) : null; } catch { j = null; }
+        try { j = m !== null ? JSON.parse(xmlUnescape(m)) : null; } catch { j = null; }
         if (!j) return { unavailable: 'El video H5P (hvp) no trae un contenido legible.' };
         const url = String(j?.interactiveVideo?.video?.files?.[0]?.path ?? '');
         const yt = YOUTUBE_ID_IN_URL.exec(url)?.[1] ?? null;
         if (!yt) return { unavailable: 'El video del curso está embebido como archivo, no en YouTube: el Taller rehace videos que se entregan por YouTube.' };
         const qs = Array.isArray(j?.interactiveVideo?.assets?.interactions) ? j.interactiveVideo.assets.interactions.length : 0;
-        return { target: { op: 'regenerate_video', moduleId: a.moduleId, chapterNumber, title: a.title, chapterTitle, container: 'hvp', delivery: 'youtube', youtubeIdBefore: yt, questionsBefore: qs, advanced: false }, expect: { contenthashes: [], jsonSha1: sha1(m![1]) } };
+        return { target: { op: 'regenerate_video', moduleId: a.moduleId, chapterNumber, title: a.title, chapterTitle, container: 'hvp', delivery: 'youtube', youtubeIdBefore: yt, questionsBefore: qs, advanced: false }, expect: { contenthashes: [], jsonSha1: sha1(m!) } };
       }
       return { unavailable: `«${a.title}» no es un video interactivo.` };
     }

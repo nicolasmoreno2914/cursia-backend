@@ -1,0 +1,316 @@
+#!/usr/bin/env node
+/* eslint-disable */
+// r107 B12 — endurecimiento final del Taller de cursos, contra el código COMPILADO (dist/). Puro: sin red, sin IA, sin
+// base, USD 0. Convierte en checks los repros de la revisión final (scratchpad h/redos2.js, h/bomb.js, h/ask.js).
+//
+//   K1 (H1 P0) escaneo lineal: tags abiertos SIN cierre (400 KB y 7,9 MB descomprimidos) en moodle_backup.xml,
+//      files.xml, questions.xml, el XML de una actividad y su HTML → identificación (readPackageFacts), inventario
+//      (readRawCourse + modelo) y diagnóstico técnico terminan en < 2 s cada uno y el event loop sigue avanzando
+//      (un temporizador de 50 ms corre entre pasos); antes: 18 s (400 KB) / ~2 h (7,9 MB) sin un tick.
+//   K1b equivalencia: allBlocks / matchBlocks / replaceBlocks / tagInner dan EXACTAMENTE lo mismo que la regex perezosa
+//      de antes sobre 4000 textos al azar bien y mal formados (incluye cierres con referencia `</\1>`).
+//   K2 (H2 P1) memoria sobre lo DESCOMPRIMIDO: bomb.js (1 MB → 140 × 7 MB) se rechaza al abrir (zip_bomb, no
+//      reintentable) sin pasar de 300 MB de RSS; con razón total < 200× el presupuesto de lectura proporcional
+//      (min(1 GB, max(64 MB, tamaño × 4))) corta la lectura (read_budget_exceeded) sin pasar de 300 MB; la reserva FIFO
+//      del servicio se agranda a max(comprimido × factor, min(total, presupuesto) × 2) después de abrir; una expansión
+//      mayor que el presupuesto entero → PackageExpansionError (zip_bomb, no reintentable).
+//   K3 (D3 P1) «Preguntar» sobre cobertura de examen: examen de 40 preguntas con las del capítulo 9 al final → llegan
+//      las 40 (enunciado corto), ANTES del texto del capítulo, sin recorte; examen enorme (200) → recortado: el prompt
+//      lo dice y un «no» baja a «parcial» con el aviso.
+//
+// Uso: npm run build && node scripts/r107/check-r107-hardening.js --ci [--dist dist]
+//      node scripts/r107/check-r107-hardening.js --bite   (copia dist/ y rompe una defensa por vez: cada una tiene que
+//                                                          hacer fallar su prueba)
+'use strict';
+require('reflect-metadata');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const zlib = require('zlib');
+const crypto = require('crypto');
+const { spawnSync } = require('child_process');
+
+const REPO = path.resolve(__dirname, '..', '..');
+const argv = process.argv.slice(2);
+const has = (n) => argv.includes(n);
+const arg = (n, d = null) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : d; };
+const DIST = path.resolve(arg('--dist', path.join(REPO, 'dist')));
+if (!has('--ci') && !has('--bite')) { console.error('Uso: --ci [--dist dist] | --bite'); process.exit(2); }
+const ONLY = arg('--only', null);
+
+// ── --bite ────────────────────────────────────────────────────────────────────────────────────────────────────────
+if (has('--bite')) {
+  const bites = [
+    { id: 'K1', file: 'modules/course-workshop/xml-scan.js', find: /function tagInner\(text, name, from = 0\) \{/, repl: 'function tagInner(text, name, from = 0) { const __m = new RegExp(`<${name}>([\\\\s\\\\S]*?)</${name}>`).exec(text.slice(from)); return __m ? __m[1] : null;' },
+    { id: 'K2', file: 'modules/course-workshop/mbz-reader.js', find: /const checkTotalRatio = \(total\) => \{/, repl: 'const checkTotalRatio = (total) => { return;' },
+    { id: 'K3', file: 'modules/course-workshop/quality/ask.js', find: /if \(truncated && o\.verdict === 'no'\)/, repl: 'if (false)' },
+  ];
+  let bad = 0;
+  for (const b of bites) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'r107-b12-bite-'));
+    try {
+      fs.cpSync(DIST, tmp, { recursive: true });
+      const f = path.join(tmp, b.file);
+      const src = fs.readFileSync(f, 'utf8');
+      if (!b.find.test(src)) { console.log(`❌ bite ${b.id}: no encontré la guarda en ${b.file}`); bad++; continue; }
+      fs.writeFileSync(f, src.replace(b.find, b.repl));
+      const r = spawnSync(process.execPath, [__filename, '--ci', '--dist', tmp, '--only', b.id], { encoding: 'utf8', timeout: 300_000 });
+      const failed = r.status !== 0;
+      console.log(`${failed ? '✅' : '❌'} bite ${b.id}: ${failed ? 'la prueba falla con la defensa rota' : 'la prueba NO detectó la ruptura'}`);
+      if (!failed) bad++;
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  console.log(`\n${bad ? '❌' : '✅'} check-r107-hardening --bite: ${bites.length - bad}/${bites.length} rupturas detectadas`);
+  process.exit(bad ? 1 : 0);
+}
+
+const L = (rel) => require(path.join(DIST, rel));
+
+// K2 en un proceso aparte (RSS limpio: solo el lector y el modelo cargados). Imprime una línea JSON.
+if (has('--child-bomb')) {
+  (async () => {
+    const R0 = L('modules/course-workshop/mbz-reader.js');
+    const CM0 = L('modules/course-workshop/course-model.js');
+    const mk = (N, SZ, randomTail) => {
+      let acts = '';
+      for (let i = 1; i <= N; i++) acts += `<activity><moduleid>${i}</moduleid><sectionid>1</sectionid><modulename>page</modulename><title>x</title><directory>activities/page_${i}</directory></activity>`;
+      const files = [['moodle_backup.xml', Buffer.from(`<?xml version="1.0"?><moodle_backup><information><contents><activities>${acts}</activities><sections></sections></contents></information></moodle_backup>`)]];
+      const big = Buffer.alloc(SZ, 0x20);
+      if (randomTail) crypto.randomBytes(randomTail).copy(big, SZ - randomTail);
+      const def = zlib.deflateRawSync(big, { level: 9 });
+      const crc = zlib.crc32(big);
+      for (let i = 1; i <= N; i++) files.push([`activities/page_${i}/module.xml`, big, def, crc]);
+      return zip(files);
+    };
+    const peak = async (fn) => {
+      let p = process.memoryUsage().rss;
+      const iv = setInterval(() => { p = Math.max(p, process.memoryUsage().rss); }, 5);
+      let err = null;
+      try { await fn(); } catch (e) { err = e; }
+      clearInterval(iv);
+      return { peak: Math.max(p, process.memoryUsage().rss), code: err ? err.code || err.message : null };
+    };
+    const z = mk(140, 7 * 1024 * 1024, 0);
+    const a = await peak(async () => { const pkg = await R0.openMbz(z); await CM0.readRawCourse(pkg, { family: 'v1-legacy', builderLine: 'x' }); });
+    // razón total < 200×: 20 × 7,5 MB con 50 KB al azar cada uno (~130×) → abre; el presupuesto proporcional corta la lectura
+    const z2 = mk(20, 7.5 * 1024 * 1024, 50_000);
+    const b = await peak(async () => { const pkg = await R0.openMbz(z2); if (pkg.readBudgetBytes !== R0.readBudgetFor(z2.length)) throw new Error('presupuesto no proporcional'); await CM0.readRawCourse(pkg, { family: 'v1-legacy', builderLine: 'x' }); });
+    console.log(JSON.stringify({ a: { ...a, size: z.length }, b: { ...b, ratio: (20 * 7.5 * 1048576) / z2.length } }));
+    process.exit(0);
+  })().catch((e) => { console.error(e); process.exit(1); });
+  return;
+}
+require(path.join(REPO, 'node_modules/@nestjs/common')).Logger.overrideLogger(false);
+const R = L('modules/course-workshop/mbz-reader.js');
+const ID = L('modules/course-workshop/identify.js');
+const CM = L('modules/course-workshop/course-model.js');
+const INV = L('modules/course-workshop/inventory.js');
+const DX = L('modules/course-workshop/diagnosis/diagnose.js');
+const XS = L('modules/course-workshop/xml-scan.js');
+const SVC = L('modules/course-workshop/course-workshop.service.js');
+const QL = L('modules/course-workshop/quality/ask.js');
+const QT = L('modules/course-workshop/quality/types.js');
+
+let ok = 0;
+let fail = 0;
+async function check(id, name, fn) {
+  if (ONLY && ONLY !== id) return;
+  try { await fn(); ok++; console.log(`✅ ${id} ${name}`); } catch (e) { fail++; console.log(`❌ ${id} ${name}\n   ${e && e.stack ? e.stack.split('\n').slice(0, 3).join('\n   ') : e}`); }
+}
+const assert = (c, m) => { if (!c) throw new Error(m); };
+const eq = (a, b, m) => { const x = JSON.stringify(a), y = JSON.stringify(b); if (x !== y) throw new Error(`${m}: esperado ${y}, encontrado ${x}`); };
+
+// ZIP mínimo (DEFLATE) — mismo armado que los repros del revisor.
+function zip(files) {
+  const locals = [], centrals = []; let off = 0;
+  for (const f of files) {
+    const [name, data] = f; const def = f[2] || zlib.deflateRawSync(data); const crc = f[3] ?? zlib.crc32(data); const nb = Buffer.from(name);
+    const h = Buffer.alloc(30); h.writeUInt32LE(0x04034b50, 0); h.writeUInt16LE(20, 4); h.writeUInt16LE(8, 8); h.writeUInt32LE(crc >>> 0, 14); h.writeUInt32LE(def.length, 18); h.writeUInt32LE(data.length, 22); h.writeUInt16LE(nb.length, 26);
+    locals.push(h, nb, def);
+    const c = Buffer.alloc(46); c.writeUInt32LE(0x02014b50, 0); c.writeUInt16LE(20, 4); c.writeUInt16LE(20, 6); c.writeUInt16LE(8, 10); c.writeUInt32LE(crc >>> 0, 16); c.writeUInt32LE(def.length, 20); c.writeUInt32LE(data.length, 24); c.writeUInt16LE(nb.length, 28); c.writeUInt32LE(off, 42);
+    centrals.push(c, nb); off += 30 + nb.length + def.length;
+  }
+  const cd = Buffer.concat(centrals);
+  const e = Buffer.alloc(22); e.writeUInt32LE(0x06054b50, 0); e.writeUInt16LE(files.length, 8); e.writeUInt16LE(files.length, 10); e.writeUInt32LE(cd.length, 12); e.writeUInt32LE(off, 16);
+  return Buffer.concat([...locals, cd, e]);
+}
+
+/** Mide `fn` con un temporizador de 50 ms: tiempo y ticks del event loop durante la medición (await entre pasos). */
+async function timed(fn) {
+  let ticks = 0;
+  const iv = setInterval(() => ticks++, 50);
+  const t0 = Date.now();
+  let err = null;
+  try { await fn(); } catch (e) { err = e; }
+  const ms = Date.now() - t0;
+  await new Promise((r) => setTimeout(r, 120)); // el loop sigue vivo después
+  clearInterval(iv);
+  return { ms, ticks, err };
+}
+
+(async () => {
+  // ── K1 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  await check('K1', 'H1: tags abiertos sin cierre (400 KB y 7,9 MB) → identificación, inventario y diagnóstico < 2 s; el event loop avanza', async () => {
+    const OPENERS = ['<sections>', '<section>', '<contents>', '<activities>', '<activity>', '<file id="1">', '<question_category id="1">', '<question id="1">', '<chapter id="1">', '<!--', '<script>', '<a href="#">', '<h2>', '<sco id="1">', '<setting>', '<intro>'];
+    const unit = OPENERS.join('');
+    const report = [];
+    for (const kb of [400, 7900]) {
+      const n = Math.ceil((kb * 1024) / unit.length);
+      const junk = unit.repeat(n);
+      const mbHead = '<?xml version="1.0"?><moodle_backup><information><name>x.mbz</name><original_course_fullname>Curso</original_course_fullname>';
+      const goodActs = '<contents><activities><activity><moduleid>7</moduleid><sectionid>1</sectionid><modulename>page</modulename><title>P</title><directory>activities/page_7</directory></activity></activities><sections><section><sectionid>1</sectionid><title>S</title><directory>sections/section_1</directory></section></sections></contents>';
+      const variants = {
+        // todo el moodle_backup.xml abierto (el repro: <sections> repetido)
+        'moodle_backup abierto': [['moodle_backup.xml', Buffer.from(mbHead + junk)]],
+        // moodle_backup válido; files.xml / questions.xml / la actividad y su HTML abiertos
+        'files/questions/actividad abiertos': [
+          ['moodle_backup.xml', Buffer.from(`${mbHead}${goodActs}</information></moodle_backup>`)],
+          ['files.xml', Buffer.from(`<?xml version="1.0"?><files>${junk}`)],
+          ['questions.xml', Buffer.from(`<?xml version="1.0"?><question_categories>${junk}`)],
+          ['sections/section_1/section.xml', Buffer.from(`<section id="1"><number>1</number><name>S</name><summary>${junk}`)],
+          ['activities/page_7/module.xml', Buffer.from(`<module id="7"><sectionid>1</sectionid>${junk}`)],
+          // el HTML (escapado en el XML) también abierto; < 8 MB por entrada (bajo el control de razón por entrada)
+          ['activities/page_7/page.xml', Buffer.from(`<activity id="7" moduleid="7" modulename="page" contextid="70"><page id="7"><name>P</name><intro>${junk.slice(0, Math.floor(junk.length * 0.4)).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</intro><content>x</content></page></activity>`)],
+        ],
+      };
+      for (const [label, files] of Object.entries(variants)) {
+        const buf = zip(files);
+        const pkg = await R.openMbz(buf);
+        const t1 = await timed(() => ID.readPackageFacts(pkg, 'x.mbz').catch((e) => { if (!(e instanceof ID.PackageFactsError)) throw e; }));
+        const t2 = await timed(() => INV.buildInventory(pkg, { family: 'v1-legacy', builderLine: 'legacy-v1', builderVersion: null }));
+        const t3 = await timed(async () => { const p2 = await R.openMbz(buf); await DX.runTechnicalDiagnosis({ pkg: p2, packageBytes: buf, family: 'v1-legacy', builderLine: 'legacy-v1', builderVersion: null, expectations: null, expectationsReason: 'check' }, { prevalidateFixes: false }); });
+        for (const [what, t] of [['identificación', t1], ['inventario', t2], ['diagnóstico', t3]]) {
+          report.push(`${kb} KB ${label} ${what}: ${t.ms} ms, ${t.ticks} ticks`);
+          if (t.err && !(t.err instanceof R.MbzReaderError)) throw new Error(`${kb} KB ${label} ${what}: error inesperado ${t.err && t.err.message}`);
+          assert(t.ms < 2000, `${kb} KB ${label} ${what}: ${t.ms} ms (≥ 2 s): el escaneo no es lineal`);
+          assert(t.ticks >= 1, `${kb} KB ${label} ${what}: el event loop no avanzó`);
+        }
+      }
+    }
+    console.log(`   ${report.filter((_, i) => i % 3 === 0 || /7900/.test(report[i])).slice(0, 6).join('\n   ')}`);
+  });
+
+  await check('K1', 'H1b: el escaneo lineal = la regex perezosa de antes (4000 textos al azar, bien y mal formados)', async () => {
+    let seed = 42;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const PIECES = ['<x>', '</x>', '<y>', '</y>', 'a', ' ', '<file id="3">', '</file>', '<style>', '</style>', '<script a>', '</script >', '<!--', '-->', '<h2 c>', '</h2>', '<h3>', '</h3>'];
+    const make = () => Array.from({ length: Math.floor(rnd() * 30) }, () => PIECES[Math.floor(rnd() * PIECES.length)]).join('');
+    for (let i = 0; i < 4000; i++) {
+      const t = make();
+      const lazy = (re) => [...t.matchAll(re)].map((m) => [m.index, m[0]]);
+      eq(XS.allBlocks(t, '<x>', '</x>').map((b) => [b.start, b.whole]), lazy(/<x>([\s\S]*?)<\/x>/g), `x: ${t}`);
+      eq(XS.matchBlocks(t, /<file id="(\d+)">/, '</file>').map((m) => [m.index, m[0], m[1], m[2]]), [...t.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].map((m) => [m.index, m[0], m[1], m[2]]), `file: ${t}`);
+      eq(XS.matchBlocks(t, /<(style|script)\b/i, (o) => new RegExp(`</${o[1]}\\s*>`, 'i')).map((m) => [m.index, m[0]]), lazy(/<(style|script)\b[\s\S]*?<\/\1\s*>/gi), `style/script: ${t}`);
+      eq(XS.matchBlocks(t, /<h([1-3])\b[^<>]*>/i, (o) => new RegExp(`</h${o[1]}\\s*>`, 'i')).map((m) => [m.index, m[0], m[1], m[2]]), [...t.matchAll(/<h([1-3])\b[^<>]*>([\s\S]*?)<\/h\1\s*>/gi)].map((m) => [m.index, m[0], m[1], m[2]]), `h: ${t}`);
+      eq(XS.replaceBlocks(t, '<!--', '-->', () => ' '), t.replace(/<!--[\s\S]*?-->/g, ' '), `comment: ${t}`);
+      eq(XS.tagInner(t, 'y'), (/<y>([\s\S]*?)<\/y>/.exec(t) || [])[1] ?? null, `tagInner: ${t}`);
+    }
+  });
+
+  // ── K2 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  const bombPkg = (N, SZ) => {
+    let acts = '';
+    for (let i = 1; i <= N; i++) acts += `<activity><moduleid>${i}</moduleid><sectionid>1</sectionid><modulename>page</modulename><title>x</title><directory>activities/page_${i}</directory></activity>`;
+    const files = [['moodle_backup.xml', Buffer.from(`<?xml version="1.0"?><moodle_backup><information><contents><activities>${acts}</activities><sections></sections></contents></information></moodle_backup>`)]];
+    const big = Buffer.alloc(SZ, 0x20);
+    const def = zlib.deflateRawSync(big, { level: 9 });
+    const crc = zlib.crc32(big);
+    for (let i = 1; i <= N; i++) files.push([`activities/page_${i}/module.xml`, big, def, crc]);
+    return zip(files);
+  };
+  const peakOf = async (fn) => {
+    let peak = process.memoryUsage().rss;
+    const iv = setInterval(() => { peak = Math.max(peak, process.memoryUsage().rss); }, 10);
+    let err = null;
+    try { await fn(); } catch (e) { err = e; }
+    clearInterval(iv);
+    return { peak: Math.max(peak, process.memoryUsage().rss), err };
+  };
+  await check('K2', 'H2: bomba 1 MB → 140 × 7 MB rechazada al abrir (zip_bomb) sin pasar de 300 MB de RSS; razón < 200× → el presupuesto proporcional corta la lectura', async () => {
+    const r = spawnSync(process.execPath, [__filename, '--ci', '--child-bomb', '--dist', DIST], { encoding: 'utf8', timeout: 300_000 });
+    const line = (r.stdout || '').trim().split('\n').pop();
+    let out;
+    try { out = JSON.parse(line); } catch { throw new Error(`proceso de la bomba: ${r.status} ${(r.stderr || '').slice(0, 300)}`); }
+    console.log(`   bomba ${out.a.size} B: ${out.a.code}, RSS pico ${Math.round(out.a.peak / 1048576)} MB · razón ${Math.round(out.b.ratio)}×: ${out.b.code}, RSS pico ${Math.round(out.b.peak / 1048576)} MB`);
+    assert(out.a.code === 'zip_bomb', `bomba: ${out.a.code || 'abrió y leyó'}`);
+    assert(out.b.ratio < 200, `el segundo paquete tiene que quedar bajo 200× (${Math.round(out.b.ratio)}×)`);
+    assert(out.a.peak < 300 * 1048576, `bomba: RSS ${Math.round(out.a.peak / 1048576)} MB ≥ 300 MB`);
+    // razón total < 200×: se abre, pero leer más de max(64 MB, 4 × tamaño) se corta.
+    assert(out.b.code === 'read_budget_exceeded' || out.b.code === 'zip_bomb', `razón ${Math.round(out.b.ratio)}×: ${out.b.code || 'leyó todo'}`);
+    assert(out.b.peak < 300 * 1048576, `razón ${Math.round(out.b.ratio)}×: RSS ${Math.round(out.b.peak / 1048576)} MB ≥ 300 MB`);
+    eq([R.readBudgetFor(1e6), R.readBudgetFor(100 * 1048576), R.readBudgetFor(300 * 1048576)], [64 * 1048576, 400 * 1048576, 1024 * 1048576], 'min(1 GB, max(64 MB, tamaño × 4))');
+    // un error de bomba NO es reintentable (lo que el servicio guarda): mismo código que el lector
+    const pe = new SVC.PackageExpansionError(3e9, 2e9);
+    assert(R.isMbzReaderError(pe) && pe.code === 'zip_bomb', 'PackageExpansionError es zip_bomb');
+  });
+
+  await check('K2', 'H2b: la reserva FIFO se agranda tras abrir a max(comprimido × factor, min(total, presupuesto) × 2); expansión > presupuesto → zip_bomb', async () => {
+    const svc = new SVC.CourseWorkshopService(null, null, null);
+    svc.memoryBudgetBytes = 512 * 1048576;
+    // 60 MB de XML declarado en ~0,1 MB comprimido (razón < 200 por debajo de 64 MB): antes reservaba 3 × 0,1 MB.
+    const sp = Buffer.alloc(7.5 * 1048576, 0x20);
+    const z = zip([['moodle_backup.xml', Buffer.from('<moodle_backup><information></information></moodle_backup>')], ...Array.from({ length: 8 }, (_, i) => [`files/${i}`, sp])]);
+    const key = 'identify:k2';
+    let reservedInside = 0;
+    await svc.withMemory(key, z.length * SVC.IDENTIFY_MEMORY_FACTOR, async () => {
+      const before = svc.reservedFor(key);
+      assert(before === z.length * SVC.IDENTIFY_MEMORY_FACTOR, 'reserva inicial = comprimido × factor');
+      const pkg = await svc.reserveForPackage(key, z, SVC.IDENTIFY_MEMORY_FACTOR);
+      reservedInside = svc.reservedFor(key);
+      eq(reservedInside, SVC.packageMemoryBytes(pkg, z.length, SVC.IDENTIFY_MEMORY_FACTOR), 'reserva = fórmula');
+      assert(reservedInside >= 60 * 1048576 * 2, `reserva agrandada: ${reservedInside}`);
+    });
+    eq(svc.reservedMemoryBytes, 0, 'al terminar se suelta todo');
+    // expansión por encima del presupuesto entero → zip_bomb (no reintentable)
+    svc.memoryBudgetBytes = 64 * 1048576;
+    let err = null;
+    await svc.withMemory('identify:k2b', 1, async () => { await svc.reserveForPackage('identify:k2b', z, SVC.IDENTIFY_MEMORY_FACTOR); }).catch((e) => { err = e; });
+    assert(err && err.code === 'zip_bomb' && R.isMbzReaderError(err), `expansión > presupuesto: ${err && err.code}`);
+    eq(svc.reservedMemoryBytes, 0, 'sin fugas');
+    // sin reserva previa con esa clave (quien llama no reservó) → no toma nada
+    await svc.reserveForPackage('nadie', zip([['a', Buffer.from('x')]]), 3);
+    eq(svc.reservedMemoryBytes, 0, 'sin clave previa no reserva');
+  });
+
+  // ── K3 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  const askFixture = (nQ) => {
+    const chapters = Array.from({ length: 9 }, (_, i) => ({ number: i + 1, moduleNumber: Math.floor(i / 3) + 1, title: 'C' + (i + 1), activities: [] }));
+    const qs = Array.from({ length: nQ }, (_, i) => ({ id: 100 + i, chapterNumber: null }));
+    const course = { chapters, modules: [], activities: [{ moduleId: 50, exam: { final: true, unit: null, questions: qs } }] };
+    const docs = [];
+    for (const c of chapters) for (let k = 0; k < 4; k++) docs.push({ key: `t${c.number}-${k}`, moduleId: 10 + c.number, questionId: null, chapterNumber: c.number, role: 'libro', what: 'libro', activityTitle: 'Libro', text: `Texto del capítulo ${c.number} sobre el tema de la ventilación mecánica número ${k}. `.repeat(8) });
+    qs.forEach((q, i) => docs.push({ key: `q${q.id}`, moduleId: 50, questionId: q.id, chapterNumber: null, role: 'exam', what: 'pregunta', activityTitle: 'Evaluación final', text: `Pregunta ${i + 1} (tema del capítulo ${Math.floor(i / (nQ / 9)) + 1}): ¿Cuál es la respuesta correcta sobre el procedimiento ${i}? ${'Contexto largo del caso clínico. '.repeat(12)}` }));
+    return { course, docs };
+  };
+  await check('K3', 'D3: examen de 40 preguntas (las del capítulo 9 al final) → llegan las 40, antes del capítulo, sin recorte; examen enorme → recorte dicho en el prompt y «no» → «parcial»', async () => {
+    const { course, docs } = askFixture(40);
+    const ev = QL.retrieveEvidence(course, docs, '¿El examen final cubre el capítulo 9?');
+    const exam = ev.passages.filter((p) => p.role === 'exam');
+    eq(exam.length, 40, 'todas las preguntas del examen');
+    eq(exam[exam.length - 1].questionId, 139, 'incluye las del final (capítulo 9)');
+    assert(exam.every((p) => p.text.length <= QT.QUALITY_LIMITS.askExamQuestionChars + 1), 'enunciado corto');
+    const firstText = ev.passages.findIndex((p) => p.role !== 'exam');
+    assert(firstText > 0 && ev.passages.slice(0, firstText).every((p) => p.role === 'exam'), 'las preguntas van ANTES del texto del capítulo');
+    assert(ev.passages.some((p) => p.role !== 'exam' && p.chapterNumber === 9), 'texto del capítulo 9');
+    eq(ev.truncated, false, 'sin recorte');
+    assert(!/RECORTADA/.test(QL.askUser('C', 'q', ev.passages, ev.truncated)), 'sin aviso de recorte');
+    // un «no» con evidencia completa se respeta
+    const cite = { passageId: exam[0].id, quote: exam[0].text.slice(0, 40) };
+    eq(QL.verifyAnswer({ verdict: 'no', answer: 'No lo cubre.', citations: [cite] }, ev.passages, ev.truncated).verdict, 'no', '«no» con todo a la vista');
+    // examen enorme: no entra todo → recortado, el prompt lo dice, «no» baja a «parcial» con el aviso
+    const big = askFixture(200);
+    const ev2 = QL.retrieveEvidence(big.course, big.docs, '¿El examen final cubre el capítulo 9?');
+    eq(ev2.truncated, true, 'examen enorme recortado');
+    assert(ev2.examQuestions && ev2.examQuestions.total === 200 && ev2.examQuestions.sent < 200, 'cuenta lo que entró');
+    assert(/RECORTADA/.test(QL.askUser('C', 'q', ev2.passages, true)) && /RECORTADA/.test(QL.ASK_SYSTEM), 'el prompt avisa el recorte');
+    const ex2 = ev2.passages.find((p) => p.role === 'exam');
+    const a = QL.verifyAnswer({ verdict: 'no', answer: 'No lo cubre.', citations: [{ passageId: ex2.id, quote: ex2.text.slice(0, 40) }] }, ev2.passages, true);
+    eq(a.verdict, 'parcial', '«no» con evidencia recortada → parcial');
+    assert(a.answer.includes(QL.TRUNCATED_NOTE), 'con el aviso para el docente');
+  });
+
+  console.log(`\n${fail ? '❌' : '✅'} check-r107-hardening --ci: ${ok}/${ok + fail}`);
+  process.exit(fail ? 1 : 0);
+})().catch((e) => { console.error(e); process.exit(1); });

@@ -16,6 +16,7 @@
  */
 import { WorkshopCourse, plainText } from '../course-model';
 import { xmlUnescape } from '../../visual-design/preview-extract';
+import { allBlocks, replaceBlocks, stripCommentsAndBlocks, stripTags, tagInner } from '../xml-scan';
 import { libroStructure } from '../patch/op-libro';
 import { chapterPlainText } from '../plan/summary';
 
@@ -44,16 +45,14 @@ const words = (s: string) => (s.match(/[\p{L}\p{N}]+/gu) || []).length;
 
 /** HTML → markdown simple (títulos `##`, párrafos y listas): suficiente para el guion y los prompts. */
 export function htmlToMarkdown(html: string): string {
-  let s = String(html || '')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(style|script)\b[\s\S]*?<\/\1\s*>/gi, ' ');
-  s = s.replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, (_m, t) => `\n\n# ${plainText(t, 400)}\n\n`)
-    .replace(/<h[2-3]\b[^>]*>([\s\S]*?)<\/h[2-3]>/gi, (_m, t) => `\n\n## ${plainText(t, 400)}\n\n`)
-    .replace(/<h[4-6]\b[^>]*>([\s\S]*?)<\/h[4-6]>/gi, (_m, t) => `\n\n### ${plainText(t, 400)}\n\n`)
-    .replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_m, t) => `\n- ${plainText(t, 4000)}`)
-    .replace(/<\/(p|div|section|article|tr|table|ul|ol|blockquote)>/gi, '\n\n')
+  let s = stripCommentsAndBlocks(String(html || ''));
+  s = replaceBlocks(s, /<h1\b[^<>]*>/i, /<\/h1>/i, (b) => `\n\n# ${plainText(b.inner, 400)}\n\n`);
+  s = replaceBlocks(s, /<h[2-3]\b[^<>]*>/i, /<\/h[2-3]>/i, (b) => `\n\n## ${plainText(b.inner, 400)}\n\n`);
+  s = replaceBlocks(s, /<h[4-6]\b[^<>]*>/i, /<\/h[4-6]>/i, (b) => `\n\n### ${plainText(b.inner, 400)}\n\n`);
+  s = replaceBlocks(s, /<li\b[^<>]*>/i, /<\/li>/i, (b) => `\n- ${plainText(b.inner, 4000)}`);
+  s = s.replace(/<\/(p|div|section|article|tr|table|ul|ol|blockquote)>/gi, '\n\n')
     .replace(/<br\s*\/?>/gi, '\n');
-  s = s.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ');
+  s = stripTags(s).replace(/&nbsp;/g, ' ');
   s = xmlUnescape(s);
   return s.split('\n').map((l) => l.replace(/[ \t]+/g, ' ').trim()).join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -66,10 +65,10 @@ async function bookChapters(course: WorkshopCourse, read: (e: string) => Promise
   if (!x) return [];
   const xml = x.toString('utf8');
   const out: Array<{ title: string; html: string; pagenum: number }> = [];
-  for (const m of xml.matchAll(/<chapter id="\d+">([\s\S]*?)<\/chapter>/g)) {
-    const body = m[1];
-    const title = xmlUnescape(/<title>([\s\S]*?)<\/title>/.exec(body)?.[1] ?? '');
-    const html = xmlUnescape(/<content>([\s\S]*?)<\/content>/.exec(body)?.[1] ?? '');
+  for (const m of allBlocks(xml, /<chapter id="\d+">/, '</chapter>')) {
+    const body = m.inner;
+    const title = xmlUnescape(tagInner(body, 'title') ?? '');
+    const html = xmlUnescape(tagInner(body, 'content') ?? '');
     const pagenum = Number(/<pagenum>(\d+)<\/pagenum>/.exec(body)?.[1] ?? out.length + 1);
     const sub = /<subchapter>1<\/subchapter>/.test(body);
     if (!sub) out.push({ title, html, pagenum });
