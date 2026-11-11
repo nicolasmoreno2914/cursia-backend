@@ -705,7 +705,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
           return;
         }
         const pricing = await this.plan.pricing();
-        const call = askCall(evidence.courseTitle, row.question, ev.passages);
+        const call = askCall(evidence.courseTitle, row.question, ev.passages, 1, [], ev.truncated === true);
         const estimate = this.plan.estimateOf([plannedCallOf(call, pricing)], `Responder la pregunta con ${ev.passages.length} fragmento(s) del curso como evidencia (1 llamada; un reintento por forma entra en el margen). La IA no corre hasta que lo apruebes.`);
         await this.q(this.dataSource, `update public.workshop_questions set status = 'awaiting_confirmation', evidence = $3::jsonb, estimate = $4::jsonb, updated_at = now() where ${CLAIMED}`,
           [questionId, claimId, JSON.stringify(evidence), JSON.stringify(estimate)]);
@@ -751,7 +751,7 @@ export class WorkshopQualityService implements OnModuleInit, OnModuleDestroy {
         const pricing = await this.plan.pricing();
         const ai = this.plan.invokerFor(s, approval, pricing, { purpose: 'question', questionId: row.id, qualityCodeVersion: QUALITY_CODE_VERSION });
         try {
-          const out = await answerQuestion(row.evidence!.courseTitle, row.question, row.evidence!.passages, ai);
+          const out = await answerQuestion(row.evidence!.courseTitle, row.question, row.evidence!.passages, ai, row.evidence!.truncated === true);
           await this.q(this.dataSource, `update public.workshop_questions set status = 'answered', answer = $3::jsonb, spent_usd = spent_usd + $4, ai_calls = ai_calls + $5, error = null, updated_at = now() where ${CLAIMED}`,
             [job.questionId, claimId, JSON.stringify(out.answer), out.spentUsd, out.calls]);
         } catch (err) {

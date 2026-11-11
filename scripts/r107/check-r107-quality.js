@@ -484,7 +484,11 @@ async function censusMode(surveyPath) {
     assert(examP[0].chapterNumber === 5, 'primero las del capítulo 5');
     assert(ev.passages.some((p) => p.role !== 'exam' && p.chapterNumber === 5), 'texto del capítulo 5');
     assert(ev.passages.every((p) => baseAS.prep.docs.some((d) => d.key === p.key)), 'solo textos de ESTA sesión');
-    assert(ev.passages.length <= QL.QUALITY_LIMITS.askPassagesMax && ev.passages.reduce((n, p) => n + p.text.length, 0) <= QL.QUALITY_LIMITS.askEvidenceMaxChars, 'topes');
+    // B12 (D3): las preguntas del examen tienen su propio tope (van TODAS primero); el resto, el tope de siempre.
+    const exQ = ev.passages.filter((p) => p.role === 'exam'), noEx = ev.passages.filter((p) => p.role !== 'exam');
+    assert(noEx.length <= QL.QUALITY_LIMITS.askPassagesMax && noEx.reduce((n, p) => n + p.text.length, 0) <= QL.QUALITY_LIMITS.askEvidenceMaxChars, 'topes (capítulos)');
+    assert(exQ.length <= QL.QUALITY_LIMITS.askExamQuestionsMax && exQ.reduce((n, p) => n + p.text.length, 0) <= QL.QUALITY_LIMITS.askExamMaxChars, 'topes (examen)');
+    assert(ev.passages.findIndex((p) => p.role !== 'exam') > ev.passages.findLastIndex((p) => p.role === 'exam'), 'las preguntas del examen van ANTES del texto del capítulo');
     const q2 = '¿El video del capítulo 1 dice bien la velocidad máxima en zona escolar?';
     const ev2 = QL.retrieveEvidence(baseV1.ctx.course, baseV1.prep.docs, q2);
     assert(ev2.passages.some((p) => p.moduleId === 911 && p.role === 'video') && ev2.passages.some((p) => p.role === 'libro' && /30 km\/h/.test(p.text)), `video y Libro del capítulo 1: ${JSON.stringify(ev2.passages.map((p) => [p.moduleId, p.role]))}`);

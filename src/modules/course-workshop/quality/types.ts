@@ -87,6 +87,13 @@ export const QUALITY_LIMITS = Object.freeze({
   askPassageChars: 700,
   askAnswerMax: 1_500,
   askCitationsMax: 8,
+  /**
+   * r107 B12 (D3): cobertura de un examen — TODAS sus preguntas van primero, cada una como enunciado corto, con su
+   * propio tope (no compiten con el texto del capítulo). Solo si un examen trae más de esto, la evidencia se recorta.
+   */
+  askExamQuestionChars: 240,
+  askExamQuestionsMax: 120,
+  askExamMaxChars: 24_000,
   questionsPerSession: 200,
 });
 
