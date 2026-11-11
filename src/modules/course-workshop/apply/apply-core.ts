@@ -192,6 +192,16 @@ export const STRUCTURAL_COMBINATION = 'WORKSHOP_STRUCTURAL_COMBINATION';
  * Ronda 2 (P2-A): quitar en el MISMO plan una actividad del capítulo molde de un agregar capítulo / módulo deja el molde
  * distinto del aprobado (STALE_TARGET después de pagar): también es una combinación que se hace en dos rondas.
  */
+/**
+ * Ronda 3 (P2-E): mensaje PROPIO para quitar una actividad del molde. Se usa el MISMO código
+ * (`WORKSHOP_STRUCTURAL_COMBINATION`: el frontend ya lo trata como «hacerlo en dos rondas») con un texto que nombra la
+ * actividad del molde que se quita.
+ */
+export function templateRemovalMessage(titles: readonly string[]): string {
+  const names = titles.length ? titles.map((t) => `«${t}»`).join(', ') : 'una actividad';
+  return `Este plan quita ${names}, que es parte del capítulo que sirve de modelo para el capítulo nuevo: las dos cosas no se pueden aplicar juntas. Hay que hacerlo en dos rondas: quita del plan uno de los dos cambios, aplica el otro y, sobre la versión nueva, vuelve a pedir el que quitaste. No se llamó a ningún proveedor.`;
+}
+
 export function removesTemplate(templateIds: readonly number[], removeIds: readonly number[]): number[] {
   const t = new Set(templateIds.map(Number));
   return removeIds.map(Number).filter((m) => t.has(m));
@@ -290,7 +300,9 @@ export async function runApply(input: ApplyRunInput): Promise<ApplyRunOk | Apply
   if (!input.items.length) return fail('engine', 'WORKSHOP_APPLY_EMPTY', 'El plan no tiene ítems para aplicar.');
   if (input.items.filter((i) => isStructuralOperation(i.operation)).length > 1) return fail('engine', STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE);
   const tpl = input.items.filter((i) => isStructuralOperation(i.operation)).flatMap((i) => ((i.params as any)?.expect?.templateModuleIds ?? []) as number[]);
-  if (removesTemplate(tpl, input.items.filter((i) => i.operation === 'remove_activity').map((i) => Number((i.params as any)?.moduleId))).length) return fail('engine', STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE);
+  const rmItems = input.items.filter((i) => i.operation === 'remove_activity');
+  const hit = removesTemplate(tpl, rmItems.map((i) => Number((i.params as any)?.moduleId)));
+  if (hit.length) return fail('engine', STRUCTURAL_COMBINATION, templateRemovalMessage(rmItems.filter((i) => hit.includes(Number((i.params as any)?.moduleId))).map((i) => i.summary || `actividad ${(i.params as any)?.moduleId}`)));
   const items = structuralLast(input.items);
   const res = await applyPatchPlan({ original: input.original, filename: input.filename ?? null, operations: items.map((i) => i.params), baseline: input.baseline ?? null });
   if (!res.ok || !res.package) {

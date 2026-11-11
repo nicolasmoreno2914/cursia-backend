@@ -32,7 +32,7 @@ import { ModuleRef } from '@nestjs/core';
 import { decideRunSpend } from '../../finops/run-spend-guard';
 import { effectiveOutputRowsSql } from '../../dynamic-generation/item-generations';
 import { PaidCallGate, PaidCallTicket, RegenProviders } from '../regenerate/ports';
-import { STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE, isStructuralOperation, removesTemplate, structuralLast } from '../apply/apply-core';
+import { STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE, isStructuralOperation, removesTemplate, structuralLast, templateRemovalMessage } from '../apply/apply-core';
 import { PROVIDER_OVER_BOUND, RegenDeferred, RegenError, RegenExternal, RegenPrior, RegenerateOp, isPaidOperation, isRegenOperation } from '../regenerate/types';
 import { WaitTimeout, gammaFinal, pollUntilFinal, settleGammaGeneration, settleVideogenJob, videogenFinal } from '../regenerate/async-wait';
 import { RegenDbSources } from '../regenerate/sources';
@@ -794,9 +794,10 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
       if (Number(st?.n ?? 0) > 1) throw new ConflictException({ code: STRUCTURAL_COMBINATION, message: STRUCTURAL_COMBINATION_MESSAGE });
       // Ronda 2 (P2-A): el plan quita una actividad del capítulo molde → 409 antes de gastar (dos rondas).
       const tpl = items.filter((i) => isStructuralOperation(i.operation)).flatMap((i) => ((i.view?.plannedCall as any)?.regen?.templateModuleIds ?? (i.params as any)?.expect?.templateModuleIds ?? []) as number[]);
-      const rms = await this.q<any[]>(this.dataSource, `select coalesce(i.params->>'moduleId', r.target->>'moduleId') as mid from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
+      const rms = await this.q<any[]>(this.dataSource, `select coalesce(i.params->>'moduleId', r.target->>'moduleId') as mid, r.target->>'title' as title from public.workshop_plan_items i join public.workshop_requests r on r.id = i.request_id
           where i.plan_id = $1 and i.status = 'proposed' and i.operation = 'remove_activity' and r.status not in ('withdrawn', 'failed', 'unavailable', 'out_of_scope')`, [plan.id]);
-      if (removesTemplate(tpl, rms.map((x) => Number(x.mid)).filter((n) => Number.isFinite(n))).length) throw new ConflictException({ code: STRUCTURAL_COMBINATION, message: STRUCTURAL_COMBINATION_MESSAGE });
+      const hit = removesTemplate(tpl, rms.map((x) => Number(x.mid)).filter((n) => Number.isFinite(n)));
+      if (hit.length) throw new ConflictException({ code: STRUCTURAL_COMBINATION, message: templateRemovalMessage(rms.filter((x) => hit.includes(Number(x.mid))).map((x) => String(x.title || `actividad ${x.mid}`))) });
     }
     if (items.length !== ids.length) throw new ConflictException({ code: PLAN_ERRORS.ITEMS_INVALID, message: 'Algún ítem elegido no está esperando generación (ya se generó, se quitó o es de otro plan).' });
     // r107 B10: una regeneración usa otros proveedores (OpenAI TTS, Gamma, Videogen, YouTube): todos tienen que estar

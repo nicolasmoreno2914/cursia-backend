@@ -949,6 +949,9 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       assert(add && pl.items.some((i) => i.operation === 'remove_activity'), `ítems: ${JSON.stringify(pl.items.map((i) => [i.operation, i.stage, i.requestStatus]))}`);
       const err = await p.approveGeneration({ id: U }, sid4, pl.planId, { itemIds: [add.id], confirmEstimateUsd: Number(add.plannedCall.expectedUsd), capUsd: Math.ceil(Number(add.plannedCall.regen.totalBoundUsd) * 100) / 100 }).then(() => null, (e) => e);
       eq(err && (err.getResponse ? err.getResponse().code : err.code), 'WORKSHOP_STRUCTURAL_COMBINATION', '409 antes de gastar');
+      // Ronda 3 (P2-E): mensaje propio con la actividad del molde.
+      const msg = err.getResponse().message;
+      assert(msg.includes(`«${cta1.title}»`) && /modelo para el capítulo nuevo/.test(msg) && !/más de un cambio que agrega/.test(msg), `mensaje: ${msg}`);
       eq([sim.calls.anthropic.length, sim.calls.videogen.length, sim.calls.gamma.length], [0, 0, 0], '0 llamadas');
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });

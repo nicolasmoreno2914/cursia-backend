@@ -600,8 +600,11 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     eq(A.removesTemplate(tpl, [tpl[3]]), [tpl[3]], 'quitar el CTA del molde → combinación');
     eq(A.removesTemplate(tpl, [ctx.course.activities.find((a) => a.modname === 'forum').moduleId]), [], 'quitar el foro → no');
     const r = await produce(V1, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }));
-    const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', r, 'add_chapter'), { id: 'x', requestId: 'rx', operation: 'remove_activity', quote: '', summary: '', params: { op: 'remove_activity', moduleId: tpl[3] } }] });
+    const ctaTitle = ctx.course.activities.find((a) => a.moduleId === tpl[3]).title;
+    const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', r, 'add_chapter'), { id: 'x', requestId: 'rx', operation: 'remove_activity', quote: '', summary: ctaTitle, params: { op: 'remove_activity', moduleId: tpl[3] } }] });
     eq([run.ok, run.code], [false, A.STRUCTURAL_COMBINATION], 'aplicar también lo frena');
+    // Ronda 3 (P2-E): mensaje propio que nombra la actividad del molde y explica las dos rondas (sin voseo).
+    assert(run.message.includes(`«${ctaTitle}»`) && /modelo para el capítulo nuevo/.test(run.message) && /dos rondas/.test(run.message) && !/más de un cambio que agrega/.test(run.message) && !/\b(aplicá|quitá|pedí|vos)\b/.test(run.message), `mensaje: ${run.message}`);
   });
 
   await check('R14 (ronda 2, P2-B) lo que el sintético no cubre se valida ANTES de guardar la pieza: un Libro con otro «Capítulo K:» adentro se rechaza y NO queda guardado (el reintento lo rehace); el motor también lo rechaza', async () => {
