@@ -32,7 +32,6 @@ import { hasPendingMarker } from '../regenerate/target';
 import { ADD_CHAPTER_FAMILIES, AddChapterOp, ChapterPiece, ProducedChapter, V3_ADD_CHAPTER_UNAVAILABLE } from '../regenerate/chapter-types';
 import { sha1Of } from './container';
 import { xmlEsc } from './html-edit';
-import { IdAllocator } from './ids';
 import { OpContext, blobPath, noteModified } from './op-context';
 import { libroStructure, recomposeLibro } from './op-libro';
 import { producedProblems } from './op-regenerate';
@@ -269,12 +268,11 @@ export function chapterMisalignment(ctx: OpContext, position: number): void {
 }
 
 /** Inserta las actividades del capítulo (y renumera los posteriores). Exportada para `add_module`. */
-export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: TemplateChapter; pl: ChapterPlacement; pieces: Array<{ piece: ChapterPiece; activity: WorkshopActivity }>; p: ProducedChapter; title: string; renumber?: boolean; unitExams?: Map<number, number>; noVideo?: boolean }): Promise<InsertedChapter> {
+export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: TemplateChapter; pl: ChapterPlacement; pieces: Array<{ piece: ChapterPiece; activity: WorkshopActivity }>; p: ProducedChapter; title: string; renumber?: boolean; unitExams?: Map<number, number>; noVideo?: boolean; afterMid?: number | null }): Promise<InsertedChapter> {
   const { t, pl, pieces, p } = a;
   const P = p.chapterNumber;
   if (a.renumber !== false) await renumberChapters(ctx, texts, P, pl);
   const alloc = await ctx.ids();
-  await reserveAttributeIds(ctx, alloc);
   const takeSco = () => { const v = alloc.takeSco('sco'); (ctx.report.idsAssigned.sco ||= []).push(v); return v; };
   const libro = ctx.inv.activities.find((x) => x.kind === 'libro' && !x.missingFolder) ?? null;
   // ids nuevos por actividad (antes de escribir, para los tokens entre ellas).
@@ -417,12 +415,27 @@ export async function insertChapter(ctx: OpContext, texts: Texts, a: { t: Templa
       .replace(/<sectionid>\d+<\/sectionid>/, `<sectionid>${pl.sectionId}</sectionid>`)
       .replace(/<title>[\s\S]*?<\/title>/, `<title>${xmlEsc(newName)}</title>`)
       .replace(`<directory>${src.dir}</directory>`, `<directory>${dir}</directory>`);
-    // Orden de <activities>: el de la secuencia (después de la actividad que precede al capítulo nuevo).
+    // Ronda 4 (M1): orden de <activities> = la secuencia FINAL de la sección (Moodle arma la secuencia restaurada en el
+    // orden de moodle_backup.xml): después de la actividad anterior de la sección; si no hay, ANTES de la siguiente; en
+    // una sección nueva (add_module), encadenada después de `afterMid` (lo último que agregó el capítulo anterior).
     const secNow = ctx.inv.sections.find((z) => z.id === pl.sectionId);
-    const prevMid = added.length ? added[added.length - 1] : secNow && pl.sequenceIndex > 0 ? secNow.sequence[pl.sequenceIndex - 1] : null;
-    const anchor = (prevMid !== null ? new RegExp(`<activity>\\s*<moduleid>${prevMid}</moduleid>[\\s\\S]*?</activity>`).exec(backup) : null) ?? blk;
-    const at = (anchor!.index ?? 0) + anchor![0].length;
-    backup = backup.slice(0, at) + nb + backup.slice(at);
+    const blockOf = (mid: number) => new RegExp(`<activity>\\s*<moduleid>${mid}</moduleid>[\\s\\S]*?</activity>`).exec(backup);
+    const prevMid = added.length ? added[added.length - 1] : secNow && pl.sequenceIndex > 0 ? secNow.sequence[pl.sequenceIndex - 1] : (!secNow ? a.afterMid ?? null : null);
+    const nextMid = !added.length && secNow && pl.sequenceIndex < secNow.sequence.length ? secNow.sequence[pl.sequenceIndex] : null;
+    let at: number;
+    const prevBlk = prevMid !== null ? blockOf(prevMid) : null;
+    const nextBlk = !prevBlk && nextMid !== null ? blockOf(nextMid) : null;
+    if (prevBlk) at = (prevBlk.index ?? 0) + prevBlk[0].length;
+    else if (nextBlk) at = nextBlk.index ?? 0;
+    else {
+      // Sección nueva sin nada antes: al final de la lista de actividades.
+      const last = [...backup.matchAll(/<activity>\s*<moduleid>\d+<\/moduleid>[\s\S]*?<\/activity>/g)].pop();
+      if (!last) throw new PatchError('invariant', 'moodle_backup.xml no lista actividades.');
+      at = (last.index ?? 0) + last[0].length;
+    }
+    const lead = /^\s*/.exec(blk[0])![0];
+    const nb2 = nextBlk ? `${nb.replace(/^\s*/, '')}${lead}` : nb;
+    backup = backup.slice(0, at) + nb2 + backup.slice(at);
     const key = `${src.modname}_${src.moduleId}`;
     const sets = [...backup.matchAll(new RegExp(`(\\s*)<setting>\\s*<level>activity</level>\\s*<activity>${key}</activity>[\\s\\S]*?</setting>`, 'g'))];
     if (sets.length) {
@@ -533,17 +546,6 @@ async function rewriteMain(xml: string, a: { piece: ChapterPiece; src: WorkshopA
   const i1 = out.indexOf('</intro>');
   if (i0 < 0 || i1 < 0) throw new PatchError('unsupported', `${a.src.dir}: sin <intro>.`);
   return out.slice(0, i0 + '<intro>'.length) + xmlEsc(html) + out.slice(i1);
-}
-
-/** `contextid="N"` y `moduleid="N"` (atributos) no los ve el escaneo general: se reservan para no repetirlos. */
-async function reserveAttributeIds(ctx: OpContext, alloc: IdAllocator): Promise<void> {
-  const xs: number[] = [];
-  for (const n of ctx.state.names()) {
-    if (!/\.xml$/i.test(n)) continue;
-    const x = await ctx.state.readText(n);
-    for (const m of x.matchAll(/\b(?:contextid|moduleid|instanceid|contextinstanceid)="(\d{1,15})"/g)) xs.push(Number(m[1]));
-  }
-  alloc.reserve(xs);
 }
 
 // ─── Renumeración de los capítulos posteriores ──────────────────────────────

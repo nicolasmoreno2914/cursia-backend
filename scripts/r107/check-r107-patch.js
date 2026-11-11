@@ -1194,7 +1194,7 @@ async function moodleSuite() {
     assert(o1.cms.some((c) => c.name === game.title && c.modname === 'scorm'), 'M5 V1: el juego rehecho restaurado');
     console.log(`   M5 V1: restaurado (curso ${o1.courseid}), juego ${game.moduleId} (5 salas) + audiolibro ${book.moduleId}`);
   });
-  await check('M6 (B11) agregar capítulo EN MEDIO y agregar módulo (2 capítulos + examen) — V1 real «Anatomía» y V1 del builder real (con Gamma; el Moodle local no tiene mod_hvp) — producción simulada → restauran en Moodle 4.5 sin errores ni warnings, con las actividades nuevas, sus nombres renumerados y el examen nuevo', async () => {
+  await check('M6 (B11) agregar capítulo EN MEDIO, como PRIMER capítulo de un módulo y agregar módulo (2 capítulos + examen) — V1 real «Anatomía» y V1 del builder real (con Gamma; el Moodle local no tiene mod_hvp) — producción simulada → restauran en Moodle 4.5 sin errores ni warnings, con las actividades nuevas EN EL ORDEN de section.xml (ronda 4, M1), sus nombres renumerados y el examen nuevo', async () => {
     const B = require(path.join(DIST, 'modules/course-workshop/plan/builder.js'));
     const AC = require(path.join(DIST, 'modules/course-workshop/apply/apply-core.js'));
     const DRY = require(path.join(DIST, 'modules/pedagogy/dry-run.js'));
@@ -1203,14 +1203,26 @@ async function moodleSuite() {
     const sha = (b) => crypto.createHash('sha1').update(b).digest('hex');
     const realPath = process.env.R107_V1_REAL || path.join(os.homedir(), 'Downloads/Anatomía_y_Fisiología_Animal_moodle (1).mbz');
     const cases = [
-      ['anatomia', fs.readFileSync(realPath), { module: 2, position: 5, title: 'Sistema excretor y equilibrio hídrico' }, { title: 'Genética y reproducción', chapters: ['Genética básica', 'Reproducción animal'] }],
-      ['builder-v1', await CF.v1BuilderCourse(DIST, { hvp: false }), { module: 1, position: 2, title: 'Lenguaje corporal' }, { title: 'Servicio digital', chapters: ['Redes sociales', 'Correo electrónico'] }],
+      ['anatomia', fs.readFileSync(realPath), { module: 2, position: 5, title: 'Sistema excretor y equilibrio hídrico', first: 4 }, { title: 'Genética y reproducción', chapters: ['Genética básica', 'Reproducción animal'] }],
+      ['builder-v1', await CF.v1BuilderCourse(DIST, { hvp: false }), { module: 1, position: 2, title: 'Lenguaje corporal', first: 4, firstModule: 2 }, { title: 'Servicio digital', chapters: ['Redes sociales', 'Correo electrónico'] }],
     ];
+    // Ronda 4 (M1): el orden restaurado de cada sección = el <sequence> de su section.xml en el paquete.
+    const orderOf = async (pkgBuf) => {
+      const z = await JSZip.loadAsync(pkgBuf);
+      const mb = await z.file('moodle_backup.xml').async('string');
+      const titles = new Map([...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>[\s\S]*?<title>([\s\S]*?)<\/title>/g)].map((m) => [Number(m[1]), m[2].replace(/&quot;/g, '"').replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&')]));
+      const out = [];
+      for (const m of mb.matchAll(/<section>\s*<sectionid>\d+<\/sectionid>[\s\S]*?<directory>([^<]*)<\/directory>/g)) {
+        const sx = await z.file(`${m[1]}/section.xml`).async('string');
+        out.push([Number(/<number>(\d+)<\/number>/.exec(sx)[1]), (/<sequence>([^<]*)<\/sequence>/.exec(sx)[1] || '').split(',').filter(Boolean).map((x) => titles.get(Number(x)))]);
+      }
+      return out.sort((a, b) => a[0] - b[0]);
+    };
     for (const [tag, buf, ch, md] of cases) {
-      for (const kind of ['chapter', 'module']) {
+      for (const kind of ['chapter', 'first', 'module']) {
         const ctx = await B.openBuildCtx(buf, { originalSha1: sha(buf), pricing: DRY.seedPricing() });
-        const req = kind === 'chapter'
-          ? { quote: 'x', instruction: 'x', operation: 'add_chapter', status: 'resolved', target: { kind: 'module', moduleNumber: ch.module, title: '' }, rawTarget: null, details: { chapters: 1, newChapters: [{ title: ch.title, objective: null }], position: ch.position, omit: [] }, questions: [], reason: null }
+        const req = kind !== 'module'
+          ? { quote: 'x', instruction: 'x', operation: 'add_chapter', status: 'resolved', target: { kind: 'module', moduleNumber: kind === 'first' ? (ch.firstModule ?? ch.module) : ch.module, title: '' }, rawTarget: null, details: { chapters: 1, newChapters: [{ title: ch.title, objective: null }], position: kind === 'first' ? ch.first : ch.position, omit: [] }, questions: [], reason: null }
           : { quote: 'x', instruction: 'x', operation: 'add_module', status: 'resolved', target: { kind: 'course', title: '' }, rawTarget: null, details: { chapters: 2, newChapters: md.chapters.map((t) => ({ title: t, objective: null })), moduleTitle: md.title, omit: [] }, questions: [], reason: null };
         const prov = SIMLIB.simProviders(DIST); const gate = SIMLIB.memGate(DIST, { capUsd: 80 });
         const prep = await B.prepareRegenItem(ctx, req, { providers: prov, gate, spent: () => gate.spent() });
@@ -1220,10 +1232,13 @@ async function moodleSuite() {
         eq(run.diagnosis.introduced, [], `M6 ${tag} ${kind}: sin hallazgos nuevos`);
         const o = restore(run.package, `r107-b11-${tag}-${kind}`);
         clean(o, `M6 ${tag} ${kind}`);
+        const want = await orderOf(run.package);
+        eq(o.sections.map((x) => [x.section, x.cms.map((c) => c.name)]), want, `M6 ${tag} ${kind}: orden restaurado = section.xml`);
+        if (kind === 'first') assert(o.cms.some((c) => c.modname === 'scorm' && c.name.includes(`Cap ${ch.first} — ${ch.title}`)), `M6 ${tag}: el primer capítulo nuevo del módulo`);
         if (kind === 'chapter') {
           assert(o.cms.some((c) => c.modname === 'scorm' && c.name.includes(`Cap ${ch.position} — ${ch.title}`)), `M6 ${tag}: el juego nuevo restaurado`);
           assert(o.cms.some((c) => c.modname === 'scorm' && new RegExp(`Cap ${ch.position + 1} — `).test(c.name)), `M6 ${tag}: el siguiente renumerado`);
-        } else {
+        } else if (kind === 'module') {
           assert(o.cms.some((c) => c.modname === 'quiz' && /Examen Unidad 4/.test(c.name)), `M6 ${tag}: el examen de la unidad nueva restaurado`);
           assert(o.cms.filter((c) => c.modname === 'scorm' && md.chapters.some((t) => c.name.includes(t))).length === 2, `M6 ${tag}: los 2 juegos nuevos`);
         }

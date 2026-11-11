@@ -94,7 +94,7 @@ export async function applyAddModule(ctx: OpContext, op: AddModuleOp): Promise<v
   if (examMids) unitExams.set(M, examMids.quiz);
   for (let i = 0; i < p.chapters.length; i++) {
     const c = p.chapters[i];
-    const ins = await insertChapter(ctx, texts, { t, pl: { ...pl, sequenceIndex: seq.length }, pieces, p: c, title: op.chapters[i].title, renumber: false, unitExams, noVideo: (op.omit ?? []).includes('video') });
+    const ins = await insertChapter(ctx, texts, { t, pl: { ...pl, sequenceIndex: seq.length }, pieces, p: c, title: op.chapters[i].title, renumber: false, unitExams, noVideo: (op.omit ?? []).includes('video'), afterMid: seq.length ? seq[seq.length - 1] : null });
     seq.push(...ins.moduleIds);
     await insertLibroChapter(ctx, texts, { position: c.chapterNumber, title: op.chapters[i].title, md: c.libroMd, moduleOf: (n) => (n > L ? M : inv.chapters.find((x) => x.number === n)?.moduleNumber ?? null), moduleNumber: M });
   }

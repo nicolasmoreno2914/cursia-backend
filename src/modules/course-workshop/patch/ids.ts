@@ -37,6 +37,14 @@ export class IdAllocator {
     let max = 0;
     for (const v of used) if (!sco.has(v) && v > max) max = v;
     for (const v of sco) used.add(v);
+    // Ronda 4 (M-P2-1): los ids que viven solo en atributos (`contextid="N"`, `moduleid="N"`, `instanceid` / `contextinstanceid`)
+    // se reservan SIEMPRE en el escaneo (antes lo hacía cada operación, después de haber tomado ids): nunca se repiten. No
+    // suben el máximo general (los ids que ya asignaban las demás operaciones no cambian).
+    for (const n of state.names()) {
+      if (!/\.xml$/i.test(n)) continue;
+      const x = await state.readText(n);
+      for (const m of x.matchAll(/\b(?:contextid|moduleid|instanceid|contextinstanceid)="(\d{1,15})"/g)) used.add(Number(m[1]));
+    }
     return new IdAllocator(max, used, Math.max(0, ...sco));
   }
 

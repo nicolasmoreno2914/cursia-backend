@@ -125,6 +125,26 @@ export function diagnosisDelta(before: Finding[], after: Finding[], counts: { be
   return { before: counts.before, after: counts.after, resolved, introduced, removed };
 }
 
+/**
+ * Ronda 4 (M1): Moodle arma la secuencia restaurada de cada sección en el ORDEN de `<activities>` de moodle_backup.xml.
+ * Devuelve las secciones (por id) cuyo orden en moodle_backup.xml (filtrado por `<sectionid>`) no es su `<sequence>`.
+ */
+export async function sectionOrderMismatches(pkg: MbzPackage): Promise<Set<number>> {
+  const out = new Set<number>();
+  const mb = await pkg.readText('moodle_backup.xml');
+  if (!mb) return out;
+  const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>(\d+)<\/sectionid>/g)].map((m) => [Number(m[1]), Number(m[2])] as const);
+  const secs = [...mb.matchAll(/<section>\s*<sectionid>(\d+)<\/sectionid>[\s\S]*?<directory>([^<]*)<\/directory>/g)].map((m) => [Number(m[1]), m[2]] as const);
+  for (const [id, dir] of secs) {
+    const sx = await pkg.readText(`${dir}/section.xml`);
+    if (!sx) continue;
+    const want = (/<sequence>([^<]*)<\/sequence>/.exec(sx)?.[1] ?? '').split(',').filter(Boolean).map(Number);
+    const got = acts.filter((a) => a[1] === id).map((a) => a[0]);
+    if (want.join(',') !== got.join(',')) out.add(id);
+  }
+  return out;
+}
+
 function checkInventory(given: WorkshopCourse, actual: WorkshopCourse): string | null {
   const key = (c: WorkshopCourse) => c.activities.map((a) => `${a.moduleId}:${a.dir}:${a.html.map((h) => `${h.field}=${h.rawSha1}`).join(',')}`).join('|');
   return key(given) === key(actual) ? null : 'el inventario recibido no corresponde a este paquete (actividades o campos distintos)';
@@ -213,6 +233,17 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
   for (const e of pkg.entries) {
     if (changedSet.has(e.name) || touched.removed.includes(e.name)) continue;
     if (out.entry(e.name)?.size !== e.size) return fail({ opIndex: null, op: null, code: 'invariant', message: `La entrada no tocada ${e.name} cambió de tamaño.` }, pkg.container);
+  }
+
+  // Ronda 4 (M1): para CUALQUIER operación, ninguna sección queda con <activities> en otro orden que su <sequence>
+  // (un original que ya no lo cumplía cuenta como delta: no empeorar, no fallar por lo que ya traía).
+  try {
+    const before = await sectionOrderMismatches(await openMbz(input.original));
+    const after = await sectionOrderMismatches(out);
+    const worse = [...after].filter((x) => !before.has(x));
+    if (worse.length) return fail({ opIndex: null, op: null, code: 'invariant', message: `El orden de las actividades de moodle_backup.xml no coincide con la secuencia de la sección ${worse.join(', ')} (Moodle las restauraría en otro orden).` }, pkg.container);
+  } catch (e) {
+    return fail({ opIndex: null, op: null, code: 'invariant', message: `No se pudo verificar el orden de las actividades: ${e instanceof Error ? e.message : String(e)}` }, pkg.container);
   }
 
   // Diagnóstico B3 antes / después.
