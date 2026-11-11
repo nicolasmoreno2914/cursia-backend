@@ -12,6 +12,7 @@ import { humanName } from '../diagnosis/checks';
 import { libroStructure } from '../patch/op-libro';
 import { stringsOf } from '../../quality/course-quality-checks';
 import type { QualityDoc, QualityDocRole } from './types';
+import { replaceMarkWithWs } from '../xml-scan';
 
 const BIG = 400_000;
 const chapterOf = (a: WorkshopActivity): number | null => (a.placement.scope === 'chapter' ? a.placement.chapterNumber : null);
@@ -60,7 +61,9 @@ export function decodeEntities(s: string): string {
   });
 }
 export function blockText(html: string, max = BIG): string {
-  return decodeEntities(plainText(String(html).replace(BLOCK_END, (m) => `${m}\uE000`), max * 2)).replace(/[^\S\n\uE000]+/g, ' ').replace(/ ?\uE000 ?/g, '\n') /* B12 ronda 1: plainText ya colapsó los espacios (`\s*\uE000\s*` era cuadrática aislada) */.replace(/\n{2,}/g, '\n').trim().slice(0, max);
+  // B12 ronda 2: la marca de fin de bloque se reemplaza con TODO el blanco pegado (también los \n que deja
+  // decodeEntities, p. ej. `&#10;`), en una pasada: mismo resultado que `\s*\uE000\s*`, sin backtracking.
+  return replaceMarkWithWs(decodeEntities(plainText(String(html).replace(BLOCK_END, (m) => `${m}\uE000`), max * 2)).replace(/[^\S\n\uE000]+/g, ' '), '\uE000', '\n').replace(/\n{2,}/g, '\n').trim().slice(0, max);
 }
 
 /** Número de capítulo que declara un texto al empezar («Capítulo 3: …» / «Capítulo 3 · …»). */

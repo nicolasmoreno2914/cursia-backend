@@ -308,3 +308,24 @@ export function stripTagsQuoted(html: string): string {
   return out + html.slice(cur);
 }
 
+/**
+ * Cada `marca` con TODO el espacio en blanco (\s) pegado a cada lado → `by`. Equivale a
+ * `s.replace(new RegExp(`\\s*${marca}\\s*`, 'g'), by)` pero lineal (la regex es cuadrática con corridas de espacios).
+ */
+export function replaceMarkWithWs(s: string, mark: string, by: string): string {
+  const isWs = (ch: string) => /\s/.test(ch);
+  const parts: string[] = [];
+  let i = 0;
+  while (i < s.length) {
+    const k = s.indexOf(mark, i);
+    if (k < 0) { parts.push(s.slice(i)); break; }
+    let chunk = s.slice(i, k);
+    let t = chunk.length;
+    while (t > 0 && isWs(chunk[t - 1])) t--;
+    chunk = chunk.slice(0, t);
+    parts.push(chunk, by);
+    i = k + mark.length;
+    while (i < s.length && isWs(s[i])) i++;
+  }
+  return parts.join('');
+}

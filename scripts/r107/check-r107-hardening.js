@@ -24,6 +24,7 @@
 //      `<a href="#" title="x < y">Libro Guía</a>` → «Libro Guía» (helper y de punta a punta: diagnóstico → motor).
 //   K6 (B12 ronda 2) 400 KB que llegan a defectKey (hallazgo con 400 K espacios antes de «—», por la compuerta del
 //      motor) y al desenlace de un token (`<a` sin `>` × 400 KB): < 2 s cada uno.
+//   K7 (B12 ronda 2) blockText = la versión con `\s*\uE000\s*` sobre 3000 HTML al azar con `&#10;`, `&#9;`, `&nbsp;`…
 //   K3 (D3 P1) «Preguntar» sobre cobertura de examen: examen de 40 preguntas con las del capítulo 9 al final → llegan
 //      las 40 (enunciado corto), ANTES del texto del capítulo, sin recorte; examen enorme (200) → recortado: el prompt
 //      lo dice y un «no» baja a «parcial» con el aviso.
@@ -57,6 +58,7 @@ if (has('--bite')) {
     { id: 'K5', file: 'modules/course-workshop/plan/builder.js', find: /function unwrapLinkHtml\(rawLink\) \{/, repl: 'function unwrapLinkHtml(rawLink) { return (0, preview_extract_1.xmlUnescape)(rawLink).replace(/<[^<>]*>/g, "");' },
     { id: 'K6', label: 'K6 defectKey', file: 'modules/course-workshop/patch/engine.js', find: /beforeSpacedDash\(f\.detail\)/, repl: "f.detail.replace(/\\s+—[\\s\\S]*$/, '')" },
     { id: 'K6', label: 'K6 OPEN_A', file: 'modules/course-workshop/patch/html-edit.js', find: /for \(const a of \(0, xml_scan_1\.openTags\)\(html, \/<a\\b\/i\)\) \{/, repl: 'for (const a of [...html.matchAll(/<a\\b(?:[^>"\']|"[^"]*"|\'[^\']*\')*>/gi)].map((m) => ({ start: m.index, end: m.index + m[0].length, attrs: (0, xml_scan_1.parseAttrs)(m[0], 2) }))) {' },
+    { id: 'K7', file: 'modules/course-workshop/quality/docs.js', find: /return \(0, xml_scan_1\.replaceMarkWithWs\)\(/, repl: 'return ((s) => s.replace(/ ?\\uE000 ?/g, "\\n"))(' },
     { id: 'K3', file: 'modules/course-workshop/quality/ask.js', find: /if \(truncated && o\.verdict === 'no'\)/, repl: 'if (false)' },
   ];
   let bad = 0;
@@ -442,6 +444,23 @@ async function timed(fn) {
     console.log(`   desenlace del token: ${ms2} ms (ok=${r2.ok}${r2.ok ? '' : `, ${r2.failure && r2.failure.code}`})`);
     assert(r2.ok || (r2.failure && r2.failure.code === 'invalid_content'), `el desenlace llegó al escaneo de enlaces: ${r2.failure && r2.failure.code} ${r2.failure && r2.failure.message}`);
     assert(ms2 < 2000, `desenlace ≥ 2 s (${ms2} ms)`);
+  });
+
+  await check('K7', 'blockText = la versión con `\\s*\\uE000\\s*` (3000 HTML al azar con &#10;, &#9;, &nbsp;, <br>, </p>…)', async () => {
+    const D = L('modules/course-workshop/quality/docs.js');
+    const BLOCK_END = /<\/(?:p|div|h[1-6]|li|tr|td|th|section|article|header|footer|blockquote|figcaption|dt|dd)\s*>|<br\s*\/?>|<hr\b[^<>]*>/gi;
+    const ref = (html, max = 1e9) => D.decodeEntities(CM.plainText(String(html).replace(BLOCK_END, (m) => `${m}\uE000`), max * 2)).replace(/[^\S\n\uE000]+/g, ' ').replace(/\s*\uE000\s*/g, '\n').replace(/\n{2,}/g, '\n').trim().slice(0, max);
+    let seed = 7;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const P = ['a', 'b', ' ', '  ', '\n', '&#10;', '&#9;', '&nbsp;', '&#13;', '<p>', '</p>', '<br>', '<br/>', '</li>', '<div>', '</div>', '&#10;&#10;', ' &#10; ', '&amp;', 'é'];
+    for (let i = 0; i < 3000; i++) {
+      const h = Array.from({ length: Math.floor(rnd() * 25) }, () => P[Math.floor(rnd() * P.length)]).join('');
+      eq(D.blockText(h), ref(h), `blockText ${JSON.stringify(h)}`);
+    }
+    eq(D.blockText('<p>uno&#10;&#10; </p> &#10; <p>dos</p>'), 'uno\ndos', '`&#10;` junto a la marca');
+    const t0 = Date.now();
+    D.blockText(`<p>x${'&#10; '.repeat(40_000)}</p>y`);
+    assert(Date.now() - t0 < 2000, 'lineal');
   });
 
   // ── K3 ─────────────────────────────────────────────────────────────────────────────────────────────────────────
