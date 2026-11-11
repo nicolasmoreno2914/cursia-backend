@@ -592,6 +592,18 @@ const unesc = (s) => String(s).split('&quot;').join('"').split('&gt;').join('>')
     assert(OPS.VIDEO_PENDING_RE.test('<!-- CC_VIDEO_SLOT_START -->'), 'el bloque sin resolver se rechaza');
   });
 
+  await check('R13 (ronda 2, P2-A) add_chapter + quitar una actividad DE SU MOLDE en el mismo plan → combinación (dos rondas): regla pura de la aprobación antes de gastar y defensa en aplicar; quitar otra actividad sí aplica', async () => {
+    const ctx = await ctxOf(V1);
+    const est = await B.estimateContent(ctx, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }));
+    const tpl = est.regen.templateModuleIds;
+    assert(Array.isArray(tpl) && tpl.length === 5, `el estimado trae el molde: ${JSON.stringify(tpl)}`);
+    eq(A.removesTemplate(tpl, [tpl[3]]), [tpl[3]], 'quitar el CTA del molde → combinación');
+    eq(A.removesTemplate(tpl, [ctx.course.activities.find((a) => a.modname === 'forum').moduleId]), [], 'quitar el foro → no');
+    const r = await produce(V1, addReq(ctx, { module: 1, title: 'Lenguaje corporal', position: 2 }));
+    const run = await A.runApply({ original: V1, expectedSha1: sha1(V1), items: [itemOf('a', r, 'add_chapter'), { id: 'x', requestId: 'rx', operation: 'remove_activity', quote: '', summary: '', params: { op: 'remove_activity', moduleId: tpl[3] } }] });
+    eq([run.ok, run.code], [false, A.STRUCTURAL_COMBINATION], 'aplicar también lo frena');
+  });
+
   const total = Object.values(REAL).reduce((a, b) => a + b, 0);
   await check('C12 cero llamadas reales (anthropic, openai, fetch, undici, http, net, binarios)', async () => eq(total, 0, JSON.stringify(REAL)));
   if (process.env.R107_ADD_CHAPTER_OUT && mid) fs.writeFileSync(process.env.R107_ADD_CHAPTER_OUT, mid);

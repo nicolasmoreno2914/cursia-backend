@@ -188,6 +188,14 @@ export function structuralLast<T extends { operation: string }>(xs: T[]): T[] {
   return [...xs.filter((x) => !isStructuralOperation(x.operation)), ...xs.filter((x) => isStructuralOperation(x.operation))];
 }
 export const STRUCTURAL_COMBINATION = 'WORKSHOP_STRUCTURAL_COMBINATION';
+/**
+ * Ronda 2 (P2-A): quitar en el MISMO plan una actividad del capítulo molde de un agregar capítulo / módulo deja el molde
+ * distinto del aprobado (STALE_TARGET después de pagar): también es una combinación que se hace en dos rondas.
+ */
+export function removesTemplate(templateIds: readonly number[], removeIds: readonly number[]): number[] {
+  const t = new Set(templateIds.map(Number));
+  return removeIds.map(Number).filter((m) => t.has(m));
+}
 /** P1-2 c: un plan admite UN solo cambio estructural (los dos se arman sobre la numeración original). */
 export const STRUCTURAL_COMBINATION_MESSAGE = 'Este plan tiene más de un cambio que agrega capítulos o módulos y no se pueden aplicar juntos. Hay que hacerlo en dos rondas: quita uno de este plan, aplica el otro y, sobre la versión nueva, vuelve a pedir el que quitaste. No se llamó a ningún proveedor.';
 
@@ -281,6 +289,8 @@ export async function runApply(input: ApplyRunInput): Promise<ApplyRunOk | Apply
   }
   if (!input.items.length) return fail('engine', 'WORKSHOP_APPLY_EMPTY', 'El plan no tiene ítems para aplicar.');
   if (input.items.filter((i) => isStructuralOperation(i.operation)).length > 1) return fail('engine', STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE);
+  const tpl = input.items.filter((i) => isStructuralOperation(i.operation)).flatMap((i) => ((i.params as any)?.expect?.templateModuleIds ?? []) as number[]);
+  if (removesTemplate(tpl, input.items.filter((i) => i.operation === 'remove_activity').map((i) => Number((i.params as any)?.moduleId))).length) return fail('engine', STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE);
   const items = structuralLast(input.items);
   const res = await applyPatchPlan({ original: input.original, filename: input.filename ?? null, operations: items.map((i) => i.params), baseline: input.baseline ?? null });
   if (!res.ok || !res.package) {

@@ -923,6 +923,36 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
 
+    await check('L24 (B11 ronda 2 P2-A) add_chapter + quitar una actividad de SU molde en el mismo plan → aprobar la generación = 409 WORKSHOP_STRUCTURAL_COMBINATION antes de gastar (0 llamadas)', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '20.00', reason: 'QA r107 B11 L24' });
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s4 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l24-v1.mbz', sizeBytes: V1.length });
+      objects.set(s4.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s4.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid4 = s4.session.id;
+      const inv = await svc.persistedInventory(sid4);
+      const cta1 = inv.activities.find((a) => a.role === 'cta' && a.placement.chapterNumber === 1);
+      const Q = `Agrega en el módulo 1 el capítulo «Lenguaje corporal». Quita la actividad «${cta1.title}».`;
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [
+        { quote: 'Agrega en el módulo 1 el capítulo «Lenguaje corporal».', operation: 'add_chapter', instruction: 'Agregar capítulo', target: { moduleNumber: 1 }, newChapters: [{ title: 'Lenguaje corporal' }], position: 2, targetEvidence: 'en el módulo 1', changeEvidence: 'Lenguaje corporal' },
+        { quote: `Quita la actividad «${cta1.title}».`, operation: 'remove_activity', instruction: 'Quitar la actividad', target: { moduleId: cta1.moduleId }, targetEvidence: cta1.title, changeEvidence: 'Quita la actividad' },
+      ] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false });
+      const p = planFor(client); p.regenProviders = () => sim;
+      const a = await p.createTextIntake({ id: U }, sid4, Q);
+      await p.confirmInterpretation({ id: U }, sid4, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p.whenIdle();
+      const pl = await p.getPlan({ id: U }, sid4);
+      const add = pl.items.find((i) => i.operation === 'add_chapter' && i.stage === 'estimate');
+      assert(add && pl.items.some((i) => i.operation === 'remove_activity'), `ítems: ${JSON.stringify(pl.items.map((i) => [i.operation, i.stage, i.requestStatus]))}`);
+      const err = await p.approveGeneration({ id: U }, sid4, pl.planId, { itemIds: [add.id], confirmEstimateUsd: Number(add.plannedCall.expectedUsd), capUsd: Math.ceil(Number(add.plannedCall.regen.totalBoundUsd) * 100) / 100 }).then(() => null, (e) => e);
+      eq(err && (err.getResponse ? err.getResponse().code : err.code), 'WORKSHOP_STRUCTURAL_COMBINATION', '409 antes de gastar');
+      eq([sim.calls.anthropic.length, sim.calls.videogen.length, sim.calls.gamma.length], [0, 0, 0], '0 llamadas');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});

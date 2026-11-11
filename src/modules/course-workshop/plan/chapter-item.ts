@@ -183,7 +183,7 @@ function chapterViewOf(plan: ChapterPlan) {
 export function plannedCallOf(plan: ChapterPlan, est: ChapterEstimate): PlannedCall {
   return {
     model: 'claude-sonnet-4-6', kind: 'regenerate' as any, promptChars: 0, maxTokens: 0, size: { promptChars: 0 }, expectedUsd: est.expectedUsd, boundUsd: est.pieces[0]?.boundUsd ?? '0',
-    regen: { op: plan.op.op, totalBoundUsd: est.totalBoundUsd, providers: est.providers, calls: est.calls, min: est.min, max: est.max, basis: est.basis, pieces: est.pieces, before: { chapters: plan.structure.before.length }, notes: plan.notes, target: { op: plan.op.op, moduleNumber: plan.op.moduleNumber } },
+    regen: { op: plan.op.op, totalBoundUsd: est.totalBoundUsd, providers: est.providers, calls: est.calls, min: est.min, max: est.max, basis: est.basis, pieces: est.pieces, before: { chapters: plan.structure.before.length }, notes: plan.notes, target: { op: plan.op.op, moduleNumber: plan.op.moduleNumber }, templateModuleIds: [...plan.op.expect.templateModuleIds] },
   } as unknown as PlannedCall;
 }
 
