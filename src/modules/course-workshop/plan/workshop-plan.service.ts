@@ -1564,12 +1564,16 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     const handOff = async (): Promise<void> => {
       const rc = `${this.workshop.bootId}.${randomUUID()}`;
       this.beat(rc, true);
-      const done = returningRows(await this.q(this.dataSource, `update public.workshop_requests set claim_id = $3, details = (coalesce(details, '{}'::jsonb) || $4::jsonb) - 'regenPending', updated_at = now()
-          where id = $1 and claim_id = $2 and status = 'preparing' returning id`, [requestId, claim, rc, JSON.stringify({ regenPaid: { ...paid, [w.provider]: { ...(paid as any)[w.provider], charged: true } } })]));
-      // B12 (G1): el latido de `rc` lo sostiene la reanudación encolada (enqueue lo toma y lo suelta al terminar); este
-      // par solo cubre la ventana del update. Con el conteo de referencias, soltarlo acá ya no deja la reanudación sin latir.
-      if (done.length) this.enqueue({ kind: 'regen_resume', sessionId, approvalId: w.approvalId, requestId }, rc);
-      this.beat(rc, false);
+      // B12 ronda 1: si el update falla, `rc` no queda latiendo para siempre (finally).
+      try {
+        const done = returningRows(await this.q(this.dataSource, `update public.workshop_requests set claim_id = $3, details = (coalesce(details, '{}'::jsonb) || $4::jsonb) - 'regenPending', updated_at = now()
+            where id = $1 and claim_id = $2 and status = 'preparing' returning id`, [requestId, claim, rc, JSON.stringify({ regenPaid: { ...paid, [w.provider]: { ...(paid as any)[w.provider], charged: true } } })]));
+        // B12 (G1): el latido de `rc` lo sostiene la reanudación encolada (enqueue lo toma y lo suelta al terminar); este
+        // par solo cubre la ventana del update. Con el conteo de referencias, soltarlo acá ya no deja la reanudación sin latir.
+        if (done.length) this.enqueue({ kind: 'regen_resume', sessionId, approvalId: w.approvalId, requestId }, rc);
+      } finally {
+        this.beat(rc, false);
+      }
     };
     let ticket: PaidCallTicket;
     try {
