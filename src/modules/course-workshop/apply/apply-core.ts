@@ -177,6 +177,38 @@ export function itemReports(items: Array<Pick<ApplyCandidate, 'id' | 'requestId'
   });
 }
 
+// ── r107 B11: ítems estructurales ──
+
+export const isStructuralOperation = (op: unknown): boolean => op === 'add_chapter' || op === 'add_module';
+/**
+ * P1-2 a: los ítems ESTRUCTURALES (agregar capítulo / módulo) se aplican AL FINAL: todo lo que el plan direcciona por
+ * número de capítulo (Libro, exámenes, quitas) se aplica con la numeración ORIGINAL con la que se armó.
+ */
+export function structuralLast<T extends { operation: string }>(xs: T[]): T[] {
+  return [...xs.filter((x) => !isStructuralOperation(x.operation)), ...xs.filter((x) => isStructuralOperation(x.operation))];
+}
+export const STRUCTURAL_COMBINATION = 'WORKSHOP_STRUCTURAL_COMBINATION';
+/**
+ * Ronda 2 (P2-A): quitar en el MISMO plan una actividad del capítulo molde de un agregar capítulo / módulo deja el molde
+ * distinto del aprobado (STALE_TARGET después de pagar): también es una combinación que se hace en dos rondas.
+ */
+/**
+ * Ronda 3 (P2-E): mensaje PROPIO para quitar una actividad del molde. Se usa el MISMO código
+ * (`WORKSHOP_STRUCTURAL_COMBINATION`: el frontend ya lo trata como «hacerlo en dos rondas») con un texto que nombra la
+ * actividad del molde que se quita.
+ */
+export function templateRemovalMessage(titles: readonly string[]): string {
+  const names = titles.length ? titles.map((t) => `«${t}»`).join(', ') : 'una actividad';
+  return `Este plan quita ${names}, que es parte del capítulo que sirve de modelo para el capítulo nuevo: las dos cosas no se pueden aplicar juntas. Hay que hacerlo en dos rondas: quita del plan uno de los dos cambios, aplica el otro y, sobre la versión nueva, vuelve a pedir el que quitaste. No se llamó a ningún proveedor.`;
+}
+
+export function removesTemplate(templateIds: readonly number[], removeIds: readonly number[]): number[] {
+  const t = new Set(templateIds.map(Number));
+  return removeIds.map(Number).filter((m) => t.has(m));
+}
+/** P1-2 c: un plan admite UN solo cambio estructural (los dos se arman sobre la numeración original). */
+export const STRUCTURAL_COMBINATION_MESSAGE = 'Este plan tiene más de un cambio que agrega capítulos o módulos y no se pueden aplicar juntos. Hay que hacerlo en dos rondas: quita uno de este plan, aplica el otro y, sobre la versión nueva, vuelve a pedir el que quitaste. No se llamó a ningún proveedor.';
+
 // ── validador ──
 
 export interface ApplyValidation {
@@ -266,10 +298,16 @@ export async function runApply(input: ApplyRunInput): Promise<ApplyRunOk | Apply
     return fail('verify_original', 'WORKSHOP_ORIGINAL_CHANGED', 'Los bytes del original no son los de la sesión: no se aplica nada.');
   }
   if (!input.items.length) return fail('engine', 'WORKSHOP_APPLY_EMPTY', 'El plan no tiene ítems para aplicar.');
-  const res = await applyPatchPlan({ original: input.original, filename: input.filename ?? null, operations: input.items.map((i) => i.params), baseline: input.baseline ?? null });
+  if (input.items.filter((i) => isStructuralOperation(i.operation)).length > 1) return fail('engine', STRUCTURAL_COMBINATION, STRUCTURAL_COMBINATION_MESSAGE);
+  const tpl = input.items.filter((i) => isStructuralOperation(i.operation)).flatMap((i) => ((i.params as any)?.expect?.templateModuleIds ?? []) as number[]);
+  const rmItems = input.items.filter((i) => i.operation === 'remove_activity');
+  const hit = removesTemplate(tpl, rmItems.map((i) => Number((i.params as any)?.moduleId)));
+  if (hit.length) return fail('engine', STRUCTURAL_COMBINATION, templateRemovalMessage(rmItems.filter((i) => hit.includes(Number((i.params as any)?.moduleId))).map((i) => i.summary || `actividad ${(i.params as any)?.moduleId}`)));
+  const items = structuralLast(input.items);
+  const res = await applyPatchPlan({ original: input.original, filename: input.filename ?? null, operations: items.map((i) => i.params), baseline: input.baseline ?? null });
   if (!res.ok || !res.package) {
     const f = res.failure;
-    const item = f && f.opIndex !== null ? input.items[f.opIndex] ?? null : null;
+    const item = f && f.opIndex !== null ? items[f.opIndex] ?? null : null;
     const gate = f?.code === 'new_findings';
     return fail(gate ? 'gate' : 'engine', `WORKSHOP_APPLY_${String(f?.code ?? 'failed').toUpperCase()}`,
       gate
@@ -305,7 +343,7 @@ export async function runApply(input: ApplyRunInput): Promise<ApplyRunOk | Apply
   }
   return {
     ok: true, package: out, sha1, sha256: sha('sha256', out), size: out.length, container: res.container,
-    items: itemReports(input.items, res.operations), diagnosis: res.diagnosis as DiagnosisDelta, validation, preservedEntries: res.preservedEntries, restoreCheck,
+    items: itemReports(items, res.operations), diagnosis: res.diagnosis as DiagnosisDelta, validation, preservedEntries: res.preservedEntries, restoreCheck,
   };
 }
 

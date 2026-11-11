@@ -30,9 +30,11 @@ import { applyExamAdd, applyExamRemove, applyExamReplace } from './op-exam';
 import { applyBrandReplace } from './op-brand';
 import { applyRemoveActivity } from './op-remove';
 import { applyRegenerate } from './op-regenerate';
+import { applyAddChapter, chapterPieces, templateOf } from './op-add-chapter';
+import { applyAddModule } from './op-add-module';
 import { DiagnosisDelta, OperationReport, PATCH_OPERATIONS, PatchError, PatchFailure, PatchOperation, PatchResult, emptyReport } from './types';
 
-export const PATCH_ENGINE_VERSION = 'b10-r0';
+export const PATCH_ENGINE_VERSION = 'b11-r0';
 
 export interface PatchInput {
   /** Bytes del paquete ORIGINAL verificado (B2 `loadVerifiedOriginal`). No se modifican. */
@@ -123,6 +125,26 @@ export function diagnosisDelta(before: Finding[], after: Finding[], counts: { be
   return { before: counts.before, after: counts.after, resolved, introduced, removed };
 }
 
+/**
+ * Ronda 4 (M1): Moodle arma la secuencia restaurada de cada sección en el ORDEN de `<activities>` de moodle_backup.xml.
+ * Devuelve las secciones (por id) cuyo orden en moodle_backup.xml (filtrado por `<sectionid>`) no es su `<sequence>`.
+ */
+export async function sectionOrderMismatches(pkg: MbzPackage): Promise<Set<number>> {
+  const out = new Set<number>();
+  const mb = await pkg.readText('moodle_backup.xml');
+  if (!mb) return out;
+  const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>(\d+)<\/sectionid>/g)].map((m) => [Number(m[1]), Number(m[2])] as const);
+  const secs = [...mb.matchAll(/<section>\s*<sectionid>(\d+)<\/sectionid>[\s\S]*?<directory>([^<]*)<\/directory>/g)].map((m) => [Number(m[1]), m[2]] as const);
+  for (const [id, dir] of secs) {
+    const sx = await pkg.readText(`${dir}/section.xml`);
+    if (!sx) continue;
+    const want = (/<sequence>([^<]*)<\/sequence>/.exec(sx)?.[1] ?? '').split(',').filter(Boolean).map(Number);
+    const got = acts.filter((a) => a[1] === id).map((a) => a[0]);
+    if (want.join(',') !== got.join(',')) out.add(id);
+  }
+  return out;
+}
+
 function checkInventory(given: WorkshopCourse, actual: WorkshopCourse): string | null {
   const key = (c: WorkshopCourse) => c.activities.map((a) => `${a.moduleId}:${a.dir}:${a.html.map((h) => `${h.field}=${h.rawSha1}`).join(',')}`).join('|');
   return key(given) === key(actual) ? null : 'el inventario recibido no corresponde a este paquete (actividades o campos distintos)';
@@ -138,6 +160,8 @@ async function runOp(ctx: OpContext, op: PatchOperation): Promise<void> {
     case 'brand_replace': return applyBrandReplace(ctx, op);
     case 'remove_activity': return applyRemoveActivity(ctx, op);
     case 'regenerate_scorm': case 'regenerate_video': case 'regenerate_gamma': case 'regenerate_audio': return applyRegenerate(ctx, op);
+    case 'add_chapter': return applyAddChapter(ctx, op);
+    case 'add_module': return applyAddModule(ctx, op);
     default: throw new PatchError('invalid_params', `Operación fuera del catálogo de esta fase: «${(op as { op?: string }).op}».`);
   }
 }
@@ -211,6 +235,17 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
     if (out.entry(e.name)?.size !== e.size) return fail({ opIndex: null, op: null, code: 'invariant', message: `La entrada no tocada ${e.name} cambió de tamaño.` }, pkg.container);
   }
 
+  // Ronda 4 (M1): para CUALQUIER operación, ninguna sección queda con <activities> en otro orden que su <sequence>
+  // (un original que ya no lo cumplía cuenta como delta: no empeorar, no fallar por lo que ya traía).
+  try {
+    const before = await sectionOrderMismatches(await openMbz(input.original));
+    const after = await sectionOrderMismatches(out);
+    const worse = [...after].filter((x) => !before.has(x));
+    if (worse.length) return fail({ opIndex: null, op: null, code: 'invariant', message: `El orden de las actividades de moodle_backup.xml no coincide con la secuencia de la sección ${worse.join(', ')} (Moodle las restauraría en otro orden).` }, pkg.container);
+  } catch (e) {
+    return fail({ opIndex: null, op: null, code: 'invariant', message: `No se pudo verificar el orden de las actividades: ${e instanceof Error ? e.message : String(e)}` }, pkg.container);
+  }
+
   // Diagnóstico B3 antes / después.
   let delta: DiagnosisDelta;
   try {
@@ -227,6 +262,36 @@ export async function applyPatchPlan(input: PatchInput): Promise<PatchResult> {
     const r = fail({ opIndex: null, op: null, code: 'new_findings', message: `El resultado tiene ${delta.introduced.length} hallazgo(s) nuevo(s): ${delta.introduced.slice(0, 3).map((x) => `[${x.severity}] ${x.title}`).join(' · ')}` }, pkg.container);
     r.diagnosis = delta;
     return r;
+  }
+  // r107 B11: agregar capítulo / módulo — los conteos de capítulos y actividades suben EXACTO lo agregado (ni más ni menos).
+  // P2-3: lo esperado sale de los PARÁMETROS (piezas del molde × capítulos + examen), no de lo que la operación dice que
+  // hizo; P1-2b: las actividades que el plan quita (y los capítulos que quedan vacíos) se descuentan.
+  const adds = input.operations.filter((o) => o.op === 'add_chapter' || o.op === 'add_module');
+  if (adds.length) {
+    try {
+      const invOf = async (p: MbzPackage) => buildWorkshopCourse(await readRawCourse(p, meta), adapterFor(family));
+      const b = await invOf(await openMbz(input.original));
+      const a = await invOf(await openMbz(bytes));
+      let wantCh = 0; let wantAct = 0;
+      for (const o of adds as any[]) {
+        const per = chapterPieces(templateOf(b, o.templateChapter, o.expect?.templateModuleIds), o.omit ?? []).length;
+        if (o.op === 'add_chapter') { wantCh += 1; wantAct += per; continue; }
+        const n = Array.isArray(o.chapters) ? o.chapters.length : 0;
+        wantCh += n; wantAct += per * n;
+        if (o.templateExamModuleId !== null && o.templateExamModuleId !== undefined) {
+          const ex = b.activities.find((x) => x.moduleId === o.templateExamModuleId);
+          wantAct += 1 + (ex && b.activities.some((x) => x.kind === 'exam_info' && x.unit === ex.unit && x.sectionId === ex.sectionId) ? 1 : 0);
+        }
+      }
+      const removed = new Set(input.operations.filter((o) => o.op === 'remove_activity').map((o) => (o as any).moduleId as number));
+      wantAct -= [...removed].filter((m) => b.activities.some((x) => x.moduleId === m)).length;
+      wantCh -= b.chapters.filter((c) => c.activities.length && c.activities.every((m) => removed.has(m))).length;
+      const dCh = a.chapters.length - b.chapters.length;
+      const dAct = a.activities.length - b.activities.length;
+      if (dCh !== wantCh || dAct !== wantAct) return fail({ opIndex: null, op: null, code: 'invariant', message: `El paquete nuevo tiene ${dCh} capítulo(s) y ${dAct} actividad(es) de diferencia; el plan pide ${wantCh} y ${wantAct}.` }, pkg.container);
+    } catch (e) {
+      return fail({ opIndex: null, op: null, code: 'invariant', message: `No se pudieron contar los capítulos del resultado: ${e instanceof Error ? e.message : String(e)}` }, pkg.container);
+    }
   }
   return { ok: true, package: bytes, container: pkg.container, sha1: sha1Of(bytes), operations: reports, diagnosis: delta, preservedEntries: preserved, failure: null };
 }

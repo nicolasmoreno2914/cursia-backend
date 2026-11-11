@@ -125,6 +125,29 @@ function simProviders(DIST, opts = {}) {
         if (fault.narrationShort && fault.narrationShort === chap) text = text.split(/\s+/).slice(0, 5).join(' ');
       } else if (/CONTINUAR \(no repetir/.test(req.system) || /CONDENSAR/.test(req.system)) {
         text = fault.narrationShort ? 'Sigue.' : 'Continuación de la narración del bloque.';
+      } else if (/^Eres diseñador instruccional experto de CampusCloud\. Generas libros guía/.test(req.system)) {
+        // r107 B11: capítulo del Libro (sysL + pLibro). `fault.libroShort` → cortado.
+        const cn = Number(/CAPÍTULO (\d+) COMPLETO/.exec(req.user)?.[1] || 0);
+        const title = /COMPLETO: "([^"]*)"/.exec(req.user)?.[1] || 'Capítulo';
+        const para = 'En el trabajo diario del sector conviene revisar cada caso con datos concretos, comparar alternativas y anotar lo que se aprende para aplicarlo en la siguiente situación con el equipo.';
+        const sec = (k) => `## ${cn}.${k} Tema ${k} del capítulo\n\n${Array.from({ length: 5 }, () => para).join(' ')}\n\n${Array.from({ length: 4 }, () => para).join(' ')}`;
+        // `fault.libroExtraHeading` → el capítulo trae OTRO «Capítulo K:» adentro (rompería la secuencia del Libro).
+        text = fault.libroShort ? `# Capítulo ${cn}: ${title}\n\nCorto.` : [`# Capítulo ${cn}: ${title}`, ...(fault.libroExtraHeading ? [`## Capítulo ${cn + 1}: Otro tema`] : []), ...[1, 2, 3, 4, 5].map(sec), '| Opción | Ventaja |\n|---|---|\n| A | Rápida |\n| B | Segura |', `## Glosario del Capítulo\n\n- **Término**: definición breve.`].join('\n\n');
+      } else if (/^Eres desarrollador de e-learning de CampusCloud/.test(req.system)) {
+        // r107 B11: página del capítulo (sysH + pHTML). `fault.pagePending` → con «⚠️ Pendiente».
+        const body = 'Esta página presenta el capítulo con ejemplos del sector, pasos concretos y una invitación a practicar con la actividad del capítulo para fijar lo aprendido.';
+        // Si el prompt pide el espacio del video (CC_VIDEO_SLOT), la página lo trae como lo arma la IA (con su texto de
+        // espera ADENTRO: el motor lo reemplaza o lo quita). `fault.videoPlaceholder` → «Video en preparación» AFUERA.
+        const slot = /CC_VIDEO_SLOT_START/.test(req.user) ? '<!-- CC_VIDEO_SLOT_START --><div style="padding:20px;color:#E2E6F3;">Video en preparación: disponible próximamente</div><!-- CC_VIDEO_SLOT_END -->' : '';
+        text = `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><h2 style="color:#E2E6F3;">Página del capítulo</h2><p style="color:#E2E6F3;">${body} ${body}</p>${slot}${fault.pagePending ? '<p>⚠️ Pendiente</p>' : ''}${fault.videoPlaceholder ? '<p style="color:#E2E6F3;">🎬 Video en preparación — disponible próximamente.</p>' : ''}${fault.pageDeadLink ? '<p><a href="#" style="color:#E2E6F3;">Ver más</a></p>' : ''}</div>`;
+      } else if (/^Eres experto en evaluación educativa de CampusCloud\. Generas exámenes GIFT/.test(req.system)) {
+        // r107 B11: examen GIFT de unidad (sysG + pGIFT): 15 opción múltiple, 5 V/F, 5 emparejamiento.
+        const u = Number(/IDs: U(\d+)-01/.exec(req.user)?.[1] || 1);
+        const id = (k) => `U${u}-${String(k).padStart(2, '0')}`;
+        const mc = Array.from({ length: 15 }, (_, i) => `::${id(i + 1)}::¿Qué conviene revisar en el caso ${i + 1} del módulo? {\n  =Los datos del caso concreto\n  ~La opinión de un tercero\n  ~El resultado de otro año\n  ~Un dato sin fuente clara\n}`);
+        const tf = Array.from({ length: 5 }, (_, i) => `::${id(16 + i)}::Revisar los datos antes de decidir reduce errores en el caso ${i + 1}. {${i % 2 ? 'FALSE' : 'TRUE'}}`);
+        const mt = Array.from({ length: 5 }, (_, i) => `::${id(21 + i)}::Relaciona los conceptos del bloque ${i + 1}. {\n  =Dato -> Hecho medido\n  =Fuente -> Origen del dato\n  =Caso -> Situación concreta\n  =Paso -> Acción ordenada\n}`);
+        text = fault.examBad ? '::U9-01::Sin respuesta correcta {\n  ~a\n  ~b\n}' : [...mc, ...tf, ...mt].join('\n\n');
       } else {
         throw new Error(`simulador: prompt de IA no reconocido (${req.system.slice(0, 60)})`);
       }

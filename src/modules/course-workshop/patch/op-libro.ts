@@ -82,6 +82,16 @@ export function libroStructure(html: string): { headings: Heading[]; chapters: C
   return { headings, chapters, bodyClose };
 }
 
+/** Título del capítulo (lo que sigue a «Capítulo N:») según su encabezado en el Libro. */
+export function libroHeadingTitle(html: string, c: { headStart: number; headEnd: number }): string {
+  return plainText(html.slice(c.headStart, c.headEnd), 300).replace(/^\s*Cap[ií]tulo\s+\d{1,3}\s*[:—–-]\s*/i, '').replace(/\s+/g, ' ').trim();
+}
+function checkExpectTitle(html: string, c: { number: number; headStart: number; headEnd: number }, p: LibroChapterInput): void {
+  if (p.expectTitle === undefined) return;
+  const now = libroHeadingTitle(html, c);
+  if (now !== p.expectTitle.replace(/\s+/g, ' ').trim()) throw new PatchError('stale_target', `El capítulo ${c.number} del Libro ahora es «${now.slice(0, 80)}», no «${p.expectTitle.slice(0, 80)}»: la numeración cambió desde que se armó el plan.`);
+}
+
 function validateChapterHtml(c: LibroChapterInput): void {
   if (!Number.isInteger(c.number) || c.number < 1) throw new PatchError('invalid_params', `Capítulo inválido: ${c.number}.`);
   if (typeof c.html !== 'string' || !plainText(c.html, 20)) throw new PatchError('invalid_content', `El capítulo ${c.number} viene vacío.`);
@@ -149,6 +159,7 @@ export function recomposeLibro(html: string, input: EditLibroSectionOp, titleOf:
     for (const c of st.chapters) {
       const p = byNum.get(c.number);
       if (!p) continue;
+      checkExpectTitle(html, c, p);
       edits.push({ start: c.headEnd, end: c.bodyEnd, ins: p.html });
       if (p.title !== undefined) edits.push({ start: c.headStart, end: c.headEnd, ins: heading(c.number, p.title) });
       notes.push(`capítulo ${c.number}: cuerpo reemplazado${p.title !== undefined ? ' y título' : ''}`);
@@ -201,6 +212,7 @@ export function recomposeLibro(html: string, input: EditLibroSectionOp, titleOf:
     for (const c of st2) {
       const p = byNum.get(c.number);
       if (!p) continue;
+      checkExpectTitle(html, c, p);
       edits.push({ start: c.headEnd - off, end: c.bodyEnd - off, ins: p.html });
       if (p.title !== undefined) edits.push({ start: c.headStart - off, end: c.headEnd - off, ins: heading(c.number, p.title) });
       notes.push(`capítulo ${c.number}: cuerpo reemplazado`);

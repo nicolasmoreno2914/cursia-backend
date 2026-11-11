@@ -829,6 +829,160 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       eq((await A.getPlan({ id: U }, sid)).items.find((i) => i.id === it.id).stage, 'ready', 'ítem listo');
     });
 
+    // ── r107 B11: agregar capítulo contra el ledger REAL (enforce): aprobación MULTIPIEZA, Σ cotas, committedUsd y reuso ──
+    await check('L22 (B11) agregar capítulo (V1 del builder real) contra el ledger REAL: tope < Σ cotas → 409; aprobación multipieza (Anthropic + Videogen + YouTube + Gamma) con cada cargo atado a la aprobación; una pieza que falla (Gamma rechaza) deja el ítem reintentable y el reintento REUSA lo pagado (Libro, páginas, juego, render, video publicado y sus preguntas): solo paga lo que falta', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '40.00', reason: 'QA r107 B11 L22' });
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s2 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l22-v1.mbz', sizeBytes: V1.length });
+      objects.set(s2.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s2.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid2 = s2.session.id;
+      const Q = 'Agrega en el módulo 1 un capítulo nuevo «Lenguaje corporal» como capítulo 2.';
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [{ quote: Q, operation: 'add_chapter', instruction: 'Agregar el capítulo Lenguaje corporal', target: { moduleNumber: 1 }, newChapters: [{ title: 'Lenguaje corporal' }], position: 2, targetEvidence: 'en el módulo 1', changeEvidence: 'Lenguaje corporal' }] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const mk = (sim) => { const p = planFor(client); p.regenProviders = () => sim; return p; };
+      const sim1 = SIMLIB.simProviders(distRoot, { simulated: false, fault: { gammaCreate: 'rejected' }, videogenJobId: 'vg_sim_l22' });
+      const p1 = mk(sim1);
+      const a = await p1.createTextIntake({ id: U }, sid2, Q);
+      await p1.confirmInterpretation({ id: U }, sid2, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p1.whenIdle();
+      const pl = await p1.getPlan({ id: U }, sid2);
+      const it = pl.items.find((i) => i.operation === 'add_chapter' && i.stage === 'estimate');
+      assert(it, `ítem en estimado: ${JSON.stringify(pl.items.map((i) => [i.operation, i.stage, i.requestStatus]))} ${JSON.stringify(pl.pending)}`);
+      eq(it.plannedCall.regen.pieces.map((x) => x.piece), ['libro', 'video_page', 'game_page', 'game', 'video', 'presentation'], 'costo por pieza');
+      const exp = Number(it.plannedCall.expectedUsd);
+      const bound = Number(it.plannedCall.regen.totalBoundUsd);
+      eq(await errCode(p1.approveGeneration({ id: U }, sid2, pl.planId, { itemIds: [it.id], confirmEstimateUsd: exp, capUsd: Math.ceil(exp * 101) / 100 })), 'WORKSHOP_CAP_BELOW_CALL_BOUND', 'tope < Σ cotas → 409');
+      const cap = Math.ceil(bound * 100) / 100;
+      const g1 = await p1.approveGeneration({ id: U }, sid2, pl.planId, { itemIds: [it.id], confirmEstimateUsd: exp, capUsd: cap });
+      await p1.whenIdle();
+      const ap1 = await p1.approvalOf(g1.approval.id);
+      const kinds1 = Object.values(ap1.calls).map((c) => `${c.kind}:${c.status}`);
+      assert(kinds1.includes('anthropic:libro_chapter:charged') && kinds1.includes('videogen:render:charged') && kinds1.includes('youtube:upload:charged') && kinds1.some((k) => /^gamma:generate:/.test(k)), `multipieza: ${kinds1.join(', ')}`);
+      assert(Number(ap1.spent_usd) <= Number(ap1.cap_usd) + 1e-9, 'gastado ≤ tope');
+      const rq1 = (await ds.query(`select r.status, r.details from public.workshop_requests r join public.workshop_plan_items i on i.request_id = r.id where i.id = $1`, [it.id]))[0];
+      eq(rq1.status, 'awaiting_generation', 'la pieza fallida deja el ítem reintentable (nada aplicado)');
+      const paid = rq1.details.regenPaid.chapterPieces['2'];
+      assert(paid.libroMd && paid.videoPageHtml && paid.gamePageHtml && paid.scorm && paid.videogen && paid.videogen.charged && paid.youtube, `lo pagado quedó guardado: ${Object.keys(paid)}`);
+      near(await net(`workshop:approval:${g1.approval.id}`), 0, 'reserva liberada (neto 0): queda lo cobrado');
+      const charged1 = await ds.query(`select provider from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true' order by provider`, [g1.approval.id]);
+      eq([...new Set(charged1.map((x) => x.provider))], ['anthropic', 'videogen'], 'cargos reales atados a la aprobación (YouTube USD 0, Gamma rechazado sin cobro)');
+      // Reintento: solo lo que falta (preguntas del video sobre el render YA pagado + Gamma).
+      const sim2 = SIMLIB.simProviders(distRoot, { simulated: false, videogenJobId: 'vg_sim_l22' });
+      const p2 = mk(sim2);
+      const pl2 = await p2.getPlan({ id: U }, sid2);
+      const it2 = pl2.items.find((i) => i.id === it.id);
+      const g2 = await p2.approveGeneration({ id: U }, sid2, pl2.planId, { itemIds: [it.id], confirmEstimateUsd: Number(it2.plannedCall.expectedUsd), capUsd: cap });
+      await p2.whenIdle();
+      const ap2 = await p2.approvalOf(g2.approval.id);
+      eq(Object.values(ap2.calls).map((c) => c.kind), ['gamma:generate'], 'el reintento solo paga lo que faltaba (Gamma)');
+      eq(sim2.calls.videogen.filter((c) => c.op === 'create').length + sim2.calls.youtube.length, 0, 'sin re-render ni re-subida');
+      const done = (await p2.getPlan({ id: U }, sid2)).items.find((i) => i.id === it.id);
+      eq([done.stage, done.dryRun && done.dryRun.ok, done.requiresItemConfirm, done.params.op], ['ready', true, true, 'add_chapter'], 'ítem listo, prueba en seco ok, confirmación ítem por ítem, sin bytes en params');
+      assert(!('produced' in done.params) && done.params.result && done.params.result.artifactId, 'resultado guardado como artifact del Taller');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    await check('L23 (B11 P1-2 c) dos ítems estructurales en el mismo plan → aprobar la generación de cualquiera = 409 WORKSHOP_STRUCTURAL_COMBINATION ANTES de reservar ni llamar (0 llamadas, sin aprobación abierta); un estructural FALLIDO no cuenta (P2-D) y el otro se aprueba', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '20.00', reason: 'QA r107 B11 L23' });
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s3 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l23-v1.mbz', sizeBytes: V1.length });
+      objects.set(s3.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s3.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid3 = s3.session.id;
+      const Q = 'Agrega en el módulo 1 el capítulo «Lenguaje corporal» y en el módulo 3 el capítulo «Encuestas de satisfacción».';
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [
+        { quote: 'Agrega en el módulo 1 el capítulo «Lenguaje corporal»', operation: 'add_chapter', instruction: 'Agregar capítulo', target: { moduleNumber: 1 }, newChapters: [{ title: 'Lenguaje corporal' }], targetEvidence: 'en el módulo 1', changeEvidence: 'Lenguaje corporal' },
+        { quote: 'en el módulo 3 el capítulo «Encuestas de satisfacción»', operation: 'add_chapter', instruction: 'Agregar capítulo', target: { moduleNumber: 3 }, newChapters: [{ title: 'Encuestas de satisfacción' }], targetEvidence: 'en el módulo 3', changeEvidence: 'Encuestas de satisfacción' },
+      ] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false });
+      const p = planFor(client); p.regenProviders = () => sim;
+      const a = await p.createTextIntake({ id: U }, sid3, Q);
+      await p.confirmInterpretation({ id: U }, sid3, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p.whenIdle();
+      const pl = await p.getPlan({ id: U }, sid3);
+      const its = pl.items.filter((i) => i.operation === 'add_chapter' && i.stage === 'estimate');
+      eq(its.length, 2, 'dos ítems estructurales');
+      const before = (await ds.query(`select count(*)::int n from public.workshop_ai_approvals where session_id = $1 and kind = 'generate'`, [sid3]))[0].n;
+      const err = await p.approveGeneration({ id: U }, sid3, pl.planId, { itemIds: [its[0].id], confirmEstimateUsd: Number(its[0].plannedCall.expectedUsd), capUsd: Math.ceil(Number(its[0].plannedCall.regen.totalBoundUsd) * 100) / 100 }).then(() => null, (e) => e);
+      eq(err && (err.getResponse ? err.getResponse().code : err.code), 'WORKSHOP_STRUCTURAL_COMBINATION', '409 por combinación');
+      assert(/dos rondas/.test(err.getResponse().message), err.getResponse().message);
+      eq([sim.calls.anthropic.length, sim.calls.videogen.length, sim.calls.gamma.length], [0, 0, 0], '0 llamadas');
+      eq((await ds.query(`select count(*)::int n from public.workshop_ai_approvals where session_id = $1 and kind = 'generate'`, [sid3]))[0].n, before, 'sin aprobación abierta');
+      // Ronda 2 (P2-D): el otro estructural FALLIDO (o no disponible) no cuenta para la combinación.
+      await ds.query(`update public.workshop_requests set status = 'failed', reason = 'L23' where id = (select request_id from public.workshop_plan_items where id = $1)`, [its[1].id]);
+      const pl2 = await p.getPlan({ id: U }, sid3);
+      const it0 = pl2.items.find((i) => i.id === its[0].id);
+      const g = await p.approveGeneration({ id: U }, sid3, pl2.planId, { itemIds: [it0.id], confirmEstimateUsd: Number(it0.plannedCall.expectedUsd), capUsd: Math.ceil(Number(it0.plannedCall.regen.totalBoundUsd) * 100) / 100 });
+      await p.whenIdle();
+      eq((await p.getPlan({ id: U }, sid3)).items.find((i) => i.id === it0.id).stage, 'ready', 'con el otro fallido, se genera');
+      assert(g.approval, 'aprobada');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    await check('L24 (B11 ronda 2 P2-A) add_chapter + quitar una actividad de SU molde en el mismo plan → aprobar la generación = 409 WORKSHOP_STRUCTURAL_COMBINATION antes de gastar (0 llamadas)', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '20.00', reason: 'QA r107 B11 L24' });
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s4 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l24-v1.mbz', sizeBytes: V1.length });
+      objects.set(s4.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s4.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid4 = s4.session.id;
+      const inv = await svc.persistedInventory(sid4);
+      const cta1 = inv.activities.find((a) => a.role === 'cta' && a.placement.chapterNumber === 1);
+      const Q = `Agrega en el módulo 1 el capítulo «Lenguaje corporal». Quita la actividad «${cta1.title}».`;
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [
+        { quote: 'Agrega en el módulo 1 el capítulo «Lenguaje corporal».', operation: 'add_chapter', instruction: 'Agregar capítulo', target: { moduleNumber: 1 }, newChapters: [{ title: 'Lenguaje corporal' }], position: 2, targetEvidence: 'en el módulo 1', changeEvidence: 'Lenguaje corporal' },
+        { quote: `Quita la actividad «${cta1.title}».`, operation: 'remove_activity', instruction: 'Quitar la actividad', target: { moduleId: cta1.moduleId }, targetEvidence: cta1.title, changeEvidence: 'Quita la actividad' },
+      ] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false });
+      const p = planFor(client); p.regenProviders = () => sim;
+      const a = await p.createTextIntake({ id: U }, sid4, Q);
+      await p.confirmInterpretation({ id: U }, sid4, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p.whenIdle();
+      const pl = await p.getPlan({ id: U }, sid4);
+      const add = pl.items.find((i) => i.operation === 'add_chapter' && i.stage === 'estimate');
+      assert(add && pl.items.some((i) => i.operation === 'remove_activity'), `ítems: ${JSON.stringify(pl.items.map((i) => [i.operation, i.stage, i.requestStatus]))}`);
+      const err = await p.approveGeneration({ id: U }, sid4, pl.planId, { itemIds: [add.id], confirmEstimateUsd: Number(add.plannedCall.expectedUsd), capUsd: Math.ceil(Number(add.plannedCall.regen.totalBoundUsd) * 100) / 100 }).then(() => null, (e) => e);
+      eq(err && (err.getResponse ? err.getResponse().code : err.code), 'WORKSHOP_STRUCTURAL_COMBINATION', '409 antes de gastar');
+      // Ronda 3 (P2-E): mensaje propio con la actividad del molde.
+      const msg = err.getResponse().message;
+      assert(msg.includes(`«${cta1.title}»`) && /modelo para el capítulo nuevo/.test(msg) && !/más de un cambio que agrega/.test(msg), `mensaje: ${msg}`);
+      eq([sim.calls.anthropic.length, sim.calls.videogen.length, sim.calls.gamma.length], [0, 0, 0], '0 llamadas');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
+    await check('L25 (B11 ronda 4, D2) add_module sin título → pregunta; responder con texto libre deja el pedido `awaiting_confirmation` con el estimado de la re-interpretación (predicado único con answerRequest), nunca `failed`', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '5.00', reason: 'QA r107 B11 L25' });
+      const CF = require(path.join(REPO, 'scripts/r107/lib/r107-chapter-fixtures.js'));
+      const V1 = await CF.v1BuilderCourse(distRoot, {});
+      const s5 = await svc.createSession({ id: U, email: 'u@cursia.test' }, { filename: 'l25-v1.mbz', sizeBytes: V1.length });
+      objects.set(s5.upload.storagePath, V1);
+      await svc.markUploaded({ id: U }, s5.session.id);
+      await Promise.all([...svc.inFlight.values()]);
+      const sid5 = s5.session.id;
+      const Q = 'Agrega un módulo nuevo sobre ventas.';
+      const client = { simulated: false, calls: 0, async call(req) { this.calls++; return { input: { requests: [{ quote: Q, operation: 'add_module', instruction: 'Agregar un módulo de ventas' }] }, stopReason: 'tool_use', model: req.model, messageId: `msg_b11_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false }; } };
+      const p = planFor(client);
+      const a = await p.createTextIntake({ id: U }, sid5, Q);
+      await p.confirmInterpretation({ id: U }, sid5, a.id, { confirmEstimateUsd: Number(a.estimate.expectedUsd), capUsd: Number(a.estimate.proposedCapUsd) });
+      await p.whenIdle();
+      const row = (await p.listRequests({ id: U }, sid5)).requests.find((r) => r.operation === 'add_module');
+      eq(row && row.status, 'needs_answer', 'pregunta el título');
+      const q = row.questions[0];
+      const r = await p.answer({ id: U }, sid5, row.id, [{ questionId: q.id, text: 'Ventas consultivas, con los capítulos Prospección y Cierre' }]);
+      await p.whenIdle();
+      eq(r.status, 'awaiting_confirmation', 'respuesta → espera aprobar la re-interpretación');
+      const after = (await p.listRequests({ id: U }, sid5)).requests.find((x) => x.id === row.id);
+      eq(after.status, 'awaiting_confirmation', 'no queda en failed');
+      assert(after.estimate && Number(after.estimate.expectedUsd) > 0, `con su estimado: ${JSON.stringify(after.estimate).slice(0, 160)}`);
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
+
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});

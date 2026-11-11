@@ -7,7 +7,8 @@ import type { DataSource } from 'typeorm';
 import type { ArtifactsService } from '../../artifacts/artifacts.service';
 import { WORKSHOP_BUCKET } from '../course-workshop.service';
 import { decodeProduced, encodeProduced, producedSummary, sha256Hex } from './bundle';
-import { ProducedRegen, RegenerateOp, isRegenOperation } from './types';
+import { ProducedRegen, RegenerateOp, isPaidOperation } from './types';
+import type { ProducedChapter, ProducedModule } from './chapter-types';
 
 export const REGEN_RESULT_TYPE = 'workshop_regen_result';
 export const REGEN_RESULT_MIME = 'application/zip';
@@ -20,7 +21,7 @@ export function regenResultPath(ownerId: string, sessionId: string, approvalId: 
   return `${ownerId}/workshop/${sessionId}/regen/${approvalId}/${itemId}-${sha256.slice(0, 12)}.zip`;
 }
 
-export async function storeRegenResult(ds: Pick<DataSource, 'query'>, artifacts: Pick<ArtifactsService, 'putStorageObject' | 'deleteUnreferencedServerObject'>, a: { ownerId: string; sessionId: string; approvalId: string; itemId: string; requestId: string; operation: string; produced: ProducedRegen }): Promise<RegenResultRef> {
+export async function storeRegenResult(ds: Pick<DataSource, 'query'>, artifacts: Pick<ArtifactsService, 'putStorageObject' | 'deleteUnreferencedServerObject'>, a: { ownerId: string; sessionId: string; approvalId: string; itemId: string; requestId: string; operation: string; produced: ProducedRegen | ProducedChapter | ProducedModule }): Promise<RegenResultRef> {
   const buf = await encodeProduced(a.produced);
   const sha256 = sha256Hex(buf);
   const path = regenResultPath(a.ownerId, a.sessionId, a.approvalId, a.itemId, sha256);
@@ -63,8 +64,12 @@ export async function resolveRegenParams<T>(ds: Pick<DataSource, 'query'>, artif
     return { ...(lb as object), pdf: { base64: r.pdf.toString('base64'), previousSha1: r.previousSha1 } } as unknown as T;
   }
   const p = params as unknown as RegenerateOp;
-  if (!p || !isRegenOperation(p.op)) return params;
+  if (!p || !isPaidOperation(p.op)) return params;
   if (!p.result) throw new Error(`el ítem «${p.op}» no tiene su resultado producido`);
   const produced = await loadRegenResult(ds, artifacts, s, p.result);
+  // r107 B11: el resultado tiene que ser del tipo de la operación (un capítulo para add_chapter, un módulo para add_module).
+  const op = String(p.op);
+  const want = op === 'add_chapter' ? 'chapter' : op === 'add_module' ? 'module' : null;
+  if (want && (produced as unknown as { kind: string }).kind !== want) throw new Error(`el resultado guardado no es ${want === 'chapter' ? 'un capítulo' : 'un módulo'}`);
   return { ...(p as object), produced } as unknown as T;
 }

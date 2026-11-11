@@ -17,6 +17,11 @@ export const PHASE3_OPERATIONS = Object.freeze(['regenerate_scorm', 'regenerate_
 export type RegenOperation = (typeof PHASE3_OPERATIONS)[number];
 export const isRegenOperation = (op: unknown): op is RegenOperation => typeof op === 'string' && (PHASE3_OPERATIONS as readonly string[]).includes(op);
 
+/** r107 B11: operaciones cuyo contenido se PRODUCE con proveedores pagos y aprobación con tope (Fase 3 + Fase 4). */
+export const PAID_OPERATIONS = Object.freeze([...PHASE3_OPERATIONS, 'add_chapter', 'add_module'] as const);
+export type PaidOperation = (typeof PAID_OPERATIONS)[number];
+export const isPaidOperation = (op: unknown): op is PaidOperation => typeof op === 'string' && (PAID_OPERATIONS as readonly string[]).includes(op);
+
 export type RegenProvider = 'anthropic' | 'openai' | 'gamma' | 'videogen' | 'youtube';
 export const REGEN_PROVIDERS: readonly RegenProvider[] = Object.freeze(['anthropic', 'openai', 'gamma', 'videogen', 'youtube'] as RegenProvider[]);
 
@@ -143,6 +148,21 @@ export interface RegenPrior {
   videogen?: { jobId: string; charged: boolean; callId?: string | null; approvalId?: string | null } | null;
   youtube?: { videoId: string } | null;
   gamma?: { generationId: string; charged: boolean; callId?: string | null; approvalId?: string | null } | null;
+  /**
+   * r107 B11: piezas YA producidas de cada capítulo nuevo (por número): el texto y el juego se guardan tal cual; el
+   * render, el video publicado y la presentación, por su id externo (se vuelven a consultar gratis). Nunca se repagan.
+   */
+  chapterPieces?: Record<string, {
+    libroMd?: string; videoPageHtml?: string; gamePageHtml?: string;
+    scorm?: { html: string; manifestXml: string; roomAssignment: string[]; rooms: number };
+    /** El video terminado (con sus preguntas ya pagadas): una reanudación por la espera de Gamma no lo vuelve a armar. */
+    video?: { hvpJson: string; youtubeId: string; durationSec: number; interactions: number; script: string; scenes: number; videogenJobId: string };
+    videogen?: RegenPrior['videogen']; youtube?: RegenPrior['youtube']; gamma?: RegenPrior['gamma'];
+  }>;
+  /** r107 B11: capítulo cuyo proveedor asíncrono ocupa las ranuras de arriba (null = libres). */
+  chapterCurrent?: string | null;
+  /** r107 B11: examen de la unidad nueva ya producido. */
+  unitExam?: { gift?: string; infoHtml?: string };
 }
 
 /** Cómo se esperan los proveedores asíncronos: en línea (pruebas puras) o diferida (servicio). */

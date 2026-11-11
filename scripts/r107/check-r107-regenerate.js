@@ -471,9 +471,9 @@ const L = (rel) => { try { return require(path.join(DIST, rel)); } catch (e) { c
     assert(bad && /huella/.test(bad.message), 'un binario alterado no se acepta');
     // la vista del ítem NO guarda los bytes (params sin `produced`)
     assert(!('produced' in prods.gamma.prep.view.params) && JSON.stringify(prods.gamma.prep.view).length < 200_000, 'params sin binarios');
-    // catálogo: rehacer = Fase 3 (resuelto), agregar capítulo sigue en fase posterior
+    // catálogo: rehacer = Fase 3 (resuelto); r107 B11: agregar capítulo / módulo = Fase 4 (ya no hay fase posterior)
     eq([...PL.PHASE3_OPERATIONS], ['regenerate_scorm', 'regenerate_video', 'regenerate_gamma', 'regenerate_audio'], 'Fase 3');
-    eq([...PL.LATER_OPERATIONS], ['add_chapter', 'add_module'], 'fase posterior');
+    eq([[...PL.PHASE4_OPERATIONS], [...PL.LATER_OPERATIONS]], [['add_chapter', 'add_module'], []], 'Fase 4, sin fase posterior');
     const ctx = await ctxOf(V1);
     const out = await PL.interpretText(ctx, 'Rehace el juego del capítulo 1 como una sopa de letras.', async (call) => ({ result: { input: { requests: [{ quote: 'Rehace el juego del capítulo 1 como una sopa de letras.', operation: 'regenerate_scorm', instruction: 'Rehacer el juego como sopa de letras.', target: { chapterNumber: 1 }, targetEvidence: 'el juego del capítulo 1', changeEvidence: 'como una sopa de letras' }] }, stopReason: 'tool_use', model: 'claude-sonnet-4-6', messageId: 'm1', usage: { input_tokens: 10, output_tokens: 10 }, simulated: true }, costUsd: '0' }));
     eq(out.requests.map((r) => [r.status, r.operation, r.target && r.target.moduleId]), [['resolved', 'regenerate_scorm', V1M.scorm]], 'interpretado y resuelto');
