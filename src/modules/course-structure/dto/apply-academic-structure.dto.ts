@@ -53,6 +53,15 @@ export class ApplyAcademicStructureDto {
   @IsOptional()
   @IsIn(['document', 'cursia', 'format', 'custom'])
   choice?: 'document' | 'cursia' | 'format' | 'custom';
+
+  /**
+   * r109 M3b: con choice «cursia», cuál de sus propuestas se usó: «document» (la forma del documento: un módulo por unidad,
+   * un capítulo por contenido; la forma tiene que ser exactamente esa) o «cursia» (la recomendación pareja). Se guarda en
+   * el origen de la estructura para volver a preseleccionarla. Opcional.
+   */
+  @IsOptional()
+  @IsIn(['document', 'cursia'])
+  variant?: 'document' | 'cursia';
 }
 
 // LOOP 8.0: POST /courses/:courseId/modules/structure-origin — el editor avisa que terminó de aplicar la propuesta de la

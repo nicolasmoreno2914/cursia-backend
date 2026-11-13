@@ -87,19 +87,12 @@ export function shapeDifferences(required: DocumentRequirement[], shape: Structu
   return out;
 }
 
-export interface ShapeRecommendation extends StructureShape {
-  reason: string;
-  /** r109 M3b: la forma es la del documento (un módulo por unidad, un capítulo por contenido). */
-  fromDocument?: boolean;
-}
+export interface ShapeRecommendation extends StructureShape { reason: string }
 
 /** «4 / 5 / 4 / 4». */
 export function shapeSlashes(counts: number[]): string {
   return counts.join(' / ');
 }
-
-const validCounts = (c: number[] | null | undefined): c is number[] =>
-  Array.isArray(c) && c.length >= 1 && c.length <= SHAPE_INPUT_MAX.modules && c.every((n) => Number.isInteger(n) && n >= 1 && n <= SHAPE_INPUT_MAX.chaptersPerModule);
 
 /**
  * Lo que recomienda Cursia (dentro de lo que exige el documento):
@@ -108,7 +101,7 @@ const validCounts = (c: number[] | null | undefined): c is number[] =>
  *   3. si no, el formato S/M/L más cercano a las horas (sin horas: M); lo que el documento fije (solo módulos o solo
  *      capítulos) se respeta.
  */
-export function recommendShape(required: DocumentRequirement[], documentShape: number[] | null, targetHours: number | null, documentContents?: number[] | null): ShapeRecommendation {
+export function recommendShape(required: DocumentRequirement[], documentShape: number[] | null, targetHours: number | null): ShapeRecommendation {
   const s = structuralRequirements(required);
   const fixed = (rs: DocumentRequirement[]) => {
     const r = rs.find((x) => x.mode === 'exact' && typeof x.value === 'number');
@@ -118,26 +111,6 @@ export function recommendShape(required: DocumentRequirement[], documentShape: n
   const reqModules = fixed(s.modules) ?? (st ? st.shape!.length : null);
   const reqChapters = fixed(s.chapters) ?? (st ? st.shape![0] : null);
   if (reqModules && reqChapters) return { modules: reqModules, chaptersPerModule: reqChapters, reason: 'Es la estructura que exige el documento.' };
-  // r109 M3b: una estructura desigual que EXIGE el documento («estructura 4, 5, 4, 4») es la recomendación, tal cual.
-  const stUneven = !st && !reqChapters
-    ? s.structure.find((r) => validCounts(r.shape) && r.shape!.some((n) => n !== r.shape![0]) && (reqModules === null || reqModules === r.shape!.length))
-    : undefined;
-  if (stUneven) {
-    const mc = [...stUneven.shape!];
-    return { modules: mc.length, chaptersPerModule: Math.max(...mc), moduleChapters: mc, reason: 'Es la estructura que exige el documento.' };
-  }
-  // r109 M3b: el documento organiza sus contenidos en unidades DESIGUALES (p. ej. 4 / 5 / 4 / 4) y no fija otra cantidad
-  // de capítulos por módulo: se recomienda esa misma forma (cada unidad, un módulo; cada contenido, un capítulo) en vez de
-  // emparejarla en N × M. Las formas parejas y los formatos S/M/L siguen como alternativas.
-  if (validCounts(documentContents) && documentContents.some((n) => n !== documentContents[0]) && !reqChapters
-    && (reqModules === null || reqModules === documentContents.length)) {
-    const mc = [...documentContents];
-    const n = mc.reduce((a, b) => a + b, 0);
-    return {
-      modules: mc.length, chaptersPerModule: Math.max(...mc), moduleChapters: mc, fromDocument: true,
-      reason: `Como el documento: ${plural(mc.length, 'unidad', 'unidades')} con ${shapeSlashes(mc)} contenidos. Cada unidad es un módulo y cada uno de sus ${n} contenidos, un capítulo, en el orden del documento.`,
-    };
-  }
   if (documentShape && documentShape.length) {
     // Hacia abajo: nunca más capítulos que contenidos (Cursia no inventa capítulos de «profundización» al recomendar).
     const modules = reqModules ?? documentShape.length;
@@ -158,17 +131,46 @@ export function recommendShape(required: DocumentRequirement[], documentShape: n
 }
 
 /**
- * r109 M3b · lo que recomienda Cursia y, si esa recomendación es la forma desigual del documento, la forma pareja que se
- * recomendaba antes (una alternativa más, junto a los formatos S/M/L y la personalizada).
+ * r109 M3b · «Como el documento»: cada unidad del documento es un módulo y cada uno de sus contenidos, un capítulo, en
+ * orden (sin el tope de 5 que usa el distribuidor al agregar). Es un campo APARTE de `recommended` (que sigue siendo la
+ * recomendación pareja de siempre: un cliente anterior la ve idéntica). Se ofrece SOLO si el documento trae contenidos por
+ * unidad y la forma cumple todo lo que el documento exige de módulos, capítulos por módulo (exacto, mínimo, máximo,
+ * rango…) y estructura; si no, `documentRecommendation` es null y `note` dice por qué. Una estructura desigual exigida
+ * solo por requisito (sin contenidos por unidad) no se ofrece aquí.
  */
-export function shapeRecommendations(required: DocumentRequirement[], documentShape: number[] | null, targetHours: number | null, documentContentsShape: number[] | null) {
-  const recommended = recommendShape(required, documentShape, targetHours, documentContentsShape);
-  let evenAlternative: ShapeRecommendation | null = null;
-  if (recommended.moduleChapters) {
-    const even = recommendShape(required, documentShape, targetHours);
-    evenAlternative = even.moduleChapters ? null : { ...even, reason: `Forma pareja: ${even.modules} × ${even.chaptersPerModule}, con los contenidos del documento repartidos en orden.` };
+export interface DocumentShapeRecommendation {
+  modules: number;
+  chaptersPerModule: number;
+  /** Siempre presente (también si es pareja, p. ej. 7 / 7 / 7). */
+  moduleChapters: number[];
+  reason: string;
+}
+export function documentShapeRecommendation(
+  context: AcademicContextV1 | null, required: DocumentRequirement[],
+): { documentRecommendation: DocumentShapeRecommendation | null; note: string | null } {
+  const none = (note: string | null) => ({ documentRecommendation: null, note });
+  if (!context) return none(null);
+  const units = context.units.filter((u) => u.contents.length > 0);
+  if (!units.length) return none(null);
+  const counts = units.map((u) => u.contents.length);
+  const too = units.filter((u) => u.contents.length > SHAPE_INPUT_MAX.chaptersPerModule);
+  if (too.length) {
+    return none(`«Como el documento» no está disponible: ${too.length === 1 ? `la unidad ${too[0].id} trae ${too[0].contents.length} contenidos` : `las unidades ${too.map((u) => `${u.id} (${u.contents.length})`).join(', ')} traen más contenidos`} y un módulo admite hasta ${SHAPE_INPUT_MAX.chaptersPerModule} capítulos.`);
   }
-  return { recommended, evenAlternative };
+  if (units.length > SHAPE_INPUT_MAX.modules) return none(`«Como el documento» no está disponible: el documento trae ${units.length} unidades con contenidos y un curso admite hasta ${SHAPE_INPUT_MAX.modules} módulos.`);
+  const shape: StructureShape = { modules: counts.length, chaptersPerModule: Math.max(...counts), moduleChapters: counts };
+  const diffs = shapeDifferences(required, shape);
+  if (diffs.length) return none(`«Como el documento» (${shapeSlashes(counts)}) no cumple lo que exige el documento: ${diffs.map((d) => d.text.replace(/\.$/, '')).join('; ')}. Cursia recomienda la forma pareja.`);
+  const total = counts.reduce((a, b) => a + b, 0);
+  const skipped = context.units.length - units.length;
+  return {
+    documentRecommendation: {
+      ...shape, moduleChapters: [...counts],
+      reason: `Como el documento: ${plural(units.length, 'unidad', 'unidades')} con ${shapeSlashes(counts)} contenidos. Cada unidad es un módulo y cada uno de sus ${plural(total, 'contenido', 'contenidos')}, un capítulo, en el orden del documento.`
+        + (skipped ? ` ${skipped === 1 ? 'Una unidad sin contenidos no se usa.' : `${skipped} unidades sin contenidos no se usan.`}` : ''),
+    },
+    note: null,
+  };
 }
 
 /**

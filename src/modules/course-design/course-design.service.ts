@@ -1,6 +1,6 @@
 import { contentCoverage, contentMapIsStale, documentContents, readContentMap, writeContentMap } from '../academic-context/content-coverage';
 import { documentContentShape, documentStructureShape, normalizeShape } from '../academic-context/context-design';
-import { shapeRecommendations, structuralRequirements, structurePreviewOf } from './structure-options';
+import { documentShapeRecommendation, recommendShape, structuralRequirements, structurePreviewOf } from './structure-options';
 import { BadRequestException, Injectable, Optional } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
@@ -92,7 +92,8 @@ export class CourseDesignService {
          from public.course_modules m left join public.course_chapters c on c.module_id = m.id where m.course_id = $1 group by m.id, m.position order by m.position`,
       [courseId],
     );
-    const recs = shapeRecommendations(auth.required, docShape, hours, contentShape);
+    // r109 M3b: «Como el documento» va APARTE; `recommended` es la recomendación de siempre (un cliente anterior no cambia).
+    const docRec = documentShapeRecommendation(academic ? academic.context : null, auth.required);
     return {
       providersCalled: 0,
       contextVersion: academic ? academic.version : null,
@@ -106,11 +107,12 @@ export class CourseDesignService {
         hours: sreq.hours.map((r) => requirementText(r)),
       },
       targetHours: hours !== null ? { value: hours, source: facts.targetHours.source } : null,
-      recommended: recs.recommended,
-      // r109 M3b: con la forma desigual del documento recomendada, la forma pareja de antes queda como alternativa.
-      evenAlternative: recs.evenAlternative,
+      recommended: recommendShape(auth.required, docShape, hours),
+      // r109 M3b: un módulo por unidad y un capítulo por contenido (o null con `documentRecommendationNote`: por qué no).
+      documentRecommendation: docRec.documentRecommendation,
+      documentRecommendationNote: docRec.note,
       formats: COURSE_FORMAT_CODES.map((c) => { const f = COURSE_FORMATS[c]; return { code: c, label: f.label, modules: f.modules, chaptersPerModule: f.chaptersPerModule, hoursMin: f.hoursMin, hoursMax: f.hoursMax, targetHours: f.targetHours }; }),
-      current: { choice: origin && origin.choice ? origin.choice : null, format: fmt ? fmt.code : null, shape: live.map((r) => Number(r.n)) },
+      current: { choice: origin && origin.choice ? origin.choice : null, format: fmt ? fmt.code : null, shape: live.map((r) => Number(r.n)), ...(origin && origin.variant ? { variant: origin.variant } : {}) },
     };
   }
 

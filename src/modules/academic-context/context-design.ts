@@ -459,12 +459,12 @@ export function documentStructureShape(ctx: AcademicContextV1): number[] | null 
  * r109 M3b · contenidos de cada unidad del documento (las unidades sin contenidos no cuentan), en orden: la forma «como el
  * documento» (cada unidad, un módulo; cada contenido, un capítulo). A diferencia de `documentStructureShape`, no agrupa
  * los contenidos de una unidad larga en el tope de capítulos que el distribuidor agrega por su cuenta (5): una unidad con
- * 7 contenidos son 7 capítulos. Tope: el de la entrada (SHAPE_INPUT_MAX). null si no trae unidades con contenidos.
+ * 7 contenidos son 7 capítulos. Sin tope (los conteos reales: quien la usa como forma revisa SHAPE_INPUT_MAX). null si no
+ * trae unidades con contenidos.
  */
 export function documentContentShape(ctx: AcademicContextV1): number[] | null {
   const units = ctx.units.filter((u) => u.contents.length > 0);
-  if (!units.length || units.length > SHAPE_INPUT_MAX.modules) return null;
-  return units.map((u) => Math.min(SHAPE_INPUT_MAX.chaptersPerModule, u.contents.length));
+  return units.length ? units.map((u) => u.contents.length) : null;
 }
 
 /**

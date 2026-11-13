@@ -572,7 +572,17 @@ export function fitDesignToBudget(input: BudgetFitInput): BudgetFitResult {
     const out: string[] = [];
     const s = d.structure;
     out.push(`${s.modules} ${s.modules === 1 ? 'módulo' : 'módulos'} con ${s.contentChapters} ${s.contentChapters === 1 ? 'capítulo de contenido' : 'capítulos de contenido'} y ${s.practiceChapters} de práctica.`);
-    if (e.params.cap !== null) out.push(`Hasta ${e.params.cap} ${e.params.cap === 1 ? 'capítulo de contenido' : 'capítulos de contenido'} por módulo: el resto de las horas es práctica real (capítulos de práctica y Actividades de Aplicación con instrucciones, ejercicios, entregable y criterios).`);
+    if (e.params.cap !== null) {
+      // r109 M3b: el tope no recorta capítulos que la estructura ya tiene (p. ej. un módulo de 7 por la forma del documento):
+      // el texto dice cuáles lo superan en vez de prometer «hasta N» en todos.
+      const cap = e.params.cap;
+      const over = s.contentByModule.map((n, i) => ({ n, i })).filter((x) => x.n > cap);
+      const capText = `Hasta ${cap} ${cap === 1 ? 'capítulo de contenido' : 'capítulos de contenido'} por módulo`;
+      const overText = !over.length ? ''
+        : over.length === 1 ? ` (el módulo ${over[0].i + 1} conserva sus ${over[0].n}: Cursia no quita capítulos de la estructura)`
+          : ` (los módulos ${over.map((x) => `${x.i + 1} (${x.n})`).join(', ')} conservan los suyos: Cursia no quita capítulos de la estructura)`;
+      out.push(`${capText}${overText}: el resto de las horas es práctica real (capítulos de práctica y Actividades de Aplicación con instrucciones, ejercicios, entregable y criterios).`);
+    }
     if (s.guidedPractices > 0 && !(ref.design && ref.design.structure.guidedPractices > 0)) out.push(`Ejercicios guiados en ${s.guidedPractices} ${s.guidedPractices === 1 ? 'capítulo' : 'capítulos'} de contenido (${fmtH(s.guidedPracticeMinutes / 60)} h): casos, problemas resueltos o análisis de decisiones con consignas, producto esperado, criterios y respuesta modelo.`);
     if (e.params.em !== baseParams.em) out.push('Primero práctica y después profundización: cada módulo suma capítulos de práctica integradora y de casos antes que capítulos de profundización.');
     if (e.params.av !== baseParams.av) out.push(e.params.av === 'less' ? 'Un video por módulo (en el capítulo que lo abre), en lugar de uno en casi cada capítulo.' : 'Video en los capítulos que abren y desarrollan cada módulo.');

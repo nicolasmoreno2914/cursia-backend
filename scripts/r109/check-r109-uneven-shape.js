@@ -4,15 +4,26 @@
 // Sin red, sin base y sin proveedores (USD 0): todo sobre funciones puras de dist/.
 //
 //   US1  forma del documento: los contenidos de cada unidad, sin agrupar en el tope de 5 (4/5/4/4 y 4/7/4/5)
-//   US2  «structure-options» recomienda «Como el documento» con la razón real; la forma pareja de antes queda como alternativa
+//   US2  «Como el documento» (documentRecommendation, aparte de `recommended`): un capítulo por contenido, razón real; solo
+//        si cumple TODOS los requisitos de módulos, capítulos por módulo (exacto / mínimo / máximo / rango) y estructura;
+//        pareja 7/7/7 también; una unidad > 30 contenidos no se ofrece y se explica; sin contenidos por unidad, no se ofrece
+//   US2b compatibilidad: la respuesta de structure-options para un cliente anterior (sin los campos nuevos) es IDÉNTICA a la
+//        de origin/staging, también en documentos desiguales (huellas en el golden)
 //   US3  la propuesta con esa forma: exactamente esos capítulos por módulo, en orden, sin omitir ni duplicar; cada unidad
 //        es su módulo; trazabilidad (sourceContentIds) y cobertura de resultados iguales a la estructura del documento
 //   US4  forma de entrada: normalizeShape / isValidShape (topes SHAPE_INPUT_MAX), DTO de preview y de aplicar
 //   US5  vista previa y diferencias con el documento: «4 módulos (4, 7, 4, 5 capítulos)», requisito desigual exigido
-//   US6  horas (distribuidor), costo estimado, ajuste al presupuesto y verificación con la estructura desigual aplicada
+//   US6  horas (distribuidor), costo estimado, ajuste al presupuesto (su texto «Hasta N…» dice qué módulos conservan más) y
+//        verificación con la estructura desigual aplicada
 //   US7  forma desigual que no sigue a las unidades (otra cantidad de módulos): reparto proporcional, sin pérdidas
 //   US8  sin regresión: las formas N × M dan lo mismo que origin/staging (huellas en scripts/fixtures/r109/nxm-golden.json,
 //        o en vivo con --base <dist de origin/staging>); sin documento / sin unidades: como hoy
+//   US9  (--db) Postgres 16 local: options → preview → aplicar con variant «document» / «cursia» → vuelve preseleccionada
+//
+// Qué cambia A PROPÓSITO frente a origin/staging (y nada más): campos NUEVOS en structure-options (documentRecommendation,
+// documentRecommendationNote, document.contentShape, current.variant), `label` en la vista previa de una forma desigual, y
+// la entrada moduleChapters / variant. `recommended` y todo lo N × M quedan idénticos. El resultado esperado nuevo de los
+// documentos de prueba está en el golden («intentional»), escrito a mano en EXPECTED_DOC_RECOMMENDATIONS.
 //
 // Uso: npm run build && node scripts/r109/check-r109-uneven-shape.js --ci [--dist dist] [--base <dist-base>]
 //      node scripts/r109/check-r109-uneven-shape.js --bite          (cada mordida tiene que hacer fallar --ci)
@@ -33,10 +44,13 @@ if (process.argv.includes('--bite')) {
   const bites = [
     { name: 'splitEven en la forma del documento (todos los módulos con M capítulos)', file: 'modules/academic-context/context-design.js', from: 'splitEven(group, counts[mi])', to: 'splitEven(group, M)' },
     { name: 'la forma del documento no sigue a sus unidades', file: 'modules/academic-context/context-design.js', from: 'const byUnit = uneven && counts.length === units.length;', to: 'const byUnit = false;' },
-    { name: 'recomendación pareja (la de antes)', file: 'modules/course-design/structure-options.js', from: 'if (validCounts(documentContents) &&', to: 'if (false &&' },
-    { name: 'la forma del documento agrupada en el tope de 5', file: 'modules/academic-context/context-design.js', from: 'Math.min(exports.SHAPE_INPUT_MAX.chaptersPerModule, u.contents.length)', alt: 'Math.min(SHAPE_INPUT_MAX.chaptersPerModule, u.contents.length)', to: 'Math.min(5, u.contents.length)' },
+    { name: '«Como el documento» ignora los requisitos (máximo / rango)', file: 'modules/course-design/structure-options.js', from: 'if (diffs.length)', to: 'if (false)' },
+    { name: '«Como el documento» no se ofrece', file: 'modules/course-design/course-design.service.js', from: 'documentRecommendation: docRec.documentRecommendation,', to: 'documentRecommendation: null,' },
+    { name: 'recommended cambia para el cliente anterior (P1-2)', file: 'modules/course-design/course-design.service.js', from: 'recommended: (0, structure_options_1.recommendShape)(auth.required, docShape, hours),', to: 'recommended: docRec.documentRecommendation || (0, structure_options_1.recommendShape)(auth.required, docShape, hours),' },
+    { name: 'la forma del documento agrupada en el tope de 5', file: 'modules/academic-context/context-design.js', from: 'units.map((u) => u.contents.length)', to: 'units.map((u) => Math.min(5, u.contents.length))' },
     { name: 'N × M con otras notas (regresión)', file: 'modules/academic-context/context-design.js', from: 'const label = shapeLabel(shape);', to: 'const label = `${N} módulos`;' },
     { name: 'el preview ignora la forma desigual', file: 'modules/course-design/course-design.service.js', from: 'const shape = (0, context_design_1.normalizeShape)(input);', alt: 'const shape = normalizeShape(input);', to: 'const shape = (0, context_design_1.normalizeShape)({ modules: input.modules, chaptersPerModule: input.chaptersPerModule });' },
+    { name: 'el texto del presupuesto promete «hasta N» en todos los módulos', file: 'modules/course-design/budget-fit.js', from: 'const over = s.contentByModule.map((n, i) => ({ n, i })).filter((x) => x.n > cap);', to: 'const over = [];' },
   ];
   const tmp = fs.mkdtempSync(path.join(REPO, '.r109-bite-'));
   let code = 0;
@@ -103,9 +117,9 @@ function ctxWith(base, counts) {
   const keep = new Set(c.outcomes.map((o) => o.id).concat(c.competencies.map((x) => x.id)));
   c.evaluation = c.evaluation.map((e) => ({ ...e, outcomeIds: (e.outcomeIds || []).filter((id) => keep.has(id)) }));
   const src0 = clone(base.units[0].contents[0]);
-  c.units = A1A2_UNITS.map((u, i) => ({
+  c.units = A1A2_UNITS.slice(0, counts.length).map((u, i) => ({
     ...clone(base.units[0]), id: `U${i + 1}`, title: u.title, hours: null, outcomeIds: u.ra,
-    contents: u.contents.slice(0, counts[i]).map((t, j) => ({ ...src0, id: `U${i + 1}.${j + 1}`, text: t, outcomeIds: [] })),
+    contents: Array.from({ length: counts[i] }, (_, j) => ({ ...src0, id: `U${i + 1}.${j + 1}`, text: u.contents[j] || `${u.title}: tema ${j + 1}`, outcomeIds: [] })),
   }));
   return c;
 }
@@ -118,8 +132,48 @@ async function contexts(root) {
   const ctxOf = async (name, data) => (await E.extractAcademicContext([{ name, data }])).context;
   const costos = await ctxOf('c.docx', await AF.fixture('consistent', 'docx'));
   const pilot = await ctxOf('p.docx', fs.readFileSync(path.join(REPO, 'scripts/fixtures/microcurriculum/atencion-violencia-sexual-2x2.docx')));
-  return { costos, pilot, a1a2: ctxWith(costos, [4, 5, 4, 4]), a1a2b: ctxWith(costos, [4, 7, 4, 5]) };
+  return { costos, pilot, a1a2: ctxWith(costos, [4, 5, 4, 4]), a1a2b: ctxWith(costos, [4, 7, 4, 5]), even777: ctxWith(costos, [7, 7, 7]), big31: ctxWith(costos, [4, 31, 4, 4]) };
 }
+
+/**
+ * structure-options con el servicio REAL y lecturas simuladas (el contexto guardado; sin requisitos, formato ni origen).
+ * `legacy`: la respuesta que ve un cliente anterior (sin los campos que agrega r109 M3b).
+ */
+async function optionsOf(root, ctx) {
+  const R = loader(root);
+  const FEAT = R('modules/features/dynamic-features.js');
+  const AC = R('modules/academic-context/academic-context.js');
+  const SVC = R('modules/course-design/course-design.service.js');
+  process.env[FEAT.DYNAMIC_FLAG_ENV] = 'true';
+  process.env[FEAT.GENERAL_AVAILABILITY_ENV] = 'true';
+  const stored = AC.normalizeAcademicContext(clone(ctx));
+  const svc = Object.create(SVC.CourseDesignService.prototype);
+  svc.loadCourse = async () => {};
+  svc.dataSource = { query: async (sql) => (/from public\.course_profiles/.test(sql) && /'academic'/.test(sql) ? [{ id: 1, version: 3, data: stored, sha256: AC.academicContextSha256(stored) }] : []) };
+  return svc.structureOptions(1, 'owner');
+}
+function legacyView(o) {
+  const x = clone(o);
+  delete x.documentRecommendation;
+  delete x.documentRecommendationNote;
+  if (x.document) delete x.document.contentShape;
+  if (x.current) delete x.current.variant;
+  return x;
+}
+async function legacyCases(root, ctxs) {
+  const out = {};
+  for (const [cn, ctx] of Object.entries(ctxs)) out[`options:${cn}`] = sha(legacyView(await optionsOf(root, ctx)));
+  return out;
+}
+
+/** Resultado esperado NUEVO (a propósito) de «Como el documento» en los documentos de prueba. */
+const EXPECTED_DOC_RECOMMENDATIONS = {
+  a1a2: { documentRecommendation: { modules: 4, chaptersPerModule: 5, moduleChapters: [4, 5, 4, 4], reason: 'Como el documento: 4 unidades con 4 / 5 / 4 / 4 contenidos. Cada unidad es un módulo y cada uno de sus 17 contenidos, un capítulo, en el orden del documento.' }, note: null },
+  a1a2b: { documentRecommendation: { modules: 4, chaptersPerModule: 7, moduleChapters: [4, 7, 4, 5], reason: 'Como el documento: 4 unidades con 4 / 7 / 4 / 5 contenidos. Cada unidad es un módulo y cada uno de sus 20 contenidos, un capítulo, en el orden del documento.' }, note: null },
+  even777: { documentRecommendation: { modules: 3, chaptersPerModule: 7, moduleChapters: [7, 7, 7], reason: 'Como el documento: 3 unidades con 7 / 7 / 7 contenidos. Cada unidad es un módulo y cada uno de sus 21 contenidos, un capítulo, en el orden del documento.' }, note: null },
+  big31: { documentRecommendation: null, note: '«Como el documento» no está disponible: la unidad U2 trae 31 contenidos y un módulo admite hasta 30 capítulos.' },
+  costos: { documentRecommendation: { modules: 5, chaptersPerModule: 4, moduleChapters: [4, 4, 4, 3, 3], reason: 'Como el documento: 5 unidades con 4 / 4 / 4 / 3 / 3 contenidos. Cada unidad es un módulo y cada uno de sus 18 contenidos, un capítulo, en el orden del documento.' }, note: null },
+};
 
 /** Huellas N × M (las mismas funciones en dist y en origin/staging): propuesta, vista previa, diferencias, recomendación. */
 const NXM_SHAPES = [[1, 1], [1, 4], [2, 2], [2, 3], [3, 3], [3, 4], [4, 1], [4, 4], [4, 5], [5, 3], [2, 9], [6, 2]];
@@ -175,10 +229,16 @@ function nxmCases(root, ctxs) {
 (async () => {
   if (process.argv.includes('--write-golden')) {
     if (!BASE) { console.error('❌ --write-golden necesita --base <dist de origin/staging>'); process.exit(1); }
-    const cases = nxmCases(BASE, await contexts(BASE));
+    const bctx = await contexts(BASE);
+    const cases = nxmCases(BASE, bctx);
+    const legacy = await legacyCases(BASE, bctx);
     fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
-    fs.writeFileSync(GOLDEN, JSON.stringify({ generatedFrom: 'origin/staging 461d17ee (dist compilado)', note: 'r109 M3b: huellas sha256 de las formas N × M; el check las compara con dist.', cases }, null, 1) + '\n');
-    console.log(`✅ golden: ${Object.keys(cases).length} huellas en ${path.relative(REPO, GOLDEN)}`);
+    fs.writeFileSync(GOLDEN, JSON.stringify({
+      generatedFrom: 'origin/staging 461d17ee (dist compilado)',
+      note: 'r109 M3b: `cases` = huellas sha256 de las formas N × M; `legacyOptions` = huellas de la respuesta de structure-options que ve un cliente anterior (sin los campos nuevos), también en documentos desiguales; las dos se generan con origin/staging y tienen que quedar idénticas. `intentional` = lo que cambia A PROPÓSITO: «Como el documento» (documentRecommendation / documentRecommendationNote, campos nuevos), con su resultado esperado escrito a mano.',
+      cases, legacyOptions: legacy, intentional: EXPECTED_DOC_RECOMMENDATIONS,
+    }, null, 1) + '\n');
+    console.log(`✅ golden: ${Object.keys(cases).length} huellas N × M y ${Object.keys(legacy).length} de structure-options en ${path.relative(REPO, GOLDEN)}`);
     process.exit(0);
   }
 
@@ -209,39 +269,53 @@ function nxmCases(root, ctxs) {
     // La estructura «según el documento» de siempre (y document.shape de structure-options) sigue igual: agrupa en 5.
     eq(CD.documentStructureShape(a1a2b), [4, 5, 4, 5], 'documentStructureShape no cambia');
     eq(CD.documentContentShape(costos), [4, 4, 4, 3, 3], 'Contabilidad de Costos');
+    eq(CD.documentContentShape(ctxs.big31), [4, 31, 4, 4], 'conteos reales (sin tope: quien la usa revisa los 30)');
     const empty = clone(a1a2); empty.units.forEach((u) => { u.contents = []; });
     eq(CD.documentContentShape(empty), null, 'sin contenidos: null');
     const partial = clone(a1a2); partial.units[1].contents = [];
     eq(CD.documentContentShape(partial), [4, 4, 4], 'una unidad sin contenidos no cuenta (como en la estructura del documento)');
   });
 
-  await check('US2 structure-options recomienda «Como el documento» (razón real); la pareja de antes es una alternativa', () => {
-    for (const c of CASES) {
-      const r = SO.shapeRecommendations([], CD.documentStructureShape(c.ctx), 28, CD.documentContentShape(c.ctx));
-      eq([r.recommended.modules, r.recommended.chaptersPerModule, r.recommended.moduleChapters, r.recommended.fromDocument], [4, Math.max(...c.shape), c.shape, true], `${c.name}: recomendada`);
-      const n = c.shape.reduce((a, b) => a + b, 0);
-      eq(r.recommended.reason, `Como el documento: 4 unidades con ${c.shape.join(' / ')} contenidos. Cada unidad es un módulo y cada uno de sus ${n} contenidos, un capítulo, en el orden del documento.`, `${c.name}: razón`);
-      const old = SO.recommendShape([], CD.documentStructureShape(c.ctx), 28);
-      assert(r.evenAlternative && !r.evenAlternative.moduleChapters, `${c.name}: alternativa pareja`);
-      eq([r.evenAlternative.modules, r.evenAlternative.chaptersPerModule], [old.modules, old.chaptersPerModule], `${c.name}: la alternativa es la recomendación pareja de antes`);
-      eq([old.modules, old.chaptersPerModule], [4, 4], `${c.name}: antes se emparejaba en 4 × 4`);
-    }
-    // Requisitos del documento que fijan otra cosa mandan (como antes).
-    const r44 = SO.shapeRecommendations(reqsOf('El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 4 capítulos de contenido.'), CD.documentStructureShape(a1a2), 28, CD.documentContentShape(a1a2));
-    eq([r44.recommended.modules, r44.recommended.chaptersPerModule, r44.recommended.moduleChapters, r44.evenAlternative], [4, 4, undefined, null], 'el documento exige 4 × 4: esa');
-    const r5 = SO.shapeRecommendations(reqsOf('El curso tendrá exactamente 5 módulos.'), CD.documentStructureShape(a1a2), 28, CD.documentContentShape(a1a2));
-    eq(r5.recommended.moduleChapters, undefined, 'el documento exige 5 módulos (y trae 4 unidades): no la forma de las unidades');
-    eq(r5.recommended.modules, 5, '5 módulos');
-    const r4 = SO.shapeRecommendations(reqsOf('El curso tendrá exactamente 4 módulos.'), CD.documentStructureShape(a1a2), 28, CD.documentContentShape(a1a2));
-    eq(r4.recommended.moduleChapters, [4, 5, 4, 4], 'exige 4 módulos y trae 4 unidades: la forma del documento');
-    // Una estructura desigual EXIGIDA por el documento es la recomendación.
-    const st = { id: 'RQX', key: 'structure@structure', kind: 'structure', scope: { level: 'structure' }, mode: 'exact', value: null, shape: [4, 7, 4, 5], obligation: 'required', confidence: 'high', active: true, source: null };
-    const rs = SO.recommendShape([st], [4, 5, 4, 5], 28, [4, 5, 4, 4]);
-    eq([rs.moduleChapters, rs.reason], [[4, 7, 4, 5], 'Es la estructura que exige el documento.'], 'estructura desigual exigida');
-    // Documentos con unidades parejas, sin documento: lo de siempre (misma forma y la misma razón).
-    const even = ctxWith(costos, [4, 4, 4, 4]);
-    eq(SO.shapeRecommendations([], CD.documentStructureShape(even), 28, CD.documentContentShape(even)), { recommended: SO.recommendShape([], CD.documentStructureShape(even), 28), evenAlternative: null }, 'unidades parejas');
-    eq(SO.shapeRecommendations([], null, 28, null), { recommended: SO.recommendShape([], null, 28), evenAlternative: null }, 'sin documento');
+  await check('US2 «Como el documento»: un capítulo por contenido, razón real, solo si cumple TODOS los requisitos', () => {
+    const DR = (ctx, req) => SO.documentShapeRecommendation(ctx, req || []);
+    for (const [cn, exp] of Object.entries(EXPECTED_DOC_RECOMMENDATIONS)) eq(DR(ctxs[cn]), exp, `${cn}: resultado esperado`);
+    // `recommended` sigue siendo la pareja de siempre (no se toca).
+    for (const c of CASES) eq([SO.recommendShape([], CD.documentStructureShape(c.ctx), 28).modules, SO.recommendShape([], CD.documentStructureShape(c.ctx), 28).chaptersPerModule, SO.recommendShape([], CD.documentStructureShape(c.ctx), 28).moduleChapters], [4, 4, undefined], `${c.name}: recommended pareja`);
+    // P1-1: máximo y rango de capítulos por módulo (contenidos 4/7/4/4).
+    const c4744 = ctxWith(costos, [4, 7, 4, 4]);
+    const max5 = DR(c4744, reqsOf('Cada módulo tendrá como máximo 5 capítulos de contenido.'));
+    eq(max5.documentRecommendation, null, 'máximo 5 por módulo: no se ofrece (sería «Excepción al documento»)');
+    eq(max5.note, '«Como el documento» (4 / 7 / 4 / 4) no cumple lo que exige el documento: El documento establece hasta 5 capítulos de contenido por módulo y has seleccionado 4 módulos (4, 7, 4, 4 capítulos de contenido): el módulo 2 no cumple. Cursia recomienda la forma pareja.', 'por qué');
+    eq(DR(c4744, reqsOf('Cada módulo tendrá como máximo 7 capítulos de contenido.')).documentRecommendation.moduleChapters, [4, 7, 4, 4], 'máximo 7: se ofrece');
+    eq(DR(c4744, reqsOf('Cada módulo tendrá entre 3 y 5 capítulos de contenido.')).documentRecommendation, null, 'rango 3–5: no');
+    eq(DR(c4744, reqsOf('Cada módulo tendrá de 4 a 7 capítulos.')).documentRecommendation.moduleChapters, [4, 7, 4, 4], 'rango 4–7: sí');
+    eq(DR(c4744, reqsOf('Cada módulo tendrá al menos 5 capítulos de contenido.')).documentRecommendation, null, 'mínimo 5: no');
+    eq(DR(c4744, reqsOf('El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 4 capítulos de contenido.')).documentRecommendation, null, 'exige 4 × 4: no');
+    eq(DR(c4744, reqsOf('El curso tendrá exactamente 5 módulos.')).documentRecommendation, null, 'exige 5 módulos: no');
+    eq(DR(c4744, reqsOf('El curso tendrá exactamente 4 módulos.')).documentRecommendation.moduleChapters, [4, 7, 4, 4], 'exige 4 módulos: sí');
+    const st = (shape) => ({ id: 'RQX', key: 'structure@structure', kind: 'structure', scope: { level: 'structure' }, mode: 'exact', value: null, shape, obligation: 'required', confidence: 'high', active: true, source: null });
+    eq(DR(c4744, [st([4, 7, 4, 4])]).documentRecommendation.moduleChapters, [4, 7, 4, 4], 'estructura exigida igual: sí');
+    eq(DR(c4744, [st([4, 5, 4, 4])]).documentRecommendation, null, 'estructura exigida distinta: no');
+    // P2-3: una estructura desigual exigida SOLO por requisito (sin contenidos por unidad) no se ofrece como «Como el documento».
+    const noUnits = clone(pilot); noUnits.units = [];
+    eq(DR(noUnits, [st([4, 5, 4, 4])]), { documentRecommendation: null, note: null }, 'sin contenidos por unidad');
+    eq(SO.recommendShape([st([4, 5, 4, 4])], null, 28).moduleChapters, undefined, 'y `recommended` no es desigual (como en staging)');
+    eq(DR(null), { documentRecommendation: null, note: null }, 'sin documento');
+    // La razón cuenta lo real (unidades sin contenidos se dicen).
+    const withEmpty = clone(a1a2); withEmpty.units.push({ ...clone(withEmpty.units[0]), id: 'U5', title: 'Unidad vacía', contents: [] });
+    eq(DR(withEmpty).documentRecommendation.reason, 'Como el documento: 4 unidades con 4 / 5 / 4 / 4 contenidos. Cada unidad es un módulo y cada uno de sus 17 contenidos, un capítulo, en el orden del documento. Una unidad sin contenidos no se usa.', 'unidad vacía');
+  });
+
+  await check('US2b compatibilidad: un cliente anterior ve structure-options IDÉNTICO a origin/staging (también desigual)', async () => {
+    const now = await legacyCases(DIST, ctxs);
+    const ref = BASE ? await legacyCases(BASE, await contexts(BASE)) : JSON.parse(fs.readFileSync(GOLDEN, 'utf8')).legacyOptions;
+    assert(ref && Object.keys(ref).length === Object.keys(ctxs).length, 'huellas de structure-options en el golden');
+    eq(Object.keys(ref).filter((k) => now[k] !== ref[k]), [], 'respuestas distintas para un cliente anterior');
+    const o = await optionsOf(DIST, a1a2b);
+    eq([o.recommended, o.documentRecommendation && o.documentRecommendation.moduleChapters, o.document.contentShape, 'evenAlternative' in o], [SO.recommendShape([], [4, 5, 4, 5], 64), [4, 7, 4, 5], [4, 7, 4, 5], false], 'campos nuevos aparte; `recommended` de siempre');
+    const big = await optionsOf(DIST, ctxs.big31);
+    eq([big.documentRecommendation, big.documentRecommendationNote], [null, EXPECTED_DOC_RECOMMENDATIONS.big31.note], 'más de 30 contenidos: se explica');
+    if (!BASE) eq(JSON.parse(fs.readFileSync(GOLDEN, 'utf8')).intentional, EXPECTED_DOC_RECOMMENDATIONS, 'el golden documenta el cambio esperado');
   });
 
   await check('US3 propuesta con la forma del documento: esos capítulos por módulo, en orden, ni omitidos ni duplicados', () => {
@@ -384,6 +458,18 @@ function nxmCases(root, ctxs) {
           assert(per.every((n, i) => n >= c.shape[i]), `${c.name} USD ${usd}: el diseño mostrado conserva ${c.shape} (${per})`);
         }
         console.log(`   ${c.name} · presupuesto USD ${usd.toFixed(2)} → ${fit.status}`);
+      }
+      // El texto del tope («Hasta N capítulos de contenido por módulo») dice qué módulos conservan más (no los recorta).
+      if (c.shape.some((n) => n > 5)) {
+        const capped = [90, 100, 110].map((usd) => F.fitDesignToBudget({ base: { structure: clone(structure), profile: profile(80), activityTypeRules: 2 }, budgetUsd: usd, levers: LEVERS }))
+          .flatMap((r) => (r.reasons || []).filter((t) => /^Hasta \d/.test(t)).map((t) => ({ t, per: r.chosen.structure.contentByModule })));
+        assert(capped.length > 0, `${c.name}: algún diseño con tope`);
+        for (const x of capped) {
+          const cap = Number(x.t.match(/^Hasta (\d+)/)[1]);
+          const over = x.per.map((n, i) => ({ n, i })).filter((y) => y.n > cap);
+          assert(over.length > 0 && over.every((y) => x.t.includes(`${y.i + 1}`) && x.t.includes(`${y.n}`)) && /Cursia no quita capítulos/.test(x.t), `${c.name}: «${x.t}» con ${x.per}`);
+        }
+        console.log(`   ${c.name} · texto del tope: «${capped[0].t.slice(0, 120)}…»`);
       }
       // Verificación: la estructura desigual frente a un formato (siempre parejo) se dice con su forma real.
       const fit = CF.formatFit(CF.COURSE_FORMATS.M, structure.modules, 28);
@@ -529,12 +615,19 @@ async function dbChecks({ a1a2b, CD }) {
     await check('US9 DB: structure-options → preview → aplicar «Como el documento» 4/7/4/5 → diseño (horas y costo)', async () => {
       const c = await newCourse('A1-A2 desigual');
       const o = await design.structureOptions(c.id, OWNER);
-      eq([o.document.shape, o.document.contentShape, o.recommended.moduleChapters, o.recommended.fromDocument], [[4, 5, 4, 5], [4, 7, 4, 5], [4, 7, 4, 5], true], 'opciones');
-      eq([o.evenAlternative.modules, o.evenAlternative.chaptersPerModule], [4, 4], 'la pareja de antes, como alternativa');
-      const pv = await design.structurePreview(c.id, OWNER, { modules: o.recommended.modules, chaptersPerModule: o.recommended.chaptersPerModule, moduleChapters: o.recommended.moduleChapters }, null);
+      const dr = o.documentRecommendation;
+      eq([o.document.shape, o.document.contentShape, dr && dr.moduleChapters, o.recommended.moduleChapters, [o.recommended.modules, o.recommended.chaptersPerModule]], [[4, 5, 4, 5], [4, 7, 4, 5], [4, 7, 4, 5], undefined, [4, 4]], 'opciones');
+      const pv = await design.structurePreview(c.id, OWNER, { modules: dr.modules, chaptersPerModule: dr.chaptersPerModule, moduleChapters: dr.moduleChapters }, null);
       eq([pv.coverage, pv.label], [{ total: 20, assigned: 20, duplicated: 0 }, '4 módulos (4, 7, 4, 5 capítulos de contenido)'], 'vista previa');
       const shape = { modules: 4, chaptersPerModule: 7, moduleChapters: [4, 7, 4, 5] };
-      const res = await structure.applyAcademicStructure(c.id, OWNER, { expectedCounter: await counter(c.id), contextVersion: c.v, choice: 'cursia', shape });
+      // «Como el documento» con otra forma: rechazado.
+      let vmsg = '';
+      try { await structure.applyAcademicStructure(c.id, OWNER, { expectedCounter: await counter(c.id), contextVersion: c.v, choice: 'cursia', variant: 'document', shape: { modules: 4, chaptersPerModule: 4 } }); } catch (e) { vmsg = JSON.stringify((e.getResponse && e.getResponse()) || e.message); }
+      assert(/INVALID_CHOICE/.test(vmsg), 'variante «document» con otra forma: ' + vmsg);
+      let cmsg = '';
+      try { await structure.applyAcademicStructure(c.id, OWNER, { expectedCounter: await counter(c.id), contextVersion: c.v, choice: 'custom', variant: 'document', shape }); } catch (e) { cmsg = JSON.stringify((e.getResponse && e.getResponse()) || e.message); }
+      assert(/INVALID_CHOICE/.test(cmsg), 'variante sin «cursia»: ' + cmsg);
+      const res = await structure.applyAcademicStructure(c.id, OWNER, { expectedCounter: await counter(c.id), contextVersion: c.v, choice: 'cursia', variant: 'document', shape });
       assert(res && res.replaced, 'aplicada: ' + JSON.stringify(res).slice(0, 200));
       eq(await live(c.id), [4, 7, 4, 5], 'estructura viva');
       // Trazabilidad guardada: cada capítulo vivo con su contenido del documento; los 20, una vez cada uno.
@@ -544,7 +637,7 @@ async function dbChecks({ a1a2b, CD }) {
       const cv = CCV.contentCoverage(a1a2b, c.v, cmap, liveIds);
       eq([cv.available, cv.total, cv.covered, cv.omitted.length, cv.duplicated.length], [true, 20, 20, 0, 0], 'cobertura guardada');
       const after = await design.structureOptions(c.id, OWNER);
-      eq([after.current.choice, after.current.shape], ['cursia', [4, 7, 4, 5]], 'elección vigente');
+      eq([after.current.choice, after.current.shape, after.current.variant], ['cursia', [4, 7, 4, 5], 'document'], 'elección vigente, con su variante');
       const rec = await design.recommend(c.id, OWNER, {});
       eq([rec.design.manifestErrors, rec.providersCalled], [[], 0], 'diseño materializado, sin proveedores');
       const per = rec.design.modules.map((m) => m.chapters.filter((ch) => (ch.kind || 'content') !== 'practice').length);
@@ -567,6 +660,10 @@ async function dbChecks({ a1a2b, CD }) {
       const res = await structure.applyAcademicStructure(c.id, OWNER, { expectedCounter: before, contextVersion: c.v, choice: 'custom', confirmReplace: true, shape: { modules: 4, chaptersPerModule: 7, moduleChapters: [4, 7, 4, 5] } });
       assert(res, 'personalizada desigual');
       eq(await live(c.id), [4, 7, 4, 5], 'personalizada desigual aplicada');
+      eq((await design.structureOptions(c.id, OWNER)).current.variant, undefined, 'personalizada: sin variante');
+      await structure.applyAcademicStructure(c.id, OWNER, { expectedCounter: await counter(c.id), contextVersion: c.v, choice: 'cursia', variant: 'cursia', confirmReplace: true, shape: { modules: 4, chaptersPerModule: 4 } });
+      const o = await design.structureOptions(c.id, OWNER);
+      eq([o.current.choice, o.current.variant, o.current.shape], ['cursia', 'cursia', [4, 4, 4, 4]], 'la pareja recomendada, con su variante');
     });
   } finally {
     if (ds) await ds.destroy().catch(() => {});

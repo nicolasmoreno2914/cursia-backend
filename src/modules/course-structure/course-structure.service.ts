@@ -98,7 +98,7 @@ import {
   writeStructureOrigin,
   liveStructureShape,
 } from './structure-authority';
-import { normalizeShape, proposeShapedStructureFromContext, proposeStructureFromContext } from '../academic-context/context-design';
+import { documentContentShape, normalizeShape, proposeShapedStructureFromContext, proposeStructureFromContext, shapeChapterCounts } from '../academic-context/context-design';
 import { contentsFingerprint, writeContentMap } from '../academic-context/content-coverage';
 import { COURSE_FORMATS, readCourseFormat } from '../prebrief/course-formats';
 import { validateAcademicContext } from '../academic-context/validate';
@@ -512,6 +512,19 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'INVALID_SHAPE', message: 'INVALID_SHAPE: la estructura debe tener entre 1 y 50 módulos y entre 1 y 30 capítulos por módulo (moduleChapters: uno por módulo, el mayor = chaptersPerModule).' });
       }
+      // r109 M3b: la variante solo acompaña a «Cursia recomienda»; «document» exige la forma exacta del documento.
+      if (dto.variant && dto.choice !== 'cursia') {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'INVALID_CHOICE', message: 'INVALID_CHOICE: la variante solo acompaña a «Cursia recomienda».' });
+      }
+      if (dto.variant === 'document') {
+        const want = documentContentShape(academic.context);
+        const got = shape ? shapeChapterCounts(shape) : [];
+        if (!want || want.length !== got.length || want.some((n, i) => n !== got[i])) {
+          await queryRunner.rollbackTransaction();
+          throw new BadRequestException({ code: 'INVALID_CHOICE', message: 'INVALID_CHOICE: «Como el documento» usa un módulo por unidad y un capítulo por contenido del documento.' });
+        }
+      }
       if (dto.choice === 'format') {
         const fmt = await readCourseFormat(queryRunner, courseId);
         const def = fmt ? COURSE_FORMATS[fmt.code] : null;
@@ -652,7 +665,7 @@ export class CourseStructureService implements OnModuleInit {
         [courseId, proposal.finalExam],
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
-      await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) });
+      await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}), ...(dto.variant ? { variant: dto.variant } : {}) });
       await writeContentMap(queryRunner, courseId, { version: 1, contextVersion: academic.version, chapters: contentMap, contentsSha: contentsFingerprint(academic.context), at: new Date().toISOString() });
       // (El formato se quita ANTES con PUT /format null, que también devuelve sus horas: ver la validación de arriba.)
       const structure = await this.readStructure(queryRunner, courseId, ownerId);
