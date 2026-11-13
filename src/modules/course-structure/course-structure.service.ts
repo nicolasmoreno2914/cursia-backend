@@ -98,7 +98,7 @@ import {
   writeStructureOrigin,
   liveStructureShape,
 } from './structure-authority';
-import { proposeShapedStructureFromContext, proposeStructureFromContext } from '../academic-context/context-design';
+import { normalizeShape, proposeShapedStructureFromContext, proposeStructureFromContext } from '../academic-context/context-design';
 import { contentsFingerprint, writeContentMap } from '../academic-context/content-coverage';
 import { COURSE_FORMATS, readCourseFormat } from '../prebrief/course-formats';
 import { validateAcademicContext } from '../academic-context/validate';
@@ -506,16 +506,22 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new ConflictException({ code: 'FORMAT_STILL_SET', message: 'FORMAT_STILL_SET: el curso tiene un formato S/M/L elegido; quítalo antes de usar otra estructura.' });
       }
+      // r109 M3b: la forma puede ser desigual (moduleChapters); una desigual con todos iguales es la N × M de siempre.
+      const shape = dto.shape ? normalizeShape(dto.shape) : null;
+      if (dto.shape && !shape) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'INVALID_SHAPE', message: 'INVALID_SHAPE: la estructura debe tener entre 1 y 50 módulos y entre 1 y 30 capítulos por módulo (moduleChapters: uno por módulo, el mayor = chaptersPerModule).' });
+      }
       if (dto.choice === 'format') {
         const fmt = await readCourseFormat(queryRunner, courseId);
         const def = fmt ? COURSE_FORMATS[fmt.code] : null;
-        if (!def || def.modules !== dto.shape!.modules || def.chaptersPerModule !== dto.shape!.chaptersPerModule) {
+        if (!def || !shape || shape.moduleChapters || def.modules !== shape.modules || def.chaptersPerModule !== shape.chaptersPerModule) {
           await queryRunner.rollbackTransaction();
           throw new BadRequestException({ code: 'FORMAT_CHOICE_MISMATCH', message: 'FORMAT_CHOICE_MISMATCH: guarda primero el formato elegido; la forma debe ser la del formato.' });
         }
       }
       // Fase 3: con una forma elegida, los contenidos del documento se reparten en ella (cada uno en un solo capítulo).
-      const proposal = dto.shape ? proposeShapedStructureFromContext(academic.context, dto.shape) : proposeStructureFromContext(academic.context);
+      const proposal = shape ? proposeShapedStructureFromContext(academic.context, shape) : proposeStructureFromContext(academic.context);
       if (!proposal.available) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_STRUCTURE_IN_CONTEXT', message: `NO_STRUCTURE_IN_CONTEXT: ${proposal.reason}` });

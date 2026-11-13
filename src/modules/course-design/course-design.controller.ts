@@ -46,12 +46,12 @@ export class CourseDesignController {
     return this.service.structureOptions(courseId, access.effectiveOwnerId);
   }
 
-  // POST /api/v1/courses/:courseId/design/structure-preview  body { modules, chaptersPerModule, format? } → vista previa (Fase 2/3)
+  // POST /api/v1/courses/:courseId/design/structure-preview  body { modules, chaptersPerModule, moduleChapters?, format? } → vista previa (Fase 2/3; r109 M3b: desigual)
   @Post('structure-preview')
   @HttpCode(200)
   @RequirePermission('courses.view', { course: 'param:courseId' })
   structurePreview(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: StructurePreviewDto, @CurrentUser() user: AuthUser, @Access() access: AccessContext) {
-    return this.service.structurePreview(courseId, access.effectiveOwnerId, { modules: dto.modules, chaptersPerModule: dto.chaptersPerModule }, dto.format ?? null);
+    return this.service.structurePreview(courseId, access.effectiveOwnerId, { modules: dto.modules, chaptersPerModule: dto.chaptersPerModule, ...(dto.moduleChapters ? { moduleChapters: dto.moduleChapters } : {}) }, dto.format ?? null);
   }
 
   // POST /api/v1/courses/:courseId/design/fix  body { action: 'link_outcomes', expectedCounter } → «Corregir» automático (LOOP 8.4)

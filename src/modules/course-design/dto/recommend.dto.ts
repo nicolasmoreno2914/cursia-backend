@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 
 /** LOOP 8.3 · «Ajustar»: cambios sobre el diseño que se recalcula (nada se guarda). Ausente = lo que ya decidió el curso. */
 export class DesignAdjustDto {
@@ -123,6 +123,19 @@ export class StructurePreviewDto {
   @Min(1)
   @Max(30)
   chaptersPerModule: number;
+
+  /**
+   * r109 M3b · forma desigual: capítulos de contenido de cada módulo, en orden (p. ej. [4, 5, 4, 4]). Con ella,
+   * `modules` = su largo y `chaptersPerModule` = el mayor (si no coinciden: INVALID_SHAPE). Ausente = N × M.
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(50)
+  @IsInt({ each: true })
+  @Min(1, { each: true })
+  @Max(30, { each: true })
+  moduleChapters?: number[];
 
   @IsOptional()
   @IsIn(['S', 'M', 'L'])

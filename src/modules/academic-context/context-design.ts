@@ -358,15 +358,63 @@ export function proposeStructureFromContext(ctx: AcademicContextV1): ContextStru
 
 // ── 2b. Redistribución en otra forma (Fase 3) ─────────────────────────────────────────────────────────────────
 
-/** Forma elegida: N módulos × M capítulos de contenido (las prácticas las agrega el diseño, no cuentan aquí). */
-export interface StructureShape { modules: number; chaptersPerModule: number }
+/**
+ * Forma elegida: N módulos × M capítulos de contenido (las prácticas las agrega el diseño, no cuentan aquí).
+ * r109 M3b · forma DESIGUAL: `moduleChapters` = capítulos de contenido de cada módulo, en orden (p. ej. [4, 5, 4, 4]);
+ * entonces `modules = moduleChapters.length` y `chaptersPerModule` = el mayor (lo que leen los consumidores N × M de
+ * siempre como tope por módulo). Sin `moduleChapters` (o con todos iguales) es la forma N × M de siempre.
+ */
+export interface StructureShape { modules: number; chaptersPerModule: number; moduleChapters?: number[] }
 /** Validación de entrada (no es una capacidad: el editor no tiene máximo); evita pedidos absurdos a la API. */
 export const SHAPE_INPUT_MAX = Object.freeze({ modules: 50, chaptersPerModule: 30 });
 
+const inRange = (n: unknown, max: number) => Number.isInteger(n) && (n as number) >= 1 && (n as number) <= max;
+
 export function isValidShape(s: unknown): s is StructureShape {
   const o = s as StructureShape;
-  return !!o && Number.isInteger(o.modules) && Number.isInteger(o.chaptersPerModule) && o.modules >= 1 && o.chaptersPerModule >= 1
-    && o.modules <= SHAPE_INPUT_MAX.modules && o.chaptersPerModule <= SHAPE_INPUT_MAX.chaptersPerModule;
+  if (!o || !inRange(o.modules, SHAPE_INPUT_MAX.modules) || !inRange(o.chaptersPerModule, SHAPE_INPUT_MAX.chaptersPerModule)) return false;
+  if (o.moduleChapters === undefined || o.moduleChapters === null) return true;
+  const mc = o.moduleChapters;
+  // r109 M3b: la forma desigual, con los mismos topes; modules y chaptersPerModule tienen que decir lo mismo que ella.
+  return Array.isArray(mc) && mc.length === o.modules && mc.every((n) => inRange(n, SHAPE_INPUT_MAX.chaptersPerModule))
+    && Math.max(...mc) === o.chaptersPerModule;
+}
+
+/**
+ * r109 M3b · la forma de una entrada de la API: `{ modules, chaptersPerModule }` (N × M) o con `moduleChapters` (desigual;
+ * modules y chaptersPerModule se deducen si faltan). Una forma desigual con todos los módulos iguales vuelve a ser N × M
+ * (los mismos bytes de siempre). null = inválida.
+ */
+export function normalizeShape(s: unknown): StructureShape | null {
+  if (!s || typeof s !== 'object') return null;
+  const o = s as Partial<StructureShape>;
+  if (o.moduleChapters === undefined || o.moduleChapters === null) {
+    const even = { modules: o.modules as number, chaptersPerModule: o.chaptersPerModule as number };
+    return isValidShape(even) ? even : null;
+  }
+  const mc = o.moduleChapters;
+  if (!Array.isArray(mc) || !mc.length || !mc.every((n) => inRange(n, SHAPE_INPUT_MAX.chaptersPerModule))) return null;
+  const out: StructureShape = { modules: mc.length, chaptersPerModule: Math.max(...mc) };
+  if ((o.modules !== undefined && o.modules !== out.modules) || (o.chaptersPerModule !== undefined && o.chaptersPerModule !== out.chaptersPerModule)) return null;
+  if (mc.some((n) => n !== mc[0])) out.moduleChapters = [...mc];
+  return isValidShape(out) ? out : null;
+}
+
+/** Capítulos de contenido de cada módulo de la forma (N × M → N veces M). */
+export function shapeChapterCounts(s: StructureShape): number[] {
+  return s.moduleChapters && s.moduleChapters.length ? [...s.moduleChapters] : Array.from({ length: s.modules }, () => s.chaptersPerModule);
+}
+
+/** ¿La forma es desigual (algún módulo con otra cantidad de capítulos)? */
+export function isUnevenShape(s: StructureShape): boolean {
+  const c = shapeChapterCounts(s);
+  return c.some((n) => n !== c[0]);
+}
+
+/** «4 × 5» o, desigual, «4 módulos (4, 5, 4, 4 capítulos)» (con `content`, «capítulos de contenido»). */
+export function shapeLabel(s: StructureShape, opts?: { content?: boolean }): string {
+  if (!isUnevenShape(s)) return `${s.modules} × ${s.chaptersPerModule}`;
+  return `${s.modules} ${s.modules === 1 ? 'módulo' : 'módulos'} (${shapeChapterCounts(s).join(', ')} ${opts?.content ? 'capítulos de contenido' : 'capítulos'})`;
 }
 
 /** Reparte en EXACTAMENTE k grupos consecutivos lo más parejos posible (los primeros, uno más; puede haber vacíos). */
@@ -384,10 +432,39 @@ function splitEven<T>(xs: T[], k: number): T[][] {
   return out;
 }
 
+/**
+ * r109 M3b · reparte en grupos consecutivos de tamaño proporcional a `weights` (restos mayores; empates, los primeros).
+ * Con todos los pesos iguales da lo mismo que splitEven.
+ */
+function splitWeighted<T>(xs: T[], weights: number[]): T[][] {
+  const W = weights.reduce((a, b) => a + b, 0);
+  const exact = weights.map((w) => (xs.length * w) / W);
+  const sizes = exact.map(Math.floor);
+  let left = xs.length - sizes.reduce((a, b) => a + b, 0);
+  const order = exact.map((e, i) => ({ i, r: e - Math.floor(e) })).sort((a, b) => b.r - a.r || a.i - b.i);
+  for (const o of order) { if (left <= 0) break; sizes[o.i]++; left--; }
+  const out: T[][] = [];
+  let at = 0;
+  for (const n of sizes) { out.push(xs.slice(at, at + n)); at += n; }
+  return out;
+}
+
 /** Forma que trae el documento (capítulos de contenido por módulo), o null si no trae unidades con contenidos. */
 export function documentStructureShape(ctx: AcademicContextV1): number[] | null {
   const p = proposeStructureFromContext(ctx);
   return p.available ? p.modules.map((m) => m.chapters.length) : null;
+}
+
+/**
+ * r109 M3b · contenidos de cada unidad del documento (las unidades sin contenidos no cuentan), en orden: la forma «como el
+ * documento» (cada unidad, un módulo; cada contenido, un capítulo). A diferencia de `documentStructureShape`, no agrupa
+ * los contenidos de una unidad larga en el tope de capítulos que el distribuidor agrega por su cuenta (5): una unidad con
+ * 7 contenidos son 7 capítulos. Tope: el de la entrada (SHAPE_INPUT_MAX). null si no trae unidades con contenidos.
+ */
+export function documentContentShape(ctx: AcademicContextV1): number[] | null {
+  const units = ctx.units.filter((u) => u.contents.length > 0);
+  if (!units.length || units.length > SHAPE_INPUT_MAX.modules) return null;
+  return units.map((u) => Math.min(SHAPE_INPUT_MAX.chaptersPerModule, u.contents.length));
 }
 
 /**
@@ -448,12 +525,32 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
   };
   const N = shape.modules;
   const M = shape.chaptersPerModule;
+  // r109 M3b: capítulos de cada módulo (N × M: todos M) y su total.
+  const counts = shapeChapterCounts(shape);
+  const uneven = isUnevenShape(shape);
+  const total = counts.reduce((a, b) => a + b, 0);
+  const label = shapeLabel(shape);
   const realOn = opts?.realChapters ?? process.env.DYNAMIC_REAL_CHAPTERS === 'true';
-  const items = realOn && docItems.length < N * M ? expandBySubtopics(docItems, N * M) : docItems;
+  // r109 M3b: una forma desigual con un módulo por unidad del documento sigue a las unidades (cada unidad es su módulo,
+  // con sus contenidos en orden); los subtemas, si hacen falta, se reparten dentro de cada unidad. Si no, los contenidos
+  // se reparten en orden en grupos proporcionales a los capítulos de cada módulo. N × M: lo de siempre.
+  const byUnit = uneven && counts.length === units.length;
+  let items: ShapedItem[];
+  let groups: ShapedItem[][];
+  if (byUnit) {
+    groups = units.map((u, i) => {
+      const own = docItems.filter((x) => x.u === u);
+      return realOn && own.length < counts[i] ? expandBySubtopics(own, counts[i]) : own;
+    });
+    items = groups.flat();
+  } else {
+    items = realOn && docItems.length < total ? expandBySubtopics(docItems, total) : docItems;
+    groups = uneven ? splitWeighted(items, counts) : splitEven(items, N);
+  }
   const pieces = items.length - docItems.length;
   let extraChapters = 0;
   let skippedTotal = 0;
-  const modules: ContextModuleProposal[] = splitEven(items, N).map((group, mi) => {
+  const modules: ContextModuleProposal[] = groups.map((group, mi) => {
     // Título del módulo: la unidad que más contenidos aporta; las demás que aporta quedan nombradas en la descripción.
     const spanned = [...new Map(group.map((x) => [x.u.id, x.u])).values()];
     const dominant = spanned.map((u) => ({ u, n: group.filter((x) => x.u === u).length })).sort((a, b) => b.n - a.n)[0];
@@ -461,7 +558,7 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
     const moduleTitle = uniqueTitle(t.title, `M${mi + 1}`);
     const unitLinks = [...new Set(spanned.flatMap((u) => u.outcomeIds))];
     let skipped = 0;
-    const chapters = splitEven(group, M).map((g, ci): ContextChapterProposal | null => {
+    const chapters = splitEven(group, counts[mi]).map((g, ci): ContextChapterProposal | null => {
       if (g.length) {
         const links = [...new Set(g.flatMap((x) => x.u.outcomeIds))];
         const ch = chapterFromContents(g.map((x) => x.c), links, outcomes, raOnly, (tt) => uniqueTitle(tt, `${mi + 1}.${ci + 1}`));
@@ -497,12 +594,17 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
     };
   });
   const docShape = units.map((u) => Math.min(DISTRIBUTOR_RULES.maxContentChaptersPerModule, u.contents.length));
-  notes.push(`Los ${docItems.length} contenidos de las ${units.length} unidades del documento quedan en ${N} × ${M}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
-  if (pieces > 0) notes.push(`Para completar ${N} × ${M}, ${pieces === 1 ? 'un capítulo sale' : `${pieces} capítulos salen`} de repartir los subtemas que el documento enumera en sus contenidos (en su orden; ningún tema se inventa).`);
-  if (items.length > N * M) notes.push(`Hay más contenidos (${items.length}) que capítulos (${N * M}): algunos capítulos agrupan varios contenidos y los listan.`);
+  const asDocument = byUnit && units.every((u, i) => u.contents.length === counts[i]);
+  notes.push(asDocument
+    ? `Como el documento: cada una de sus ${units.length} unidades es un módulo y cada uno de sus ${docItems.length} contenidos, un capítulo, en su orden (ninguno se pierde ni se repite).`
+    : `Los ${docItems.length} contenidos de las ${units.length} unidades del documento quedan en ${label}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
+  if (pieces > 0) notes.push(`Para completar ${label}, ${pieces === 1 ? 'un capítulo sale' : `${pieces} capítulos salen`} de repartir los subtemas que el documento enumera en sus contenidos (en su orden; ningún tema se inventa).`);
+  if (!byUnit && items.length > total) notes.push(`Hay más contenidos (${items.length}) que capítulos (${total}): algunos capítulos agrupan varios contenidos y los listan.`);
+  if (byUnit && groups.some((g, i) => g.length > counts[i])) notes.push(`Algunos módulos tienen más contenidos que capítulos: esos capítulos agrupan varios contenidos y los listan.`);
   if (skippedTotal) notes.push(`${skippedTotal === 1 ? 'Un capítulo de la forma elegida no se crea' : `${skippedTotal} capítulos de la forma elegida no se crean`}: el documento no trae más contenidos ni subtemas para ellos y Cursia no crea capítulos sin tema. La carga horaria se completa con práctica, Actividades de Aplicación y ejercicios guiados, o la diferencia se informa en «Verificación».`);
-  if (extraChapters - skippedTotal > 0) notes.push(`${extraChapters - skippedTotal === 1 ? 'Un capítulo no tiene' : `${extraChapters - skippedTotal} capítulos no tienen`} contenido del documento (el documento trae ${items.length} ${pieces ? 'contenidos y subtemas' : 'contenidos'} para ${N * M} capítulos): quedan como profundización.`);
-  if (N !== units.length || docShape.some((n) => n !== M)) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${docShape.join(', ')} contenidos por unidad); la estructura elegida es ${N} × ${M}.`);
+  if (extraChapters - skippedTotal > 0) notes.push(`${extraChapters - skippedTotal === 1 ? 'Un capítulo no tiene' : `${extraChapters - skippedTotal} capítulos no tienen`} contenido del documento (el documento trae ${items.length} ${pieces ? 'contenidos y subtemas' : 'contenidos'} para ${total} capítulos): quedan como profundización.`);
+  if (!uneven && (N !== units.length || docShape.some((n) => n !== M))) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${docShape.join(', ')} contenidos por unidad); la estructura elegida es ${N} × ${M}.`);
+  if (uneven && !asDocument) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${units.map((u) => u.contents.length).join(', ')} contenidos por unidad); la estructura elegida es ${label}.`);
   return finishContextProposal(ctx, modules, notes);
 }
 

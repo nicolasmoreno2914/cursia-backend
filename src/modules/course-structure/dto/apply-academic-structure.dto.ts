@@ -1,7 +1,7 @@
 import { Type } from 'class-transformer';
-import { IsBoolean, IsIn, IsInt, IsOptional, Max, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, Max, Min, ValidateNested } from 'class-validator';
 
-/** Fase 3: forma elegida (N módulos × M capítulos de contenido); validación de entrada, no una capacidad. */
+/** Fase 3: forma elegida (N módulos × M capítulos de contenido, o desigual con moduleChapters); validación de entrada, no una capacidad. */
 export class StructureShapeDto {
   @IsInt()
   @Min(1)
@@ -12,6 +12,16 @@ export class StructureShapeDto {
   @Min(1)
   @Max(30)
   chaptersPerModule: number;
+
+  /** r109 M3b · forma desigual (capítulos de contenido de cada módulo, en orden); ausente = N × M. */
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(50)
+  @IsInt({ each: true })
+  @Min(1, { each: true })
+  @Max(30, { each: true })
+  moduleChapters?: number[];
 }
 
 // LOOP 8.0: POST /courses/:courseId/modules/apply-academic-structure — reemplaza la estructura con la del
