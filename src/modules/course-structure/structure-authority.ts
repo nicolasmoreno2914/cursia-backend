@@ -25,6 +25,12 @@ export type StructureOriginSource = (typeof STRUCTURE_ORIGIN_SOURCES)[number];
  */
 export const STRUCTURE_CHOICES = ['document', 'cursia', 'format', 'custom'] as const;
 export type StructureChoice = (typeof STRUCTURE_CHOICES)[number];
+/**
+ * r109 M3b · con «Cursia recomienda», cuál de sus dos propuestas se usó: la forma del documento (un módulo por unidad, un
+ * capítulo por contenido) o la recomendación pareja. Opcional: orígenes anteriores no la tienen.
+ */
+export const STRUCTURE_VARIANTS = ['document', 'cursia'] as const;
+export type StructureVariant = (typeof STRUCTURE_VARIANTS)[number];
 
 export interface StructureOrigin {
   source: StructureOriginSource;
@@ -41,6 +47,8 @@ export interface StructureOrigin {
   shape?: number[];
   /** Fase 2: la opción elegida (solo presente si se eligió en la pantalla de estructura). */
   choice?: StructureChoice;
+  /** r109 M3b: con choice «cursia», qué propuesta se usó (ausente = anterior a r109). */
+  variant?: StructureVariant;
 }
 
 export type StructureReplaceReason = 'user_edits' | 'confirmed_blueprint';
@@ -72,7 +80,8 @@ export function parseStructureOrigin(v: unknown): StructureOrigin | null {
   const contextVersion = typeof cv === 'number' && Number.isInteger(cv) && cv >= 1 ? cv : null;
   const shape = Array.isArray(o.shape) && o.shape.length > 0 && o.shape.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0) ? (o.shape as number[]) : null;
   const choice = (STRUCTURE_CHOICES as readonly string[]).includes(o.choice as string) ? (o.choice as StructureChoice) : null;
-  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '', ...(shape ? { shape } : {}), ...(choice ? { choice } : {}) };
+  const variant = choice === 'cursia' && (STRUCTURE_VARIANTS as readonly string[]).includes(o.variant as string) ? (o.variant as StructureVariant) : null;
+  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '', ...(shape ? { shape } : {}), ...(choice ? { choice } : {}), ...(variant ? { variant } : {}) };
 }
 
 const blank = (v: unknown) => v === null || v === undefined || !String(v).trim();

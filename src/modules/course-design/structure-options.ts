@@ -9,6 +9,9 @@
 import type { DocumentRequirement } from '../academic-context/requirements/requirements';
 import { requirementText } from '../academic-context/requirements/requirement-authority';
 import { COURSE_FORMATS, CourseFormatCode } from '../prebrief/course-formats';
+import { isUnevenShape, proposeShapedStructureFromContext, shapeChapterCounts, shapeLabel, SHAPE_INPUT_MAX } from '../academic-context/context-design';
+import { documentContents } from '../academic-context/content-coverage';
+import type { AcademicContextV1 } from '../academic-context/academic-context';
 import type { StructureShape } from '../academic-context/context-design';
 
 export interface StructureDifference {
@@ -51,15 +54,23 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
 export function shapeDifferences(required: DocumentRequirement[], shape: StructureShape, formatCode?: CourseFormatCode | null): StructureDifference[] {
   const s = structuralRequirements(required);
   const out: StructureDifference[] = [];
+  // r109 M3b: con una forma desigual, «capítulos por módulo» se compara módulo a módulo (se dice el primero que no cumple).
+  const counts = shapeChapterCounts(shape);
+  const uneven = isUnevenShape(shape);
   for (const r of s.modules) {
     if (!meets(r, shape.modules)) out.push({ kind: 'modules', text: `El documento establece ${requirementText(r)} y has seleccionado ${plural(shape.modules, 'módulo', 'módulos')}.` });
   }
   for (const r of s.chapters) {
-    if (!meets(r, shape.chaptersPerModule)) out.push({ kind: 'chapters', text: `El documento establece ${requirementText(r)} y has seleccionado ${plural(shape.chaptersPerModule, 'capítulo de contenido', 'capítulos de contenido')} por módulo.` });
+    if (!uneven) {
+      if (!meets(r, shape.chaptersPerModule)) out.push({ kind: 'chapters', text: `El documento establece ${requirementText(r)} y has seleccionado ${plural(shape.chaptersPerModule, 'capítulo de contenido', 'capítulos de contenido')} por módulo.` });
+    } else {
+      const bad = counts.map((n, i) => ({ n, i })).filter((x) => !meets(r, x.n));
+      if (bad.length) out.push({ kind: 'chapters', text: `El documento establece ${requirementText(r)} y has seleccionado ${shapeLabel(shape, { content: true })}: ${bad.length === 1 ? `el módulo ${bad[0].i + 1} no cumple` : `los módulos ${bad.map((x) => x.i + 1).join(', ')} no cumplen`}.` });
+    }
   }
   for (const r of s.structure) {
-    const ok = r.shape!.length === shape.modules && r.shape!.every((n) => n === shape.chaptersPerModule);
-    if (!ok) out.push({ kind: 'structure', text: `El documento establece ${requirementText(r)} y has seleccionado ${shape.modules} × ${shape.chaptersPerModule}.` });
+    const ok = r.shape!.length === shape.modules && r.shape!.every((n, i) => n === counts[i]);
+    if (!ok) out.push({ kind: 'structure', text: `El documento establece ${requirementText(r)} y has seleccionado ${shapeLabel(shape)}.` });
   }
   const f = formatCode ? COURSE_FORMATS[formatCode] : null;
   if (f) {
@@ -77,6 +88,11 @@ export function shapeDifferences(required: DocumentRequirement[], shape: Structu
 }
 
 export interface ShapeRecommendation extends StructureShape { reason: string }
+
+/** «4 / 5 / 4 / 4». */
+export function shapeSlashes(counts: number[]): string {
+  return counts.join(' / ');
+}
 
 /**
  * Lo que recomienda Cursia (dentro de lo que exige el documento):
@@ -111,5 +127,68 @@ export function recommendShape(required: DocumentRequirement[], documentShape: n
     modules: reqModules ?? f.modules,
     chaptersPerModule: reqChapters ?? f.chaptersPerModule,
     reason: typeof targetHours === 'number' ? `Para ${String(targetHours).replace('.', ',')} h, la forma del ${f.label} reparte bien el trabajo.` : `La forma del ${f.label}, la más usada.`,
+  };
+}
+
+/**
+ * r109 M3b · «Como el documento»: cada unidad del documento es un módulo y cada uno de sus contenidos, un capítulo, en
+ * orden (sin el tope de 5 que usa el distribuidor al agregar). Es un campo APARTE de `recommended` (que sigue siendo la
+ * recomendación pareja de siempre: un cliente anterior la ve idéntica). Se ofrece SOLO si el documento trae contenidos por
+ * unidad y la forma cumple todo lo que el documento exige de módulos, capítulos por módulo (exacto, mínimo, máximo,
+ * rango…) y estructura; si no, `documentRecommendation` es null y `note` dice por qué. Una estructura desigual exigida
+ * solo por requisito (sin contenidos por unidad) no se ofrece aquí.
+ */
+export interface DocumentShapeRecommendation {
+  modules: number;
+  chaptersPerModule: number;
+  /** Siempre presente (también si es pareja, p. ej. 7 / 7 / 7). */
+  moduleChapters: number[];
+  reason: string;
+}
+export function documentShapeRecommendation(
+  context: AcademicContextV1 | null, required: DocumentRequirement[],
+): { documentRecommendation: DocumentShapeRecommendation | null; note: string | null } {
+  const none = (note: string | null) => ({ documentRecommendation: null, note });
+  if (!context) return none(null);
+  const units = context.units.filter((u) => u.contents.length > 0);
+  if (!units.length) return none(null);
+  const counts = units.map((u) => u.contents.length);
+  const too = units.filter((u) => u.contents.length > SHAPE_INPUT_MAX.chaptersPerModule);
+  if (too.length) {
+    return none(`«Como el documento» no está disponible: ${too.length === 1 ? `la unidad ${too[0].id} trae ${too[0].contents.length} contenidos` : `las unidades ${too.map((u) => `${u.id} (${u.contents.length})`).join(', ')} traen más contenidos`} y un módulo admite hasta ${SHAPE_INPUT_MAX.chaptersPerModule} capítulos.`);
+  }
+  if (units.length > SHAPE_INPUT_MAX.modules) return none(`«Como el documento» no está disponible: el documento trae ${units.length} unidades con contenidos y un curso admite hasta ${SHAPE_INPUT_MAX.modules} módulos.`);
+  const shape: StructureShape = { modules: counts.length, chaptersPerModule: Math.max(...counts), moduleChapters: counts };
+  const diffs = shapeDifferences(required, shape);
+  if (diffs.length) return none(`«Como el documento» (${shapeSlashes(counts)}) no cumple lo que exige el documento: ${diffs.map((d) => d.text.replace(/\.$/, '')).join('; ')}. Cursia recomienda la forma pareja.`);
+  const total = counts.reduce((a, b) => a + b, 0);
+  const skipped = context.units.length - units.length;
+  return {
+    documentRecommendation: {
+      ...shape, moduleChapters: [...counts],
+      reason: `Como el documento: ${plural(units.length, 'unidad', 'unidades')} con ${shapeSlashes(counts)} contenidos. Cada unidad es un módulo y cada uno de sus ${plural(total, 'contenido', 'contenidos')}, un capítulo, en el orden del documento.`
+        + (skipped ? ` ${skipped === 1 ? 'Una unidad sin contenidos no se usa.' : `${skipped} unidades sin contenidos no se usan.`}` : ''),
+    },
+    note: null,
+  };
+}
+
+/**
+ * Fase 2/3 · vista previa de una forma (N × M o desigual): cómo quedan los contenidos del documento, cuántos quedan en
+ * capítulos y en qué se aparta de lo que establece el documento. Función pura (la usa structurePreview y la prueba
+ * scripts/r109/check-r109-uneven-shape.js).
+ */
+export function structurePreviewOf(context: AcademicContextV1 | null, required: DocumentRequirement[], shape: StructureShape, formatCode: CourseFormatCode | null) {
+  const differences = shapeDifferences(required, shape, formatCode);
+  const contents = context ? documentContents(context) : [];
+  // r109 M3b: «4 módulos (4, 5, 4, 4 capítulos de contenido)» solo en la forma desigual (N × M: la respuesta de siempre).
+  const label = shape.moduleChapters ? { label: shapeLabel(shape, { content: true }) } : {};
+  if (!context || !contents.length) return { providersCalled: 0, shape, ...label, differences, plan: null, coverage: null, notes: [] as string[] };
+  const p = proposeShapedStructureFromContext(context, shape);
+  const assigned = p.modules.flatMap((m) => m.chapters.flatMap((c) => c.sourceContentIds));
+  return {
+    providersCalled: 0, shape, ...label, differences, notes: p.notes,
+    plan: p.modules.map((m) => ({ title: m.title, chapters: m.chapters.map((c) => ({ title: c.title, contents: c.sourceContentIds.length, outcomeIds: c.outcomeIds })) })),
+    coverage: { total: contents.length, assigned: new Set(assigned).size, duplicated: assigned.length - new Set(assigned).size },
   };
 }

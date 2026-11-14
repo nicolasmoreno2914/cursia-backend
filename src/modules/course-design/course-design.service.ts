@@ -1,6 +1,6 @@
 import { contentCoverage, contentMapIsStale, documentContents, readContentMap, writeContentMap } from '../academic-context/content-coverage';
-import { documentStructureShape, isValidShape, proposeShapedStructureFromContext } from '../academic-context/context-design';
-import { recommendShape, shapeDifferences, structuralRequirements } from './structure-options';
+import { documentContentShape, documentStructureShape, normalizeShape } from '../academic-context/context-design';
+import { documentShapeRecommendation, recommendShape, structuralRequirements, structurePreviewOf } from './structure-options';
 import { BadRequestException, Injectable, Optional } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
@@ -80,6 +80,8 @@ export class CourseDesignService {
     const auth = await loadRequirementAuthority(this.dataSource, courseId, academic ? academic.context.documents : []);
     const facts = await loadCourseFacts(this.dataSource, courseId);
     const docShape = academic ? documentStructureShape(academic.context) : null;
+    // r109 M3b: los contenidos de cada unidad (sin agrupar): la forma «como el documento».
+    const contentShape = academic ? documentContentShape(academic.context) : null;
     const contents = academic ? documentContents(academic.context) : [];
     const hours = facts.targetHours && typeof facts.targetHours.value === 'number' ? facts.targetHours.value : null;
     const sreq = structuralRequirements(auth.required);
@@ -90,12 +92,14 @@ export class CourseDesignService {
          from public.course_modules m left join public.course_chapters c on c.module_id = m.id where m.course_id = $1 group by m.id, m.position order by m.position`,
       [courseId],
     );
+    // r109 M3b: «Como el documento» va APARTE; `recommended` es la recomendación de siempre (un cliente anterior no cambia).
+    const docRec = documentShapeRecommendation(academic ? academic.context : null, auth.required);
     return {
       providersCalled: 0,
       contextVersion: academic ? academic.version : null,
       hasDocumentContents: contents.length > 0,
       contentsCount: contents.length,
-      document: docShape ? { shape: docShape, modules: docShape.length, chapters: docShape.reduce((a, b) => a + b, 0) } : null,
+      document: docShape ? { shape: docShape, modules: docShape.length, chapters: docShape.reduce((a, b) => a + b, 0), ...(contentShape ? { contentShape } : {}) } : null,
       requirements: {
         modules: sreq.modules.map((r) => requirementText(r)),
         chapters: sreq.chapters.map((r) => requirementText(r)),
@@ -104,8 +108,11 @@ export class CourseDesignService {
       },
       targetHours: hours !== null ? { value: hours, source: facts.targetHours.source } : null,
       recommended: recommendShape(auth.required, docShape, hours),
+      // r109 M3b: un módulo por unidad y un capítulo por contenido (o null con `documentRecommendationNote`: por qué no).
+      documentRecommendation: docRec.documentRecommendation,
+      documentRecommendationNote: docRec.note,
       formats: COURSE_FORMAT_CODES.map((c) => { const f = COURSE_FORMATS[c]; return { code: c, label: f.label, modules: f.modules, chaptersPerModule: f.chaptersPerModule, hoursMin: f.hoursMin, hoursMax: f.hoursMax, targetHours: f.targetHours }; }),
-      current: { choice: origin && origin.choice ? origin.choice : null, format: fmt ? fmt.code : null, shape: live.map((r) => Number(r.n)) },
+      current: { choice: origin && origin.choice ? origin.choice : null, format: fmt ? fmt.code : null, shape: live.map((r) => Number(r.n)), ...(origin && origin.variant ? { variant: origin.variant } : {}) },
     };
   }
 
@@ -113,23 +120,17 @@ export class CourseDesignService {
    * Fase 2/3 · vista previa de una forma: cómo quedan los contenidos del documento (sin aplicar nada), cuántos quedan en
    * capítulos y qué diferencias tiene con lo que establece el documento. Solo lectura, sin proveedores.
    */
-  async structurePreview(courseId: number, ownerId: string, shape: { modules: number; chaptersPerModule: number }, formatCode: string | null) {
+  async structurePreview(courseId: number, ownerId: string, input: { modules: number; chaptersPerModule?: number; moduleChapters?: number[] }, formatCode: string | null) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
-    if (!isValidShape(shape)) throw new BadRequestException('INVALID_SHAPE: la estructura debe tener entre 1 y 50 módulos y entre 1 y 30 capítulos por módulo.');
+    // r109 M3b: N × M o desigual (moduleChapters); una desigual con todos iguales es la N × M de siempre.
+    const shape = normalizeShape(input);
+    if (!shape) throw new BadRequestException('INVALID_SHAPE: la estructura debe tener entre 1 y 50 módulos y entre 1 y 30 capítulos por módulo.');
     const code = formatCode && (COURSE_FORMAT_CODES as readonly string[]).includes(formatCode) ? (formatCode as CourseFormatCode) : null;
+    if (code && shape.moduleChapters) throw new BadRequestException('INVALID_SHAPE: un formato S/M/L tiene la misma cantidad de capítulos en cada módulo.');
     const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(missingProfilesTable);
     const auth = await loadRequirementAuthority(this.dataSource, courseId, academic ? academic.context.documents : []);
-    const differences = shapeDifferences(auth.required, shape, code);
-    const contents = academic ? documentContents(academic.context) : [];
-    if (!academic || !contents.length) return { providersCalled: 0, shape, differences, plan: null, coverage: null, notes: [] };
-    const p = proposeShapedStructureFromContext(academic.context, shape);
-    const assigned = p.modules.flatMap((m) => m.chapters.flatMap((c) => c.sourceContentIds));
-    return {
-      providersCalled: 0, shape, differences, notes: p.notes,
-      plan: p.modules.map((m) => ({ title: m.title, chapters: m.chapters.map((c) => ({ title: c.title, contents: c.sourceContentIds.length, outcomeIds: c.outcomeIds })) })),
-      coverage: { total: contents.length, assigned: new Set(assigned).size, duplicated: assigned.length - new Set(assigned).size },
-    };
+    return structurePreviewOf(academic ? academic.context : null, auth.required, shape, code);
   }
 
   private async loadCourse(courseId: number, ownerId: string) {
