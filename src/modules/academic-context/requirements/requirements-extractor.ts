@@ -509,10 +509,13 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc', opt
   // r109 M3c · forma DESIGUAL («4 módulos con 4, 7, 4 y 5 capítulos», un módulo por renglón, con o sin título). Un documento
   // solo la declara si es realmente desigual (las N × M las lee el lector de siempre, más abajo); la caja del docente
   // siempre. Los tramos que ocupa se quitan del texto: no se leen otra vez como «capítulos» sueltos.
-  {
+  // (Hasta 5 formas: dos formas distintas en el mismo texto se leen las dos y quedan como conflicto, nunca una en silencio.)
+  for (let round = 0; round < 5; round++) {
     const eligible = segs.map((sg) => (sg.option || sg.example || sg.informative || (sg.cells && !declarative) ? '' : sg.text));
     const uneven = findUnevenStructure(eligible, declarative);
-    if (uneven) {
+    if (!uneven) break;
+    let acted = false;
+    {
       const sh = uneven.found.shape;
       const isUneven = sh.some((n) => n !== sh[0]);
       const first = segs[uneven.firstSegment];
@@ -521,6 +524,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc', opt
       const mismatch = uneven.found.declaredModules !== null && uneven.found.declaredModules !== sh.length;
       // Un documento con una cantidad de módulos que no cuadra con lo que lista: no se toca (lo lee el lector de siempre).
       if ((declarative || isUneven) && (declarative || !mismatch)) {
+        acted = true;
         const bySeg = new Map<number, { start: number; end: number }[]>();
         for (const s of uneven.spans) bySeg.set(s.segment, [...(bySeg.get(s.segment) || []), s]);
         for (const [i, sp] of bySeg) segs[i].text = blankSpans(segs[i].text, sp);
@@ -539,6 +543,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc', opt
         }
       }
     }
+    if (!acted) break;
   }
 
   let optionRun: { group: RequirementGroup; labels: Set<string> } | null = null;

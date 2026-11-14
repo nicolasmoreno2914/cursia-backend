@@ -214,6 +214,9 @@ async function main() {
     const hpm = viewOf(null, 'Módulo 1: 4 capítulos (6 h), Módulo 2: 7 capítulos (8 h)\n13 horas');
     assert(hpm.box.notUnderstood.some((n) => /horas por módulo \(próximamente\)/.test(n.reason)), 'horas por módulo: «No entendí todavía … (próximamente)»: ' + JSON.stringify(hpm.box.notUnderstood));
     eq(hpm.items.filter((i) => i.kind === 'target_hours').map((i) => i.value), [13], 'las horas por módulo no se vuelven horas del curso (solo las 13 h)');
+    // Dos formas distintas en la caja: se leen las dos y queda un conflicto visible (nunca se elige una en silencio).
+    const two = viewOf(null, '4 módulos con 4, 7, 4 y 5 capítulos\n3 módulos con 4, 4 y 4 capítulos');
+    assert(two.box.conflicts.length === 1 && /^La caja de requisitos dice dos cosas distintas sobre la estructura/.test(two.box.conflicts[0].message), JSON.stringify(two.box.conflicts));
     const inc = viewOf(null, '3 módulos con 4 y 7 capítulos');
     assert(inc.box.notUnderstood.some((n) => n.line === 1 && /cantidad de módulos/.test(n.reason)), 'módulos que no cuadran con lo listado: ' + JSON.stringify(inc.box.notUnderstood));
     assert(!inc.items.some((i) => i.kind === 'structure'), 'y no se inventa una estructura');
