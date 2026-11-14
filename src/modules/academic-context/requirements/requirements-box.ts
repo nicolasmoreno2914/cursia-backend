@@ -150,6 +150,32 @@ const isStructureFamily = (r: DocumentRequirement) => {
   return r.kind === 'structure' || (r.kind === 'modules' && s.level === 'course') || (r.kind === 'chapters' && (s.level === 'course' || (s.level === 'module' && !!s.each)) && s.chapterKind !== 'practice');
 };
 
+/** ¿El valor `v` cumple lo que pide el requisito (exacto, mínimo, máximo, rango, aproximado)? */
+function meetsValue(r: DocumentRequirement, v: number): boolean {
+  const x = r.value as number;
+  switch (r.mode) {
+    case 'exact': return v === x;
+    case 'min': return v >= x;
+    case 'max': return v <= x;
+    case 'range': return v >= x && v <= (r.valueMax ?? x);
+    case 'approx': return Math.abs(v - x) <= Math.max(1, 0.1 * x);
+    default: return true;
+  }
+}
+
+/**
+ * r109 M3c (ronda 1, P1-2) · una caja PARCIAL («3 módulos», «6 capítulos por módulo») también reemplaza la `structure` del
+ * documento cuando la contradice: esa forma sale de la misma frase que ya se reemplazó, y dejarla activa dejaba dos
+ * requisitos obligatorios que ninguna forma cumple a la vez.
+ */
+function contradictsBoxCount(doc: DocumentRequirement, boxWins: RequirementItem[]): boolean {
+  if (doc.kind !== 'structure' || !doc.shape || !doc.shape.length) return false;
+  const mods = boxWins.find((b) => b.kind === 'modules' && b.scope.level === 'course' && typeof b.value === 'number' && b.obligation === 'required');
+  if (mods && !meetsValue(mods, doc.shape.length)) return true;
+  const chs = boxWins.find((b) => b.kind === 'chapters' && b.scope.level === 'module' && !!(b.scope as { each?: boolean }).each && (b.scope as { chapterKind?: string }).chapterKind !== 'practice' && typeof b.value === 'number' && b.obligation === 'required');
+  return !!chs && doc.shape.some((n) => !meetsValue(chs, n));
+}
+
 function hoursOf(rs: RequirementItem[]): number | null {
   const h = rs.find((r) => r.kind === 'target_hours' && r.scope.level === 'course' && r.applies && typeof r.value === 'number');
   return h ? (h.value as number) : null;
@@ -170,8 +196,11 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
   const replaced = new Set<string>();
   const docItems: RequirementItem[] = view.items.map((it) => {
     if (!it.applies) return it;
-    const by = boxKeys.get(it.key) || (boxStructure && isStructureFamily(it) ? boxStructure : undefined);
+    const by = boxKeys.get(it.key) || (boxStructure && isStructureFamily(it) ? boxStructure : undefined)
+      || (contradictsBoxCount(it, boxWins) ? boxWins.find((b) => b.kind === 'modules' || b.kind === 'chapters') : undefined);
     if (!by) return it;
+    // P2-3: una recomendación de la caja («aproximadamente 28 horas») no vuelve «recomendación» un mínimo obligatorio del documento.
+    if (by.obligation !== 'required' && it.obligation === 'required') return it;
     const message = `La caja de requisitos reemplaza a «${it.source.quote.slice(0, 80)}» del documento.`;
     overrides.push({ boxRequirementId: by.id, documentRequirementId: it.id, message });
     replaced.add(it.id);
@@ -233,7 +262,8 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
   return {
     ...view,
     // Con requisitos de la caja, la vista vale aunque no haya lectura del documento («Requisitos del docente» es una fuente).
-    state: view.state === 'current' || !boxItems.length ? view.state : 'current',
+    // P2-2: una lectura desactualizada del documento (stale) se sigue diciendo; solo «none» (sin documento) pasa a «current».
+    state: view.state === 'none' && boxItems.length ? 'current' : view.state,
     items,
     groups: [...view.groups, ...x.groups],
     conflicts,

@@ -41,6 +41,9 @@ if (process.argv.includes('--bite')) {
     { name: 'el documento reemplazado queda sin aviso', file: 'modules/academic-context/requirements/requirements-box.js', from: 'La caja de requisitos reemplaza a', to: 'x' },
     { name: 'lo que no se entiende se calla', file: 'modules/academic-context/requirements/requirements-box.js', from: 'notUnderstood.sort(', to: 'notUnderstood.splice(0); notUnderstood.sort(' },
     { name: 'la verificación sigue diciendo «del documento» a un requisito de la caja', file: 'modules/academic-context/requirements/requirement-authority.js', from: 'if (!boxReqs.length)', to: 'if (true)' },
+    { name: 'una lista «capítulos 3, 4 y 5» se lee como estructura (sin «por módulo»)', file: 'modules/academic-context/requirements/uneven-structure.js', from: 'por\\\\s+(?:cada\\\\s+)?m[oó]dulo\\\\s*(?:', to: '(?:por\\\\s+m[oó]dulo\\\\s*)?(?:' },
+    { name: 'la caja parcial deja viva la structure del documento', file: 'modules/academic-context/requirements/requirements-box.js', from: 'function contradictsBoxCount(doc, boxWins) {', to: 'function contradictsBoxCount(doc, boxWins) {\n    return false;' },
+    { name: 'una caja «aproximadamente» quita un mínimo obligatorio', file: 'modules/academic-context/requirements/requirements-box.js', from: "if (by.obligation !== 'required' && it.obligation === 'required')", to: 'if (false)' },
     { name: 'una caja vacía cambia la vista', file: 'modules/academic-context/requirements/requirements-box.js', from: 'if (!box)\n        return view;', to: 'if (!box)\n        return { ...view, items: [...view.items] };' },
   ];
   const tmp = fs.mkdtempSync(path.join(REPO, '.r109-bite-'));
@@ -158,6 +161,28 @@ async function main() {
     assert(!XN.extractRequirements(linesN(DOC_CORPUS.noTrigger), 'D1').requirements.some((r) => r.kind === 'structure'), 'rótulos sueltos de un documento no son una forma');
   });
 
+  // ── BX1b (ronda 1, P1-1) ──
+  await check('BX1b referencias ordinales («capítulos 3, 4 y 5 del texto», «Capítulos 1, 2 y 7») NO son estructura, ni en documentos ni en la caja', () => {
+    const REFS = [
+      'Los estudiantes deberán leer los capítulos 3, 4 y 5 del texto guía.',
+      'Lectura obligatoria: capítulos 2 y 3 del libro de Pérez (2019).',
+      'Bibliografía: Smith, J. (2010). Gestión. Capítulos 1, 2 y 7.',
+      'El curso incluye los capítulos 2 y 5 del manual.',
+      'Semana 1 y 2: capítulos 1 y 2. Semana 3: capítulo 3.',
+      'Lee los capítulos 4 y 6 del documento de apoyo.',
+      'Ver capítulos 1 y 3 en la guía.',
+    ];
+    for (const t of REFS) {
+      assert(!XN.extractRequirements(linesN(t), 'D1').requirements.some((r) => r.kind === 'structure'), `documento: «${t}» no es una forma`);
+      assert(!boxReqs(t).some((r) => r.kind === 'structure'), `caja: «${t}» no es una forma`);
+    }
+    // Un documento solo declara la lista con «N módulos» que coincide, o «capítulos por módulo».
+    const okDoc = (t) => XN.extractRequirements(linesN(t), 'D1').requirements.find((r) => r.kind === 'structure');
+    eq(okDoc('El curso deberá tener 4 módulos con 4, 5, 4 y 4 capítulos.').shape, [4, 5, 4, 4], 'N módulos coincide');
+    eq(okDoc('El curso deberá tener 4 módulos con 4, 5 y 4 capítulos.'), undefined, 'N módulos no coincide: el documento no se toca');
+    eq(okDoc('El curso tendrá 4 módulos. Capítulos por módulo: 4 / 5 / 4 / 4.').shape, [4, 5, 4, 4], '«capítulos por módulo»');
+  });
+
   // ── BX2 ──
   await check('BX2 títulos parciales: null en los módulos que faltan; sin títulos no hay campo nuevo', () => {
     const s = shapeOf('Movilidad segura: 4 capítulos\n7 capítulos\nSeñalización: 4 capítulos');
@@ -244,6 +269,28 @@ async function main() {
     // Lo que NO choca queda activo (nunca se descarta de más).
     const w = viewOf('El curso tendrá 3 evaluaciones parciales. Cada capítulo tendrá 2 videos.', BOX_EXAMPLE);
     assert(w.items.filter((i) => !i.fromBox && (i.kind === 'evaluations' || i.kind === 'videos')).every((i) => i.applies && !i.overriddenByBox), 'evaluaciones y videos del documento siguen aplicando');
+    // P1-2: una caja PARCIAL reemplaza también la `structure` del documento que contradice (misma frase), y la forma que
+    // recomienda «tus requisitos» cumple todo lo activo (0 conflictos).
+    const nxm = 'El curso tendrá 4 módulos con 5 capítulos cada uno.';
+    for (const [boxText, want] of [['3 módulos', [3, 5]], ['6 capítulos por módulo', [4, 6]]]) {
+      const pv = viewOf(nxm, boxText);
+      const docStruct = pv.items.find((i) => !i.fromBox && i.kind === 'structure');
+      eq([docStruct.applies, docStruct.overriddenByBox], [false, true], `${boxText}: la structure del documento queda reemplazada`);
+      assert(docStruct.review.some((x) => /^La caja de requisitos reemplaza a «/.test(x)), `${boxText}: con aviso`);
+      const reqs = pv.items.filter((i) => i.applies && i.obligation === 'required' && i.confidence === 'high');
+      const rec = SO.recommendShape(reqs, null, null);
+      eq([rec.modules, rec.chaptersPerModule, rec.origin], [want[0], want[1], 'teacher_box'], `${boxText}: recomendada`);
+      eq(SO.shapeDifferences(reqs, { modules: rec.modules, chaptersPerModule: rec.chaptersPerModule }, null), [], `${boxText}: la forma recomendada cumple todo lo activo (0 conflictos)`);
+    }
+    // Una caja que NO contradice (4 módulos) no toca la structure del documento.
+    const same = viewOf(nxm, '4 módulos').items.find((i) => !i.fromBox && i.kind === 'structure');
+    eq([same.applies, !!same.overriddenByBox], [true, false], '4 módulos no contradice 4 × 5');
+    // P2-3: «aproximadamente» no quita un mínimo obligatorio.
+    const ap = viewOf('El curso tendrá como mínimo 40 horas de trabajo del estudiante.', 'aproximadamente 28 horas').items.find((i) => !i.fromBox && i.kind === 'target_hours');
+    eq([ap.applies, !!ap.overriddenByBox], [true, false], 'el mínimo obligatorio sigue');
+    // P2-2: un documento sin lectura de requisitos (stale) se sigue diciendo aunque haya caja.
+    const stale = BOXM.applyBoxToView(DOCR.buildRequirementsView([], null, [{ sha256: 'c'.repeat(64) }]), { version: 1, text: '28 horas', at: '' });
+    eq(stale.state, 'stale', 'stale se conserva');
     // Los requisitos que aplican (los que ve el diseño): solo la caja decide la estructura.
     const applying = v.items.filter((i) => i.applies && (i.kind === 'structure' || i.kind === 'modules' || i.kind === 'chapters'));
     assert(applying.every((i) => i.fromBox), 'solo la caja decide módulos y capítulos');

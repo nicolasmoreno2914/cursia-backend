@@ -539,8 +539,11 @@ export class CourseStructureService implements OnModuleInit {
       // r109 M3c: con la forma de la caja «Requisitos obligatorios», los módulos llevan los títulos que escribió el docente.
       let boxTitles: (string | null)[] | null = null;
       if (shape) {
-        const auth = await loadRequirementAuthority(queryRunner, courseId, academic.context.documents);
-        boxTitles = boxModuleTitlesFor(auth.required, shapeChapterCounts(shape));
+        // Solo adorna los títulos: si la lectura de requisitos falla, la estructura se aplica igual (como antes de M3c).
+        try {
+          const auth = await loadRequirementAuthority(queryRunner, courseId, academic.context.documents);
+          boxTitles = boxModuleTitlesFor(auth.required, shapeChapterCounts(shape));
+        } catch { boxTitles = null; }
       }
       const proposal = shape ? proposeShapedStructureFromContext(academic.context, shape, boxTitles ? { moduleTitles: boxTitles } : undefined) : proposeStructureFromContext(academic.context);
       if (!proposal.available) {

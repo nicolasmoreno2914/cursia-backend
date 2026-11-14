@@ -64,14 +64,21 @@ function cleanTitle(raw: string): string | null {
  * lector no los lea otra vez como «capítulos» sueltos). null si no hay una forma con al menos 2 módulos.
  */
 export function findUnevenIn(text: string, titled = true): { found: UnevenFound; spans: { start: number; end: number }[] } | null {
+  // Espacios normalizados (la regex de módulos se solapa con `\s*`: con tramos largos de espacios sería cuadrática). Los
+  // tramos devueltos son del texto normalizado; el lector ya recibe los segmentos con los espacios colapsados.
+  text = text.replace(/\s+/g, ' ');
   // 1. «N módulos con 4, 7, 4 y 5 capítulos» / «N módulos (4/7/4/5 capítulos)» / «capítulos por módulo: 4, 7, 4, 5».
   const lead = new RegExp(`(\\d{1,2})\\s*m[oó]dulos?\\s*(?:\\(|:|,|con|de|=|→|-|–)?\\s*${LIST}\\s*${NOUN_CAP}`, 'iu').exec(text);
-  const per = new RegExp(`${NOUN_CAP}\\s*(?:por\\s+m[oó]dulo\\s*)?(?:\\(|:|=|→|-|–)?\\s*${LIST}`, 'iu').exec(text);
+  // r109 M3c (ronda 1, P1-1): la lista tras «capítulos» solo es una forma si dice «por módulo». «Los capítulos 3, 4 y 5 del
+  // texto», «capítulos 2 y 3 del libro» o «Capítulos 1, 2 y 7» son referencias (lecturas, bibliografía), nunca estructura.
+  const per = new RegExp(`${NOUN_CAP}\\s*por\\s+(?:cada\\s+)?m[oó]dulo\\s*(?:\\(|:|=|→|-|–)?\\s*${LIST}(?!\\s*(?:del?|de la|de los|en el|en la)\\s)`, 'iu').exec(text);
   const declared = /(\d{1,2})\s*m[oó]dulos?\b/i.exec(text);
   const listHit = lead ? { counts: numbersOf(lead[2]), start: lead.index, end: lead.index + lead[0].length, declared: Number(lead[1]) } : per
     ? { counts: numbersOf(per[1]), start: per.index, end: per.index + per[0].length, declared: declared ? Number(declared[1]) : null }
     : null;
-  if (listHit && okCounts(listHit.counts)) {
+  // Un DOCUMENTO solo declara la lista si «N módulos» coincide con lo listado (la caja del docente avisa la diferencia).
+  const listOk = listHit && okCounts(listHit.counts) && (titled || listHit.declared === null || listHit.declared === listHit.counts.length);
+  if (listHit && listOk) {
     // Una forma «4 módulos» + capítulos en la misma frase: se ocupa también el «N módulos» suelto de la frase (no se lee aparte).
     const spans = [{ start: listHit.start, end: listHit.end }];
     if (!lead && declared && (declared.index + declared[0].length <= listHit.start || declared.index >= listHit.end)) spans.push({ start: declared.index, end: declared.index + declared[0].length });
@@ -130,6 +137,7 @@ export interface UnevenGroup {
 }
 
 export function findUnevenStructure(texts: string[], titled = true): UnevenGroup | null {
+  texts = texts.map((t) => t.replace(/\s+/g, ' '));
   // a) Una sola frase con toda la forma.
   for (let i = 0; i < texts.length; i++) {
     const hit = findUnevenIn(texts[i], titled);
