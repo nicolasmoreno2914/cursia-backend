@@ -114,6 +114,7 @@ export type IgnoredReason =
   | 'no_trigger' // cifra sin verbo de obligación ni campo de ficha: no se convierte en requisito
   | 'condition_clause' // la cifra está dentro de la condición («si el curso tiene más de 5 unidades, …»)
   | 'not_modeled' // el objeto no es algo que Cursia diseñe (foros, webconferencias…)
+  | 'module_hours_invalid' // r109 M4: «Módulo 2: 0,3 h»: horas de módulo fuera de rango (no son horas del curso)
   | 'inconsistent' // r109 M3c: la forma dice una cantidad de módulos y lista otra («4 módulos» con 3 capítulos listados)
   | 'not_prescriptive'; // LOOP 9.2: sección que el propio documento declara no prescriptiva («Información no prescriptiva»)
 

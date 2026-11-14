@@ -14,6 +14,7 @@ import type {
   RequirementsExtraction,
 } from './requirements';
 import { blankSpans, findUnevenStructure } from './uneven-structure';
+import { RE_COMPONENT_HOURS, blankHitSpans, findModuleHoursIn } from './module-hours-reader';
 
 /**
  * LOOP 8.6A · Extractor de requisitos explícitos. Determinista, local, sin proveedores (USD 0).
@@ -108,7 +109,6 @@ const RE_PROPOSE = /\b(se propone|se proponen)\b/;
 const RE_PERMITTED = /\b(podra|podran|puede|pueden|opcional\w*|es posible)\b/;
 const RE_NEGATION = /\b(no se requiere|no se requieren|no incluira|no tendra|no debera|no deben|no debe)\b/;
 // Horas que NO son el total de trabajo del estudiante.
-const RE_COMPONENT_HOURS = /\b(clase|clases|acompanamiento|presencial\w*|teoric\w*|practic\w*|autonom\w*|independiente|semanal\w*|por semana|a la semana|sincronic\w*|encuentro|tutoria\w*|limite|despues|antes|dedicacion semanal|had|hti|ht|hp)\b/;
 const RE_TOTAL_HOURS_LABEL = /(intensidad horaria total|horas totales|total de horas|total horas|numero total de horas|duracion total|trabajo academico del estudiante|horas academicas totales)/;
 // Rótulo de ficha: corto (≤ 8 palabras) y sin cifras. «…es un curso de 3 módulos por 3 capítulos: 9 capítulos» NO es un rótulo.
 const RE_FIELD_LABEL = /^((?:[^:\d\s]+\s+){0,7}[^:\d\s]+)\s*:\s*(.+)$/;
@@ -528,7 +528,9 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc', opt
         const bySeg = new Map<number, { start: number; end: number }[]>();
         for (const s of uneven.spans) bySeg.set(s.segment, [...(bySeg.get(s.segment) || []), s]);
         for (const [i, sp] of bySeg) segs[i].text = blankSpans(segs[i].text, sp);
-        if (uneven.found.moduleExtras) ignored.push({ reason: 'component_hours', quote: 'horas por módulo (próximamente)', line: first.line });
+        // r109 M4: las horas que acompañan a cada módulo («4 capítulos, 7 h») son requisitos; solo lo que no se pudo leer
+        // como horas del módulo (de un componente, un rango) se aparta.
+        if (uneven.found.moduleExtras && !uneven.found.moduleHours) ignored.push({ reason: 'component_hours', quote: 'horas por módulo que no se entendieron (de clase, rango…)', line: first.line });
         if (uneven.found.declaredModules !== null && uneven.found.declaredModules !== sh.length) {
           ignored.push({ reason: 'inconsistent', quote: `${uneven.found.declaredModules} módulos, pero se listan ${sh.length}: ${quote}`.slice(0, 160), line: first.line });
         } else {
@@ -540,10 +542,37 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc', opt
             obligation: 'required', active: true, status: 'found', confidence: trigger ? 'high' : 'medium',
             ...(trigger ? {} : { review: ['Forma por módulo sin un verbo de obligación: revisa esta lectura.'] }), source: srcU,
           });
+          // r109 M4 · horas por módulo junto a la forma: un requisito `target_hours` por módulo (alcance: ese módulo).
+          (uneven.found.moduleHours || []).forEach((h, k) => {
+            if (h === null) return;
+            const sg = segs[(uneven.found.itemSegments || [])[k] ?? uneven.firstSegment] || first;
+            push({
+              kind: 'target_hours', scope: { level: 'module', index: k + 1 }, mode: 'exact', value: h, obligation: 'required', active: true, status: 'found',
+              confidence: trigger ? 'high' : 'medium', ...(trigger ? {} : { review: ['Horas por módulo sin un verbo de obligación: revisa esta lectura.'] }),
+              source: { documentId, line: sg.line, page: sg.page, quote: (sg.quote || sg.text).slice(0, 300) },
+            });
+          });
         }
       }
     }
     if (!acted) break;
+  }
+
+  // r109 M4 · «Módulo 2: 12 horas» y variantes (la caja: sin verbo; un documento: con verbo, «El módulo 2 tendrá 12 horas»).
+  // Se quitan del texto: no se leen otra vez como «12 horas» del curso. Las horas de componente («20 horas de clase») no entran.
+  for (const sg of segs) {
+    if (sg.option || sg.example || sg.informative || (sg.cells && !declarative)) continue;
+    const hits = findModuleHoursIn(sg.text, declarative);
+    if (!hits.length) continue;
+    const quoteOf = (h: { start: number; end: number }) => sg.text.replace(/\s+/g, ' ').slice(h.start, h.end).trim();
+    for (const h of hits) {
+      if (h.invalid) { ignored.push({ reason: 'module_hours_invalid', quote: quoteOf(h).slice(0, 160), line: sg.line }); continue; }
+      push({
+        kind: 'target_hours', scope: { level: 'module', index: h.index }, mode: 'exact', value: h.hours, obligation: 'required', active: true, status: 'found',
+        confidence: 'high', source: { documentId, line: sg.line, page: sg.page, quote: (sg.quote || quoteOf(h)).slice(0, 300) },
+      });
+    }
+    sg.text = blankHitSpans(sg.text, hits);
   }
 
   let optionRun: { group: RequirementGroup; labels: Set<string> } | null = null;

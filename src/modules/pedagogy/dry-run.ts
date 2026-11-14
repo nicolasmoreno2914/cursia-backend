@@ -47,7 +47,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileContentChaptersMax, profileDesignPreferences, profileHoursModel, profileTargetHours } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileContentChaptersMax, profileDesignPreferences, profileHoursModel, profileModuleHours, profileTargetHours } from './pedagogy-profile';
 import { LearningType, PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 import { ChapterLearningTypeDesign, LEARNING_TYPE_LABELS, classifyLearningType, learningTypeJustification } from './learning-type';
 import { defaultFrameworkRegistry, frameworkSlotLabels } from './instructional-frameworks';
@@ -483,6 +483,8 @@ function alignmentOf(s: DryRunSide, extras: DryRunInput['alignment'], registry: 
 export function distributionProposalSha256(dist: DistributionResult, extra?: { contentChaptersMax?: number | null } | null): string {
   const canon = {
     targetHours: dist.targetHours,
+    // r109 M4: las horas de cada módulo entran a la huella SOLO si el diseño las tiene (sin ellas, la huella de siempre).
+    ...(dist.moduleHours ? { moduleHours: dist.moduleHours.modules.map((m) => m.targetHours) } : {}),
     preferences: dist.preferences,
     // r79: el tope de capítulos de contenido por módulo del ajuste al presupuesto entra a la huella SOLO si existe (sin él,
     // la huella de siempre: ninguna propuesta aprobada cambia).
@@ -931,6 +933,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     summary.push(`Tipos de aprendizaje: ${[...byType.entries()].map(([k, n]) => `${k} ${n}`).join(' · ')}.`);
     if (learningPlan.unknownOverrides.length) summary.push(`${learningPlan.unknownOverrides.length} ajuste(s) del plan apuntan a capítulos o módulos que ya no existen (se ignoran).`);
   }
+  const distribution = targetHours === null ? null : distributionFor(input, base, rules, targetHours, activityTypeRules, registry, appContext, pricing, profileHm, chapters, planOn, (ms) => { materializedSide = ms; });
   const out: DryRunResult = {
     ...(alignment ? { alignment } : {}),
     ...(learningPlan ? { learningPlan } : {}),
@@ -943,13 +946,14 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     profileEmpty,
     rules,
     targetHours,
-    distribution: targetHours === null ? null : distributionFor(input, base, rules, targetHours, activityTypeRules, registry, appContext, pricing, profileHm, chapters, planOn, (ms) => { materializedSide = ms; }),
+    distribution,
     workload: targetHours === null
       ? null
       : {
-        targetHours,
+        // r109 M4: con horas por módulo, el total puede ser la suma de los módulos (si pasaba del total pedido).
+        targetHours: distribution && distribution.moduleHours ? distribution.targetHours : targetHours,
         estimatedHours: view.studyTime.courseEstimatedHours,
-        deltaHours: Math.round((view.studyTime.courseEstimatedHours - targetHours) * 10) / 10,
+        deltaHours: Math.round((view.studyTime.courseEstimatedHours - (distribution && distribution.moduleHours ? distribution.targetHours : targetHours)) * 10) / 10,
       },
     baseline,
     pedagogical,
@@ -1045,7 +1049,8 @@ function distributionFor(
       const contentCap = profileContentChaptersMax(input.profile);
       const requirements = withContentChaptersCap(mix ? mix.constraints : input.requirementConstraints ?? null, contentCap, lockShaped.modules.length);
       const lock = input.tierLock ?? null;
-      const runDistributor = () => distributeCourseHours({ ...(realChaptersOf(input) ? { realChapters: true } : {}), snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}), ...(lock ? { tierSelectable: (t: number) => isTierSelectable('standard', t, lock) } : {}) });
+      const moduleHours = profileModuleHours(input.profile);
+      const runDistributor = () => distributeCourseHours({ ...(realChaptersOf(input) ? { realChapters: true } : {}), ...(moduleHours ? { moduleHours } : {}), snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}), ...(lock ? { tierSelectable: (t: number) => isTierSelectable('standard', t, lock) } : {}) });
       // r79.1 (rendimiento): en la búsqueda del ajuste (distributionOnly) el distribuidor se corre UNA vez por combinación
       // que lo afecta: los tipos de actividad no cambian su entrada (se asignan después), así que «automático» y «ninguno»
       // comparten el resultado. Caché por la estructura recibida (misma identidad en toda la búsqueda) y el resto de la

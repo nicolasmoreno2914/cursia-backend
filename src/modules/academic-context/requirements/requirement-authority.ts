@@ -727,7 +727,7 @@ function requirementVerificationChecksCore(applicable: DocumentRequirement[], ch
     if (twin0) {
       out.push({ id, area: 'requirements', severity: 'critical', title: `Conflicto con un requisito del documento: ${asked}`,
         detail: `El documento pide ${asked} y también «${requirementText(twin0)}»: no se pueden cumplir los dos. Cursia no elige entre ellos (el diseño tiene ${has2}): decide cuál aplica.`,
-        ...(r.kind === 'target_hours' ? { fix: { kind: 'adjust' as const, action: 'targetHours', label: 'Elegir las horas' } } : { fix: { kind: 'editor' as const, action: 'structure', label: 'Resolver en el editor' } }) });
+        ...(r.kind === 'target_hours' && r.scope.level === 'module' ? { fix: { kind: 'adjust' as const, action: 'moduleHours', label: 'Cambiar las horas del módulo' } } : r.kind === 'target_hours' ? { fix: { kind: 'adjust' as const, action: 'targetHours', label: 'Elegir las horas' } } : { fix: { kind: 'editor' as const, action: 'structure', label: 'Resolver en el editor' } }) });
       continue;
     }
     if (c.status === 'met' && !hoursClash) {
@@ -812,7 +812,10 @@ function requirementVerificationChecksCore(applicable: DocumentRequirement[], ch
     }
     // Excepción: lo eligió el docente (no se revierte).
     if (c.chosenBy === 'teacher') {
-      const fix = r.kind === 'target_hours' && typeof r.value === 'number'
+      const fix = r.kind === 'target_hours' && (r.scope.level === 'module') && typeof r.value === 'number'
+        // r109 M4: las horas de un módulo se cambian en «Estructura» (moduleTargetHours); volver = que las lean los requisitos.
+        ? { kind: 'adjust' as const, action: 'moduleHours', value: null, label: 'Volver al requisito' }
+        : r.kind === 'target_hours' && typeof r.value === 'number'
         ? { kind: 'adjust' as const, action: 'targetHours', value: 'auto', label: 'Volver al requisito del documento' }
         : r.kind === 'videos' && ctx.exceptionFields.audiovisual ? { kind: 'adjust' as const, action: 'audiovisual', value: 'requirement', label: 'Volver al requisito del documento' }
           : r.kind === 'application_activities' && ctx.exceptionFields.applicationActivities ? { kind: 'adjust' as const, action: 'applicationActivities', value: 'requirement', label: 'Volver al requisito del documento' }
@@ -875,7 +878,8 @@ function requirementVerificationChecksCore(applicable: DocumentRequirement[], ch
     }
     const fix = (r.kind === 'modules' || r.kind === 'chapters' || r.kind === 'structure' || r.kind === 'evaluations')
       ? { kind: 'editor' as const, action: r.kind === 'evaluations' ? 'module_exams' : 'structure', label: 'Resolver en el editor' }
-      : r.kind === 'target_hours' ? { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' } : undefined;
+      : r.kind === 'target_hours' && r.scope.level === 'module' ? { kind: 'adjust' as const, action: 'moduleHours', label: 'Cambiar las horas del módulo' }
+        : r.kind === 'target_hours' ? { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' } : undefined;
     out.push({ id, area: 'requirements', severity: 'critical', title: `Conflicto con un requisito del documento: ${asked}`,
       detail: `${docAsks(asked)}; el diseño tiene ${has2}.${cause}`, ...(fix ? { fix } : {}) });
   }

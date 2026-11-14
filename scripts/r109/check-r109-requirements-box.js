@@ -192,9 +192,10 @@ async function main() {
     assert(!('moduleTitles' in plain), 'sin títulos, sin moduleTitles');
     // Módulo N / Unidad N no es un título.
     eq(shapeOf('Módulo 1: 4 capítulos / Módulo 2: 7 capítulos').titles, null, '«Módulo 1» no es un título');
-    // Horas por módulo: no se aplican (M4) ni se leen como horas del curso.
+    // Horas por módulo (r109 M4): son horas de cada módulo (alcance «módulo N»), nunca horas del curso.
     const m = boxReqs('Movilidad segura: 4 capítulos - 6 horas\nNormas: 7 capítulos - 8 horas\n28 horas');
-    eq(m.filter((r) => r.kind === 'target_hours').map((r) => r.value), [28], 'solo las 28 h del curso');
+    eq(m.filter((r) => r.kind === 'target_hours' && r.scope.level === 'course').map((r) => r.value), [28], 'solo las 28 h del curso son del curso');
+    eq(m.filter((r) => r.kind === 'target_hours' && r.scope.level === 'module').map((r) => [r.scope.index, r.value]), [[1, 6], [2, 8]], 'las otras son del módulo');
     eq(m.find((r) => r.kind === 'structure').shape, [4, 7], 'la forma con horas por módulo');
   });
 
@@ -237,8 +238,10 @@ async function main() {
     const nu = w.box.notUnderstood;
     assert(nu.some((n) => n.line === 2 && /divertido/.test(n.text)), 'la línea de relleno aparece como «No entendí»: ' + JSON.stringify(nu));
     const hpm = viewOf(null, 'Módulo 1: 4 capítulos (6 h), Módulo 2: 7 capítulos (8 h)\n13 horas');
-    assert(hpm.box.notUnderstood.some((n) => /horas por módulo \(próximamente\)/.test(n.reason)), 'horas por módulo: «No entendí todavía … (próximamente)»: ' + JSON.stringify(hpm.box.notUnderstood));
-    eq(hpm.items.filter((i) => i.kind === 'target_hours').map((i) => i.value), [13], 'las horas por módulo no se vuelven horas del curso (solo las 13 h)');
+    // r109 M4: las horas por módulo YA se entienden (ya no es «próximamente»).
+    eq(hpm.box.notUnderstood.filter((n) => /pr[oó]ximamente/.test(n.reason)), [], 'horas por módulo: ya no dice «próximamente»');
+    eq(hpm.items.filter((i) => i.kind === 'target_hours' && i.scope.level === 'course').map((i) => i.value), [13], 'las horas por módulo no se vuelven horas del curso (solo las 13 h)');
+    eq(hpm.box.understood.moduleHours, [6, 8], 'Entendí: horas por módulo');
     // Dos formas distintas en la caja: se leen las dos y queda un conflicto visible (nunca se elige una en silencio).
     const two = viewOf(null, '4 módulos con 4, 7, 4 y 5 capítulos\n3 módulos con 4, 4 y 4 capítulos');
     assert(two.box.conflicts.length === 1 && /^La caja de requisitos dice dos cosas distintas sobre la estructura/.test(two.box.conflicts[0].message), JSON.stringify(two.box.conflicts));

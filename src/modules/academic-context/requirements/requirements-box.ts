@@ -69,6 +69,48 @@ export function extractBox(text: string): RequirementsExtraction {
   };
 }
 
+/** «10 horas por módulo»: horas con alcance «cada módulo». */
+export function isEachModuleHours(r: DocumentRequirement): boolean {
+  const s = r.scope as { level: string; each?: boolean; chapterKind?: string };
+  return r.kind === 'target_hours' && s.level === 'module' && !!s.each;
+}
+/** Módulo (1-based) de un requisito de horas con alcance «módulo N»; null si no lo es. */
+export function moduleIndexOf(r: DocumentRequirement): number | null {
+  const s = r.scope as { level: string; index?: number; each?: boolean };
+  return r.kind === 'target_hours' && s.level === 'module' && !s.each && typeof s.index === 'number' ? s.index : null;
+}
+
+/**
+ * r109 M4 · horas por módulo que declara una lista de requisitos (alineadas con los módulos; null = el texto no las da).
+ * Solo las exactas y vigentes; otro valor del mismo módulo no pisa al primero (el conflicto lo muestra el lector).
+ */
+export function moduleHoursOfRequirements(rs: DocumentRequirement[]): (number | null)[] | null {
+  const d = moduleHoursDetail(rs);
+  return d ? d.hours : null;
+}
+
+/** Igual que `moduleHoursOfRequirements`, con el origen de cada módulo: «de tus requisitos» (la caja) o «del documento». */
+export function moduleHoursDetail(rs: DocumentRequirement[], moduleCount = 0): { hours: (number | null)[]; origins: ('requirements_box' | 'document' | null)[] } | null {
+  const hours: (number | null)[] = [];
+  const origins: ('requirements_box' | 'document' | null)[] = [];
+  const originOf = (r: DocumentRequirement) => (r.source && r.source.documentId === BOX_DOCUMENT_ID ? 'requirements_box' as const : 'document' as const);
+  for (const r of rs) {
+    const i = moduleIndexOf(r);
+    if (i === null || r.mode !== 'exact' || typeof r.value !== 'number' || r.active === false || (r as { applies?: boolean }).applies === false) continue;
+    while (hours.length < i) { hours.push(null); origins.push(null); }
+    if (hours[i - 1] === null) { hours[i - 1] = r.value; origins[i - 1] = originOf(r); }
+  }
+  // «10 horas por módulo»: una entrada por módulo (las de un módulo concreto mandan sobre esta).
+  const each = rs.find((r) => isEachModuleHours(r) && r.mode === 'exact' && typeof r.value === 'number' && r.active !== false && (r as { applies?: boolean }).applies !== false);
+  if (each && moduleCount > 0) {
+    for (let i = 0; i < moduleCount; i++) {
+      while (hours.length <= i) { hours.push(null); origins.push(null); }
+      if (hours[i] === null) { hours[i] = each.value as number; origins[i] = originOf(each); }
+    }
+  }
+  return hours.length ? { hours, origins } : null;
+}
+
 const n1 = (n: number) => String(n).replace('.', ',');
 const plural = (n: number, one: string, many: string) => `${n1(n)} ${n === 1 ? one : many}`;
 const KIND_NOUN: Record<string, [string, string]> = {
@@ -84,6 +126,8 @@ export function boxRequirementText(r: DocumentRequirement): string {
     return `${plural(sh.length, 'módulo', 'módulos')} · capítulos ${sh.join(' / ')}`;
   }
   const v = r.value as number;
+  if (r.kind === 'target_hours' && moduleIndexOf(r) !== null) return `${n1(v)} h en el módulo ${moduleIndexOf(r)}`;
+  if (isEachModuleHours(r)) return `${n1(v)} h por módulo`;
   if (r.kind === 'target_hours') {
     const q = r.mode === 'min' ? 'al menos ' : r.mode === 'max' ? 'hasta ' : r.mode === 'approx' ? 'aprox. ' : r.mode === 'range' ? `${n1(v)}–` : '';
     return `${q}${n1(r.mode === 'range' ? (r.valueMax ?? v) : v)} h`;
@@ -104,6 +148,8 @@ export interface BoxUnderstood {
   shape: number[] | null;
   moduleTitles: (string | null)[] | null;
   hours: number | null;
+  /** r109 M4: horas de cada módulo si la caja las dio (null en los módulos sin horas); null si no dio ninguna. */
+  moduleHours: (number | null)[] | null;
 }
 
 export interface BoxNotUnderstood {
@@ -130,8 +176,6 @@ export interface BoxView {
   conflicts: RequirementsExtraction['conflicts'];
 }
 
-const MODULE_HOURS = /(?:horas?|\bh\b)\s*(?:por|de cada|en cada)\s*m[oó]dulo|m[oó]dulo\s*\d{1,2}\s*[:\-–—]\s*\d{1,3}\s*(?:h\b|horas)/i;
-
 const REASONS: Record<string, string> = {
   example: 'Parece un ejemplo, no un requisito.',
   reference: 'Parece una referencia («capítulo 6»), no una cantidad.',
@@ -142,6 +186,7 @@ const REASONS: Record<string, string> = {
   not_modeled: 'Cursia no diseña eso.',
   not_prescriptive: 'Se declara como no prescriptivo.',
   inconsistent: 'Dice una cantidad de módulos y lista otra.',
+  module_hours_invalid: 'Las horas de un módulo van de 1 a 500 h (en pasos de media hora): esta cifra no se usó.',
 };
 
 /** Familia «estructura»: lo que una forma de la caja reemplaza del documento aunque no tengan la misma `key`. */
@@ -191,12 +236,15 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
   const boxKeys = new Map<string, RequirementItem>();
   for (const b of boxWins) if (!boxKeys.has(b.key)) boxKeys.set(b.key, b);
   const boxStructure = boxWins.find((b) => b.kind === 'structure');
+  // r109 M4: si la caja trae horas por módulo (aunque sea de algunos), TODAS las horas por módulo del documento quedan
+  // reemplazadas: los módulos que la caja no menciona quedan sin horas propias.
+  const boxModuleHours = boxWins.find((b) => (moduleIndexOf(b) !== null || isEachModuleHours(b)) && b.mode === 'exact');
 
   const overrides: BoxOverride[] = [];
   const replaced = new Set<string>();
   const docItems: RequirementItem[] = view.items.map((it) => {
     if (!it.applies) return it;
-    const by = boxKeys.get(it.key) || (boxStructure && isStructureFamily(it) ? boxStructure : undefined)
+    const by = boxKeys.get(it.key) || (boxStructure && isStructureFamily(it) ? boxStructure : undefined) || (boxModuleHours && (moduleIndexOf(it) !== null || isEachModuleHours(it)) ? boxModuleHours : undefined)
       || (contradictsBoxCount(it, boxWins) ? boxWins.find((b) => b.kind === 'modules' || b.kind === 'chapters') : undefined);
     if (!by) return it;
     // P2-3: una recomendación de la caja («aproximadamente 28 horas») no vuelve «recomendación» un mínimo obligatorio del documento.
@@ -211,6 +259,7 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
   const understoodItems = boxItems.filter((i) => i.obligation !== 'informative');
   const st = boxWins.find((b) => b.kind === 'structure');
   const hours = hoursOf(boxWins);
+  const moduleHours = moduleHoursOfRequirements(boxWins);
   const mods = boxWins.find((b) => b.kind === 'modules' && b.scope.level === 'course');
   const parts: string[] = [];
   if (st) parts.push(boxRequirementText(st));
@@ -219,8 +268,10 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
     if (b === st || b === mods) continue;
     if (st && b.kind === 'chapters' && b.scope.level === 'module' && st.shape && st.shape.every((n) => n === (b.value as number))) continue;
     if (b.kind === 'target_hours' && b.value === hours) continue;
+    if (moduleIndexOf(b) !== null) continue;
     parts.push(boxRequirementText(b));
   }
+  if (moduleHours) parts.push(`horas por módulo ${moduleHours.map((h) => (h === null ? '—' : n1(h))).join(' / ')} h`);
   if (hours !== null) parts.push(`${n1(hours)} h`);
 
   // Lo que NO se convirtió en requisito: renglones sin requisito y cifras que el lector apartó.
@@ -229,17 +280,12 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
   const notUnderstood: BoxNotUnderstood[] = [];
   for (const l of lines) {
     if (!withReq.has(l.line) && !x.ignored.some((g) => g.line === l.line && g.reason === 'inconsistent')) {
-      notUnderstood.push({ line: l.line, text: l.text.slice(0, 200), reason: MODULE_HOURS.test(l.text) ? 'Horas por módulo (próximamente).' : 'No dice qué debe tener el curso (módulos, capítulos, horas, videos…).' });
+      notUnderstood.push({ line: l.line, text: l.text.slice(0, 200), reason: 'No dice qué debe tener el curso (módulos, capítulos, horas, videos…).' });
     }
   }
   for (const g of x.ignored) {
-    if (g.reason === 'component_hours' && /horas por módulo/.test(g.quote)) { notUnderstood.push({ line: g.line, text: 'horas por módulo', reason: 'No entendí todavía: horas por módulo (próximamente).' }); continue; }
+    if (g.reason === 'component_hours' && /horas por módulo/.test(g.quote)) { notUnderstood.push({ line: g.line, text: 'horas por módulo', reason: 'No pude leer estas horas como las de un módulo (¿son de clase, de un componente o un rango?). Escríbelas así: «Módulo 2: 12 horas».' }); continue; }
     notUnderstood.push({ line: g.line, text: g.quote, reason: REASONS[g.reason] || 'No se usó como requisito.' });
-  }
-  for (const l of lines) {
-    if (MODULE_HOURS.test(l.text) && !notUnderstood.some((n) => n.line === l.line && /horas por módulo/i.test(n.reason + n.text))) {
-      notUnderstood.push({ line: l.line, text: 'horas por módulo', reason: 'No entendí todavía: horas por módulo (próximamente).' });
-    }
   }
   notUnderstood.sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
 
@@ -251,6 +297,7 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
       shape: st && st.shape ? [...st.shape] : null,
       moduleTitles: st && st.moduleTitles && st.moduleTitles.some((t) => t) ? [...st.moduleTitles] : null,
       hours,
+      moduleHours,
     },
     notUnderstood, overrides, conflicts: x.conflicts,
   };

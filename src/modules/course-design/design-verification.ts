@@ -128,6 +128,8 @@ export interface VerificationInput {
    * resuelve sola), excepciones del docente (advertencia) y requisitos cumplidos. Van primero en la lista.
    */
   requirementChecks?: DesignCheck[];
+  /** r109 M4 · horas por módulo del diseño (solo si el curso las tiene: sin ellas, la verificación de siempre). */
+  moduleHours?: import('../study-time/module-hours').ModuleHoursResult | null;
 }
 
 /** Máximo de horas de un curso (la meta válida va de 1 a 500). */
@@ -179,7 +181,22 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
 
   // Horas de trabajo del estudiante.
   const hoursTitle = `Carga horaria: ${h1(input.estimatedHours)} de ${h1(input.targetHours)} h de trabajo del estudiante`;
-  if (input.status === 'within_tolerance') add({ id: 'hours', area: 'hours', severity: 'ok', title: hoursTitle });
+  const mh = input.moduleHours || null;
+  if (mh) {
+    // r109 M4: con horas por módulo, la carga horaria se juzga módulo a módulo (±10 % de las horas de cada uno).
+    const bad = mh.modules.filter((m) => m.status !== 'within_tolerance');
+    add({ id: 'hours', area: 'hours', severity: bad.length ? 'warning' : 'ok', title: `Carga horaria: ${h1(input.estimatedHours)} h de trabajo del estudiante (${h1(mh.totalHours)} h pedidas)`,
+      ...(bad.length ? { detail: `${plural(bad.length, 'módulo queda', 'módulos quedan')} fuera de sus horas (±10 %): ${bad.map((m) => `módulo ${m.index} «${m.title}»`).join(', ')}.` } : { detail: 'Cada módulo queda dentro de sus horas (±10 %).' }) });
+    if (mh.totalAdjusted) add({ id: 'module-hours-total', area: 'hours', severity: 'warning', title: `Las horas de los módulos suman ${h1(mh.totalHours)} h`, detail: mh.warnings.find((w) => /el total pasa a ser/.test(w)) || `El total del curso pasó de ${h1(mh.requestedTotalHours)} h a ${h1(mh.totalHours)} h.` });
+    for (const m of bad) {
+      if (m.source === 'remainder' && m.explanation && bad.some((x) => x.source === 'remainder' && x.index < m.index)) continue;
+      add({ id: `module-hours:${m.index}`, area: 'hours', severity: m.status === 'above_tolerance' ? 'warning' : 'critical',
+        title: m.source === 'fixed' ? `Módulo ${m.index} «${m.title}»: ${h1(m.estimatedHours)} h, pidió ${h1(m.targetHours as number)} h` : `Módulos sin horas propias: ${h1(m.estimatedHours)} h en el módulo ${m.index} «${m.title}»`,
+        ...(m.explanation ? { detail: m.explanation } : {}),
+        fix: { kind: 'adjust', action: 'moduleHours', label: 'Cambiar las horas de los módulos', targets: { moduleIds: [m.moduleId] } } });
+    }
+  }
+  else if (input.status === 'within_tolerance') add({ id: 'hours', area: 'hours', severity: 'ok', title: hoursTitle });
   else if (input.status === 'above_tolerance') {
     const up = Math.ceil(input.estimatedHours);
     add({ id: 'hours', area: 'hours', severity: 'warning', title: hoursTitle, detail: `Queda ${h1(input.estimatedHours - input.targetHours)} h por encima (tolerancia ±${h1(input.toleranceHours)} h).`,
