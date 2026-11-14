@@ -12,6 +12,7 @@ import { humanName } from '../diagnosis/checks';
 import { libroStructure } from '../patch/op-libro';
 import { stringsOf } from '../../quality/course-quality-checks';
 import type { QualityDoc, QualityDocRole } from './types';
+import { replaceMarkWithWs } from '../xml-scan';
 
 const BIG = 400_000;
 const chapterOf = (a: WorkshopActivity): number | null => (a.placement.scope === 'chapter' ? a.placement.chapterNumber : null);
@@ -50,7 +51,7 @@ export function h5pText(content: unknown): string {
  * Texto plano que CONSERVA los cortes de bloque (párrafos, títulos, celdas, listas) como saltos de línea: una «oración»
  * nunca junta el encabezado de una etiqueta con su primer párrafo (las reglas por oración dependen de eso).
  */
-const BLOCK_END = /<\/(?:p|div|h[1-6]|li|tr|td|th|section|article|header|footer|blockquote|figcaption|dt|dd)\s*>|<br\s*\/?>|<hr\b[^>]*>/gi;
+const BLOCK_END = /<\/(?:p|div|h[1-6]|li|tr|td|th|section|article|header|footer|blockquote|figcaption|dt|dd)\s*>|<br\s*\/?>|<hr\b[^<>]*>/gi;
 const ENTITIES: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'", nbsp: ' ', aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ', Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Ntilde: 'Ñ', uuml: 'ü', iexcl: '¡', iquest: '¿', laquo: '«', raquo: '»', ndash: '–', mdash: '—', hellip: '…' };
 /** Entidades HTML → caracteres (el texto que ve el estudiante; lo que parezca una etiqueta lo neutraliza el prompt). */
 export function decodeEntities(s: string): string {
@@ -60,7 +61,9 @@ export function decodeEntities(s: string): string {
   });
 }
 export function blockText(html: string, max = BIG): string {
-  return decodeEntities(plainText(String(html).replace(BLOCK_END, (m) => `${m}\uE000`), max * 2)).replace(/[^\S\n\uE000]+/g, ' ').replace(/\s*\uE000\s*/g, '\n').replace(/\n{2,}/g, '\n').trim().slice(0, max);
+  // B12 ronda 2: la marca de fin de bloque se reemplaza con TODO el blanco pegado (también los \n que deja
+  // decodeEntities, p. ej. `&#10;`), en una pasada: mismo resultado que `\s*\uE000\s*`, sin backtracking.
+  return replaceMarkWithWs(decodeEntities(plainText(String(html).replace(BLOCK_END, (m) => `${m}\uE000`), max * 2)).replace(/[^\S\n\uE000]+/g, ' '), '\uE000', '\n').replace(/\n{2,}/g, '\n').trim().slice(0, max);
 }
 
 /** Número de capítulo que declara un texto al empezar («Capítulo 3: …» / «Capítulo 3 · …»). */
@@ -81,7 +84,7 @@ export function qualityDocs(ctx: DiagnosisContext): QualityDoc[] {
   };
   const moduleOfChapter = (n: number | null) => (n === null ? null : ctx.course.chapters.find((c) => c.number === n)?.moduleNumber ?? null);
   const push = (a: WorkshopActivity, d: Omit<QualityDoc, 'moduleId' | 'activityTitle' | 'what' | 'moduleNumber'> & { moduleNumber?: number | null }) => {
-    const text = d.text.replace(/[^\S\n]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{2,}/g, '\n').trim();
+    const text = d.text.replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n') /* B12 ronda 1: tras colapsar, a lo sumo un espacio a cada lado (` *\n *` era cuadrática aislada) */.replace(/\n{2,}/g, '\n').trim();
     if (text.length < 3) return;
     out.push({ ...d, text, moduleId: a.moduleId, activityTitle: humanName(a), what: whatOf(a, d.role), moduleNumber: d.moduleNumber ?? moduleOfChapter(d.chapterNumber) ?? a.unit ?? null });
   };

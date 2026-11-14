@@ -16,6 +16,7 @@
  */
 import { WorkshopActivity, WorkshopCourse, plainText } from '../course-model';
 import { activityLabel, activityOf, chapterRoleActivities, chapterTextCandidates, editableField } from './summary';
+import { trimEndChars } from '../xml-scan';
 import {
   AI_OPERATION_VALUES, ClarifyAnswer, ClarifyOption, ClarifyQuestion, InterpretedRequest, LATER_OPERATIONS, PLAN_LIMITS, RequestDetails, RequestOperation, ResolvedTarget,
 } from './types';
@@ -626,7 +627,8 @@ export function answerRequest(req: InterpretedRequest, answers: ClarifyAnswer[],
       }
     } else if (req.operation === 'add_chapter' && !newChapters?.length) {
       // La respuesta ES el título (literal de lo que escribió el docente; una línea, sin comillas de más).
-      const title = String(x.text).split(/\r?\n/)[0].replace(/^[«"“']+|[»"”'.]+$/g, '').trim().slice(0, 160);
+      // B12 ronda 1: comillas / puntos finales con trimEndChars (`/[»"”'.]+$/` era cuadrática con una corrida de puntos).
+      const title = trimEndChars(String(x.text).split(/\r?\n/)[0].replace(/^[«"“']+/, ''), '»"”\'.').trim().slice(0, 160);
       if (title) newChapters = [{ title, objective: null }];
     } else instruction = x.text!;
   }

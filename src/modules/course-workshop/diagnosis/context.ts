@@ -21,6 +21,7 @@ import { WorkshopFamily } from '../identify';
 import { RawCourse, WorkshopActivity, WorkshopCourse, WorkshopFile, buildWorkshopCourse, readRawCourse } from '../course-model';
 import { adapterFor } from '../adapters';
 import { xmlUnescape } from '../../visual-design/preview-extract';
+import { allBlocks, tagInner } from '../xml-scan';
 import { MbzV3Issue, MbzV3ValidationExpectations, validateMbzV3, validateMbzV3Structure } from '../../../package/v3/mbz-validator-v3';
 import { Mp3Meta, mp3Meta } from './mp3-meta';
 
@@ -126,10 +127,7 @@ const SCORM_HTML_MAX = 4 * 1024 * 1024;
 const TAR_BATCH_BYTES = 128 * 1024 * 1024;
 
 const sha1 = (b: Buffer): string => createHash('sha1').update(b).digest('hex');
-const tagOf = (xml: string, name: string): string | null => {
-  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(xml);
-  return m ? m[1] : null;
-};
+const tagOf = (xml: string, name: string): string | null => tagInner(xml, name);
 
 /** Abre un zip ANIDADO (.h5p / paquete SCORM) con el lector seguro del Taller; nunca lanza. */
 async function openNested(buf: Buffer): Promise<{ pkg: MbzPackage | null; problem: string | null }> {
@@ -340,8 +338,8 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
     // Fix round 1 (P2-1): lo que Moodle RESTAURA y lanza es scorm.xml <scoes><sco><launch> (scorm_scoes), no el manifiesto.
     const sx = await pkg.readText(`${a.dir}/scorm.xml`, { maxBytes: TEXT_MAX }).catch(() => null);
     const sc = scorm.get(a.moduleId) as ScormContent;
-    sc.scoLaunches = sx ? [...sx.matchAll(/<sco id="\d+">([\s\S]*?)<\/sco>/g)]
-      .map((m) => ({ launch: xmlUnescape(tagOf(m[1], 'launch') ?? '').trim(), type: (tagOf(m[1], 'scormtype') ?? '').trim() }))
+    sc.scoLaunches = sx ? allBlocks(sx, /<sco id="\d+">/, '</sco>')
+      .map((m) => ({ launch: xmlUnescape(tagOf(m.inner, 'launch') ?? '').trim(), type: (tagOf(m.inner, 'scormtype') ?? '').trim() }))
       .filter((x) => x.launch && (x.type === 'sco' || x.type === 'asset' || x.type === ''))
       .map((x) => x.launch) : [];
   }
@@ -390,9 +388,9 @@ export async function buildDiagnosisContext(input: DiagnosisInput): Promise<Diag
   const mcSingle = new Map<number, boolean>();
   if (course.exams.length && pkg.has('questions.xml')) {
     const qx = await pkg.readText('questions.xml', { maxBytes: TEXT_MAX }).catch(() => null);
-    if (qx) for (const m of qx.matchAll(/<question id="(\d+)">([\s\S]*?)<\/question>/g)) {
-      const s = /<single>\s*(\d)\s*<\/single>/.exec(m[2]);
-      if (s) mcSingle.set(Number(m[1]), s[1] !== '0');
+    if (qx) for (const m of allBlocks(qx, /<question id="(\d+)">/, '</question>')) {
+      const s = /<single>\s*(\d)\s*<\/single>/.exec(m.inner);
+      if (s) mcSingle.set(Number(m.open![1]), s[1] !== '0');
     }
   }
 

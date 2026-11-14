@@ -26,6 +26,7 @@ import { sha1Of } from './container';
 import { locateField, rawIndexMap, writeField, xmlEsc } from './html-edit';
 import { OpContext, blobPath, noteModified, setTag } from './op-context';
 import { PatchError } from './types';
+import { firstBlock, matchBlocks } from '../xml-scan';
 
 const fileOf = (a: WorkshopActivity, area: string, re: RegExp): WorkshopFile | undefined => a.files.find((f) => f.filearea === area && re.test(f.filename) && f.filename !== '.');
 
@@ -44,7 +45,7 @@ async function replaceActivityFile(ctx: OpContext, a: WorkshopActivity, f: Works
   const mine = (body: string) => body.includes(`<contenthash>${oldHash}</contenthash>`)
     && (a.contextId === null || new RegExp(`<contextid>${a.contextId}</contextid>`).test(body))
     && body.includes(`<filearea>${xmlEsc(f.filearea)}</filearea>`) && body.includes(`<filename>${xmlEsc(f.filename)}</filename>`);
-  const blocks = [...xml.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].filter((m) => mine(m[2]));
+  const blocks = matchBlocks(xml, /<file id="(\d+)">/, '</file>').filter((m) => mine(m[2]));
   if (!blocks.length) throw new PatchError('invariant', `files.xml no tiene la entrada de «${f.filename}» de la actividad (${oldHash.slice(0, 10)}…).`);
   for (const m of blocks.reverse()) {
     const start = m.index ?? 0;
@@ -223,7 +224,7 @@ async function applyScorm(ctx: OpContext, a: WorkshopActivity, p: Extract<Produc
     ctx.report.notes.push(`paquete ${pkg.filename} rearmado (index.html + imsmanifest.xml nuevos; ${Object.keys(z.files).length} entrada(s))`);
   }
   // scoes según el manifiesto nuevo: mismos ids si son 2 (organización + ítem); si no, ids nuevos en su rango.
-  const scoes = /<scoes>([\s\S]*?)<\/scoes>/.exec(sx);
+  const scoes = matchBlocks(sx, '<scoes>', '</scoes>')[0] ?? null;
   if (!scoes) throw new PatchError('invariant', 'scorm.xml no trae <scoes>.');
   const scoIds = [...scoes[1].matchAll(/<sco id="(\d+)">/g)].map((m) => Number(m[1]));
   const dataIds = [...scoes[1].matchAll(/<sco_data id="(\d+)">/g)].map((m) => Number(m[1]));
@@ -234,7 +235,7 @@ async function applyScorm(ctx: OpContext, a: WorkshopActivity, p: Extract<Produc
   const d2 = dataIds[1] ?? take();
   if (scoIds.length !== 2) ctx.report.notes.push(`scoes: el juego tenía ${scoIds.length} sco; queda con 2 (organización ${org}, ítem ${itm})`);
   for (const [k, v] of [['org', org], ['item', itm], ['d1', d1], ['d2', d2]] as const) if (!scoIds.includes(v) && !dataIds.includes(v)) (ctx.report.idsAssigned[`sco_${k}`] ||= []).push(v);
-  const name = /<scorm id="\d+">\s*<name>([\s\S]*?)<\/name>/.exec(sx)?.[1] ?? xmlEsc(ids.title);
+  const name = firstBlock(sx, /<scorm id="\d+">\s*<name>/, '</name>')?.inner ?? xmlEsc(ids.title);
   const block = `<scoes>
       <sco id="${org}">
         <manifest>${xmlEsc(ids.manifest)}</manifest>
@@ -273,7 +274,7 @@ async function applyScorm(ctx: OpContext, a: WorkshopActivity, p: Extract<Produc
   const i0 = sx.indexOf('<scoes>');
   const i1 = sx.indexOf('</scoes>') + '</scoes>'.length;
   sx = sx.slice(0, i0) + block + sx.slice(i1);
-  if (/<launch>\d*<\/launch>/.test(/<scorm id="\d+">[\s\S]*?<scoes>/.exec(sx)?.[0] ?? '')) {
+  if (/<launch>\d*<\/launch>/.test(firstBlock(sx, /<scorm id="\d+">/, '<scoes>')?.whole ?? '')) {
     const head = sx.indexOf('<scoes>');
     sx = setTag(sx.slice(0, head), 'launch', String(itm)) + sx.slice(head);
   }

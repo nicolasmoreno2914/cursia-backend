@@ -16,12 +16,15 @@
  */
 import { plainText } from '../course-model';
 import type { NewQuestion } from '../patch/types';
+import { allBlocks, replaceBlocks } from '../xml-scan';
 
 const TOKEN_RE = /\$@[A-Z0-9_]+(?:\*[0-9]+)*@\$/g;
 const PLUGINFILE_RE = /@@PLUGINFILE@@\/([^"'\s<>)?#]+)/g;
 const FORBIDDEN_TAGS = /<\s*(script|style|link|meta|base|object|embed|form|applet)\b/i;
-const BLOCKS_RE = /<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
-const TAGS_RE = /<\s*(?:link|meta|base|object|embed|form|applet)\b[^>]*>/gi;
+// B12 (H1): bloques <script>/<style> con escaneo lineal (antes `[\s\S]*?`, O(n²) con aperturas sin cierre).
+const blocksOf = (html: string): string[] => allBlocks(html, /<(script|style)\b[^<>]*>/i, (o) => new RegExp(`</${o![1]}\\s*>`, 'i')).map((b) => b.whole);
+const dropBlocks = (html: string, fn: (b: string) => string): string => replaceBlocks(html, /<(script|style)\b[^<>]*>/i, (o) => new RegExp(`</${o![1]}\\s*>`, 'i'), (b) => fn(b.whole));
+const TAGS_RE = /<\s*(?:link|meta|base|object|embed|form|applet)\b[^<>]*>/gi;
 
 export function tokensIn(html: string): string[] {
   return [...String(html).matchAll(TOKEN_RE)].map((m) => m[0]);
@@ -29,7 +32,7 @@ export function tokensIn(html: string): string[] {
 function pluginfilesIn(html: string): string[] {
   return [...String(html).matchAll(PLUGINFILE_RE)].map((m) => { try { return decodeURIComponent(m[1]); } catch { return m[1]; } });
 }
-const iframes = (h: string) => [...String(h).matchAll(/<iframe\b[^>]*>/gi)].map((m) => m[0]);
+const iframes = (h: string) => [...String(h).matchAll(/<iframe\b[^<>]*>/gi)].map((m) => m[0]);
 
 export interface HtmlRules {
   forbiddenTokens?: string[];
@@ -43,9 +46,9 @@ export function htmlProblems(newHtml: unknown, oldHtml: string, rules: HtmlRules
   if (!plainText(newHtml, 40).trim() && !/<img\b/i.test(newHtml)) p.push('el HTML nuevo está vacío');
   // Bloques <style>/<script> (y etiquetas sueltas link/meta/…) que YA estaban EXACTOS en el campo se conservan (los v3
   // traen su <style>, que Moodle mantiene sin forceclean); uno nuevo o cambiado no pasa (misma regla que el motor B4).
-  const oldBlocks = new Set([...oldHtml.matchAll(BLOCKS_RE)].map((x) => x[0]));
+  const oldBlocks = new Set(blocksOf(oldHtml));
   const oldTags = new Set([...oldHtml.matchAll(TAGS_RE)].map((x) => x[0]));
-  const rest = newHtml.replace(BLOCKS_RE, (b) => (oldBlocks.has(b) ? '' : b)).replace(TAGS_RE, (t) => (oldTags.has(t) && !/^<\s*(script|style)\b/i.test(t) ? '' : t));
+  const rest = dropBlocks(newHtml, (b) => (oldBlocks.has(b) ? '' : b)).replace(TAGS_RE, (t) => (oldTags.has(t) && !/^<\s*(script|style)\b/i.test(t) ? '' : t));
   const m = FORBIDDEN_TAGS.exec(rest);
   if (m) p.push(`trae <${m[1].toLowerCase()}> nuevo (Moodle lo elimina o es inseguro: los estilos van en style="…")`);
   const oldFrames = new Set(iframes(oldHtml));
@@ -86,7 +89,7 @@ export function libroProblems(raw: unknown, wanted: number[]): { chapters: Array
     if (FORBIDDEN_TAGS.test(html)) p.push(`capítulo ${n} trae <script>/<style> u otra etiqueta no permitida`);
     if (/\son[a-z]+\s*=/i.test(html) || /javascript\s*:/i.test(html)) p.push(`capítulo ${n} trae código`);
     if (/<\/?(html|head|body)\b/i.test(html)) p.push(`capítulo ${n} trae <html>/<head>/<body>: va solo el cuerpo`);
-    if (/^\s*<h[1-3]\b[^>]*>\s*Cap[ií]tulo\s+\d+/i.test(html)) p.push(`capítulo ${n} empieza con su título: va solo el cuerpo`);
+    if (/^\s*<h[1-3]\b[^<>]*>\s*Cap[ií]tulo\s+\d+/i.test(html)) p.push(`capítulo ${n} empieza con su título: va solo el cuerpo`);
     out.push({ number: n as number, html });
   }
   for (const w of wanted) if (!seen.has(w)) p.push(`falta el capítulo ${w}`);

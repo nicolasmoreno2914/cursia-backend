@@ -20,6 +20,7 @@
 import { createHash } from 'crypto';
 import { WorkshopActivity, WorkshopCourse, plainText } from '../course-model';
 import { activityOf } from './summary';
+import { tagInner } from '../xml-scan';
 import type { MisalignmentWarning, RequestOperation, ResolvedTarget } from './types';
 
 /** Texto buscable de una actividad (o de una pregunta de examen). */
@@ -211,8 +212,8 @@ export async function searchDocs(course: WorkshopCourse, read: (entry: string) =
     if (html.trim()) out.push({ moduleId: a.moduleId, source: a.kind === 'libro' && a.modname !== 'resource' ? 'libro' : 'html', questionId: null, text: html });
     if (a.modname === 'hvp') {
       const b = await read(`${a.dir}/hvp.xml`);
-      const m = b ? /<json_content>([\s\S]*?)<\/json_content>/.exec(b.toString('utf8')) : null;
-      if (m) out.push({ moduleId: a.moduleId, source: 'video', questionId: null, text: plainText(m[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/\\u[0-9a-f]{4}/gi, (u) => String.fromCharCode(parseInt(u.slice(2), 16))), MAX) });
+      const m = b ? tagInner(b.toString('utf8'), 'json_content') : null;
+      if (m !== null) out.push({ moduleId: a.moduleId, source: 'video', questionId: null, text: plainText(m.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/\\u[0-9a-f]{4}/gi, (u) => String.fromCharCode(parseInt(u.slice(2), 16))), MAX) });
     }
     if (a.modname === 'scorm' || (a.kind === 'libro' && a.modname === 'resource')) {
       for (const f of a.files.filter((x) => x.filearea === 'content' && /\.(html?|js)$/i.test(x.filename) && x.blobPresent && x.filesize <= 3 * 1024 * 1024)) {

@@ -17,6 +17,12 @@ import {
   ChapterPlacement, Texts, chapterPieces, editTag, formatChapterList, insertChapter, insertLibroChapter, pagesNeeded, producedChapterProblems, templateOf,
 } from './op-add-chapter';
 import { PatchError } from './types';
+import { allBlocks, firstBlock, replaceBlocks, wsStart } from '../xml-scan';
+
+/** B12 (H1): bloques `\s*<setting>…</setting>` de `open` con su espacio inicial (lineal) — mismo shape que matchAll. */
+const settingsOf = (xml: string, open: RegExp): Array<string[] & { index: number }> =>
+  allBlocks(xml, open, '</setting>').map((b) => { const st = wsStart(xml, b.start); return Object.assign([xml.slice(st, b.end)], { index: st }); });
+const blockAt = (xml: string, open: RegExp, close: string): (string[] & { index: number }) | null => { const b = firstBlock(xml, open, close); return b ? Object.assign([b.whole], { index: b.start }) : null; };
 
 /** Preguntas GIFT del examen de unidad: todas de los tipos que el builder escribe; MC con exactamente una correcta. */
 export function unitExamProblems(gift: string): { questions: GiftQuestion[]; problems: string[] } {
@@ -112,24 +118,24 @@ export async function applyAddModule(ctx: OpContext, op: AddModuleOp): Promise<v
   ns = editTag(ns, 'name', () => xmlEsc(safeActivityName(`Módulo ${M} — ${op.title}`, 255)));
   ns = editTag(ns, 'summary', (v) => (/^Capítulos [\d, y]+ con /.test(v) ? v.replace(/^Capítulos [\d, y]+? con /, `${nums.length === 1 ? 'Capítulo' : 'Capítulos'} ${formatChapterList(nums)} con `) : v));
   ns = editTag(ns, 'sequence', () => seq.join(','));
-  if (/<section id="\d+">[\s\S]*<section id=/.test(ns)) throw new PatchError('unsupported', 'section.xml del molde trae más de una sección.');
+  if (/<section id="\d+">/.test(ns) && ns.indexOf('<section id=', (/<section id="\d+">/.exec(ns)!.index) + 1) >= 0) throw new PatchError('unsupported', 'section.xml del molde trae más de una sección.');
   const secDir = `sections/section_${newSecId}`;
   for (const e of ctx.state.names().filter((n) => n.startsWith(`${tSec.dir}/`))) {
     const rel = e.slice(tSec.dir.length + 1);
     const body = rel === 'section.xml' ? ns : await ctx.state.readText(e);
-    if (rel !== 'section.xml' && /\bid="\d+"/.test(body) && !/^<\?xml[^>]*>\s*<(inforef|roles)>/.test(body)) throw new PatchError('unsupported', `${e} trae ids que el Taller no sabe clonar.`);
+    if (rel !== 'section.xml' && /\bid="\d+"/.test(body) && !/^<\?xml[^<>]*>\s*<(inforef|roles)>/.test(body)) throw new PatchError('unsupported', `${e} trae ids que el Taller no sabe clonar.`);
     ctx.state.write(`${secDir}/${rel}`, body);
     ctx.report.entriesAdded.push(`${secDir}/${rel}`);
   }
   // moodle_backup.xml: <section> y sus <setting>, después de la del último módulo.
   let backup = await texts.get('moodle_backup.xml');
-  const sb = new RegExp(`<section>\\s*<sectionid>${tSec.id}</sectionid>[\\s\\S]*?</section>`).exec(backup);
+  const sb = blockAt(backup, new RegExp(`<section>\\s*<sectionid>${tSec.id}</sectionid>`), '</section>');
   if (!sb) throw new PatchError('invariant', 'moodle_backup.xml no lista la sección del último módulo.');
-  const nsb = sb[0].replace(`<sectionid>${tSec.id}</sectionid>`, `<sectionid>${newSecId}</sectionid>`).replace(/<title>[\s\S]*?<\/title>/, `<title>${xmlEsc(safeActivityName(`Módulo ${M} — ${op.title}`, 255))}</title>`).replace(`<directory>${tSec.dir}</directory>`, `<directory>${secDir}</directory>`);
+  const nsb = sb[0].replace(`<sectionid>${tSec.id}</sectionid>`, `<sectionid>${newSecId}</sectionid>`).replace(/<title>[^<]*<\/title>/, `<title>${xmlEsc(safeActivityName(`Módulo ${M} — ${op.title}`, 255))}</title>`).replace(`<directory>${tSec.dir}</directory>`, `<directory>${secDir}</directory>`);
   const at = (sb.index ?? 0) + sb[0].length;
   backup = backup.slice(0, at) + nsb + backup.slice(at);
   const key = `section_${tSec.id}`;
-  const sets = [...backup.matchAll(new RegExp(`\\s*<setting>\\s*<level>section</level>\\s*<section>${key}</section>[\\s\\S]*?</setting>`, 'g'))];
+  const sets = settingsOf(backup, new RegExp(`<setting>\\s*<level>section</level>\\s*<section>${key}</section>`));
   if (sets.length) {
     const last = sets[sets.length - 1];
     const ins = sets.map((m) => m[0].split(`>${key}<`).join(`>section_${newSecId}<`).split(`>${key}_`).join(`>section_${newSecId}_`)).join('');
@@ -167,7 +173,7 @@ async function cloneUnitExam(ctx: OpContext, texts: Texts, src: WorkshopActivity
   const ctxId = alloc.take('contextid');
   const aid = alloc.take('activity');
   const cat = { top: alloc.take('question_category'), def: alloc.take('question_category'), cat: alloc.take('question_category') };
-  const name = xmlUnescape(/<name>([\s\S]*?)<\/name>/.exec(quiz)?.[1] ?? '').replace(new RegExp(`Unidad ${tu}(?!\\d)`), `Unidad ${M}`);
+  const name = xmlUnescape(firstBlock(quiz, '<name>', '</name>')?.inner ?? '').replace(new RegExp(`Unidad ${tu}(?!\\d)`), `Unidad ${M}`);
   const ts = /<timecreated>(\d+)<\/timecreated>/.exec(quiz)?.[1] ?? '0';
   const markPerQ = (100 / Math.max(qs.length, 1)).toFixed(7);
   let inst = '';
@@ -202,10 +208,10 @@ async function cloneUnitExam(ctx: OpContext, texts: Texts, src: WorkshopActivity
       </question_bank_entry>\n`;
   });
   const fixQuiz = (xml: string) => {
-    let out = xml.replace(/<question_instances>[\s\S]*?<\/question_instances>/, () => `<question_instances>\n${inst}    </question_instances>`);
+    let out = replaceBlocks(xml, '<question_instances>', '</question_instances>', () => `<question_instances>\n${inst}    </question_instances>`, true);
     out = editTag(out, 'name', () => xmlEsc(name));
     // Intro: la del builder cuando no hay página del examen (`<p>📝 Examen Unidad M</p>`).
-    out = out.replace(/<intro>[\s\S]*?<\/intro>/, () => `<intro>${xmlEsc(`<p>${xmlEsc(name)}</p>`)}</intro>`);
+    out = replaceBlocks(out, '<intro>', '</intro>', () => `<intro>${xmlEsc(`<p>${xmlEsc(name)}</p>`)}</intro>`, true);
     out = editTag(out, 'sumgrades', () => '100.00000');
     return out;
   };
@@ -213,7 +219,7 @@ async function cloneUnitExam(ctx: OpContext, texts: Texts, src: WorkshopActivity
   if (src.contextId !== null) extra.set(src.contextId, ctxId);
   await cloneSimple(ctx, texts, src, mid, pl, fixQuiz, (t) => t.replace(new RegExp(`Unidad ${tu}(?!\\d)`), `Unidad ${M}`), extra, (rel, xml) => {
     if (rel !== 'inforef.xml') return xml;
-    return xml.replace(/<question_categoryref>[\s\S]*?<\/question_categoryref>/, `<question_categoryref>\n    <question_category><id>${cat.top}</id></question_category>\n    <question_category><id>${cat.def}</id></question_category>\n    <question_category><id>${cat.cat}</id></question_category>\n  </question_categoryref>`);
+    return replaceBlocks(xml, '<question_categoryref>', '</question_categoryref>', () => `<question_categoryref>\n    <question_category><id>${cat.top}</id></question_category>\n    <question_category><id>${cat.def}</id></question_category>\n    <question_category><id>${cat.cat}</id></question_category>\n  </question_categoryref>`, true);
   });
   const qx = await texts.get('questions.xml');
   const catXml = (id: number, nm: string, parent: number, sortorder: number, info: string, body: string) => `  <question_category id="${id}">\n    <name>${xmlEsc(nm)}</name>\n    <contextid>${ctxId}</contextid><contextlevel>70</contextlevel><contextinstanceid>${mid}</contextinstanceid>\n    <info>${xmlEsc(info)}</info><infoformat>0</infoformat>\n    <stamp>campusvirtual.edu.co+${ts}+ws${id}</stamp>\n    <parent>${parent}</parent><sortorder>${sortorder}</sortorder><idnumber>$@NULL@$</idnumber>\n    <question_bank_entries>${body}</question_bank_entries>\n  </question_category>\n`;
@@ -251,7 +257,7 @@ async function cloneSimple(ctx: OpContext, texts: Texts, src: WorkshopActivity, 
   const dir = `activities/${src.modname}_${mid}`;
   const entries = ctx.state.names().filter((n) => n.startsWith(`${src.dir}/`));
   const files = await texts.get('files.xml');
-  if (src.contextId !== null && [...files.matchAll(/<file id="\d+">([\s\S]*?)<\/file>/g)].some((m) => m[1].includes(`<contextid>${src.contextId}</contextid>`) && !/<filename>\.<\/filename>/.test(m[1]))) throw new PatchError('unsupported', `${src.dir} trae archivos: no se clona como actividad simple.`);
+  if (src.contextId !== null && allBlocks(files, /<file id="\d+">/, '</file>').map((b) => [b.whole, b.inner]).some((m) => m[1].includes(`<contextid>${src.contextId}</contextid>`) && !/<filename>\.<\/filename>/.test(m[1]))) throw new PatchError('unsupported', `${src.dir} trae archivos: no se clona como actividad simple.`);
   for (const e of entries) {
     const rel = e.slice(src.dir.length + 1);
     let xml = await ctx.state.readText(e);
@@ -269,16 +275,16 @@ async function cloneSimple(ctx: OpContext, texts: Texts, src: WorkshopActivity, 
     ctx.report.entriesAdded.push(`${dir}/${rel}`);
   }
   let backup = await texts.get('moodle_backup.xml');
-  const blk = new RegExp(`<activity>\\s*<moduleid>${src.moduleId}</moduleid>[\\s\\S]*?</activity>`).exec(backup);
+  const blk = blockAt(backup, new RegExp(`<activity>\\s*<moduleid>${src.moduleId}</moduleid>`), '</activity>');
   if (!blk) throw new PatchError('invariant', `moodle_backup.xml no lista ${src.dir}.`);
   const nb = blk[0].replace(`<moduleid>${src.moduleId}</moduleid>`, `<moduleid>${mid}</moduleid>`).replace(/<sectionid>\d+<\/sectionid>/, `<sectionid>${pl.sectionId}</sectionid>`)
-    .replace(/<title>([\s\S]*?)<\/title>/, (_m, v: string) => `<title>${xmlEsc(title(xmlUnescape(v)))}</title>`).replace(`<directory>${src.dir}</directory>`, `<directory>${dir}</directory>`);
+    .replace(/<title>([^<]*)<\/title>/, (_m, v: string) => `<title>${xmlEsc(title(xmlUnescape(v)))}</title>`).replace(`<directory>${src.dir}</directory>`, `<directory>${dir}</directory>`);
   // Al final de la lista de actividades (después de las del capítulo recién agregadas).
-  const lastAct = [...backup.matchAll(/<activity>\s*<moduleid>\d+<\/moduleid>[\s\S]*?<\/activity>/g)].pop()!;
-  const at = (lastAct.index ?? 0) + lastAct[0].length;
+  const lastAct = allBlocks(backup, /<activity>\s*<moduleid>\d+<\/moduleid>/, '</activity>').pop()!;
+  const at = lastAct.end;
   backup = backup.slice(0, at) + nb + backup.slice(at);
   const key = `${src.modname}_${src.moduleId}`;
-  const sets = [...backup.matchAll(new RegExp(`\\s*<setting>\\s*<level>activity</level>\\s*<activity>${key}</activity>[\\s\\S]*?</setting>`, 'g'))];
+  const sets = settingsOf(backup, new RegExp(`<setting>\\s*<level>activity</level>\\s*<activity>${key}</activity>`));
   if (sets.length) {
     const last = sets[sets.length - 1];
     const ins = sets.map((m) => m[0].split(`>${key}<`).join(`>${src.modname}_${mid}<`).split(`>${key}_`).join(`>${src.modname}_${mid}_`)).join('');
@@ -294,7 +300,7 @@ async function addLibroModuleTocEntry(ctx: OpContext, texts: Texts, M: number, t
   const fx = await texts.get('files.xml');
   const libro = ctx.inv.activities.find((x) => x.kind === 'libro' && x.modname === 'resource' && !x.missingFolder);
   if (!libro || libro.contextId === null) return;
-  const blk = [...fx.matchAll(/<file id="\d+">([\s\S]*?)<\/file>/g)].find((m) => m[1].includes(`<contextid>${libro.contextId}</contextid>`) && /<filename>[^<]*\.html?<\/filename>/.test(m[1]));
+  const blk = allBlocks(fx, /<file id="\d+">/, '</file>').map((b) => [b.whole, b.inner]).find((m) => m[1].includes(`<contextid>${libro.contextId}</contextid>`) && /<filename>[^<]*\.html?<\/filename>/.test(m[1]));
   if (!blk) return;
   const h = /<contenthash>([0-9a-f]{40})<\/contenthash>/.exec(blk[1])![1];
   const be = `files/${h.slice(0, 2)}/${h}`;
@@ -309,8 +315,8 @@ async function addLibroModuleTocEntry(ctx: OpContext, texts: Texts, M: number, t
   ctx.state.write(ne, out);
   ctx.report.entriesAdded.push(ne);
   // P2-4: solo la entrada del Libro (mismo contexto) cambia de blob.
-  await texts.set('files.xml', fx.replace(/<file id="(\d+)">([\s\S]*?)<\/file>/g, (m, id: string, body: string) => (body === blk[1]
-    ? `<file id="${id}">${body.replace(`<contenthash>${h}</contenthash>`, `<contenthash>${nh}</contenthash>`).replace(/<filesize>\d+<\/filesize>/, `<filesize>${out.length}</filesize>`)}</file>` : m)));
+  await texts.set('files.xml', replaceBlocks(fx, /<file id="(\d+)">/, '</file>', ({ whole: m, open, inner: body }) => { const id = open![1]; return (body === blk[1]
+    ? `<file id="${id}">${body.replace(`<contenthash>${h}</contenthash>`, `<contenthash>${nh}</contenthash>`).replace(/<filesize>\d+<\/filesize>/, `<filesize>${out.length}</filesize>`)}</file>` : m); }, false));
   // El blob intermedio (sin la entrada del módulo) ya no lo usa nadie.
   if (ctx.state.has(be) && !ctx.inv.activities.some((a) => a.files.some((f) => f.contenthash === h)) && !(await texts.get('files.xml')).includes(`<contenthash>${h}</contenthash>`)) { ctx.state.remove(be); const k = ctx.report.entriesAdded.indexOf(be); if (k >= 0) ctx.report.entriesAdded.splice(k, 1); }
 }
