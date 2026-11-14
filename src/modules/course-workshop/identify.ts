@@ -16,6 +16,7 @@
  * el alcance (dueño / institución): un curso ajeno no aparece ni como candidato ni en las notas.
  */
 import { MbzPackage } from './mbz-reader';
+import { tagInner } from './xml-scan';
 // Inversa exacta de `xmlEsc` de los builders (& < > " — sin apóstrofes): la de «Diseño visual», sin duplicarla.
 import { xmlUnescape } from '../visual-design/preview-extract';
 
@@ -97,7 +98,7 @@ export async function readPackageFacts(pkg: MbzPackage, filename: string | null)
   const modules: Record<string, number> = {};
   for (const m of mb.matchAll(/<modulename>([^<]+)<\/modulename>/g)) modules[m[1]] = (modules[m[1]] || 0) + 1;
   const activities = (mb.match(/<activity>/g) || []).length;
-  const sectionsBlock = /<sections>([\s\S]*?)<\/sections>/.exec(mb)?.[1] ?? '';
+  const sectionsBlock = tagInner(mb, 'sections') ?? '';
   const sections = (sectionsBlock.match(/<section>/g) || []).length;
   const backupName = tagText(mb, 'name');
   const backupId = /backup_id="([^"]{1,200})"/.exec(mb)?.[1] ?? null;

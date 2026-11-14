@@ -37,6 +37,14 @@ export function outlineOf(course: WorkshopCourse): Array<{ id: string; moduleNum
 }
 
 /** Validación del juego producido (independiente del generador): 5 salas reconocidas, sin «Pendiente», con su JS y manifiesto. */
+/** `<script` … `sv2ShowRoom` … `</script>` en ese orden (lineal; antes una regex con dos `[\s\S]*?`). */
+function hasGameScript(html: string): boolean {
+  const i = html.search(/<script\b/i);
+  if (i < 0) return false;
+  const j = html.indexOf('sv2ShowRoom', i);
+  return j >= 0 && /<\/script>/i.test(html.slice(j));
+}
+
 export function scormProblems(p: { html: string; manifestXml: string; roomAssignment: string[] }): string[] {
   const out: string[] = [];
   const rooms = scormV2Rooms(p.html);
@@ -44,7 +52,7 @@ export function scormProblems(p: { html: string; manifestXml: string; roomAssign
   if (rooms.some((r) => r === null)) out.push('hay salas que no corresponden a ninguna mecánica del motor');
   if (JSON.stringify(rooms) !== JSON.stringify(p.roomAssignment)) out.push('las salas del HTML no coinciden con la asignación de mecánicas');
   if (hasPendingMarker(p.html)) out.push('el juego trae un marcador «⚠️ Pendiente»');
-  if (!/<script\b[\s\S]*?sv2ShowRoom[\s\S]*?<\/script>/i.test(p.html)) out.push('el juego no trae su JavaScript');
+  if (!hasGameScript(p.html)) out.push('el juego no trae su JavaScript');
   if (!/<\/html>\s*$/i.test(p.html)) out.push('el HTML del juego está cortado');
   try { parseScormManifestIds(p.manifestXml); } catch (e) { out.push(`imsmanifest.xml inválido: ${e instanceof Error ? e.message : String(e)}`); }
   return out;

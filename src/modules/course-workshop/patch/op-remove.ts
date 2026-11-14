@@ -18,6 +18,7 @@ import { sha1Of } from './container';
 import { editToken, locateField, validateNewHtml, writeField } from './html-edit';
 import { OpContext, blobPath, noteModified } from './op-context';
 import { PatchError, RemoveActivityOp } from './types';
+import { matchBlocks, tagInner } from '../xml-scan';
 
 /** Quita un bloque `<tag>…</tag>` (con la sangría y el salto de línea anteriores) por posición. */
 function cutBlock(xml: string, start: number, end: number): string {
@@ -40,12 +41,12 @@ export async function applyRemoveActivity(ctx: OpContext, op: RemoveActivityOp):
   for (const x of inv.activities.filter((y) => y.moduleId !== a.moduleId && !y.missingFolder)) {
     const mx = `${x.dir}/module.xml`;
     if (!state.has(mx)) continue;
-    const av = /<availability>([\s\S]*?)<\/availability>/.exec(await state.readText(mx))?.[1] ?? '';
+    const av = tagInner(await state.readText(mx), 'availability') ?? '';
     if (new RegExp(`(&quot;|")cm(&quot;|")\\s*:\\s*${a.moduleId}\\b`).test(av)) throw new PatchError('invariant', `«${x.title}» tiene una condición de acceso que depende de «${a.title}»: no se puede quitar sin cambiar esa condición.`);
   }
   for (const s of inv.sections) {
     if (!s.entry || !state.has(s.entry)) continue;
-    const av = /<availabilityjson>([\s\S]*?)<\/availabilityjson>/.exec(await state.readText(s.entry))?.[1] ?? '';
+    const av = tagInner(await state.readText(s.entry), 'availabilityjson') ?? '';
     if (new RegExp(`(&quot;|")cm(&quot;|")\\s*:\\s*${a.moduleId}\\b`).test(av)) throw new PatchError('invariant', `La sección «${s.name}» tiene una condición de acceso que depende de «${a.title}».`);
   }
   // Fix round 1 (P2-2): dependencias por los ÍTEMS DE CALIFICACIÓN de la actividad (su grades.xml): condiciones de acceso
@@ -117,11 +118,9 @@ export async function applyRemoveActivity(ctx: OpContext, op: RemoveActivityOp):
 
   // 2. moodle_backup.xml: <activity> y sus <setting>.
   let mb = await state.readText('moodle_backup.xml');
-  const actRe = /<activity>\s*<moduleid>(\d+)<\/moduleid>[\s\S]*?<\/activity>/g;
-  const am = [...mb.matchAll(actRe)].filter((m) => Number(m[1]) === a.moduleId);
+  const am = matchBlocks(mb, /<activity>\s*<moduleid>(\d+)<\/moduleid>/, '</activity>').filter((m) => Number(m[1]) === a.moduleId);
   if (am.length !== 1) throw new PatchError('invariant', `moodle_backup.xml lista ${am.length} veces la actividad ${a.moduleId}.`);
-  const setRe = /<setting>\s*<level>activity<\/level>\s*<activity>([^<]*)<\/activity>[\s\S]*?<\/setting>/g;
-  const cuts = [{ s: am[0].index ?? 0, e: (am[0].index ?? 0) + am[0][0].length }, ...[...mb.matchAll(setRe)].filter((m) => m[1] === tag).map((m) => ({ s: m.index ?? 0, e: (m.index ?? 0) + m[0].length }))];
+  const cuts = [{ s: am[0].index ?? 0, e: (am[0].index ?? 0) + am[0][0].length }, ...matchBlocks(mb, /<setting>\s*<level>activity<\/level>\s*<activity>([^<]*)<\/activity>/, '</setting>').filter((m) => m[1] === tag).map((m) => ({ s: m.index ?? 0, e: (m.index ?? 0) + m[0].length }))];
   for (const c of cuts.sort((x, y) => y.s - x.s)) mb = cutBlock(mb, c.s, c.e);
   state.write('moodle_backup.xml', mb);
   noteModified(ctx, 'moodle_backup.xml');
@@ -144,7 +143,7 @@ export async function applyRemoveActivity(ctx: OpContext, op: RemoveActivityOp):
   // 5. files.xml: los archivos de su contexto; blobs huérfanos fuera.
   if (a.contextId !== null && state.has('files.xml')) {
     let fx = await state.readText('files.xml');
-    const mine = [...fx.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].filter((m) => Number(/<contextid>(\d+)<\/contextid>/.exec(m[2])?.[1] ?? -1) === a.contextId);
+    const mine = matchBlocks(fx, /<file id="(\d+)">/, '</file>').filter((m) => Number(/<contextid>(\d+)<\/contextid>/.exec(m[2])?.[1] ?? -1) === a.contextId);
     const hashes = new Set(mine.map((m) => /<contenthash>([0-9a-f]{40})<\/contenthash>/.exec(m[2])?.[1] ?? '').filter(Boolean));
     for (const m of mine.reverse()) fx = cutBlock(fx, m.index ?? 0, (m.index ?? 0) + m[0].length);
     if (mine.length) { state.write('files.xml', fx); noteModified(ctx, 'files.xml'); }
@@ -159,7 +158,7 @@ export async function applyRemoveActivity(ctx: OpContext, op: RemoveActivityOp):
   // 6. Examen: sus categorías del banco (contexto del quiz).
   if (a.modname === 'quiz' && a.contextId !== null && state.has('questions.xml')) {
     let qx = await state.readText('questions.xml');
-    const cats = [...qx.matchAll(/<question_category id="(\d+)">([\s\S]*?)<\/question_category>/g)].filter((m) => Number(/<contextid>(\d+)<\/contextid>/.exec(m[2])?.[1] ?? -1) === a.contextId);
+    const cats = matchBlocks(qx, /<question_category id="(\d+)">/, '</question_category>').filter((m) => Number(/<contextid>(\d+)<\/contextid>/.exec(m[2])?.[1] ?? -1) === a.contextId);
     const qids = cats.flatMap((m) => [...m[2].matchAll(/<question id="(\d+)">/g)].map((x) => Number(x[1])));
     for (const m of cats.reverse()) qx = cutBlock(qx, m.index ?? 0, (m.index ?? 0) + m[0].length);
     if (cats.length) { state.write('questions.xml', qx); noteModified(ctx, 'questions.xml'); }

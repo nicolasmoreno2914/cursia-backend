@@ -16,6 +16,7 @@ import { xmlUnescape } from '../../visual-design/preview-extract';
 import { TokenContext, WorkshopActivity, WorkshopCourse, WorkshopHtmlField, extractTokens, pluginfileRefs, tokenKindShape } from '../course-model';
 import { PatchState, sha1Of } from './container';
 import { PatchError } from './types';
+import { matchBlocks, openTags } from '../xml-scan';
 
 export { xmlEsc };
 
@@ -64,7 +65,8 @@ export function writeField(state: PatchState, loc: LocatedField, newRaw: string)
 
 // ─── Validación del contenido nuevo ─────────────────────────────────────────
 
-const BLOCKS = /<(style|script)\b[\s\S]*?<\/\1\s*>/gi;
+// B12 (H1): bloques <style>/<script> con escaneo lineal (antes `[\s\S]*?` con referencia hacia atrás).
+const blocksIn = (h: string): string[][] => matchBlocks(h, /<(style|script)\b/i, (o) => new RegExp(`</${o![1]}\\s*>`, 'i'));
 const OPEN_BLOCK = /<(style|script)\b/gi;
 
 export interface HtmlValidationCtx {
@@ -118,12 +120,12 @@ export function validateNewHtml(fragment: string, full: string, v: HtmlValidatio
   }
   const count = (h: string) => badTokens(h, v.tokenCtx).reduce((s, t) => s + t.count, 0);
   if (count(full) > count(v.oldHtml)) throw new PatchError('invalid_content', `El cambio en ${v.where} rompe un token $@…@$ existente.`);
-  const oldBlocks = new Set([...v.oldHtml.matchAll(BLOCKS)].map((m) => m[0]));
-  for (const m of full.matchAll(BLOCKS)) {
+  const oldBlocks = new Set(blocksIn(v.oldHtml).map((m) => m[0]));
+  for (const m of blocksIn(full)) {
     if (!oldBlocks.has(m[0])) throw new PatchError('invalid_content', `El HTML nuevo de ${v.where} trae un bloque <${m[1].toLowerCase()}>: Moodle lo elimina (forceclean). Los estilos van inline (style="…").`);
   }
   const opens = (h: string) => (h.match(OPEN_BLOCK) || []).length;
-  const closed = (h: string) => [...h.matchAll(BLOCKS)].length;
+  const closed = (h: string) => blocksIn(h).length;
   if (opens(full) - closed(full) > opens(v.oldHtml) - closed(v.oldHtml)) throw new PatchError('invalid_content', `El HTML nuevo de ${v.where} abre un <style>/<script> sin cerrarlo.`);
   const okFiles = new Set([...pluginfileRefs(v.oldHtml), ...v.files]);
   for (const f of pluginfileRefs(fragment)) {
@@ -187,13 +189,14 @@ export function editToken(raw: string, token: string, action: 'unlink' | 'retarg
   } else {
     // Fix round 1 (P2-8): etiqueta de apertura con atributos entre comillas (pueden traer «>»), cierre `</a >` /
     // `</A\n>` incluidos; un `<a` antes del cierre (enlace anidado o sin cerrar) → falla, nunca deja un enlace abierto.
-    const OPEN_A = /<a\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
+    // B12 ronda 1: etiquetas `<a …>` con el escáner LINEAL (la regex `(?:[^>"']|"[^"]*"|'[^']*')*` era cuadrática
+    // con muchos `<a` sin `>`); mismo criterio: comillas que pueden traer «>», el primer `>` fuera de comillas cierra.
     const covered = new Set<number>();
-    for (const a of html.matchAll(OPEN_A)) {
-      const s = a.index ?? 0;
-      const hrefs = [...a[0].matchAll(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)].map((h) => h[1] ?? h[2] ?? h[3] ?? '');
+    for (const a of openTags(html, /<a\b/i)) {
+      const s = a.start;
+      const hrefs = a.attrs.filter((x) => x.name === 'href').map((x) => x.value ?? '');
       if (!hrefs.some((h) => h.includes(token))) continue;
-      const after = s + a[0].length;
+      const after = a.end;
       const closeRe = /<\/a\s*>/gi; closeRe.lastIndex = after;
       const cm = closeRe.exec(html);
       if (!cm) throw new PatchError('invalid_content', `El enlace con ${token} no cierra (</a>): no se puede quitar sin romper el HTML.`);

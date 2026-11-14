@@ -28,6 +28,7 @@ import { videoMcLengthBias } from '../../quality/answer-length-bias';
 import { windowMentions } from '../../quality/course-quality-checks';
 import { contentWords } from '../../quality/quality-battery';
 import type { QualityCheckId, QualityDoc, QualityFinding, QualityQuote } from './types';
+import { dropWsBefore } from '../xml-scan';
 
 // ─── Armado de hallazgos ───────────────────────────────────────────────────
 
@@ -470,7 +471,8 @@ function q05(ctx: DiagnosisContext): QualityFinding[] {
     const title = c.title ? `«${c.title}»` : '';
     out.push(makeQualityFinding({
       check: 'Q05', code: 'chapter_not_assessed', severity: 'warning', scope: { level: 'chapter', chapterNumber: c.number, moduleNumber: c.moduleNumber, activity: null }, source: 'deterministic', key: `cap${c.number}`,
-      title: `Ningún examen evalúa el capítulo ${c.number} ${title}: lo que se aprende ahí no se comprueba.`.replace(/\s+:/, ':'),
+      // B12 ronda 1: sin `/\s+:/` (cuadrática con un título de espacios): mismo resultado, lineal.
+      title: dropWsBefore(`Ningún examen evalúa el capítulo ${c.number} ${title}: lo que se aprende ahí no se comprueba.`, ':'),
       detail: `capítulo ${c.number} (módulo ${c.moduleNumber ?? '—'}): ${moduleExams.length ? `el examen de su módulo (${moduleExams.map((a) => a.dir).join(', ')}) no tiene preguntas de la categoría «Capítulo ${c.number}»` : 'su módulo no tiene examen'}${finals.length ? `; el examen final ${finals.some(declares) ? 'tampoco lo incluye' : 'no declara capítulos'}` : ''}`,
       quotes: [],
       suggestedFix: target ? { operation: 'exam_question_add', params: { quizModuleId: target.moduleId, instruction: `Escribir una pregunta de opción múltiple sobre el capítulo ${c.number}${c.title ? ` («${c.title}»)` : ''}: una sola correcta, opciones de largo parecido.` } } : null,

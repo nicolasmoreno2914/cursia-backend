@@ -6,6 +6,7 @@
  * adaptador marca `unknown` con el motivo (nunca adivina en silencio).
  */
 import { ChapterRole, Classified, ClassifyInput, CourseKind, RawSection, SectionInfo } from '../course-model';
+import { firstBlock, stripTags } from '../xml-scan';
 
 const N = (s: string | undefined): number | null => (s === undefined ? null : Number(s));
 const clean = (s: string | undefined): string | null => {
@@ -80,9 +81,9 @@ const DYNAMIC_SHELL: Readonly<Record<string, CourseKind>> = Object.freeze({
 
 /** Texto del primer <hN> de un HTML (sin etiquetas, entidades HTML básicas decodificadas). */
 export function firstHeadingText(html: string, tagName: 'h2' | 'h3'): string | null {
-  const m = new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)</${tagName}>`, 'i').exec(html);
-  if (!m) return null;
-  const t = m[1].replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&amp;/g, '&');
+  const b = firstBlock(html, new RegExp(`<${tagName}\\b[^<>]*>`, 'i'), new RegExp(`</${tagName}>`, 'i'));
+  if (!b) return null;
+  const t = stripTags(b.inner).replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&amp;/g, '&');
   return clean(t);
 }
 

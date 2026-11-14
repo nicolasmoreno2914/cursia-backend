@@ -4,6 +4,7 @@ import { DataSource } from 'typeorm';
 import { returningRows } from '../../../common/db/returning-rows';
 import { ArtifactsService } from '../../artifacts/artifacts.service';
 import { isUuid } from '../../authz/schema-probe';
+import { isMbzReaderError } from '../mbz-reader';
 import { isCourseWorkshopEnabled } from '../../features/course-workshop-flag';
 import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession } from '../course-workshop.service';
 import { DIAGNOSIS_CODE_VERSION, DiagnosisReport } from '../diagnosis/diagnose';
@@ -491,6 +492,16 @@ export class WorkshopApplyService implements OnModuleInit, OnModuleDestroy {
         const terminal = code === WORKSHOP_ERRORS.ORIGINAL_CHANGED || code === WORKSHOP_ERRORS.ORIGINAL_MISSING;
         await fail({ stage: 'verify_original', code, message: String(body?.message ?? 'No se pudo leer el original; vuelve a aplicar en unos minutos.'), retryable: !terminal });
         return;
+      }
+      // B12 (H2): la reserva pasa a lo que el paquete ABIERTO puede ocupar (+ los resultados producidos ya contados).
+      try {
+        const key = `apply:${v.id}`;
+        const base = Math.ceil(Number(s.originalSize ?? 0) * applyMemoryFactor(s.container));
+        await this.workshop.reserveForPackage(key, original.buffer, applyMemoryFactor(s.container), Math.max(0, this.workshop.reservedFor(key) - base));
+      } catch (err) {
+        if (err instanceof MemoryWaitTimeoutError) { await fail({ stage: 'verify_original', code: err.code, message: err.message, retryable: true }); return; }
+        if (isMbzReaderError(err)) { await fail({ stage: 'verify_original', code: `WORKSHOP_${err.code.toUpperCase()}`, message: err.message, retryable: false }); return; }
+        throw err;
       }
       const items = await this.itemsOf(v.plan_id);
       const byId = new Map(items.map((i) => [i.id, i]));

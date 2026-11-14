@@ -179,9 +179,11 @@ export function llmMeasuredUsd(pricing: DryRunPricing, model: string, u: LlmUsag
   return PRICE(pricing, 'anthropic', 'messages', model, { input_tokens: n(u.input_tokens), output_tokens: n(u.output_tokens), cache_write_tokens: n(u.cache_creation_input_tokens), cache_read_tokens: n(u.cache_read_input_tokens) });
 }
 /** Cota de un trozo de TTS: los segundos estimados × 2 × margen (la voz puede ir más lenta). */
+export function ttsBoundSeconds(chars: number): number {
+  return Math.max(1, Math.ceil((Math.max(0, chars) / TTS_CHARS_PER_SECOND) * 2 * REGEN_PROVIDER_MARGIN));
+}
 export function ttsBoundUsd(pricing: DryRunPricing, model: string, chars: number): string {
-  const secs = Math.max(1, Math.ceil((chars / TTS_CHARS_PER_SECOND) * 2 * REGEN_PROVIDER_MARGIN));
-  return PRICE(pricing, 'openai', 'audio.speech', model, { audio_seconds: secs });
+  return PRICE(pricing, 'openai', 'audio.speech', model, { audio_seconds: ttsBoundSeconds(chars) });
 }
 export function ttsMeasuredUsd(pricing: DryRunPricing, model: string, seconds: number): string {
   return PRICE(pricing, 'openai', 'audio.speech', model, { audio_seconds: (Math.round(seconds * 1000) / 1000).toFixed(3) });
@@ -216,6 +218,15 @@ export function gammaBound(pricing: DryRunPricing, numCards: number): ProviderBo
 export function gammaBoundUsd(pricing: DryRunPricing, numCards = 10): string { return gammaBound(pricing, numCards).boundUsd; }
 export function gammaMeasuredUsd(pricing: DryRunPricing, credits: number): string {
   return PRICE(pricing, 'gamma', 'generations', 'gamma-generate', { gamma_credit: credits });
+}
+/**
+ * r107 B12 (G2): créditos equivalentes a una cota en USD (para registrar como `pending` lo que la aprobación cuenta
+ * cuando Gamma no informa `credits.deducted`, como `gammaPendingInput` del worker). null = el catálogo no tiene precio.
+ */
+export function gammaCreditsForUsd(pricing: DryRunPricing, usd: string): number | null {
+  const unit = Number(gammaMeasuredUsd(pricing, 1));
+  if (!(unit > 0) || !(Number(usd) > 0)) return null;
+  return Math.ceil(Number(usd) / unit - 1e-9);
 }
 /** Minutos máximos que se cuentan para el video de un texto de `words` palabras. */
 export function videoMaxMinutes(words: number): number {
@@ -264,24 +275,29 @@ export function llmChargeInput(c: ChargeContext, callId: string, r: { model: str
 export function ttsChargeInputOf(c: ChargeContext, callId: string, r: { model: string; requestId: string | null; seconds: number | null; characters: number }): RecordChargeInput {
   const measured = typeof r.seconds === 'number' && Number.isFinite(r.seconds) && r.seconds > 0;
   const reqId = r.requestId && !/\s/.test(r.requestId) ? r.requestId : null;
+  // B12 (G2): sin medición, el ledger registra los segundos de la COTA como `pending` (nunca USD 0 con la reserva liberada).
   return {
-    ...base(c, callId, { characters: r.characters, costBasis: 'measured_audio_seconds x pricing_catalog', ...(measured ? {} : { pendingReason: 'tts_audio_not_measurable' }) }),
+    ...base(c, callId, { characters: r.characters, costBasis: measured ? 'measured_audio_seconds x pricing_catalog' : 'workshop_call_bound_seconds x pricing_catalog (provisional)', ...(measured ? {} : { pendingReason: 'tts_audio_not_measurable', estimatedPending: true }) }),
     provider: 'openai', service: 'audio.speech', modelOrProduct: r.model, operation: 'tts.workshop_regenerate',
-    usage: measured ? { audio_seconds: (Math.round((r.seconds as number) * 1000) / 1000).toFixed(3) } : {},
+    usage: measured ? { audio_seconds: (Math.round((r.seconds as number) * 1000) / 1000).toFixed(3) } : { audio_seconds: ttsBoundSeconds(r.characters) },
     usageUnit: 'audio_seconds', externalOperationId: reqId,
     idempotencyKey: reqId ? `openai:req:${reqId}` : `openai:workshop-tts:${callId}`,
     costSource: c.simulated ? 'MOCK' : 'CALCULATED_FROM_USAGE', measurementStatus: measured ? 'final' : 'pending', unmeasuredUsage: !measured,
   } as RecordChargeInput;
 }
-export function gammaChargeInputOf(c: ChargeContext, callId: string, r: { generationId: string; credits: number | null; failed?: boolean }): RecordChargeInput {
+export function gammaChargeInputOf(c: ChargeContext, callId: string, r: { generationId: string; credits: number | null; failed?: boolean; boundCredits?: number | null }): RecordChargeInput {
   const measured = typeof r.credits === 'number' && Number.isFinite(r.credits) && r.credits >= 0;
+  // B12 (G2): sin `credits.deducted`, los créditos de la COTA quedan `pending` (como gammaPendingInput del worker): el
+  // ledger y el saldo ven el mismo monto que la aprobación cuenta, nunca USD 0.
+  const bound = !measured && typeof r.boundCredits === 'number' && r.boundCredits > 0 ? r.boundCredits : null;
+  const credits = measured ? (r.credits as number) : bound;
   return {
-    ...base(c, callId, { costBasis: 'gamma.credits.deducted x pricing_catalog', ...(measured ? {} : { pendingReason: 'gamma_credits_not_reported' }) }),
+    ...base(c, callId, { costBasis: measured ? 'gamma.credits.deducted x pricing_catalog' : 'workshop_call_bound_credits x pricing_catalog (provisional)', ...(measured ? {} : { pendingReason: 'gamma_credits_not_reported', estimatedPending: true }) }),
     provider: 'gamma', service: 'generations', modelOrProduct: 'gamma-generate', operation: 'gamma.workshop_regenerate',
-    usage: measured ? { gamma_credit: r.credits as number } : {}, usageUnit: 'gamma_credit', externalOperationId: r.generationId,
+    usage: credits !== null ? { gamma_credit: credits } : {}, usageUnit: 'gamma_credit', externalOperationId: r.generationId,
     idempotency: { kind: 'gamma', parts: { generationId: r.generationId } },
     costSource: c.simulated ? 'MOCK' : 'CALCULATED_FROM_USAGE', measurementStatus: measured ? 'final' : 'pending',
-    outcome: r.failed ? (measured && (r.credits as number) > 0 ? 'failed_charged' : 'failed_uncharged') : 'succeeded',
+    outcome: r.failed ? (credits !== null && credits > 0 ? 'failed_charged' : 'failed_uncharged') : 'succeeded',
   } as RecordChargeInput;
 }
 export function videogenChargeInputOf(c: ChargeContext, callId: string, r: { jobId: string; cost: number | null }): RecordChargeInput {

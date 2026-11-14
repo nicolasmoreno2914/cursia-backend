@@ -12,6 +12,7 @@ import { loadDryRunPricing } from '../../finops/dry-run-pricing';
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import { readDocument, DocumentReadError } from '../../academic-context';
 import { isUuid } from '../../authz/schema-probe';
+import { isMbzReaderError } from '../mbz-reader';
 import { CourseWorkshopService, MemoryWaitTimeoutError, WORKSHOP_BUCKET, WORKSHOP_ERRORS, WorkshopActor, WorkshopPlanSession, diagnosisMemoryFactor } from '../course-workshop.service';
 import { DIAGNOSIS_CODE_VERSION, DiagnosisReport } from '../diagnosis/diagnose';
 import { QUALITY_CODE_VERSION } from '../quality/types';
@@ -228,6 +229,21 @@ export type RegenGate = PaidCallGate & { spent(): string; resume(callId: string)
 export interface RegenWait { approvalId: string; reservationKey?: string | null; itemId: string; provider: 'videogen' | 'gamma'; externalId: string; callId: string; startedAt: string; deadlineAt: string }
 class WaitLost extends Error {}
 
+/**
+ * r107 B12 (G1): conjunto con CONTEO de referencias — `add` suma, `delete` resta y la clave sale recién en 0. Misma forma
+ * que un Set para quien lo lee (`has`, `size`, iterable, `clear`).
+ */
+export class RefSet implements Iterable<string> {
+  private readonly m = new Map<string, number>();
+  add(k: string): this { this.m.set(k, (this.m.get(k) ?? 0) + 1); return this; }
+  delete(k: string): boolean { const n = this.m.get(k); if (!n) return false; if (n <= 1) this.m.delete(k); else this.m.set(k, n - 1); return true; }
+  has(k: string): boolean { return this.m.has(k); }
+  count(k: string): number { return this.m.get(k) ?? 0; }
+  clear(): void { this.m.clear(); }
+  get size(): number { return this.m.size; }
+  [Symbol.iterator](): Iterator<string> { return this.m.keys(); }
+}
+
 @Injectable()
 export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WorkshopPlanService.name);
@@ -255,10 +271,14 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
   aiCalls = 0;
   private readonly queue: Array<{ job: Job; done: () => void; stamped: Promise<void>; claimId: string }> = [];
   private laneBusy = false;
-  /** Entradas / pedidos / aprobaciones con trabajo en cola o corriendo en ESTE proceso. */
-  private readonly activeIds = new Set<string>();
-  /** r107 B6: reclamos de este proceso que se laten (trabajos en cola o corriendo). */
-  private readonly beating = new Set<string>();
+  /**
+   * Entradas / pedidos / aprobaciones con trabajo en cola o corriendo en ESTE proceso. r107 B12 (G1): con CONTEO de
+   * referencias — una espera que encola su reanudación, o un `generate` que termina con la reanudación ya en cola, ya no
+   * borran la marca que el otro sigue necesitando.
+   */
+  private readonly activeIds = new RefSet();
+  /** r107 B6: reclamos de este proceso que se laten (trabajos en cola o corriendo). B12 (G1): con conteo de referencias. */
+  private readonly beating = new RefSet();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -921,12 +941,17 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
         let ctx: BuildCtx;
         try {
           const original = await this.workshop.loadVerifiedOriginal(s.id);
+          // B12 (H2): la reserva pasa a lo que el paquete ABIERTO puede ocupar (+ lo producido que el trabajo carga).
+          await this.workshop.reserveForPackage(`plan:${job.sessionId}`, original.buffer, diagnosisMemoryFactor(s.container), Math.max(0, bytes - Number(s.originalSize ?? 0) * diagnosisMemoryFactor(s.container)));
           ctx = await openBuildCtx(original.buffer, { filename: s.filename, originalSha1: s.originalSha1 as string, pricing: await this.pricing(), baseline: await this.baselineOf(s) });
           ctx.regenDbLoader = () => this.regenDbSources(s, ctx.course);
           // r107 B10 · Libro v3 (PDF): la entrada del builder del curso, solo si hace falta (perezosa).
           ctx.libroV3Loader = () => libroV3ResolverOf(this.dataSource, this.artifacts, this.moduleRef).resolve(s);
           ctx.ttsModel = resolveTtsModel(undefined, process.env).model;
         } catch (err) {
+          if (err instanceof MemoryWaitTimeoutError) throw err;
+          // B12 (H2): paquete que se expande más de lo procesable → terminal (con los mismos bytes falla igual).
+          if (isMbzReaderError(err)) { await this.failJob(job, `WORKSHOP_${err.code.toUpperCase()}`, err.message, false); return; }
           const body = (err as { getResponse?: () => any })?.getResponse?.();
           const code = String(body?.code ?? PLAN_ERRORS.PREPARE_FAILED);
           await this.failJob(job, code, String(body?.message ?? 'No se pudo abrir el original de la sesión; vuelve a intentarlo.'), code !== WORKSHOP_ERRORS.ORIGINAL_CHANGED && code !== WORKSHOP_ERRORS.ORIGINAL_MISSING);
@@ -1539,10 +1564,16 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     const handOff = async (): Promise<void> => {
       const rc = `${this.workshop.bootId}.${randomUUID()}`;
       this.beat(rc, true);
-      const done = returningRows(await this.q(this.dataSource, `update public.workshop_requests set claim_id = $3, details = (coalesce(details, '{}'::jsonb) || $4::jsonb) - 'regenPending', updated_at = now()
-          where id = $1 and claim_id = $2 and status = 'preparing' returning id`, [requestId, claim, rc, JSON.stringify({ regenPaid: { ...paid, [w.provider]: { ...(paid as any)[w.provider], charged: true } } })]));
-      if (done.length) this.enqueue({ kind: 'regen_resume', sessionId, approvalId: w.approvalId, requestId }, rc);
-      this.beat(rc, false);
+      // B12 ronda 1: si el update falla, `rc` no queda latiendo para siempre (finally).
+      try {
+        const done = returningRows(await this.q(this.dataSource, `update public.workshop_requests set claim_id = $3, details = (coalesce(details, '{}'::jsonb) || $4::jsonb) - 'regenPending', updated_at = now()
+            where id = $1 and claim_id = $2 and status = 'preparing' returning id`, [requestId, claim, rc, JSON.stringify({ regenPaid: { ...paid, [w.provider]: { ...(paid as any)[w.provider], charged: true } } })]));
+        // B12 (G1): el latido de `rc` lo sostiene la reanudación encolada (enqueue lo toma y lo suelta al terminar); este
+        // par solo cubre la ventana del update. Con el conteo de referencias, soltarlo acá ya no deja la reanudación sin latir.
+        if (done.length) this.enqueue({ kind: 'regen_resume', sessionId, approvalId: w.approvalId, requestId }, rc);
+      } finally {
+        this.beat(rc, false);
+      }
     };
     let ticket: PaidCallTicket;
     try {
@@ -1618,9 +1649,23 @@ export class WorkshopPlanService implements OnModuleInit, OnModuleDestroy {
     const approval = await this.approvalOf(approvalId);
     if (!approval) return;
     const row = await this.requestOf(s.id, requestId);
+    // B12 (G1): lo pagado por la espera (render, PDF) quedó en `regenPaid`; si el pedido ya no está preparándose (otro
+    // camino lo cerró: un barrido, un fallo), la reanudación NO sale callada: cierra la aprobación con el motivo visible y
+    // deja lo pagado en el pedido para que el reintento lo reuse (nunca se repaga).
+    const paidSome = Object.values((row.details?.regenPaid ?? {}) as Record<string, any>).some((v) => v && typeof v === 'object' && v.charged === true);
+    const closeVisible = async () => {
+      const reason = 'La regeneración terminó con el proveedor, pero el pedido ya no estaba preparándose: lo pagado quedó guardado y se reusa al volver a pedirlo.';
+      this.logger.warn(`taller regen: reanudación de ${requestId} con el pedido en ${row.status}: ${reason}`);
+      if (row.status === 'failed' || row.status === 'preparing') await this.setRequest(requestId, { status: 'awaiting_generation', reason });
+      await this.maybeCloseApproval(approvalId, 'failed', reason);
+    };
     // N2: solo la reanudación a la que la espera le pasó el reclamo sigue (una por llamada).
-    if (row.claim_id !== claimId) return;
+    if (row.claim_id !== claimId) {
+      if (row.claim_id === null && row.status !== 'preparing' && row.status !== 'resolved' && paidSome) await closeVisible();
+      return;
+    }
     const [item] = await this.q<ItemRow[]>(this.dataSource, `select * from public.workshop_plan_items where request_id = $1 and id = any($2::uuid[])`, [requestId, approval.item_ids]);
+    if (row.status !== 'preparing' && row.status !== 'resolved' && paidSome) { await closeVisible(); return; }
     if (row.status !== 'preparing' || !item || row.details?.regenPending) return;
     const [intake] = await this.q<IntakeRow[]>(this.dataSource, `select source from public.workshop_intakes where id = $1`, [row.intake_id]);
     const r = await this.runRegenItem(s, ctx, approval, item, row, { ...this.interpretedOf(row), status: 'resolved' }, intake?.source === 'finding');

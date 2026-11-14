@@ -278,6 +278,11 @@ jobs:
       - name: Check r107 Taller de cursos — agregar capítulo / módulo (proveedores simulados)
         run: node scripts/r107/check-r107-add-chapter.js --ci
 
+      # r107 B12 · endurecimiento final: escaneo lineal del XML/HTML del paquete (H1), memoria sobre lo descomprimido (H2)
+      # y «Preguntar» sobre la cobertura del examen (D3). Puro, sin red ni IA (USD 0).
+      - name: Check r107 Taller de cursos — endurecimiento (escaneo lineal, bombas, Preguntar)
+        run: node scripts/r107/check-r107-hardening.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

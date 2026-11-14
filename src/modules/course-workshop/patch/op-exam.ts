@@ -20,6 +20,7 @@ import { sha1Of } from './container';
 import { validateNewHtml, xmlEsc } from './html-edit';
 import { OpContext, blobPath, noteModified, setTag } from './op-context';
 import { ExamQuestionAddOp, ExamQuestionRemoveOp, ExamQuestionReplaceOp, NewQuestion, PatchError } from './types';
+import { matchBlocks } from '../xml-scan';
 
 /** question_bank::fraction_options_full() de Moodle (y sus negativos). */
 const FRACTIONS = [1, 0.9, 0.8333333, 0.8, 0.75, 0.7, 0.6666667, 0.6, 0.5, 0.4, 0.3333333, 0.3, 0.25, 0.2, 0.1666667, 0.1428571, 0.125, 0.1111111, 0.1, 0.05, 0];
@@ -57,9 +58,8 @@ function parseQuiz(entry: string, xml: string): QuizXml {
   const close = xml.indexOf('</question_instances>');
   if (open < 0 || close < 0) throw new PatchError('unsupported', `${entry}: sin <question_instances>.`);
   const slots: Slot[] = [];
-  const re = /<question_instance id="(\d+)">([\s\S]*?)<\/question_instance>/g;
-  re.lastIndex = open;
-  for (let m = re.exec(xml); m && m.index < close; m = re.exec(xml)) {
+  for (const m of matchBlocks(xml, /<question_instance id="(\d+)">/, '</question_instance>', open)) {
+    if (m.index >= close) break;
     const b = m[2];
     const g = (t: string) => new RegExp(`<${t}>([^<]*)</${t}>`).exec(b)?.[1] ?? null;
     const n = (t: string) => { const v = g(t); return v !== null && /^-?\d+(\.\d+)?$/.test(v.trim()) ? Number(v) : null; };
@@ -79,7 +79,7 @@ function parseQuiz(entry: string, xml: string): QuizXml {
     entry, xml, slots, instStart: open + '<question_instances>'.length, instEnd: close,
     qpp: Number(/<questionsperpage>(\d+)<\/questionsperpage>/.exec(xml)?.[1] ?? 0),
     quizId: Number(/<quiz id="(\d+)">/.exec(xml)?.[1] ?? NaN) || null,
-    ctxId: Number(/<activity [^>]*contextid="(\d+)"/.exec(xml)?.[1] ?? NaN) || null,
+    ctxId: Number(/<activity [^<>]*contextid="(\d+)"/.exec(xml)?.[1] ?? NaN) || null,
   };
 }
 
@@ -89,12 +89,11 @@ function writeSlots(q: QuizXml, blocks: string[], removedSlots: number[]): strin
   const sum = blocks.reduce((s, b) => s + Number(/<maxmark>([^<]*)<\/maxmark>/.exec(b)?.[1] ?? 0), 0);
   xml = setTag(xml, 'sumgrades', sum.toFixed(5));
   if (removedSlots.length) {
-    const secRe = /<section id="(\d+)">([\s\S]*?)<\/section>/g;
     const sOpen = xml.indexOf('<sections>');
     const sClose = xml.indexOf('</sections>');
     if (sOpen >= 0 && sClose > sOpen) {
       const inner = xml.slice(sOpen + 10, sClose);
-      const secs = [...inner.matchAll(secRe)].map((m) => ({ id: m[1], body: m[2], first: Number(/<firstslot>(\d+)<\/firstslot>/.exec(m[2])?.[1] ?? 1) }));
+      const secs = matchBlocks(inner, /<section id="(\d+)">/, '</section>').map((m) => ({ id: m[1], body: m[2], first: Number(/<firstslot>(\d+)<\/firstslot>/.exec(m[2])?.[1] ?? 1) }));
       const total = blocks.length;
       const seen = new Set<number>();
       const out: string[] = [];
@@ -123,7 +122,7 @@ function renumber(blocks: string[], qpp: number): string[] {
 
 interface Cat { id: number; start: number; end: number; contextId: number | null; parent: number | null; modern: boolean; questionIds: number[]; entryIds: number[] }
 function parseCats(xml: string): Cat[] {
-  return [...xml.matchAll(/<question_category id="(\d+)">([\s\S]*?)<\/question_category>/g)].map((m) => ({
+  return matchBlocks(xml, /<question_category id="(\d+)">/, '</question_category>').map((m) => ({
     id: Number(m[1]), start: m.index ?? 0, end: (m.index ?? 0) + m[0].length,
     contextId: Number(/<contextid>(\d+)<\/contextid>/.exec(m[2])?.[1] ?? NaN) || null,
     parent: Number(/<parent>(\d+)<\/parent>/.exec(m[2])?.[1] ?? NaN) || null,
@@ -242,8 +241,7 @@ export async function applyExamReplace(ctx: OpContext, op: ExamQuestionReplaceOp
   if (s < 0 || e < 0) throw new PatchError('target_not_found', `questions.xml no tiene la pregunta ${wq.id}.`);
   const oldBody = xml.slice(s + open.length, e);
   const oldQtype = /<qtype>([^<]*)<\/qtype>/.exec(oldBody)?.[1] ?? '';
-  const pluginRe = new RegExp(`<plugin_qtype_${oldQtype}_question>[\\s\\S]*?</plugin_qtype_${oldQtype}_question>`);
-  const pm = pluginRe.exec(oldBody);
+  const pm = matchBlocks(oldBody, `<plugin_qtype_${oldQtype}_question>`, `</plugin_qtype_${oldQtype}_question>`)[0] ?? null;
   if (!pm) throw new PatchError('unsupported', `La pregunta ${wq.id} (${oldQtype}) no tiene el bloque de su tipo.`);
   const oldAnswerIds = [...pm[0].matchAll(/<answer id="(\d+)">/g)].map((m) => Number(m[1]));
   const oldOpt = Number(/<(?:multichoice|truefalse) id="(\d+)">/.exec(pm[0])?.[1] ?? NaN);
@@ -469,7 +467,7 @@ async function dropQuestionFiles(ctx: OpContext, ids: { questionIds: number[]; a
   if (!ctx.state.has('files.xml')) return 0;
   let xml = await ctx.state.readText('files.xml');
   const ANSWER_AREAS = new Set(['answer', 'answerfeedback']);
-  const victims = [...xml.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].filter((m) => {
+  const victims = matchBlocks(xml, /<file id="(\d+)">/, '</file>').filter((m) => {
     if (!/<component>question<\/component>/.test(m[2])) return false;
     const area = /<filearea>([^<]*)<\/filearea>/.exec(m[2])?.[1] ?? '';
     const item = Number(/<itemid>(\d+)<\/itemid>/.exec(m[2])?.[1] ?? -1);

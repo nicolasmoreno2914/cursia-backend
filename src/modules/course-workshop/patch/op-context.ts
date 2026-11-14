@@ -7,6 +7,7 @@ import { WorkshopFamily } from '../identify';
 import { PatchState, sha1Of } from './container';
 import { IdAllocator } from './ids';
 import { FileChange, OperationReport, PatchError } from './types';
+import { matchBlocks } from '../xml-scan';
 
 export interface OpContext {
   state: PatchState;
@@ -36,7 +37,7 @@ export async function replaceBlob(ctx: OpContext, oldHash: string, data: Buffer,
   const nEntry = blobPath(nh);
   if (!ctx.state.has(nEntry)) { ctx.state.write(nEntry, data); r.entriesAdded.push(nEntry); }
   let xml = await ctx.state.readText('files.xml');
-  const blocks = [...xml.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)].filter((m) => m[2].includes(`<contenthash>${oldHash}</contenthash>`));
+  const blocks = matchBlocks(xml, /<file id="(\d+)">/, '</file>').filter((m) => m[2].includes(`<contenthash>${oldHash}</contenthash>`));
   if (!blocks.length) throw new PatchError('invariant', `Ninguna entrada de files.xml usa el blob ${oldHash}.`);
   for (const m of blocks.reverse()) {
     const start = m.index ?? 0;

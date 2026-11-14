@@ -10,7 +10,7 @@
 import type { DryRunPricing } from '../../pedagogy/dry-run';
 import type { GammaGenerationStatus } from '../../../workers/provider-real/provider-clients';
 import { VideogenBatchJob, isJobCompleted, isJobFailed } from '../../../video-engine/videogen.service';
-import { ChargeContext, PaidCallTicket, RegenProviders, gammaChargeInputOf, gammaMeasuredUsd, videogenChargeInputOf } from './ports';
+import { ChargeContext, PaidCallTicket, RegenProviders, gammaChargeInputOf, gammaCreditsForUsd, gammaMeasuredUsd, videogenChargeInputOf } from './ports';
 import { RegenError } from './types';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -63,6 +63,12 @@ export async function settleVideogenJob(a: { ticket: PaidCallTicket; job: Videog
 /** Liquida una generación TERMINADA de Gamma: créditos medidos o (P1-1) la COTA; una fallida se cobra y se informa. */
 export async function settleGammaGeneration(a: { ticket: PaidCallTicket; st: GammaGenerationStatus; generationId: string; boundUsd: string; pricing: DryRunPricing; charge: ChargeContext }): Promise<void> {
   const credits = typeof a.st.creditsDeducted === 'number' && Number.isFinite(a.st.creditsDeducted) && a.st.creditsDeducted >= 0 ? a.st.creditsDeducted : null;
-  await a.ticket.charged({ costUsd: credits === null ? a.boundUsd : gammaMeasuredUsd(a.pricing, credits), charge: gammaChargeInputOf(a.charge, a.ticket.id, { generationId: a.generationId, credits, failed: a.st.status === 'failed' }), externalId: a.generationId });
+  // B12 (G2): sin créditos informados se registra la cota en créditos como `pending`; si el catálogo no permite
+  // convertirla (sin precio), la llamada queda AMBIGUA con la reserva pendiente — nunca un cargo de USD 0.
+  const boundCredits = credits === null ? gammaCreditsForUsd(a.pricing, a.boundUsd) : null;
+  if (credits === null && boundCredits === null) {
+    throw await a.ticket.failed(new Error(`Gamma no informó los créditos de ${a.generationId} y el catálogo no tiene precio para convertir la cota: queda para conciliar.`), 'ambiguous');
+  }
+  await a.ticket.charged({ costUsd: credits === null ? a.boundUsd : gammaMeasuredUsd(a.pricing, credits), charge: gammaChargeInputOf(a.charge, a.ticket.id, { generationId: a.generationId, credits, failed: a.st.status === 'failed', boundCredits }), externalId: a.generationId });
   if (a.st.status === 'failed') throw new RegenError('invalid_result', `Gamma no pudo generar la presentación (${a.st.error ?? 'sin detalle'}). No se reenvía sola.`);
 }

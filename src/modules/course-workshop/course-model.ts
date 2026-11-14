@@ -20,6 +20,7 @@
  *     fechas ni nada que dependa del reloj o del orden de un Map.
  */
 import { createHash } from 'crypto';
+import { allBlocks, stripCommentsAndBlocks, stripTags, tagInner } from './xml-scan';
 import { MbzPackage } from './mbz-reader';
 import { xmlUnescape } from '../visual-design/preview-extract';
 import { WorkshopFamily } from './identify';
@@ -399,10 +400,7 @@ export interface RawCourse {
   issues: WorkshopIssue[];
 }
 
-const tag = (xml: string, name: string): string | null => {
-  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(xml);
-  return m ? m[1] : null;
-};
+const tag = (xml: string, name: string): string | null => tagInner(xml, name);
 const tagText = (xml: string, name: string): string | null => {
   const v = tag(xml, name);
   return v === null ? null : xmlUnescape(v);
@@ -467,7 +465,7 @@ function htmlFieldsOf(modname: string, entry: string, xml: string): WorkshopHtml
   at('intro', 'intro');
   if (modname === 'page') at('content', 'content');
   if (modname === 'book') {
-    for (const c of xml.matchAll(/<chapter id="(\d+)">([\s\S]*?)<\/chapter>/g)) at(`chapter:${c[1]}`, 'content', c.index ?? 0, (c.index ?? 0) + c[0].length);
+    for (const c of allBlocks(xml, /<chapter id="(\d+)">/, '</chapter>')) at(`chapter:${c.open![1]}`, 'content', c.start, c.end);
   }
   if (modname === 'assign') at('activity', 'activity');
   if (modname === 'url') at('externalurl', 'externalurl');
@@ -479,7 +477,8 @@ const MOODLE_TOP = /^(moodle_backup\.(xml|log)|files\.xml|questions\.xml|users\.
 
 function parseFilesXml(xml: string, has: (n: string) => boolean): Array<{ contextId: number | null; file: WorkshopFile }> {
   const out: Array<{ contextId: number | null; file: WorkshopFile }> = [];
-  for (const m of xml.matchAll(/<file id="(\d+)">([\s\S]*?)<\/file>/g)) {
+  for (const blk of allBlocks(xml, /<file id="(\d+)">/, '</file>')) {
+    const m = [blk.whole, blk.open![1], blk.inner];
     const b = m[2];
     const contenthash = (tag(b, 'contenthash') ?? '').trim();
     const blobEntry = /^[0-9a-f]{40}$/.test(contenthash) ? `files/${contenthash.slice(0, 2)}/${contenthash}` : '';
@@ -503,12 +502,12 @@ function parseFilesXml(xml: string, has: (n: string) => boolean): Array<{ contex
 
 function parseQuestion(id: number, b: string, cat: { id: number; name: string } | null): WorkshopQuestion {
   const answers: WorkshopQuestionAnswer[] = [];
-  for (const a of b.matchAll(/<answer id="(\d+)">([\s\S]*?)<\/answer>/g)) {
-    answers.push({ id: Number(a[1]), html: xmlUnescape(tag(a[2], 'answertext') ?? ''), fraction: num(tag(a[2], 'fraction')) });
+  for (const ab of allBlocks(b, /<answer id="(\d+)">/, '</answer>')) {
+    answers.push({ id: Number(ab.open![1]), html: xmlUnescape(tag(ab.inner, 'answertext') ?? ''), fraction: num(tag(ab.inner, 'fraction')) });
   }
   const matches: Array<{ html: string; answer: string }> = [];
-  for (const mm of b.matchAll(/<match id="\d+">([\s\S]*?)<\/match>/g)) {
-    matches.push({ html: xmlUnescape(tag(mm[1], 'questiontext') ?? ''), answer: xmlUnescape(tag(mm[1], 'answertext') ?? '') });
+  for (const mb of allBlocks(b, /<match id="\d+">/, '</match>')) {
+    matches.push({ html: xmlUnescape(tag(mb.inner, 'questiontext') ?? ''), answer: xmlUnescape(tag(mb.inner, 'answertext') ?? '') });
   }
   const ch = cat ? /^Cap[ií]tulo\s+(\d{1,3})\b/i.exec(cat.name) : null;
   const q: WorkshopQuestion = {
@@ -583,7 +582,8 @@ function locateQuestionFields(xml: string, questions: WorkshopQuestion[]): void 
 /** questions.xml (Moodle 3.x y 4.x): categorías con su contexto, preguntas y entradas del banco. */
 export function parseQuestionsXml(xml: string): RawQuestionCategory[] {
   const out: RawQuestionCategory[] = [];
-  for (const c of xml.matchAll(/<question_category id="(\d+)">([\s\S]*?)<\/question_category>/g)) {
+  for (const cb of allBlocks(xml, /<question_category id="(\d+)">/, '</question_category>')) {
+    const c = [cb.whole, cb.open![1], cb.inner];
     const body = c[2];
     const cat: RawQuestionCategory = {
       id: Number(c[1]),
@@ -593,17 +593,18 @@ export function parseQuestionsXml(xml: string): RawQuestionCategory[] {
       questions: [],
       entries: new Map(),
     };
-    for (const e of body.matchAll(/<question_bank_entry id="(\d+)">([\s\S]*?)<\/question_bank_entry>/g)) {
+    for (const eb of allBlocks(body, /<question_bank_entry id="(\d+)">/, '</question_bank_entry>')) {
+      const e = [eb.whole, eb.open![1], eb.inner];
       const entryId = Number(e[1]);
       const versions: Array<{ version: number; questionId: number }> = [];
       const qs: WorkshopQuestion[] = [];
       // Fix round 2 (P2-5): cada <question_versions> es UNA versión de la misma pregunta.
-      const blocks = [...e[2].matchAll(/<question_versions id="\d+">([\s\S]*?)<\/question_versions>/g)];
-      const parts = blocks.length ? blocks.map((v) => v[1]) : [e[2]];
+      const blocks = allBlocks(e[2], /<question_versions id="\d+">/, '</question_versions>');
+      const parts = blocks.length ? blocks.map((v) => v.inner) : [e[2]];
       parts.forEach((part, idx) => {
         const ver = int(tag(part, 'version')) ?? idx + 1;
-        for (const q of part.matchAll(/<question id="(\d+)">([\s\S]*?)<\/question>/g)) {
-          const pq = parseQuestion(Number(q[1]), q[2], cat);
+        for (const q of allBlocks(part, /<question id="(\d+)">/, '</question>')) {
+          const pq = parseQuestion(Number(q.open![1]), q.inner, cat);
           pq.bankEntryId = entryId;
           pq.version = ver;
           versions.push({ version: ver, questionId: pq.id });
@@ -617,7 +618,7 @@ export function parseQuestionsXml(xml: string): RawQuestionCategory[] {
     }
     if (!cat.entries.size) {
       // Moodle 3.x: <questions><question id> directo en la categoría.
-      for (const q of body.matchAll(/<question id="(\d+)">([\s\S]*?)<\/question>/g)) cat.questions.push(parseQuestion(Number(q[1]), q[2], cat));
+      for (const q of allBlocks(body, /<question id="(\d+)">/, '</question>')) cat.questions.push(parseQuestion(Number(q.open![1]), q.inner, cat));
     }
     out.push(cat);
   }
@@ -632,10 +633,10 @@ export async function readRawCourse(
 ): Promise<RawCourse> {
   const issues: WorkshopIssue[] = [];
   const mb = (await pkg.readText('moodle_backup.xml', { maxBytes: XML_MAX })) ?? '';
-  const contents = /<contents>([\s\S]*?)<\/contents>/.exec(mb)?.[1] ?? '';
-  const actBlock = /<activities>([\s\S]*?)<\/activities>/.exec(contents)?.[1] ?? '';
-  const secBlock = /<sections>([\s\S]*?)<\/sections>/.exec(contents)?.[1] ?? '';
-  const listedActs = [...actBlock.matchAll(/<activity>([\s\S]*?)<\/activity>/g)].map((m, i) => ({
+  const contents = tagInner(mb, 'contents') ?? '';
+  const actBlock = tagInner(contents, 'activities') ?? '';
+  const secBlock = tagInner(contents, 'sections') ?? '';
+  const listedActs = allBlocks(actBlock, '<activity>', '</activity>').map((b) => [b.whole, b.inner]).map((m, i) => ({
     i,
     moduleId: int(tag(m[1], 'moduleid')),
     sectionId: int(tag(m[1], 'sectionid')),
@@ -643,7 +644,7 @@ export async function readRawCourse(
     title: tagText(m[1], 'title') ?? '',
     dir: (tag(m[1], 'directory') ?? '').trim(),
   }));
-  const listedSecs = [...secBlock.matchAll(/<section>([\s\S]*?)<\/section>/g)].map((m) => ({
+  const listedSecs = allBlocks(secBlock, '<section>', '</section>').map((b) => [b.whole, b.inner]).map((m) => ({
     id: int(tag(m[1], 'sectionid')),
     title: tagText(m[1], 'title') ?? '',
     dir: (tag(m[1], 'directory') ?? '').trim(),
@@ -723,7 +724,7 @@ export async function readRawCourse(
       quizSlots = (qi.match(/<question_instance id=/g) || []).length;
       for (const m of qi.matchAll(/<questionid>(\d+)<\/questionid>/g)) quizRefs.questionIds.push(Number(m[1]));
       // Referencia a una entrada del banco: la versión pedida (`$@NULL@$` = la última).
-      for (const m of qi.matchAll(/<question_reference id="\d+">([\s\S]*?)<\/question_reference>/g)) {
+      for (const m of allBlocks(qi, /<question_reference id="\d+">/, '</question_reference>').map((b) => [b.whole, b.inner])) {
         const e = int(tag(m[1], 'questionbankentryid'));
         if (e !== null) quizRefs.entryIds.push({ entryId: e, version: int(tag(m[1], 'version')) });
       }
@@ -741,7 +742,7 @@ export async function readRawCourse(
       sectionNumber: modX ? int(tag(modX, 'sectionnumber')) : null,
       idnumber: modX ? (tagText(modX, 'idnumber') ?? '').trim() || null : null,
       visible: modX ? (tag(modX, 'visible') ?? '').trim() !== '0' : null,
-      contextId: typX ? int(/<activity [^>]*contextid="(\d+)"/.exec(typX)?.[1]) : null,
+      contextId: typX ? int(/<activity [^<>]*contextid="(\d+)"/.exec(typX)?.[1]) : null,
       instanceId: typX ? int(/<activity id="(\d+)"/.exec(typX)?.[1]) : null,
       html: typX ? htmlFieldsOf(a.modname, typeEntry, typX) : [],
       quizSlots,
@@ -996,10 +997,7 @@ export interface FamilyAdapter {
 
 /** Texto plano de un HTML (para reglas por contenido): sin comentarios, estilos, scripts ni etiquetas. */
 export function plainText(html: string, max = 600): string {
-  return html
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(style|script)\b[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
+  return stripTags(stripCommentsAndBlocks(html))
     .replace(/&nbsp;/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()

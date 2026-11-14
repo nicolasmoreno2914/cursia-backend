@@ -19,8 +19,10 @@ import { sha1Of } from './container';
 import { locateField, writeField, xmlEsc } from './html-edit';
 import { OpContext, blobPath, noteModified, replaceBlob } from './op-context';
 import { EditLibroSectionOp, LibroChapterInput, PatchError } from './types';
+import { firstBlock, matchBlocks } from '../xml-scan';
 
-const HEAD = /<h([1-3])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi;
+// B12 (H1): títulos <h1-3> con escaneo lineal; misma forma que matchAll: [entero, nivel, texto] + index.
+const headsOf = (html: string) => matchBlocks(html, /<h([1-3])\b[^<>]*>/i, (o) => new RegExp(`</h${o![1]}\\s*>`, 'i'));
 const CH_TITLE = /^\s*Cap[ií]tulo\s+(\d{1,3})\s*[:—–-]/i;
 const htmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
@@ -47,7 +49,7 @@ function enclosingPage(html: string, at: number): number {
 }
 
 export function libroStructure(html: string): { headings: Heading[]; chapters: ChapterBlock[]; bodyClose: number } {
-  const headings: Heading[] = [...html.matchAll(HEAD)].map((m) => {
+  const headings: Heading[] = headsOf(html).map((m) => {
     const text = plainText(m[2], 200);
     const n = CH_TITLE.exec(text);
     return { start: m.index ?? 0, end: (m.index ?? 0) + m[0].length, level: Number(m[1]), number: n ? Number(n[1]) : null, text };
@@ -98,7 +100,7 @@ function validateChapterHtml(c: LibroChapterInput): void {
   if (/\$@[A-Z0-9_]+/.test(c.html)) throw new PatchError('invalid_content', `El capítulo ${c.number} trae un token $@…@$: dentro de un archivo Moodle no los resuelve.`);
   if (/<script\b/i.test(c.html)) throw new PatchError('invalid_content', `El capítulo ${c.number} trae <script>.`);
   if (/<\/?(html|head|body)\b/i.test(c.html)) throw new PatchError('invalid_content', `El capítulo ${c.number} trae <html>/<head>/<body>: va solo el cuerpo.`);
-  if (CH_TITLE.test(plainText(c.html.match(/^\s*<h[1-3]\b[^>]*>([\s\S]*?)<\/h[1-3]>/i)?.[1] ?? '', 80))) throw new PatchError('invalid_content', `El cuerpo del capítulo ${c.number} empieza con su título: va solo el cuerpo (el título lo pone el motor).`);
+  if (CH_TITLE.test(plainText((/^\s*<h[1-3]\b/i.test(c.html) ? firstBlock(c.html, /<h[1-3]\b[^<>]*>/i, /<\/h[1-3]>/i)?.inner ?? '' : ''), 80))) throw new PatchError('invalid_content', `El cuerpo del capítulo ${c.number} empieza con su título: va solo el cuerpo (el título lo pone el motor).`);
 }
 
 /** Documento recompuesto + qué pasó con cada capítulo. */
@@ -192,7 +194,7 @@ export function recomposeLibro(html: string, input: EditLibroSectionOp, titleOf:
   } else {
     const first = st.chapters[0];
     const head = first ? html.slice(0, first.blockStart) : html;
-    if (!first || !/<\/head\s*>/i.test(head) || !/<body\b[^>]*>/i.test(head)) {
+    if (!first || !/<\/head\s*>/i.test(head) || !/<body\b[^<>]*>/i.test(head)) {
       throw new PatchError('invalid_params', 'El Libro está cortado antes del primer capítulo (portada o índice incompletos) y la operación no trae la portada (`front`): no se puede recomponer sin inventar.');
     }
     prefix = head;

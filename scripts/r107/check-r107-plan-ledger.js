@@ -34,6 +34,8 @@
 //   fix 2: L18 aprobación mixta: la cota del render en espera queda comprometida → el contenido corta antes de enviarse (N1)
 //   · L19 dos procesos liquidan la misma espera → uno solo la toma, un cargo, una subida, un resultado; `sent → settling` (N2)
 //   · L21 (fix 3) A gana `settling` → B lo retoma y liquida → A pierde settleCall: A sale SIN efectos, ítem listo
+//   L26 (B12 G2) Gamma sin `credits.deducted` → el ledger registra la cota (pending, > 0) y el saldo la ve
+//   · L99 (B12 G1) la reanudación de la espera late (conteo de referencias): el barrido no mata la aprobación ni repaga el render
 //   · L20 retoma fallida sin cobro / job aceptado sin espera → conciliar → re-aprobar → produce; sin conciliar, falla cerrado (N3)
 //
 // Uso: npm run build && PG_BIN=/opt/homebrew/opt/postgresql@16/bin node scripts/r107/check-r107-plan-ledger.js [--bite]
@@ -69,13 +71,17 @@ if (process.argv.includes('--bite')) {
     { name: 'la IA de B5 sin las cotas en vuelo (solo lo gastado)', anchor: 'invokerFor(s, approval, pricing, meta)', from: '(cur.spent_usd, cur.calls)', to: '(cur.spent_usd, {})', only: 'L18' },
     { name: 'sin la salida temprana del perdedor de la liquidación', anchor: 'async runRegenWait(', from: 'err.extra?.alreadySettled)', to: 'false)', only: 'L21' },
     { name: 'sin la condición del reclamo de la espera', anchor: 'async runRegenWait(', from: "and claim_id is not distinct from $3::text returning *", to: 'returning *', only: 'L19' },
+    // B12 (G1): sin el conteo de referencias, el handOff deja la reanudación sin latir → el barrido la mata (L99).
+    // B12 (G2): sin la cota en créditos, Gamma sin medición vuelve a registrar USD 0 (L26).
+    { name: 'Gamma sin créditos registra usage vacío (USD 0)', file: 'modules/course-workshop/regenerate/ports.js', anchor: 'function gammaChargeInputOf(', from: 'const credits = measured ? r.credits : bound;', to: 'const credits = measured ? r.credits : null;', only: 'L26' },
+    { name: 'latido de la reanudación sin conteo de referencias (Set)', anchor: 'this.activeIds = new RefSet()', from: 'this.beating = new RefSet()', to: 'this.beating = new Set()', only: 'L99' },
   ];
   let code = 0;
   try {
     for (const m of bites) {
       fs.rmSync(tmp, { recursive: true, force: true });
       fs.cpSync(distRoot, tmp, { recursive: true });
-      const f = path.join(tmp, 'modules/course-workshop/plan/workshop-plan.service.js');
+      const f = path.join(tmp, m.file || 'modules/course-workshop/plan/workshop-plan.service.js');
       const src = fs.readFileSync(f, 'utf8');
       const at = src.indexOf(m.anchor);
       const k = at < 0 ? -1 : src.indexOf(m.from, at);
@@ -504,6 +510,25 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       near(await net(r.key), 0.55, 'cuenta lo que Gamma cobró');
       eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
+    await check('L26 (B12 G2) Gamma SIN `credits.deducted` contra el ledger REAL: el cargo es la COTA en créditos (`pending`, monto > 0 = lo que cuenta la aprobación), el saldo lo descuenta y la reserva se libera', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '6.00', reason: 'QA r107 B12 L26' });
+      const sim = SIMLIB.simProviders(distRoot, { simulated: false, fault: { gammaNoCredits: true } });
+      const before = await available();
+      const r = await regenPlan('regenerate_gamma', 1013, 'Rehace la presentación del capítulo 1 (L26).', sim);
+      const ap = await r.p.approvalOf(r.g.approval.id);
+      const gc = Object.values(ap.calls).find((c) => /^gamma:/.test(c.kind));
+      assert(gc && gc.status === 'charged' && Number(gc.costUsd) > 0, `la aprobación cuenta la cota de Gamma: ${JSON.stringify(gc)}`);
+      const rows = await ds.query(`select provider, amount::text a, measurement_status, usage from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true' order by provider`, [r.g.approval.id]);
+      const g = rows.find((x) => x.provider === 'gamma');
+      assert(g, `hay cargo de Gamma en el ledger: ${JSON.stringify(rows)}`);
+      eq(g.measurement_status, 'pending', 'Gamma sin medición → pending');
+      assert(Number(g.a) > 0, `monto > 0 (antes: USD 0): ${g.a}`);
+      near(g.a, gc.costUsd, 'el ledger registra lo MISMO que la aprobación cuenta (la cota)');
+      near(await net(r.key), 0, 'reserva del tope liberada (el cargo pending la reemplaza)');
+      const interp = await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where metadata->>'approvalId' = $1 and coalesce(metadata->>'reservation','') <> 'true'`, [r.interpId]);
+      near(await available(), before - Number(interp[0].t) - rows.reduce((a, x) => a + Number(x.a), 0), 'el saldo descuenta la cota de Gamma');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
+    });
     // ── r107 B10 fix round 1 (P1-4): la compuerta REAL del servicio ──
     const PO = L('modules/course-workshop/regenerate/ports.js');
     const llmOk = (msg) => async () => ({ text: '{}', messageId: msg, model: 'claude-sonnet-4-6', usage: { input_tokens: 100, output_tokens: 100 }, stopReason: 'end_turn' });
@@ -703,6 +728,64 @@ const ENV_KEYS = ['CURSIA_USER_BUDGETS', 'SUPER_ADMIN_EMAILS', 'CURSIA_RBAC_MODE
       const ap2 = await p.approvalOf(g.approval.id);
       assert(Number(ap2.spent_usd) <= Number(ap2.cap_usd) + 1e-9, `gastado ${ap2.spent_usd} ≤ tope ${ap2.cap_usd}`);
       eq([ap2.status, (await reqRow(p, vid.id)).status], ['stopped', 'resolved'], 'el video terminó; la aprobación queda cortada por el tope del contenido');
+    });
+
+    await check('L99 (B12 G1, repro de la revisión final) video en espera + otro ítem en la MISMA aprobación: la reanudación LATE → el barrido no cierra la aprobación, el render no se repaga y el video queda listo', async () => {
+      await admin.adjust(sa, U, { month: BCOM.currentMonth(), amountUsd: '20.00', reason: 'QA review L99' });
+      const q1 = 'Rehace el video del capítulo 1 (L99).';
+      const q2 = 'Agrega un ejemplo a la profundización del capítulo 1 (L99).';
+      let release; const gateP = new Promise((r) => { release = r; });
+      let blocked = false;
+      const client = {
+        simulated: false, calls: 0, content: 0,
+        async call(req) {
+          this.calls++;
+          if (req.purpose === 'content') { this.content++; blocked = true; await gateP; const e = new Error('429 sim'); e.status = 429; throw e; }
+          return { input: { requests: [
+            { quote: q1, operation: 'regenerate_video', instruction: q1, target: { moduleId: 1016 }, targetEvidence: q1, changeEvidence: q1 },
+            { quote: q2, operation: 'edit_html', instruction: 'Agregar un ejemplo al final de la profundización del capítulo 1.', target: { moduleId: 1014 }, targetEvidence: 'la profundización del capítulo 1', changeEvidence: 'Agrega un ejemplo' },
+          ] }, stopReason: 'tool_use', model: req.model, messageId: `msg_l99_${crypto.randomUUID()}`, usage: { input_tokens: 1500, output_tokens: 300 }, simulated: false };
+        },
+      };
+      const simOpts = { simulated: false, videogenPendingPolls: 1e9, pollTimeoutMs: 60000, videogenJobId: 'vg_sim_l99' };
+      const sim = SIMLIB.simProviders(distRoot, simOpts);
+      const p = planFor(client);
+      p.regenProviders = () => sim;
+      await approveIntake(p, `${q1} ${q2}`);
+      const pl = await p.getPlan({ id: U }, sid);
+      const vid = pl.items.filter((i) => i.quote === q1 && i.requestStatus === 'awaiting_generation').pop();
+      const con = pl.items.filter((i) => i.quote === q2 && i.requestStatus === 'awaiting_generation').pop();
+      assert(vid && con, 'dos items');
+      const exp = Number(vid.plannedCall.expectedUsd) + Number(con.plannedCall.expectedUsd);
+      const cap = Math.ceil((Number(vid.plannedCall.regen.totalBoundUsd) + Number(con.plannedCall.boundUsd) * 3 + 1) * 100) / 100;
+      const g = await p.approveGeneration({ id: U }, sid, pl.planId, { itemIds: [vid.id, con.id], confirmEstimateUsd: Number(exp.toFixed(6)), capUsd: cap });
+      await until(async () => (await reqRow(p, vid.id)).details.regenPending, 'render esperando');
+      await until(async () => blocked, 'contenido bloqueado en el carril');
+      simOpts.videogenPendingPolls = 0;
+      await until(async () => { const r = await reqRow(p, vid.id); return r.status === 'preparing' && !r.details.regenPending; }, 'handOff hecho');
+      const origResume = p.runRegenResume.bind(p);
+      let beatingDuringResume = null;
+      p.runRegenResume = async (s, ctx, approvalId, requestId, claimId) => {
+        beatingDuringResume = p.beating.has(claimId);
+        await p.sweep();
+        return origResume(s, ctx, approvalId, requestId, claimId);
+      };
+      release();
+      await p.whenIdle();
+      const ap = await p.approvalOf(g.approval.id);
+      const vr = await reqRow(p, vid.id);
+      const renders = Object.values(ap.calls).filter((c) => c.kind === 'videogen:render');
+      console.log('   L99 beatingDuringResume=', beatingDuringResume, 'approval=', ap.status, '|', ap.stop_reason, '| video req=', vr.status, '| calls=', JSON.stringify(Object.values(ap.calls).map((c) => [c.kind, c.status])));
+      eq(beatingDuringResume, true, 'la reanudación late mientras corre (el barrido la ve viva)');
+      assert(!/reinicio del servidor/.test(String(ap.stop_reason ?? '')), `el barrido NO cerró la aprobación: ${ap.status} · ${ap.stop_reason}`);
+      eq(vr.status, 'resolved', 'el video terminó (lo pagado se aplicó al pedido)');
+      eq(renders.length, 1, 'un solo render en la aprobación (no se repaga)');
+      eq(renders[0].status, 'charged', 'el render quedó cobrado una vez');
+      eq(sim.calls.videogen.filter((c) => c.op === 'create').length, 1, 'un solo envío del render al proveedor');
+      // Un segundo barrido (ya sin trabajo vivo) tampoco reabre ni cierra nada que esté bien.
+      await p.sweep();
+      eq((await reqRow(p, vid.id)).status, 'resolved', 'el pedido sigue listo tras otro barrido');
+      eq(REAL_AI.n, 0, 'ninguna llamada real');
     });
 
     await check('L19 (B10 fix 2 N2) dos procesos liquidan la MISMA espera: uno solo la toma (el otro no consulta), un solo cargo, una sola subida a YouTube, un solo resultado; `sent → settling` condicional', async () => {

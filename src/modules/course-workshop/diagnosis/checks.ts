@@ -15,6 +15,7 @@ import { WorkshopActivity, WorkshopToken, plainText, tokenKindShape } from '../c
 import { EXAM_OPTION_FORBIDDEN_RE, normalizeExamText } from '../../course-shell/exam-bank';
 import { VIDEO_MC_LONGEST_MAX_SHARE, videoMcLengthBias } from '../../quality/answer-length-bias';
 import { DiagnosisContext, blobVerified } from './context';
+import { allBlocks, attrOf, firstBlock, openTags, replaceBlocks } from '../xml-scan';
 import { CheckId, Finding, FindingActivityRef, FindingInput, FindingScope, SuggestedFix, makeFinding } from './finding';
 
 export interface CheckDef {
@@ -106,8 +107,11 @@ function regenerateFixFor(a: WorkshopActivity | null): SuggestedFix | null {
 /** Texto visible del enlace que usa `token` en el HTML (para nombrar el botón), o null. */
 function linkTextOf(html: string, token: string): string | null {
   const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const m = new RegExp(`<a\\b[^>]*href=["'][^"']*${esc}[^"']*["'][^>]*>([\\s\\S]*?)</a>`, 'i').exec(html);
-  const t = m ? plainText(m[1], 80) : '';
+  void esc;
+  // B12 ronda 1: la primera `<a>` cuyo href (entre comillas) lleva el token, con el escáner lineal de etiquetas.
+  const tag = openTags(html, /<a\b/i).find((x) => { const h = attrOf(x, 'href'); return !!h && h.quote !== '' && (h.value ?? '').includes(token); });
+  const m = tag ? firstBlock(html, '', /<\/a>/i, tag.end) : null;
+  const t = tag && m ? plainText(html.slice(tag.end, m.innerEnd), 80) : '';
   return t || null;
 }
 
@@ -354,7 +358,29 @@ export function rawLinkRef(ctx: DiagnosisContext, h: { entry: string; field: str
   return { ...base, linkRawByteOffset: Buffer.byteLength(raw.slice(0, a), 'utf8'), linkRawBytes: Buffer.byteLength(raw.slice(a, b), 'utf8') };
 }
 
-const DEAD_LINK = /<a\b[^>]*\bhref\s*=\s*(["'])\s*(#?|javascript:[^"']*)\s*\1[^>]*>([\s\S]*?)<\/a>/gi;
+// B12 (H1): apertura sin cuerpo perezoso + cierre con indexOf (lineal). Devuelve [entero, comilla, destino, texto] + index.
+const stripScripts = (s: string): string => replaceBlocks(s, /<script\b/i, /<\/script>/i, () => '');
+// B12 ronda 1 (P0): sin regex de atributos (`\s*(["'])\s*(…)\s*\1` era cuadrática con una comilla sin cerrar): las
+// etiquetas `<a …>` salen del escáner lineal y el destino se valida en código (vacío, «#» o «javascript:…», con trim).
+const isDeadHref = (v: string): boolean => { const t = v.trim(); return t === '' || t === '#' || /^javascript:/i.test(t); };
+const deadLinks = (html: string): Array<string[] & { index: number }> => {
+  const out: Array<string[] & { index: number }> = [];
+  const close = /<\/a>/gi;
+  const tags = openTags(html, /<a\b/i);
+  let cur = 0;
+  for (const t of tags) {
+    if (t.start < cur) continue; // dentro del enlace anterior (no se solapan, como matchAll)
+    const h0 = attrOf(t, 'href');
+    if (!h0 || h0.quote === '' || h0.value === null || !isDeadHref(h0.value)) continue;
+    close.lastIndex = t.end;
+    const c = close.exec(html);
+    if (!c) break; // sin </a> después: ninguno posterior tiene cierre
+    const h = attrOf(t, 'href')!;
+    out.push(Object.assign([html.slice(t.start, c.index + c[0].length), h.quote, (h.value as string).trim(), html.slice(t.end, c.index)], { index: t.start }));
+    cur = c.index + c[0].length;
+  }
+  return out;
+};
 
 function t04(ctx: DiagnosisContext): Finding[] {
   const out: Finding[] = [];
@@ -372,7 +398,7 @@ function t04(ctx: DiagnosisContext): Finding[] {
     }
     // Enlaces muertos (href="#", vacío, javascript:): un token saneado o inventado — el botón no hace nada.
     for (const h of a.html) {
-      for (const m of h.html.matchAll(DEAD_LINK)) {
+      for (const m of deadLinks(h.html)) {
         const text = plainText(m[3], 60);
         // El botón del Libro Guía en la tarjeta del Libro, cuando el paquete NO trae el Libro: es T07 (libro_missing).
         if (a.kind === 'libro_info' && LIBRO_BUTTON.test(text) && !hasLibroActivity(ctx)) continue;
@@ -477,7 +503,7 @@ function t06(ctx: DiagnosisContext): Finding[] {
         detail: `${a.dir} (${sc.source}): sin imsmanifest.xml en la raíz`, evidence: ev(null), suggestedFix: fix }));
       continue;
     }
-    const href = /<resource\b[^>]*\bhref\s*=\s*"([^"]+)"/i.exec(sc.manifest)?.[1] ?? null;
+    const href = /<resource\b[^<>]*\bhref\s*=\s*"([^"]+)"/i.exec(sc.manifest)?.[1] ?? null;
     if (!/<manifest\b/i.test(sc.manifest) || !href) {
       out.push(f({ check: 'T06', code: 'scorm_bad_manifest', severity: 'error', scope: scopeOf(ctx, a),
         title: `El archivo de configuración del juego ${where(a)} está incompleto: Moodle no sabe qué abrir.`,
@@ -516,7 +542,7 @@ function t06(ctx: DiagnosisContext): Finding[] {
         out.push(f({ check: 'T06', code: 'scorm_no_js', severity: 'error', scope: scopeOf(ctx, a),
           title: `El juego ${where(a)} no trae su lógica (programa): se ve la pantalla pero no se puede jugar.`,
           detail: `${a.dir}: ${launch} sin <script> y sin archivos .js`, evidence: ev(launch), suggestedFix: fix }));
-      } else if (/<\/html>/i.test(html) && /\S/.test(html.slice(html.toLowerCase().lastIndexOf('</html>') + 7).replace(/<script\b[\s\S]*?<\/script>/gi, ''))) {
+      } else if (/<\/html>/i.test(html) && /\S/.test(stripScripts(html.slice(html.toLowerCase().lastIndexOf('</html>') + 7)))) {
         // Texto DESPUÉS de </html> (restos de la generación: ``` y el manifiesto pegados): el navegador lo muestra al final.
         const tailTxt = html.slice(html.toLowerCase().lastIndexOf('</html>') + 7);
         out.push(f({ check: 'T06', code: 'scorm_trailing_text', severity: 'warning', scope: scopeOf(ctx, a),
@@ -542,7 +568,7 @@ function t06(ctx: DiagnosisContext): Finding[] {
  * no se deduce qué capítulo falta.
  */
 export function libroChapterSequence(html: string): { numbers: number[]; reliable: boolean; format: 'builder' | 'loose' | 'none' } {
-  const heads = [...html.matchAll(/<h([1-3])\b[^>]*>([\s\S]*?)<\/h\1>/gi)].map((m) => plainText(m[2], 200));
+  const heads = allBlocks(html, /<h([1-3])\b[^<>]*>/i, (o) => new RegExp(`</h${o![1]}>`, 'i')).map((m) => plainText(m.inner, 200));
   const strict = heads.map((t) => /^\s*Cap[ií]tulo\s+(\d{1,3})\s*[:—–-]/i.exec(t)).filter((m): m is RegExpExecArray => !!m).map((m) => Number(m[1]));
   const loose = heads.map((t) => /^\s*(?:\d+(?:\.\d+)*\s*[.)-]?\s*)?Cap(?:[ií]tulo|\.)?\s*(\d{1,3})\b/i.exec(t)).filter((m): m is RegExpExecArray => !!m).map((m) => Number(m[1]));
   const numbers = strict.length ? strict : loose;
@@ -561,7 +587,7 @@ function t07(ctx: DiagnosisContext): Finding[] {
     // Una tarjeta / botón del Libro Guía sin Libro Guía en el paquete (changelog #6: el botón quedaba muerto).
     const card = ctx.course.activities.find((a) => a.kind === 'libro_info' || a.kind === 'libro_mobile');
     if (card && card.kind === 'libro_info') {
-      const dead = card.html.some((h) => [...h.html.matchAll(DEAD_LINK)].some((m) => LIBRO_BUTTON.test(plainText(m[3], 60))));
+      const dead = card.html.some((h) => deadLinks(h.html).some((m) => LIBRO_BUTTON.test(plainText(m[3], 60))));
       // Fix round 1 (P2-4): error (el mismo bug #6 que el token del Libro mal tipado). Ninguna operación del catálogo
       // CREA un Libro Guía (edit_libro_section edita uno existente): sin arreglo automático, lo decide B4/B11.
       out.push(f({ check: 'T07', code: 'libro_missing', severity: 'error', scope: scopeOf(ctx, card),
@@ -649,7 +675,7 @@ function t08(ctx: DiagnosisContext): Finding[] {
     const audio = a.files.filter((x) => x.filename !== '.' && isAudioFile(x.filename, x.mimetype));
     const html = a.html.map((h) => h.html).join('\n');
     if (!audio.length) {
-      if (/<audio\b[^>]*\bsrc\s*=\s*"https?:\/\//i.test(html) || /<source\b[^>]*\bsrc\s*=\s*"https?:\/\//i.test(html)) {
+      if (/<audio\b[^<>]*\bsrc\s*=\s*"https?:\/\//i.test(html) || /<source\b[^<>]*\bsrc\s*=\s*"https?:\/\//i.test(html)) {
         out.push(f({ check: 'T08', code: 'audio_online', severity: 'info', scope: scopeOf(ctx, a),
           title: `El audio de ${where(a)} se reproduce desde internet (no viene dentro del paquete): no se puede comprobar sin conexión.`,
           detail: `${a.dir}: <audio src="https://…"> sin archivo en el paquete`, evidence: { entry: `${a.dir}/${a.modname}.xml` } }));
@@ -660,18 +686,18 @@ function t08(ctx: DiagnosisContext): Finding[] {
       } else {
         out.push(f({ check: 'T08', code: 'audio_missing', severity: 'error', scope: scopeOf(ctx, a),
           title: `${book ? 'El audiolibro' : 'El audio de bienvenida'} (${where(a)}) no trae su archivo de sonido: el reproductor queda vacío.`,
-          detail: `${a.dir}: ninguna entrada de audio en files.xml para esta actividad${/#audio-removed/.test(html) ? ' (el reproductor apunta a «#audio-removed»: el audio se quitó del paquete)' : /<source\b[^>]*\bsrc\s*=\s*""/i.test(html) ? ' (el reproductor tiene src vacío)' : ''}`, evidence: { entry: `${a.dir}/${a.modname}.xml` }, suggestedFix: fix }));
+          detail: `${a.dir}: ninguna entrada de audio en files.xml para esta actividad${/#audio-removed/.test(html) ? ' (el reproductor apunta a «#audio-removed»: el audio se quitó del paquete)' : /<source\b[^<>]*\bsrc\s*=\s*""/i.test(html) ? ' (el reproductor tiene src vacío)' : ''}`, evidence: { entry: `${a.dir}/${a.modname}.xml` }, suggestedFix: fix }));
       }
       continue;
     }
     // El reproductor tiene que apuntar a SU archivo (`@@PLUGINFILE@@/<nombre>`): un <source src="#audio"> no suena.
     // También `$@PLUGINFILEBYCONTEXT*ctx@$/mod_page/content/0/<nombre>` (re-export) y nombres con %-escapes / NFD.
     const nfc = (x: string) => { try { return decodeURIComponent(x).normalize('NFC'); } catch { return x.normalize('NFC'); } };
-    const srcs = [...html.matchAll(/<(?:audio|source)\b[^>]*\bsrc\s*=\s*"([^"]*)"/gi)].map((m) => nfc(m[1].split(/[?#]/)[0]).split('/').pop() as string);
+    const srcs = [...html.matchAll(/<(?:audio|source)\b[^<>]*\bsrc\s*=\s*"([^"]*)"/gi)].map((m) => nfc(m[1].split(/[?#]/)[0]).split('/').pop() as string);
     const names = new Set([...a.html.flatMap((h) => h.pluginfiles.map((p) => nfc(p).split('/').pop() as string)), ...srcs]);
     const linked = audio.some((x) => names.has(x.filename.normalize('NFC')));
     if (!linked && /<(audio|source)\b/i.test(html)) {
-      const src = /<(?:audio|source)\b[^>]*\bsrc\s*=\s*"([^"]*)"/i.exec(html)?.[1] ?? '';
+      const src = /<(?:audio|source)\b[^<>]*\bsrc\s*=\s*"([^"]*)"/i.exec(html)?.[1] ?? '';
       out.push(f({ check: 'T08', code: 'audio_not_linked', severity: 'error', scope: scopeOf(ctx, a),
         title: `El reproductor de ${where(a)} no apunta a su audio: el archivo viene en el paquete pero no suena.`,
         detail: `${a.dir}: reproductor con src «${short(src, 60)}»; el audio «${audio.map((x) => x.filename).join(', ')}» no está referenciado con @@PLUGINFILE@@`,

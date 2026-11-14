@@ -84,23 +84,23 @@ export async function precheckFindings(ctx: DiagnosisContext, pkg: MbzPackage, p
 
 // ─── Preguntar ─────────────────────────────────────────────────────────────
 
-export function askCall(courseTitle: string | null, question: string, passages: AskPassage[], attempt = 1, problems: string[] = []): AiCall {
-  let user = askUser(courseTitle, question, passages);
+export function askCall(courseTitle: string | null, question: string, passages: AskPassage[], attempt = 1, problems: string[] = [], truncated = false): AiCall {
+  let user = askUser(courseTitle, question, passages, truncated);
   if (attempt > 1 && problems.length) user += `\n\nTu respuesta anterior no sirvió por esto: ${problems.join('; ')}. Corrígelo.`;
   return { purpose: 'question', kind: 'question_answer', system: ASK_SYSTEM, user, tool: askTool(), maxTokens: WORKSHOP_ASK_MAX_TOKENS, size: { promptChars: user.length + ASK_SYSTEM.length }, attempt };
 }
 
-export async function answerQuestion(courseTitle: string | null, question: string, passages: AskPassage[], ai: AiInvoke): Promise<{ answer: AskAnswer; calls: number; spentUsd: string }> {
+export async function answerQuestion(courseTitle: string | null, question: string, passages: AskPassage[], ai: AiInvoke, truncated = false): Promise<{ answer: AskAnswer; calls: number; spentUsd: string }> {
   if (!passages.length) return { answer: noEvidenceAnswer(null), calls: 0, spentUsd: '0' };
   let spent = '0';
   let calls = 0;
   let problems: string[] = [];
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const { result, costUsd } = await ai(askCall(courseTitle, question, passages, attempt, problems));
+    const { result, costUsd } = await ai(askCall(courseTitle, question, passages, attempt, problems, truncated));
     calls++;
     spent = sumUsd(spent, costUsd);
     problems = result.input === null ? ['no usó la herramienta'] : askShapeProblems(result.input, result.stopReason);
-    if (!problems.length) return { answer: verifyAnswer(result.input, passages), calls, spentUsd: spent };
+    if (!problems.length) return { answer: verifyAnswer(result.input, passages, truncated), calls, spentUsd: spent };
   }
   return { answer: noEvidenceAnswer({ reason: `la respuesta del modelo no tenía la forma pedida (${problems.join('; ')})`, invalidCitations: 0 }), calls, spentUsd: spent };
 }
