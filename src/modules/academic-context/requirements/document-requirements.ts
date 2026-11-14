@@ -229,6 +229,11 @@ export interface DesignForRequirements {
     examEnabled: boolean;
     /** r109 M4: horas del módulo completo (apertura + capítulos + examen) si el diseño las mide por módulo; sin ellas, la suma de sus capítulos. */
     hours?: number;
+    /** r109 M4: lo pedido para este módulo en el reparto (null = sin horas propias) y su estado (±10 %), la misma banda del reparto. */
+    hoursTarget?: number | null;
+    hoursStatus?: string;
+    /** r109 M4: las horas de este módulo las decidió el docente (las escribió en Estructura, o vació las que traían los requisitos). */
+    hoursByTeacher?: boolean;
     /** LOOP 9.2: el docente quitó la práctica de este módulo (su decisión: las diferencias que causa son SU excepción). */
     practiceRemovedByTeacher?: boolean;
     chapters: { kind: string; proposed?: boolean; videoEnabled: boolean; videoPinned?: boolean; activityEnabled: boolean; activityPinned?: boolean; applicationMinutes: number | null; applicationPinned?: boolean; hours: number; /** Loop 9 B: práctica guiada (no es una Actividad de Aplicación: no cuenta en sus requisitos). */ guidedPracticeMinutes?: number | null }[];
@@ -291,6 +296,8 @@ function satisfies(r: DocumentRequirement, a: number, hours: boolean): boolean {
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
+/** r109 M4: banda de un módulo (la del reparto por módulo). */
+const MODULE_BAND = 0.1;
 
 /**
  * Loop 9 (A5): ¿las horas que eligió el docente se APARTAN de algún requisito de horas del curso? (la meta, no lo estimado).
@@ -411,9 +418,17 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
         } else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];
           if (!m) missingModule(r, s.index, modulesBy);
-          else one(r, typeof m.hours === 'number' ? m.hours : m.chapters.reduce((a, c) => a + c.hours, 0), 'cursia', true);
+          else if (typeof m.hours === 'number') {
+            // r109 M4: la misma banda del reparto (±10 %): si el módulo se diseñó para lo que pide el requisito, manda su estado;
+            // si el docente fijó otras horas, se compara con la banda del requisito y la decisión es SUYA (excepción).
+            const same = r.mode === 'exact' && m.hoursTarget === r.value && m.hoursStatus;
+            const ok = same ? m.hoursStatus === 'within_tolerance' : r.mode === 'exact' ? Math.abs(m.hours - (r.value as number)) <= (r.value as number) * MODULE_BAND + 1e-9 : satisfies(r, m.hours, true);
+            out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { value: round1(m.hours) }, chosenBy: m.hoursByTeacher ? 'teacher' : 'cursia' });
+          } else one(r, m.chapters.reduce((a, c) => a + c.hours, 0), m.hoursByTeacher ? 'teacher' : 'cursia', true);
         } else if (s.level === 'module' && isEach) {
-          out.push({ requirementId: r.id, status: mods.length && mods.every((m) => satisfies(r, m.chapters.reduce((a, c) => a + c.hours, 0), true)) ? 'met' : 'unmet', actual: { each: mods.map((m) => round1(m.chapters.reduce((a, c) => a + c.hours, 0))) }, chosenBy: 'cursia' });
+          const hrsOf = (m: DesignForRequirements['modules'][number]) => (typeof m.hours === 'number' ? m.hours : m.chapters.reduce((a, c) => a + c.hours, 0));
+          const okEach = (m: DesignForRequirements['modules'][number]) => (typeof m.hours === 'number' && r.mode === 'exact' ? Math.abs(m.hours - (r.value as number)) <= (r.value as number) * MODULE_BAND + 1e-9 : satisfies(r, hrsOf(m), true));
+          out.push({ requirementId: r.id, status: mods.length && mods.every(okEach) ? 'met' : 'unmet', actual: { each: mods.map((m) => round1(hrsOf(m))) }, chosenBy: mods.some((m) => m.hoursByTeacher) ? 'teacher' : 'cursia' });
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       case 'videos': {

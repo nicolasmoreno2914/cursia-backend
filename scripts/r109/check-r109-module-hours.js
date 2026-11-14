@@ -38,12 +38,18 @@ if (process.argv.includes('--bite')) {
     { name: 'la suma que pasa del total no cambia el total', file: 'modules/study-time/module-hours.js', from: 'if (sum > total) {', to: 'if (false) {' },
     { name: 'el módulo con muy pocas horas se da por cumplido (sin explicación)', file: 'modules/study-time/distributor.js', from: "if (Math.abs(est - target) <= target * module_hours_1.MODULE_HOURS_TOLERANCE_PCT + 1e-9)\n        return 'within_tolerance';", to: "return 'within_tolerance';" },
     { name: 'Verificación no dice qué módulo se queda corto', file: 'modules/course-design/design-verification.js', from: 'for (const m of bad) {', to: 'for (const m of []) {' },
-    { name: 'las horas de componente («20 horas de clase») se toman como horas de un módulo', file: 'modules/academic-context/requirements/module-hours-reader.js', from: 'componentAfter(t, h.end)', to: 'false' },
-    { name: 'la caja no reemplaza las horas por módulo del documento', file: 'modules/academic-context/requirements/requirements-box.js', from: '(boxModuleHours && moduleIndexOf(it) !== null ? boxModuleHours : undefined)', to: 'undefined' },
+    { name: 'las horas de componente («20 horas de clase», «trabajo autónomo») se toman como horas de un módulo', file: 'modules/academic-context/requirements/module-hours-reader.js', from: 'componentIn(t, h.start, h.end)', to: 'false' },
+    { name: 'la caja no reemplaza las horas por módulo del documento', file: 'modules/academic-context/requirements/requirements-box.js', from: '(boxModuleHours && (moduleIndexOf(it) !== null', to: '(false && (moduleIndexOf(it) !== null' },
     { name: 'las horas por módulo no se redondean a 0,5 h', file: 'modules/study-time/module-hours.js', from: 'let h = Math.round(v * 2) / 2;', to: 'let h = v;' },
     { name: 'la caja sigue diciendo «próximamente» (no entiende «Módulo 2: 12 horas»)', file: 'modules/academic-context/requirements/requirements-extractor.js', from: 'const hits = (0, module_hours_reader_1.findModuleHoursIn)(sg.text, declarative);', to: 'const hits = [];' },
     { name: 'el resumen del Prebrief no dice las horas por módulo', file: 'modules/prebrief/prebrief-document.js', from: 'if (m.duration.moduleHours) {', to: 'if (false) {' },
     { name: 'un perfil con todo null guarda moduleTargetHours (el sha cambia sin horas por módulo)', file: 'modules/pedagogy/pedagogy-profile.js', from: 'while (out.length && out[out.length - 1] === null)', to: 'while (false)' },
+    { name: 'Verificación compara el módulo con la tolerancia vieja de 1 h (no con su estado ±10 %)', file: 'modules/academic-context/requirements/document-requirements.js', from: "else if (typeof m.hours === 'number') {", to: 'else if (false) {' },
+    { name: 'las horas que cambió el docente en un módulo salen como conflicto del documento (no como excepción)', file: 'modules/academic-context/requirements/document-requirements.js', from: "actual: { value: round1(m.hours) }, chosenBy: m.hoursByTeacher ? 'teacher' : 'cursia' });", to: "actual: { value: round1(m.hours) }, chosenBy: 'cursia' });" },
+    { name: 'vaciar todas las horas no se guarda como decisión del docente ([])', file: 'modules/pedagogy/pedagogy-profile.js', from: 'if (v.length === 0)\n        return [];', to: '' },
+    { name: '«10 horas por módulo» no se convierte en una entrada por módulo', file: 'modules/academic-context/requirements/requirements-box.js', from: 'if (each && moduleCount > 0) {', to: 'if (false) {' },
+    { name: 'el resto no descuenta los recursos del curso', file: 'modules/study-time/module-hours.js', from: 'Math.max(0, courseOverheadHours)', to: '0' },
+    { name: 'las horas de módulos que no existen se pierden sin aviso cuando ninguna coincide', file: 'modules/study-time/distributor.js', from: 'return plan.warnings.length ? {', to: 'return false ? {' },
   ];
   const tmp = fs.mkdtempSync(path.join(REPO, '.r109-bite-'));
   let code = 0;
@@ -192,15 +198,18 @@ async function main() {
   // ── MH2 ──
   await check('MH2 un módulo null se reparte el resto del total (uno y varios)', () => {
     const one = dist(A1A2, 28, [7, null, 6, 3.5]);
-    eq(one.moduleHours.remainderHours, 11.5, 'quedan 28 − 16,5 h');
+    // El resto descuenta los recursos del curso (bienvenida, marco, foro, examen final ≈ 1 h): 28 − 16,5 − 1 h.
+    const oh = Math.round(one.moduleHours.courseOverheadHours * 2) / 2;
+    eq(one.moduleHours.remainderHours, 28 - 16.5 - oh, 'quedan 28 − 16,5 h − recursos del curso');
+    assert(oh >= 0.5 && oh <= 1.5, `recursos del curso ≈ 1 h (${oh})`);
     const m2 = one.moduleHours.modules[1];
     eq([m2.source, m2.targetHours], ['remainder', null], 'el módulo 2 es «el resto»');
-    assert(within(m2.estimatedHours, 11.5), `módulo 2: ${m2.estimatedHours} h dentro de ±10 % de 11,5 h`);
+    assert(within(m2.estimatedHours, one.moduleHours.remainderHours), `módulo 2: ${m2.estimatedHours} h dentro de ±10 % de ${one.moduleHours.remainderHours} h`);
     assert(within(one.estimatedHours, 28), `total ${one.estimatedHours} h ±10 %`);
     const two = dist(A1A2, 28, [7, null, null, 3.5]);
-    eq(two.moduleHours.remainderHours, 17.5, 'dos módulos sin horas: 28 − 10,5 h entre los dos');
+    eq(two.moduleHours.remainderHours, 28 - 10.5 - oh, 'dos módulos sin horas: 28 − 10,5 h − recursos del curso entre los dos');
     const sum = two.moduleHours.modules.filter((m) => m.source === 'remainder').reduce((a, m) => a + m.estimatedHours, 0);
-    assert(within(sum, 17.5), `los dos módulos suman ${sum.toFixed(1)} h ±10 % de 17,5 h`);
+    assert(within(sum, two.moduleHours.remainderHours), `los dos módulos suman ${sum.toFixed(1)} h ±10 % de ${two.moduleHours.remainderHours} h`);
     eq(two.moduleHours.modules.map((m) => m.source), ['fixed', 'remainder', 'remainder', 'fixed'], 'origen por módulo');
     // Todos null (o ninguno usable) = el reparto de siempre (sin la clave moduleHours).
     assert(dist(A1A2, 28, [null, null, null, null]).moduleHours === undefined, 'todo null: sin moduleHours');
@@ -216,7 +225,7 @@ async function main() {
     assert(r.priorityTrace.some((t) => /el total pasa a ser 29 h/.test(t)), 'el aviso también está en la traza del diseño');
     // Con un módulo sin horas y la suma pasada: el mínimo de 1 h para el módulo sin horas.
     const r2 = dist(A1A2, 20, [7, null, 6, 12]);
-    eq([r2.moduleHours.totalAdjusted, r2.moduleHours.remainderHours, r2.targetHours], [true, 1, 26], 'módulo sin horas: 1 h y total 26 h');
+    eq([r2.moduleHours.totalAdjusted, r2.moduleHours.remainderHours, r2.targetHours], [true, 1, 25 + 1 + Math.round(r2.moduleHours.courseOverheadHours * 2) / 2], 'módulo sin horas: 1 h y total = suma + 1 h + recursos del curso');
     assert(r2.moduleHours.warnings.some((w) => /no queda tiempo/.test(w)), 'aviso del módulo sin margen');
     // Sin pasar del total no se avisa.
     const r3 = dist(A1A2, 40, [7, 12, 6, 4]);
@@ -311,6 +320,16 @@ async function main() {
     nope('Módulo 3: 4 horas semanales', 'horas semanales');
     nope('Módulo 2: 10–12 horas', 'un rango no es una cifra de módulo');
     nope('20 horas de clase para el módulo 2', 'al revés, también');
+    // Ronda 1 (P1-1): las horas de componente se descartan mirando la ORACIÓN entera, no solo la palabra que sigue al número.
+    for (const t of ['Módulo 2: 20 horas de trabajo autónomo', 'Módulo 2: 12 horas de trabajo independiente', 'Módulo 2: 12 horas cada semana', 'Horas de clase: módulo 1: 10 h', 'Módulo 3: 8 horas presenciales']) {
+      nope(t, `caja: «${t}»`);
+      eq(modHours(XN.extractRequirements(linesN(t), 'doc').requirements), [], `documento: «${t}»`);
+    }
+    eq(modHours(XN.extractRequirements(linesN('El módulo 2 tendrá 12 horas de trabajo autónomo.'), 'doc').requirements), [], 'documento con verbo: «de trabajo autónomo»');
+    eq(modHours(BOXM.extractBox('Módulo 1: 7 horas. Módulo 2: 12 horas de trabajo autónomo. Módulo 3: 6 horas').requirements), [[1, 7], [3, 6]], 'en otra oración del mismo renglón, las horas buenas se leen');
+    // Una cifra de módulo fuera de rango no se vuelve horas del curso: se aparta con su motivo.
+    const tiny = BOXM.extractBox('Módulo 2: 0,3 horas');
+    eq([modHours(tiny.requirements), courseHours(tiny.requirements), tiny.ignored.map((g) => g.reason)], [[], [], ['module_hours_invalid']], '«Módulo 2: 0,3 h»');
     eq(courseHours(BOXM.extractBox('Módulo 2: 20 horas de clase').requirements), [], 'tampoco son horas del curso');
     const comp = XN.extractRequirements(linesN('Módulo 2: 20 horas de clase\nEl curso tendrá 28 horas de trabajo del estudiante.'), 'doc');
     eq(modHours(comp.requirements), [], 'documento: sin horas de módulo');
@@ -361,11 +380,16 @@ async function main() {
     const sinHoras = norm(prof({ targetHours: 28 }));
     assert(!('moduleTargetHours' in sinHoras), 'sin horas por módulo, la clave no existe');
     eq(PRO.pedagogicalProfileSha256(norm(prof({ targetHours: 28, moduleTargetHours: [null, null] }))), PRO.pedagogicalProfileSha256(sinHoras), 'todo null = el mismo perfil (mismo sha)');
-    const con = norm(prof({ targetHours: 28, moduleTargetHours: [7, 12.2, null, 3.4] }));
-    eq(con.moduleTargetHours, [7, 12, null, 3.5], 'se redondea a múltiplos de 0,5 h');
+    const con = norm(prof({ targetHours: 28, moduleTargetHours: [7, 12, null, 3.5, null] }));
+    eq(con.moduleTargetHours, [7, 12, null, 3.5], 'sin null al final');
+    // `[]` = decisión explícita del docente: se conserva (y cambia el sha: es un dato nuevo del perfil).
+    eq(norm(prof({ targetHours: 28, moduleTargetHours: [] })).moduleTargetHours, [], '[] se guarda');
+    assert(PRO.pedagogicalProfileSha256(norm(prof({ targetHours: 28, moduleTargetHours: [] }))) !== PRO.pedagogicalProfileSha256(sinHoras), '[] es una decisión distinta de «sin decidir»');
+    eq(PRO.profileModuleHours(prof({ moduleTargetHours: [] })), null, 'y para el distribuidor no hay horas');
     eq(PRO.profileModuleHours(prof({ moduleTargetHours: [7, null, 6] })), [7, null, 6], 'lector de horas por módulo');
     eq(PRO.profileModuleHours(prof({})), null, 'sin horas: null');
-    for (const bad of [[0, 5], [-3], ['x'], 'siete', [501], Array.from({ length: 100 }, () => 1)]) {
+    // La API del perfil no redondea en silencio: lo que no es múltiplo de 0,5 h o es menor que 1 h se rechaza.
+    for (const bad of [[0, 5], [-3], ['x'], 'siete', [501], [12.2], [0.5], Array.from({ length: 100 }, () => 1)]) {
       let e = null; try { norm(prof({ moduleTargetHours: bad })); } catch (x) { e = x; }
       assert(e && /INVALID_MODULE_HOURS/.test(e.message), `inválido: ${JSON.stringify(bad).slice(0, 30)} → ${e && e.message}`);
     }
@@ -438,12 +462,77 @@ async function main() {
     eq([errs({ moduleTargetHours: [7, 12, null, 3] }), errs({ moduleTargetHours: null }), errs({ moduleTargetHours: Array.from({ length: 100 }, () => 1) })].map((n) => n > 0), [false, false, true], 'DTO');
     const src = fs.readFileSync(path.join(REPO, 'src/modules/course-design/course-design.service.ts'), 'utf8');
     assert(/moduleHoursDetail\(auth\.applicable\)/.test(src) && /suggestedOrigins/.test(src) && /'requirements_box'|requirements_box/.test(fs.readFileSync(path.join(REPO, 'src/modules/academic-context/requirements/requirements-box.ts'), 'utf8')), 'la respuesta trae origen por módulo');
-    assert(/moduleHours: \{ saved: savedMh, suggested: reqMh \? reqMh\.hours : null, suggestedOrigins: reqMh \? reqMh\.origins : null \}/.test(src), 'structure-options trae moduleHours { saved, suggested, suggestedOrigins } para precargar «Estructura»');
+    assert(/saved: savedMh, suggested: reqMh \? reqMh\.hours : null, suggestedOrigins: reqMh \? reqMh\.origins : null/.test(src), 'structure-options trae moduleHours { saved, suggested, suggestedOrigins } para precargar «Estructura»');
     // Autoridad: lo que el docente escribió gana a la caja, que gana al documento.
     const detail = BOXM.moduleHoursDetail(viewOf('El módulo 1 tendrá 8 horas. El módulo 2 tendrá 10 horas.', 'Módulo 1: 7 horas').items.filter((i) => i.applies));
     eq(detail, { hours: [7], origins: ['requirements_box'] }, 'caja > documento');
     const origins = (vals, det) => vals.map((v, i) => (v === null ? null : det && det.hours[i] === v ? det.origins[i] : 'teacher'));
     eq(origins([7, 11, null], detail), ['requirements_box', 'teacher', null], 'docente > caja: un valor distinto es del docente');
+  });
+
+  // ── MH12 (ronda 1: P1-2, P1-3) ──
+  const AUTH = R('modules/academic-context/requirements/requirement-authority.js');
+  const reqsOf = (text) => BOXM.extractBox(text).requirements.filter((r) => r.obligation === 'required' && r.confidence === 'high');
+  const forReq = (r, teacher = []) => ({
+    modules: r.modules.map((m, i) => { const e = r.moduleHours.modules.find((x) => x.moduleId === m.id); return { examEnabled: m.examEnabled, hours: e.estimatedHours, hoursTarget: e.targetHours, hoursStatus: e.status, ...(teacher[i] ? { hoursByTeacher: true } : {}), chapters: m.chapters.map((c) => ({ kind: c.kind, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, applicationMinutes: c.applicationMinutes, hours: c.targetMinutes / 60 })) }; }),
+    evaluations: r.counts.evaluations, targetHours: r.targetHours, estimatedHours: r.estimatedHours, hoursStatus: r.status, hoursSource: 'user', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false,
+  });
+  const cctx = { status: 'ok', baseHours: 20, estimatedHours: 20, modules: 4, moduleExams: 4, exceptionFields: {}, structureByTeacher: false };
+  await check('MH12 Verificación usa la misma banda ±10 % del reparto; la decisión del docente es una «Excepción», no un conflicto crítico', () => {
+    // P1-2: el requisito del módulo sale del estado del módulo: nunca «cumple» y crítico a la vez.
+    const r = dist(A1A2, 28, [7, 12, 6, 3]);
+    const reqs = reqsOf('Módulo 1: 7 horas\nMódulo 2: 12 horas\nMódulo 4: 3 horas');
+    const checks = DOCR.compareRequirements(reqs, forReq(r));
+    const byIdx = (i) => checks.find((c) => c.requirementId === reqs.find((x) => x.scope.index === i).id);
+    eq([byIdx(1).status, byIdx(2).status, byIdx(4).status], ['met', 'met', 'unmet'], 'módulos 1 y 2 cumplen; el 4 (3,4 h de 3 h) no, como dice el reparto');
+    assert(r.moduleHours.modules[3].status !== 'within_tolerance', 'y el reparto lo dice igual');
+    // Un módulo de 20 h que queda en 18,1 h (dentro de ±10 %) cumple (antes: «no cumple» por la tolerancia de 1 h).
+    const synth = { modules: [{ examEnabled: true, hours: 18.1, hoursTarget: 20, hoursStatus: 'within_tolerance', chapters: [{ kind: 'content', videoEnabled: true, activityEnabled: true, applicationMinutes: null, hours: 3 }] }], evaluations: 2, targetHours: 20, estimatedHours: 19, hoursStatus: 'within_tolerance', hoursSource: 'user', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false };
+    const r20 = reqsOf('Módulo 1: 20 horas');
+    eq(DOCR.compareRequirements(r20, synth)[0].status, 'met', '18,1 h de 20 h cumple');
+    // P1-3: el docente cambió el módulo 2 a 16 h; el documento/la caja decían 12 h → «Excepción», advertencia, no crítico.
+    const r16 = dist(A1A2, 28, [7, 16, 6, 4]);
+    const rq2 = reqsOf('Módulo 2: 12 horas');
+    const c2 = DOCR.compareRequirements(rq2, forReq(r16, [false, true, false, false]));
+    eq([c2[0].status, c2[0].chosenBy], ['unmet', 'teacher'], 'las horas del módulo son decisión del docente');
+    const v = AUTH.requirementVerificationChecks(rq2, c2, cctx);
+    assert(v.length === 1 && v[0].severity === 'warning' && /^Excepción a(l requisito| tus requisitos)/.test(v[0].title), `excepción, no conflicto: ${JSON.stringify(v.map((x) => [x.severity, x.title]))}`);
+    eq(v[0].fix.action, 'moduleHours', 'el arreglo es de horas por módulo (no «targetHours»)');
+    // Sin decisión del docente, el mismo choque es el conflicto de siempre (crítico) y su arreglo también es por módulo.
+    const c3 = DOCR.compareRequirements(rq2, forReq(r16));
+    const v3 = AUTH.requirementVerificationChecks(rq2, c3, cctx);
+    assert(v3.length === 1 && v3[0].severity === 'critical' && v3[0].fix && v3[0].fix.action === 'moduleHours', `conflicto crítico con arreglo por módulo: ${JSON.stringify(v3.map((x) => [x.severity, x.fix]))}`);
+  });
+
+  // ── MH13 (ronda 1: P1-4, P1-5, P2-2) ──
+  await check('MH13 vaciar todas las horas es una decisión que se guarda; «10 horas por módulo» se aplica; las horas sobrantes se avisan', () => {
+    // P1-4: `[]` = el docente decidió que ningún módulo tiene horas propias.
+    const run = (extra) => D.P.runPedagogyDryRun({ structure: struct(A1A2, LIGHT), profile: profileOf('competencias', { targetHours: 28, ...extra }) });
+    const off = run({ moduleTargetHours: [] });
+    assert(off.distribution.moduleHours === undefined, 'sin horas por módulo en el reparto');
+    eq(off.profile.moduleTargetHours, [], 'y la decisión queda en el perfil');
+    eq(off.distribution.proposalSha256, run({}).distribution.proposalSha256, 'la huella de la propuesta es la de siempre');
+    const src = fs.readFileSync(path.join(REPO, 'src/modules/course-design/course-design.service.ts'), 'utf8');
+    assert(/moduleHoursOff = Array\.isArray\(base\.moduleTargetHours\) && base\.moduleTargetHours\.length === 0/.test(src) && /!hasModuleHours\(base\.moduleTargetHours\) && !moduleHoursOff && reqModuleHours/.test(src), 'recommend no vuelve a cargar los requisitos si el docente decidió «ninguno»');
+    // P1-5: «10 horas por módulo» = una entrada por módulo.
+    const v = viewOf(null, '4 módulos de 5 capítulos\n10 horas por módulo');
+    const each = v.items.filter((i) => i.applies);
+    eq(BOXM.moduleHoursDetail(each, 4), { hours: [10, 10, 10, 10], origins: ['requirements_box', 'requirements_box', 'requirements_box', 'requirements_box'] }, '10 h en cada uno de los 4 módulos');
+    eq(BOXM.moduleHoursDetail(viewOf(null, '10 horas por módulo\nMódulo 2: 12 horas').items.filter((i) => i.applies), 3).hours, [10, 12, 10], 'un módulo concreto manda sobre «por módulo»');
+    assert(/10 h por módulo/.test(v.box.understood.summary), `«Entendí» dice «10 h por módulo»: ${v.box.understood.summary}`);
+    const dEach = viewOf('Cada módulo tendrá 8 horas.', '10 horas por módulo');
+    assert(dEach.items.filter((i) => i.kind === 'target_hours' && !i.fromBox).every((i) => i.overriddenByBox || i.scope.each === undefined), 'la caja reemplaza «por módulo» del documento');
+    // El diseño con esas horas.
+    const r = dist(A1A2, 40, [10, 10, 10, 10]);
+    assert(r.moduleHours.modules.every((m) => m.targetHours === 10), 'cada módulo diseñado para 10 h');
+    // P2-2: horas de módulos que la estructura ya no tiene: aviso visible, también si ninguna posición coincide.
+    const extra = dist(A1A2, 28, [7, 12, 6, 3.5, 9]);
+    assert(extra.moduleHours.warnings.some((w) => /Hay horas para el módulo 5 \(9 h\), pero el curso solo tiene 4 módulos: no se usaron/.test(w)), JSON.stringify(extra.moduleHours.warnings));
+    const onlyExtra = dist(A1A2, 28, [null, null, null, null, 9]);
+    assert(onlyExtra.moduleHours === undefined && onlyExtra.moduleHoursNotes && onlyExtra.moduleHoursNotes.some((w) => /no se usaron/.test(w)), 'solo horas de módulos que no existen: el aviso no se pierde');
+    eq(JSON.stringify({ ...onlyExtra, moduleHoursNotes: undefined }), JSON.stringify({ ...dist(A1A2, 28), moduleHoursNotes: undefined }), 'y el diseño es el de siempre');
+    const card = fs.readFileSync(path.join(REPO, 'src/modules/course-design/course-design.service.ts'), 'utf8');
+    assert(/dist\.moduleHoursNotes/.test(card), 'la respuesta de recommend lleva el aviso (la tarjeta de Diseño lo muestra)');
   });
 
   eq(netAttempts, [], 'red');

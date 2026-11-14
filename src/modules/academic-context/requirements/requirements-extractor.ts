@@ -566,6 +566,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc', opt
     if (!hits.length) continue;
     const quoteOf = (h: { start: number; end: number }) => sg.text.replace(/\s+/g, ' ').slice(h.start, h.end).trim();
     for (const h of hits) {
+      if (h.invalid) { ignored.push({ reason: 'module_hours_invalid', quote: quoteOf(h).slice(0, 160), line: sg.line }); continue; }
       push({
         kind: 'target_hours', scope: { level: 'module', index: h.index }, mode: 'exact', value: h.hours, obligation: 'required', active: true, status: 'found',
         confidence: 'high', source: { documentId, line: sg.line, page: sg.page, quote: (sg.quote || quoteOf(h)).slice(0, 300) },

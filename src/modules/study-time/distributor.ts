@@ -215,6 +215,8 @@ export interface DistributionResult {
   studyTime: StudyTimeEstimate;
   /** r109 M4: SOLO con horas por módulo (sin ellas la clave no existe: salida de siempre). */
   moduleHours?: ModuleHoursResult;
+  /** r109 M4: avisos cuando las horas por módulo no se pudieron usar (p. ej. son de módulos que la estructura ya no tiene). */
+  moduleHoursNotes?: string[];
 }
 
 /**
@@ -423,6 +425,18 @@ function scopeRequirements(rq: DistributorRequirementConstraints | null | undefi
   return { ...rest, ...(Array.isArray(practiceByModule) ? { practiceByModule: idx.map((i) => practiceByModule[i] ?? 0) } : {}) };
 }
 
+/** Recursos del curso (bienvenida, marco, foro y examen final): medir con y sin ellos un módulo vacío con tantos capítulos de contenido como el diseño. */
+function courseOverheadOf(finalExam: boolean, timeCfg: TimeModelConfig, contentTotal: number) {
+  const probeModule = { moduleId: '__r109m4__', intro: false, exam: false, chapters: Array.from({ length: Math.max(1, contentTotal) }, (_, i) => ({ chapterId: `__r109m4c${i}__`, kind: 'content' as const, libro: false, presentation: false, video: false, activity: false, review: false })) };
+  const withFrame = estimateCourseStudyTimeWith({ frame: true, welcomeAudio: true, forum: true, finalExam, modules: [probeModule] }, timeCfg);
+  const noFrame = estimateCourseStudyTimeWith({ frame: false, welcomeAudio: false, forum: false, finalExam: false, modules: [probeModule] }, timeCfg);
+  return {
+    ...withFrame,
+    courseEstimatedMinutes: r2(withFrame.courseEstimatedMinutes - noFrame.courseEstimatedMinutes),
+    byComponent: Object.fromEntries(Object.keys(withFrame.byComponent).map((k) => [k, r2((withFrame.byComponent as Record<string, number>)[k] - (noFrame.byComponent as Record<string, number>)[k])])) as StudyTimeEstimate['byComponent'],
+  };
+}
+
 const STATUS_RANK: Readonly<Record<DistributionStatus, number>> = Object.freeze({ within_tolerance: 0, above_tolerance: 1, minimum_exceeds_target: 2, cannot_reach_target: 3 });
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -457,8 +471,10 @@ function distributeByModule(input: DistributorInput): DistributionResult | null 
   const snapshot = input.snapshot;
   const timeCfg = input.timeModelConfig ?? DEFAULT_TIME_MODEL_CONFIG;
   const mods = [...snapshot.modules].sort((a, b) => a.position - b.position);
-  const plan = planModuleHours(input.moduleHours, input.targetHours, mods.length);
-  if (plan.fixed.every((h) => h === null)) return null;
+  const finalExam = snapshot.course.finalExam === true;
+  const contentNow = mods.reduce((n, m) => n + m.chapters.filter((c) => (c as { kind?: string }).kind !== 'practice').length, 0);
+  const plan = planModuleHours(input.moduleHours, input.targetHours, mods.length, courseOverheadOf(finalExam, timeCfg, contentNow).courseEstimatedMinutes / 60);
+  if (plan.fixed.every((h) => h === null)) return plan.warnings.length ? { ...distributeWhole(input), moduleHoursNotes: plan.warnings } as DistributionResult : null;
 
   const groups: { idx: number[]; target: number; source: 'fixed' | 'remainder' }[] = [];
   plan.fixed.forEach((h, i) => { if (h !== null) groups.push({ idx: [i], target: h, source: 'fixed' }); });
@@ -479,17 +495,7 @@ function distributeByModule(input: DistributorInput): DistributionResult | null 
     return { g, r: distributeWhole(sub) };
   });
 
-  // Recursos del curso (bienvenida, marco, foro y examen final): la diferencia entre medir con y sin ellos un módulo vacío con
-  // tantos capítulos de contenido como tiene el diseño completo (el examen final depende de ese total).
-  const contentTotal = runs.reduce((n, x) => n + x.r.counts.contentChapters, 0);
-  const probeModule = { moduleId: '__r109m4__', intro: false, exam: false, chapters: Array.from({ length: Math.max(1, contentTotal) }, (_, i) => ({ chapterId: `__r109m4c${i}__`, kind: 'content' as const, libro: false, presentation: false, video: false, activity: false, review: false })) };
-  const withFrame = estimateCourseStudyTimeWith({ frame: true, welcomeAudio: true, forum: true, finalExam: snapshot.course.finalExam === true, modules: [probeModule] }, timeCfg);
-  const noFrame = estimateCourseStudyTimeWith({ frame: false, welcomeAudio: false, forum: false, finalExam: false, modules: [probeModule] }, timeCfg);
-  const overhead = {
-    ...withFrame,
-    courseEstimatedMinutes: r2(withFrame.courseEstimatedMinutes - noFrame.courseEstimatedMinutes),
-    byComponent: Object.fromEntries(Object.keys(withFrame.byComponent).map((k) => [k, r2((withFrame.byComponent as Record<string, number>)[k] - (noFrame.byComponent as Record<string, number>)[k])])) as StudyTimeEstimate['byComponent'],
-  };
+  const overhead = courseOverheadOf(snapshot.course.finalExam === true, timeCfg, runs.reduce((n, x) => n + x.r.counts.contentChapters, 0));
   const runOfModule = new Map<string, (typeof runs)[number]>();
   for (const x of runs) for (const i of x.g.idx) runOfModule.set(mods[i].id, x);
 

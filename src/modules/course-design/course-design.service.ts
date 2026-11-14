@@ -14,7 +14,7 @@ import { isDocumentlessContext } from '../academic-context/profile-outcomes';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { hasModuleHours, normalizeModuleHours } from '../study-time/module-hours';
-import { moduleHoursDetail } from '../academic-context/requirements/requirements-box';
+import { BOX_DOCUMENT_ID, isEachModuleHours, moduleHoursDetail } from '../academic-context/requirements/requirements-box';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
 import { approachFromMethodology } from '../academic-context/context-design';
 import { clearDesignPins, loadDesignPins, loadProposedHours, setProposedHours } from './design-pins';
@@ -100,8 +100,16 @@ export class CourseDesignService {
     const reqMh = moduleHoursDetail(auth.applicable);
     const savedProfile = await loadCurrentPedagogicalProfile(this.dataSource, courseId).catch(missingProfilesTable);
     const savedMh: (number | null)[] | null = savedProfile && Array.isArray((savedProfile.profile as any).moduleTargetHours) && hasModuleHours((savedProfile.profile as any).moduleTargetHours) ? (savedProfile.profile as any).moduleTargetHours : null;
+    const eachReq = auth.applicable.find((r) => isEachModuleHours(r) && r.mode === 'exact' && typeof r.value === 'number');
+    const savedNone = !!savedProfile && Array.isArray((savedProfile.profile as any).moduleTargetHours) && (savedProfile.profile as any).moduleTargetHours.length === 0;
     return {
-      ...(reqMh || savedMh ? { moduleHours: { saved: savedMh, suggested: reqMh ? reqMh.hours : null, suggestedOrigins: reqMh ? reqMh.origins : null } } : {}),
+      ...(reqMh || savedMh || eachReq || savedNone ? { moduleHours: {
+        saved: savedMh, suggested: reqMh ? reqMh.hours : null, suggestedOrigins: reqMh ? reqMh.origins : null,
+        // «10 horas por módulo»: el mismo valor para cada módulo (se completa con la cantidad de módulos de la forma elegida).
+        ...(eachReq ? { suggestedEach: { hours: eachReq.value as number, origin: eachReq.source && eachReq.source.documentId === BOX_DOCUMENT_ID ? 'requirements_box' : 'document' } } : {}),
+        // El docente decidió que ningún módulo tiene horas propias.
+        ...(savedNone ? { savedNone: true } : {}),
+      } } : {}),
       providersCalled: 0,
       contextVersion: academic ? academic.version : null,
       hasDocumentContents: contents.length > 0,
@@ -283,18 +291,21 @@ export class CourseDesignService {
     if (adjust.moduleTargetHours !== undefined && adjust.moduleTargetHours !== null) {
       const arr = adjust.moduleTargetHours;
       if (!Array.isArray(arr) || arr.some((h) => h !== null && !(typeof h === 'number' && Number.isFinite(h) && h > 0 && h <= 500))) {
-        throw new BadRequestException('moduleTargetHours debe ser una lista de horas por módulo (números de 0,5 a 500, o null si el módulo no tiene horas propias).');
+        throw new BadRequestException('moduleTargetHours debe ser una lista de horas por módulo (números de 1 a 500, o null si el módulo no tiene horas propias).');
       }
     }
-    const reqModuleHours = moduleHoursDetail(auth.applicable);
+    const moduleCountRow: { n: number }[] = await this.dataSource.query('select count(*)::int as n from public.course_modules where course_id = $1', [courseId]);
+    const reqModuleHours = moduleHoursDetail(auth.applicable, Number(moduleCountRow[0] ? moduleCountRow[0].n : 0));
     const moduleHoursNotes: string[] = [];
     if (adjust.moduleTargetHours === null) delete base.moduleTargetHours; // volver a lo que dicen los requisitos
     else if (Array.isArray(adjust.moduleTargetHours)) {
       const n = normalizeModuleHours(adjust.moduleTargetHours, adjust.moduleTargetHours.length);
       moduleHoursNotes.push(...n.notes);
-      if (hasModuleHours(n.hours)) base.moduleTargetHours = n.hours; else delete base.moduleTargetHours;
+      // Sin ninguna hora: decisión explícita del docente («ningún módulo tiene horas propias»): se guarda `[]`.
+      base.moduleTargetHours = hasModuleHours(n.hours) ? n.hours : [];
     }
-    if (!hasModuleHours(base.moduleTargetHours) && reqModuleHours) {
+    const moduleHoursOff = Array.isArray(base.moduleTargetHours) && base.moduleTargetHours.length === 0;
+    if (!hasModuleHours(base.moduleTargetHours) && !moduleHoursOff && reqModuleHours) {
       const n = normalizeModuleHours(reqModuleHours.hours, reqModuleHours.hours.length);
       moduleHoursNotes.push(...n.notes);
       base.moduleTargetHours = n.hours;
@@ -428,8 +439,12 @@ export class CourseDesignService {
       const liveShape = dist.modules.map((m) => m.chapters.filter((c) => !c.proposed && c.kind === 'content').length);
       const shapeIsDocuments = !!docShape && liveShape.length === docShape.length && liveShape.every((n, i) => n === docShape[i]);
       if (shapeIsDocuments) structureByTeacher = false;
+      // r109 M4: ¿las horas de cada módulo las decidió el docente (las escribió en Estructura o vació las de los requisitos)?
+      const profMh: (number | null)[] | null = Array.isArray((profile as any).moduleTargetHours) ? (profile as any).moduleTargetHours : null;
+      const moduleTeacher: boolean[] = dist.modules.map((_, i) => !!reqModuleHours && reqModuleHours.hours[i] !== undefined && reqModuleHours.hours[i] !== null
+        && (profMh && profMh.length === 0 ? true : hasModuleHours(profMh) ? ((profMh as (number | null)[])[i] ?? null) !== reqModuleHours.hours[i] : false));
       reqChecks = compareRequirements(auth.applicable, designForRequirements(dist, profile.targetHours ?? null, hoursSource === 'requirement' ? 'proposed' : hoursSource,
-        structureByTeacher, !!decisions.audiovisual, !!decisions.applicationActivities));
+        structureByTeacher, !!decisions.audiovisual, !!decisions.applicationActivities, moduleTeacher));
       // Loop 9 (A5): las horas son «del docente» (su excepción, sin chequeo de choque) solo si su meta se APARTA del documento.
       // Una meta escrita en «Ajustar» dentro de lo que pide el documento, con un diseño que no llega, es el mismo choque que
       // con las horas del documento (antes: «Cumple» junto a «24,2 horas (estimadas)»).
@@ -566,7 +581,7 @@ export class CourseDesignService {
       // r109 M4: solo con horas por módulo (propias o de los requisitos); sin ellas la clave no existe.
       ...(() => {
         const vals: (number | null)[] | null = Array.isArray((profile as any).moduleTargetHours) ? (profile as any).moduleTargetHours : null;
-        if (!vals && !reqModuleHours) return {};
+        if (!vals && !reqModuleHours && !dist?.moduleHoursNotes) return {};
         const count = dist ? dist.modules.length : Math.max(vals ? vals.length : 0, reqModuleHours ? reqModuleHours.hours.length : 0);
         const values = Array.from({ length: count }, (_, i) => (vals && typeof vals[i] === 'number' ? (vals[i] as number) : null));
         const origins = values.map((v, i) => (v === null ? null : reqModuleHours && reqModuleHours.hours[i] === v ? reqModuleHours.origins[i] : 'teacher'));
@@ -574,7 +589,8 @@ export class CourseDesignService {
           active: values.some((v) => v !== null), values, origins,
           suggested: reqModuleHours ? Array.from({ length: count }, (_, i) => reqModuleHours.hours[i] ?? null) : null,
           suggestedOrigins: reqModuleHours ? Array.from({ length: count }, (_, i) => reqModuleHours.origins[i] ?? null) : null,
-          notes: moduleHoursNotes,
+          explicitNone: moduleHoursOff,
+          notes: [...moduleHoursNotes, ...((dist && dist.moduleHoursNotes) || [])],
           result: dist && dist.moduleHours ? dist.moduleHours : null,
         } };
       })(),
@@ -1391,11 +1407,13 @@ export function uncoveredEvaluations(
 function designForRequirements(
   dist: DistributionResult, targetHours: number | null, hoursSource: DesignForRequirements['hoursSource'],
   structureByTeacher: boolean, audiovisualByTeacher: boolean, applicationByTeacher: boolean,
+  moduleTeacher: boolean[] = [],
 ): DesignForRequirements {
   return {
-    modules: dist.modules.map((m) => ({
+    modules: dist.modules.map((m, mi) => ({
       examEnabled: m.examEnabled,
-      ...(dist.moduleHours ? (() => { const e = dist.moduleHours.modules.find((x) => x.moduleId === m.id); return e ? { hours: e.estimatedHours } : {}; })() : {}),
+      ...(dist.moduleHours ? (() => { const e = dist.moduleHours.modules.find((x) => x.moduleId === m.id); return e ? { hours: e.estimatedHours, hoursTarget: e.targetHours, hoursStatus: e.status } : {}; })() : {}),
+      ...(moduleTeacher[mi] ? { hoursByTeacher: true } : {}),
       ...(m.practiceRemovedByTeacher ? { practiceRemovedByTeacher: true } : {}),
       chapters: m.chapters.map((c) => ({
         kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, activityEnabled: c.activityEnabled, activityPinned: !!c.activityPinned,

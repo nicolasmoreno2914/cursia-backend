@@ -1,6 +1,6 @@
 import { sha256Canonical } from '../coherence/canonical-json';
 import { TARGET_HOURS_MAX, TARGET_HOURS_MIN, isValidTargetHours } from '../study-time/target-hours';
-import { MODULE_HOURS_MIN, hasModuleHours } from '../study-time/module-hours';
+import { MODULE_HOURS_MIN, hasModuleHours, isValidModuleHours } from '../study-time/module-hours';
 import { HoursModelOverride, canonicalHoursModel } from '../study-time/time-model-config';
 import { PracticeMixSpec, normalizePracticeMixSpec, practiceMixSpecErrors } from '../study-time/practice-mix';
 import { PedagogicalApproachRegistry } from './approach-registry';
@@ -102,6 +102,7 @@ export interface PedagogicalProfile {
   /**
    * r109 M4 · horas por módulo, alineadas con los módulos (null = sin horas propias: ese módulo se reparte el resto del
    * total). Múltiplos de 0,5 h. Opcional: la clave existe SOLO si algún módulo tiene horas (perfiles anteriores conservan su sha).
+   * `[]` = el docente decidió que ningún módulo tiene horas propias (los requisitos no las vuelven a cargar).
    */
   moduleTargetHours?: (number | null)[];
 }
@@ -378,11 +379,13 @@ export function profileModuleHours(p: unknown): (number | null)[] | null {
 }
 function moduleHoursError(v: unknown): string | null {
   if (!Array.isArray(v) || v.length > 99) return 'debe ser una lista de hasta 99 módulos (horas o null)';
-  for (const h of v) if (h !== null && !(typeof h === 'number' && Number.isFinite(h) && h > 0 && h <= TARGET_HOURS_MAX)) return `cada módulo lleva horas (más de 0 y hasta ${TARGET_HOURS_MAX}) o null (fue ${JSON.stringify(h)})`;
+  for (const h of v) if (h !== null && !isValidModuleHours(h)) return `cada módulo lleva horas (de 1 a ${TARGET_HOURS_MAX}, en pasos de 0,5) o null (fue ${JSON.stringify(h)})`;
   return null;
 }
 /** Canónico: horas en múltiplos de 0,5 (un valor intermedio se redondea; el aviso lo da el servicio) y sin null al final. */
 function canonicalModuleHours(v: (number | null)[]): (number | null)[] | null {
+  // `[]` es una decisión explícita del docente («ningún módulo tiene horas propias»): se conserva y los requisitos no las vuelven a cargar.
+  if (v.length === 0) return [];
   const out = v.map((h) => (h === null ? null : Math.min(TARGET_HOURS_MAX, Math.max(MODULE_HOURS_MIN, Math.round(h * 2) / 2))));
   while (out.length && out[out.length - 1] === null) out.pop();
   return out.length ? out : null;

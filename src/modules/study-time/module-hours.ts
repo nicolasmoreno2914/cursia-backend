@@ -41,7 +41,7 @@ export function normalizeModuleHours(raw: unknown, moduleCount: number): ModuleH
     const v = src[i];
     if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) { hours.push(null); continue; }
     let h = Math.round(v * 2) / 2;
-    if (h !== v) notes.push(`Las horas del módulo ${i + 1} (${fmt(v)} h) se redondearon a ${fmt(h)} h: las horas se guardan de media en media hora.`);
+    if (h !== v && h >= MODULE_HOURS_MIN) notes.push(`Las horas del módulo ${i + 1} (${fmt(v)} h) se redondearon a ${fmt(h)} h: las horas se guardan de media en media hora.`);
     if (h < MODULE_HOURS_MIN) { notes.push(`El módulo ${i + 1} no puede tener menos de ${MODULE_HOURS_MIN} h: se usó ${MODULE_HOURS_MIN} h.`); h = MODULE_HOURS_MIN; }
     if (h > MODULE_HOURS_MAX) { notes.push(`El módulo ${i + 1} no puede tener más de ${MODULE_HOURS_MAX} h: se usó ${MODULE_HOURS_MAX} h.`); h = MODULE_HOURS_MAX; }
     hours.push(h);
@@ -64,7 +64,7 @@ export interface ModuleHoursPlan {
   total: number;
   requestedTotal: number;
   totalAdjusted: boolean;
-  /** Lo que queda para los módulos sin horas propias (0 si no hay ninguno). */
+  /** Lo que queda para los módulos sin horas propias, descontados los recursos del curso (0 si no hay ninguno). */
   remainder: number;
   /** Avisos visibles (redondeos, total que pasa a ser la suma, módulos sin horas que se quedan sin margen). */
   warnings: string[];
@@ -76,7 +76,7 @@ export interface ModuleHoursPlan {
  *  - Si quedan módulos sin horas y el resto es menor que 1 h, esos módulos reciben 1 h (el mínimo que Cursia diseña) y el
  *    total pasa a ser la suma con ese mínimo (con aviso).
  */
-export function planModuleHours(moduleHours: unknown, total: number, moduleCount: number): ModuleHoursPlan {
+export function planModuleHours(moduleHours: unknown, total: number, moduleCount: number, courseOverheadHours = 0): ModuleHoursPlan {
   const n = normalizeModuleHours(moduleHours, moduleCount);
   const fixed = n.hours;
   const warnings = [...n.notes];
@@ -89,12 +89,14 @@ export function planModuleHours(moduleHours: unknown, total: number, moduleCount
     totalAdjusted = true;
     warnings.push(`Las horas de los módulos suman ${fmt(sum)} h, más que las ${fmt(total)} h del curso: el total pasa a ser ${fmt(sum)} h.`);
   }
-  let remainder = nulls ? eff - sum : 0;
+  // Los recursos del curso (bienvenida, marco, foro, examen final) también salen del total: el resto es lo que queda para los módulos sin horas.
+  const overhead = Math.round(Math.max(0, courseOverheadHours) * 2) / 2;
+  let remainder = nulls ? Math.floor((eff - sum - overhead) * 2) / 2 : 0;
   if (nulls && remainder < MODULE_HOURS_MIN) {
     remainder = MODULE_HOURS_MIN;
-    eff = sum + remainder;
+    eff = sum + remainder + overhead;
     totalAdjusted = true;
-    warnings.push(`Con las horas de los demás módulos no queda tiempo para ${nulls === 1 ? 'el módulo sin horas' : 'los módulos sin horas'}: se les dejó el mínimo de ${MODULE_HOURS_MIN} h y el total pasa a ser ${fmt(eff)} h.`);
+    warnings.push(`Con las horas de los demás módulos y los recursos del curso (≈ ${fmt(overhead)} h) no queda tiempo para ${nulls === 1 ? 'el módulo sin horas' : 'los módulos sin horas'}: se les dejó el mínimo de ${MODULE_HOURS_MIN} h y el total pasa a ser ${fmt(eff)} h.`);
   }
   return { fixed, total: eff, requestedTotal: total, totalAdjusted, remainder, warnings };
 }

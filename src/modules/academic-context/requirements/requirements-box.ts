@@ -69,6 +69,11 @@ export function extractBox(text: string): RequirementsExtraction {
   };
 }
 
+/** «10 horas por módulo»: horas con alcance «cada módulo». */
+export function isEachModuleHours(r: DocumentRequirement): boolean {
+  const s = r.scope as { level: string; each?: boolean; chapterKind?: string };
+  return r.kind === 'target_hours' && s.level === 'module' && !!s.each;
+}
 /** Módulo (1-based) de un requisito de horas con alcance «módulo N»; null si no lo es. */
 export function moduleIndexOf(r: DocumentRequirement): number | null {
   const s = r.scope as { level: string; index?: number; each?: boolean };
@@ -85,14 +90,23 @@ export function moduleHoursOfRequirements(rs: DocumentRequirement[]): (number | 
 }
 
 /** Igual que `moduleHoursOfRequirements`, con el origen de cada módulo: «de tus requisitos» (la caja) o «del documento». */
-export function moduleHoursDetail(rs: DocumentRequirement[]): { hours: (number | null)[]; origins: ('requirements_box' | 'document' | null)[] } | null {
+export function moduleHoursDetail(rs: DocumentRequirement[], moduleCount = 0): { hours: (number | null)[]; origins: ('requirements_box' | 'document' | null)[] } | null {
   const hours: (number | null)[] = [];
   const origins: ('requirements_box' | 'document' | null)[] = [];
+  const originOf = (r: DocumentRequirement) => (r.source && r.source.documentId === BOX_DOCUMENT_ID ? 'requirements_box' as const : 'document' as const);
   for (const r of rs) {
     const i = moduleIndexOf(r);
     if (i === null || r.mode !== 'exact' || typeof r.value !== 'number' || r.active === false || (r as { applies?: boolean }).applies === false) continue;
     while (hours.length < i) { hours.push(null); origins.push(null); }
-    if (hours[i - 1] === null) { hours[i - 1] = r.value; origins[i - 1] = r.source && r.source.documentId === BOX_DOCUMENT_ID ? 'requirements_box' : 'document'; }
+    if (hours[i - 1] === null) { hours[i - 1] = r.value; origins[i - 1] = originOf(r); }
+  }
+  // «10 horas por módulo»: una entrada por módulo (las de un módulo concreto mandan sobre esta).
+  const each = rs.find((r) => isEachModuleHours(r) && r.mode === 'exact' && typeof r.value === 'number' && r.active !== false && (r as { applies?: boolean }).applies !== false);
+  if (each && moduleCount > 0) {
+    for (let i = 0; i < moduleCount; i++) {
+      while (hours.length <= i) { hours.push(null); origins.push(null); }
+      if (hours[i] === null) { hours[i] = each.value as number; origins[i] = originOf(each); }
+    }
   }
   return hours.length ? { hours, origins } : null;
 }
@@ -113,6 +127,7 @@ export function boxRequirementText(r: DocumentRequirement): string {
   }
   const v = r.value as number;
   if (r.kind === 'target_hours' && moduleIndexOf(r) !== null) return `${n1(v)} h en el módulo ${moduleIndexOf(r)}`;
+  if (isEachModuleHours(r)) return `${n1(v)} h por módulo`;
   if (r.kind === 'target_hours') {
     const q = r.mode === 'min' ? 'al menos ' : r.mode === 'max' ? 'hasta ' : r.mode === 'approx' ? 'aprox. ' : r.mode === 'range' ? `${n1(v)}–` : '';
     return `${q}${n1(r.mode === 'range' ? (r.valueMax ?? v) : v)} h`;
@@ -171,6 +186,7 @@ const REASONS: Record<string, string> = {
   not_modeled: 'Cursia no diseña eso.',
   not_prescriptive: 'Se declara como no prescriptivo.',
   inconsistent: 'Dice una cantidad de módulos y lista otra.',
+  module_hours_invalid: 'Las horas de un módulo van de 1 a 500 h (en pasos de media hora): esta cifra no se usó.',
 };
 
 /** Familia «estructura»: lo que una forma de la caja reemplaza del documento aunque no tengan la misma `key`. */
@@ -222,13 +238,13 @@ export function applyBoxToView(view: RequirementsView, box: StoredBox | null): R
   const boxStructure = boxWins.find((b) => b.kind === 'structure');
   // r109 M4: si la caja trae horas por módulo (aunque sea de algunos), TODAS las horas por módulo del documento quedan
   // reemplazadas: los módulos que la caja no menciona quedan sin horas propias.
-  const boxModuleHours = boxWins.find((b) => moduleIndexOf(b) !== null && b.mode === 'exact');
+  const boxModuleHours = boxWins.find((b) => (moduleIndexOf(b) !== null || isEachModuleHours(b)) && b.mode === 'exact');
 
   const overrides: BoxOverride[] = [];
   const replaced = new Set<string>();
   const docItems: RequirementItem[] = view.items.map((it) => {
     if (!it.applies) return it;
-    const by = boxKeys.get(it.key) || (boxStructure && isStructureFamily(it) ? boxStructure : undefined) || (boxModuleHours && moduleIndexOf(it) !== null ? boxModuleHours : undefined)
+    const by = boxKeys.get(it.key) || (boxStructure && isStructureFamily(it) ? boxStructure : undefined) || (boxModuleHours && (moduleIndexOf(it) !== null || isEachModuleHours(it)) ? boxModuleHours : undefined)
       || (contradictsBoxCount(it, boxWins) ? boxWins.find((b) => b.kind === 'modules' || b.kind === 'chapters') : undefined);
     if (!by) return it;
     // P2-3: una recomendación de la caja («aproximadamente 28 horas») no vuelve «recomendación» un mínimo obligatorio del documento.
