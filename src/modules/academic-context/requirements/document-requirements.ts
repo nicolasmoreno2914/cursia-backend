@@ -227,6 +227,8 @@ export function buildRequirementsView(entries: StoredRequirementsEntry[], sel: S
 export interface DesignForRequirements {
   modules: {
     examEnabled: boolean;
+    /** r109 M4: horas del módulo completo (apertura + capítulos + examen) si el diseño las mide por módulo; sin ellas, la suma de sus capítulos. */
+    hours?: number;
     /** LOOP 9.2: el docente quitó la práctica de este módulo (su decisión: las diferencias que causa son SU excepción). */
     practiceRemovedByTeacher?: boolean;
     chapters: { kind: string; proposed?: boolean; videoEnabled: boolean; videoPinned?: boolean; activityEnabled: boolean; activityPinned?: boolean; applicationMinutes: number | null; applicationPinned?: boolean; hours: number; /** Loop 9 B: práctica guiada (no es una Actividad de Aplicación: no cuenta en sus requisitos). */ guidedPracticeMinutes?: number | null }[];
@@ -409,7 +411,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
         } else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];
           if (!m) missingModule(r, s.index, modulesBy);
-          else one(r, m.chapters.reduce((a, c) => a + c.hours, 0), 'cursia', true);
+          else one(r, typeof m.hours === 'number' ? m.hours : m.chapters.reduce((a, c) => a + c.hours, 0), 'cursia', true);
         } else if (s.level === 'module' && isEach) {
           out.push({ requirementId: r.id, status: mods.length && mods.every((m) => satisfies(r, m.chapters.reduce((a, c) => a + c.hours, 0), true)) ? 'met' : 'unmet', actual: { each: mods.map((m) => round1(m.chapters.reduce((a, c) => a + c.hours, 0))) }, chosenBy: 'cursia' });
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');

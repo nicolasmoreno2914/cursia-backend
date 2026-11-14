@@ -7,6 +7,8 @@
  * es una declaración). Las formas N × M («4 módulos × 5 capítulos») no pasan por aquí: las sigue leyendo el lector de siempre.
  */
 
+import { parseHoursTail } from './module-hours-reader';
+
 export interface UnevenFound {
   /** Capítulos de cada módulo, en orden. */
   shape: number[];
@@ -15,8 +17,12 @@ export interface UnevenFound {
   /** Cuántos módulos dijo el texto («4 módulos»), si lo dijo. */
   declaredModules: number | null;
   pattern: 'list' | 'items';
-  /** Entre un módulo y el siguiente hay cifras (p. ej. «(6 h)»): horas por módulo, que M3c no aplica todavía (M4). */
+  /** Entre un módulo y el siguiente hay cifras (p. ej. «(6 h)»): horas por módulo (r109 M4: se leen en `moduleHours`). */
   moduleExtras?: boolean;
+  /** r109 M4 · horas de cada módulo si el texto las da junto al módulo («4 capítulos, 7 h»); null = no las da. Mismo largo que `shape`. */
+  moduleHours?: (number | null)[];
+  /** r109 M4 · segmento de cada módulo (para citar la línea de sus horas); solo con `moduleHours`. */
+  itemSegments?: number[];
 }
 
 export interface UnevenSpan {
@@ -90,7 +96,7 @@ export function findUnevenIn(text: string, titled = true): { found: UnevenFound;
     `(?:^|[,;:|\\/.]|\\s[yYeE]\\s)\\s*(?<pfx>(?:m[oó]dulo|unidad)\\s*\\d{1,2}\\s*[:\\-–—.)]?\\s*)?(?<title>[^,;:|\\/.\\d\\n]{0,90}?)\\s*[:\\-–—(]?\\s*(?<n>\\d{1,2})\\s*${NOUN_CAP}${NOT_PER}${ITEM_TAIL}`,
     'giu',
   );
-  const items: { title: string | null; chapters: number; start: number; end: number; extras: boolean; hoursTail: number; prefixed: boolean }[] = [];
+  const items: { title: string | null; chapters: number; start: number; end: number; extras: boolean; hoursTail: number; prefixed: boolean; hours: number | null }[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
     const g = m.groups as { pfx?: string; title: string; n: string; par?: string; ht?: string };
@@ -101,28 +107,35 @@ export function findUnevenIn(text: string, titled = true): { found: UnevenFound;
     // El tramo del módulo empieza donde empieza su título (o su número), no en el delimitador.
     const body = m[0].replace(/^(?:[,;:|\/.]|\s[yYeE]\s)?\s*/, '');
     const start = m.index + (m[0].length - body.length);
-    items.push({ title: cleanTitle(g.title), chapters: n, start, end: m.index + m[0].length, extras: /\d/.test(`${g.par || ''}${g.ht || ''}`), hoursTail: (g.ht || '').length, prefixed: !!g.pfx });
+    items.push({ title: cleanTitle(g.title), chapters: n, start, end: m.index + m[0].length, extras: /\d/.test(`${g.par || ''}${g.ht || ''}`), hoursTail: (g.ht || '').length, prefixed: !!g.pfx, hours: parseHoursTail(g.ht) ?? parseHoursTail(g.par) });
   }
   if (items.length < 2 || items.length > MAX_MODULES) return null;
   // Un documento solo declara módulos con «Módulo N:»; los títulos sueltos («Introducción: 2 capítulos») son de la caja del docente.
   if (!titled && items.some((i) => !i.prefixed)) return null;
   // «…, 28 horas» tras el ÚLTIMO módulo son las horas del curso, no de ese módulo: no se ocupan (un paréntesis sí).
+  // r109 M4: salvo que TODOS los demás módulos traigan sus horas: entonces las del último también son de su módulo.
   const last = items[items.length - 1];
-  if (last.hoursTail) { last.end -= last.hoursTail; last.extras = false; }
+  const othersAllHours = items.slice(0, -1).every((i) => i.hours !== null);
+  if (last.hoursTail && !(othersAllHours && last.hours !== null)) { last.end -= last.hoursTail; last.extras = false; last.hours = null; }
   // «N módulos:» al frente de la lista se ocupa también (no se lee aparte como «N módulos»).
   const spans = items.map((i) => ({ start: i.start, end: i.end }));
   // Cifras entre un módulo y el siguiente («… 4 capítulos (6 h), Normas 7 capítulos»): se apartan, no son horas del curso.
   let moduleExtras = items.some((i) => i.extras);
   for (let i = 0; i + 1 < items.length; i++) {
     const gap = text.slice(items[i].end, items[i + 1].start);
-    if (/\d/.test(gap)) { moduleExtras = true; spans.push({ start: items[i].end, end: items[i + 1].start }); }
+    if (/\d/.test(gap)) {
+      moduleExtras = true;
+      spans.push({ start: items[i].end, end: items[i + 1].start });
+      if (items[i].hours === null) items[i].hours = parseHoursTail(gap);
+    }
   }
   const first = items[0].start;
   const head = new RegExp(`(\\d{1,2})\\s*m[oó]dulos?\\s*[:,\\-–—]?\\s*$`, 'iu').exec(text.slice(0, first));
   let declaredModules: number | null = null;
   if (head) { spans.unshift({ start: head.index, end: head.index + head[0].length }); declaredModules = Number(head[1]); }
   else if (declared && declared.index < first) declaredModules = Number(declared[1]);
-  return { found: { shape: items.map((i) => i.chapters), titles: items.map((i) => i.title), declaredModules, pattern: 'items', ...(moduleExtras ? { moduleExtras: true } : {}) }, spans };
+  const anyHours = items.some((i) => i.hours !== null);
+  return { found: { shape: items.map((i) => i.chapters), titles: items.map((i) => i.title), declaredModules, pattern: 'items', ...(moduleExtras ? { moduleExtras: true } : {}), ...(anyHours ? { moduleHours: items.map((i) => i.hours) } : {}) }, spans };
 }
 
 /**
@@ -142,17 +155,17 @@ export function findUnevenStructure(texts: string[], titled = true): UnevenGroup
   for (let i = 0; i < texts.length; i++) {
     const hit = findUnevenIn(texts[i], titled);
     if (hit && (hit.found.pattern === 'list' || hit.found.shape.length >= 2)) {
-      return { found: hit.found, spans: hit.spans.map((s) => ({ segment: i, ...s })), firstSegment: i };
+      return { found: hit.found.moduleHours ? { ...hit.found, itemSegments: hit.found.moduleHours.map(() => i) } : hit.found, spans: hit.spans.map((s) => ({ segment: i, ...s })), firstSegment: i };
     }
   }
   // b) Un módulo por renglón, renglones seguidos (cada uno con UN módulo).
-  const singles: { i: number; title: string | null; n: number; span: { start: number; end: number }; extras: boolean; prefixed: boolean }[] = [];
+  const singles: { i: number; title: string | null; n: number; span: { start: number; end: number }; extras: boolean; prefixed: boolean; hours: number | null; hoursTail: number }[] = [];
   for (let i = 0; i < texts.length; i++) {
     const t = texts[i];
     const re = new RegExp(`^\\s*(?:[-*•·]\\s*|\\d{1,2}\\s*[.)]\\s*)?(?:(?<pfx>m[oó]dulo|unidad)\\s*\\d{1,2}\\s*[:\\-–—.)]?\\s*)?(?<title>[^\\d:|\\n]{0,90}?)\\s*[:\\-–—(|]?\\s*(?<n>\\d{1,2})\\s*${NOUN_CAP}${NOT_PER}${ITEM_TAIL}\\s*\\)?\\s*[.;,]?\\s*$`, 'iu');
     const m = re.exec(t);
     const g = m && (m.groups as { pfx?: string; title: string; n: string; par?: string; ht?: string });
-    if (g && Number(g.n) >= 1 && Number(g.n) <= MAX_CHAPTERS && !SENTENCE_WORD.test(g.title) && (titled || g.pfx)) singles.push({ i, title: cleanTitle(g.title), n: Number(g.n), span: { start: 0, end: t.length }, extras: /\d/.test(`${g.par || ''}${g.ht || ''}`), prefixed: !!g.pfx });
+    if (g && Number(g.n) >= 1 && Number(g.n) <= MAX_CHAPTERS && !SENTENCE_WORD.test(g.title) && (titled || g.pfx)) singles.push({ i, title: cleanTitle(g.title), n: Number(g.n), span: { start: 0, end: t.length }, extras: /\d/.test(`${g.par || ''}${g.ht || ''}`), prefixed: !!g.pfx, hours: parseHoursTail(g.ht) ?? parseHoursTail(g.par), hoursTail: (g.ht || '').length });
   }
   // La racha más larga de renglones consecutivos.
   let best: typeof singles = [];
@@ -164,9 +177,17 @@ export function findUnevenStructure(texts: string[], titled = true): UnevenGroup
   if (best.length >= 2 && best.length <= MAX_MODULES) {
     let declaredModules: number | null = null;
     const before = best[0].i > 0 ? /^\s*(\d{1,2})\s*m[oó]dulos?\b[^\d]{0,30}$/i.exec(texts[best[0].i - 1]) : null;
+    // r109 M4: las horas del último renglón son del curso (no del módulo) si algún otro módulo no trae las suyas.
+    const lastS = best[best.length - 1];
+    const allOthers = best.slice(0, -1).every((s) => s.hours !== null);
+    if (lastS.hoursTail && lastS.hours !== null && !allOthers) {
+      const at = texts[lastS.i].lastIndexOf((texts[lastS.i].match(/[,\-–—]\s*\d{1,3}\s*(?:h|horas)\b[^,\-–—]*$/i) || [''])[0]);
+      if (at > 0) { lastS.span = { start: 0, end: at }; lastS.hours = null; lastS.extras = false; }
+    }
     const spans: UnevenSpan[] = best.map((s) => ({ segment: s.i, ...s.span }));
     if (before) { declaredModules = Number(before[1]); spans.unshift({ segment: best[0].i - 1, start: 0, end: texts[best[0].i - 1].length }); }
-    return { found: { shape: best.map((s) => s.n), titles: best.map((s) => s.title), declaredModules, pattern: 'items', ...(best.some((s) => s.extras) ? { moduleExtras: true } : {}) }, spans, firstSegment: spans[0].segment };
+    const anyHours = best.some((s) => s.hours !== null);
+    return { found: { shape: best.map((s) => s.n), titles: best.map((s) => s.title), declaredModules, pattern: 'items', ...(best.some((s) => s.extras) ? { moduleExtras: true } : {}), ...(anyHours ? { moduleHours: best.map((s) => s.hours), itemSegments: best.map((s) => s.i) } : {}) }, spans, firstSegment: spans[0].segment };
   }
   return null;
 }

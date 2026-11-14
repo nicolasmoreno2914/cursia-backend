@@ -131,6 +131,8 @@ export interface PrebriefModel {
     estimatedHours: number;
     format: (OriginValue<string> & { code: string; modules: number; chaptersPerModule: number; hoursMin: number; hoursMax: number }) | null;
     credits: OriginValue<number> | null;
+    /** r109 M4 · horas por módulo (SOLO si el curso las tiene; sin ellas la clave no existe). `requested` null = sin horas propias. */
+    moduleHours?: { n: number; title: string; requested: number | null; estimated: number; origin: PrebriefOrigin; within: boolean }[];
   };
   structure: {
     origin: PrebriefOrigin;
@@ -371,6 +373,8 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
 
   // Estructura (la del diseño verificado; con cambios pendientes la preparación se bloquea).
   let chN = 0;
+  // r109 M4: con horas por módulo, las horas de cada módulo son las suyas (apertura + capítulos + examen), no la suma de sus capítulos.
+  const mhCard = card && card.moduleHours && card.moduleHours.active && card.moduleHours.result ? card.moduleHours : null;
   const modules: PrebriefModule[] = (design ? design.modules : []).map((m: any, mi: number) => {
     const chapters: PrebriefChapter[] = (m.chapters || []).map((c: any) => ({
       n: ++chN,
@@ -385,7 +389,8 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       outcomeIds: Array.isArray(c.outcomeIds) ? [...c.outcomeIds].map(String).sort() : [],
       proposed: !!c.proposed,
     }));
-    return { n: mi + 1, title: clean(m.title), hours: round1(chapters.reduce((a, c) => a + c.hours, 0)), exam: !!m.examEnabled, chapters };
+    const mhe = mhCard ? (mhCard.result.modules || []).find((x: any) => x.index === mi + 1) : null;
+    return { n: mi + 1, title: clean(m.title), hours: mhe ? round1(mhe.estimatedHours) : round1(chapters.reduce((a, c) => a + c.hours, 0)), exam: !!m.examEnabled, chapters };
   });
   const allCh = modules.flatMap((m) => m.chapters);
   const totals = {
@@ -606,6 +611,10 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       estimatedHours: totals.hours,
       format: fdef ? { value: fdef.label, origin: 'format', code: fdef.code, modules: fdef.modules, chaptersPerModule: fdef.chaptersPerModule, hoursMin: fdef.hoursMin, hoursMax: fdef.hoursMax } : null,
       credits,
+      ...(mhCard ? { moduleHours: (mhCard.result.modules as any[]).map((e) => ({
+        n: e.index, title: clean(e.title), requested: typeof e.targetHours === 'number' ? e.targetHours : null, estimated: round1(e.estimatedHours),
+        origin: ((mhCard.origins || [])[e.index - 1] === 'document' ? 'document' : 'institution') as PrebriefOrigin, within: e.status === 'within_tolerance',
+      })) } : {}),
     },
     structure: {
       origin: structureOrigin,
@@ -654,6 +663,10 @@ export function diffModels(prev: PrebriefModel, next: PrebriefModel): string[] {
   const h = (x: { value: number } | null) => (x ? `${String(x.value).replace('.', ',')} h` : 'sin horas');
   if (prev.course.title !== next.course.title) out.push(`Nombre del curso: «${prev.course.title}» → «${next.course.title}»`);
   if (!eq(prev.duration.targetHours, next.duration.targetHours)) out.push(`Horas: ${h(prev.duration.targetHours)} → ${h(next.duration.targetHours)}`);
+  if (!eq(prev.duration.moduleHours ?? null, next.duration.moduleHours ?? null)) {
+    const mh = (x: PrebriefModel) => (x.duration.moduleHours ? x.duration.moduleHours.map((e) => (e.requested === null ? 'resto' : String(e.requested).replace('.', ','))).join(' / ') + ' h' : 'sin horas por módulo');
+    out.push(`Horas por módulo: ${mh(prev)} → ${mh(next)}`);
+  }
   if (!eq(prev.duration.format, next.duration.format)) out.push(`Formato: ${prev.duration.format ? prev.duration.format.value : 'sin formato'} → ${next.duration.format ? next.duration.format.value : 'sin formato'}`);
   const shape = (m: PrebriefModel) => m.structure.modules.map((x) => x.chapters.length).join(', ');
   if (prev.structure.totals.modules !== next.structure.totals.modules || shape(prev) !== shape(next)) {

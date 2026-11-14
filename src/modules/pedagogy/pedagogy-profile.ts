@@ -1,5 +1,6 @@
 import { sha256Canonical } from '../coherence/canonical-json';
 import { TARGET_HOURS_MAX, TARGET_HOURS_MIN, isValidTargetHours } from '../study-time/target-hours';
+import { MODULE_HOURS_MIN, hasModuleHours } from '../study-time/module-hours';
 import { HoursModelOverride, canonicalHoursModel } from '../study-time/time-model-config';
 import { PracticeMixSpec, normalizePracticeMixSpec, practiceMixSpecErrors } from '../study-time/practice-mix';
 import { PedagogicalApproachRegistry } from './approach-registry';
@@ -98,6 +99,11 @@ export interface PedagogicalProfile {
    * autorizado» de la generación). Opcional: la clave existe SOLO si se definió (perfiles anteriores conservan su sha).
    */
   productionBudgetUsd?: number;
+  /**
+   * r109 M4 · horas por módulo, alineadas con los módulos (null = sin horas propias: ese módulo se reparte el resto del
+   * total). Múltiplos de 0,5 h. Opcional: la clave existe SOLO si algún módulo tiene horas (perfiles anteriores conservan su sha).
+   */
+  moduleTargetHours?: (number | null)[];
 }
 
 /** T2 (r57): configuración del plan de aprendizaje (en el perfil pedagógico del curso). */
@@ -275,7 +281,7 @@ const TOP_KEYS = [
 /** `designRules` lo escribe el servidor: se tolera en la entrada (se ignora y se recalcula). */
 const TOLERATED_KEYS = ['designRules'];
 /** Claves opcionales (ausentes = comportamiento anterior). */
-const OPTIONAL_KEYS = ['targetHours', 'designPreferences', 'learningPlan', 'hoursModel', 'productionBudgetUsd'];
+const OPTIONAL_KEYS = ['targetHours', 'designPreferences', 'learningPlan', 'hoursModel', 'productionBudgetUsd', 'moduleTargetHours'];
 /** r79: límites del presupuesto de producción del curso (USD) y del tope de capítulos de contenido por módulo. */
 export const PRODUCTION_BUDGET_USD_MIN = 1;
 export const PRODUCTION_BUDGET_USD_MAX = 5000;
@@ -357,6 +363,29 @@ function checkDesignPreferences(v: unknown, errors: PedagogyValidationError[]): 
   if (v.guidedPractice !== undefined && !GUIDED_PRACTICE_MODES_ALLOWED.includes(v.guidedPractice as string)) {
     errors.push({ path: 'designPreferences.guidedPractice', code: 'INVALID_OPTION', message: `guidedPractice inválido (permitidos: ${GUIDED_PRACTICE_MODES_ALLOWED.join(', ')})` });
   }
+}
+
+/**
+ * r109 M4 · horas por módulo de un perfil guardado o enviado: arreglo alineado con los módulos (null = sin horas propias) o
+ * null si no hay ninguna. Un valor inválido lanza PROFILE_INVALID (nunca se ignora en silencio).
+ */
+export function profileModuleHours(p: unknown): (number | null)[] | null {
+  if (!isPlainObject(p) || p.moduleTargetHours === undefined || p.moduleTargetHours === null) return null;
+  const err = moduleHoursError(p.moduleTargetHours);
+  if (err) throw new Error(`PROFILE_INVALID: INVALID_MODULE_HOURS moduleTargetHours: ${err}`);
+  const v = (p.moduleTargetHours as (number | null)[]);
+  return hasModuleHours(v) ? v.map((h) => (h === null ? null : h)) : null;
+}
+function moduleHoursError(v: unknown): string | null {
+  if (!Array.isArray(v) || v.length > 99) return 'debe ser una lista de hasta 99 módulos (horas o null)';
+  for (const h of v) if (h !== null && !(typeof h === 'number' && Number.isFinite(h) && h > 0 && h <= TARGET_HOURS_MAX)) return `cada módulo lleva horas (más de 0 y hasta ${TARGET_HOURS_MAX}) o null (fue ${JSON.stringify(h)})`;
+  return null;
+}
+/** Canónico: horas en múltiplos de 0,5 (un valor intermedio se redondea; el aviso lo da el servicio) y sin null al final. */
+function canonicalModuleHours(v: (number | null)[]): (number | null)[] | null {
+  const out = v.map((h) => (h === null ? null : Math.min(TARGET_HOURS_MAX, Math.max(MODULE_HOURS_MIN, Math.round(h * 2) / 2))));
+  while (out.length && out[out.length - 1] === null) out.pop();
+  return out.length ? out : null;
 }
 
 /**
@@ -467,6 +496,10 @@ export function validatePedagogicalProfile(
   }
   if ('targetHours' in p && p.targetHours !== null && !isValidTargetHours(p.targetHours)) {
     err('targetHours', 'INVALID_TARGET_HOURS', `targetHours debe ser un número de ${TARGET_HOURS_MIN} a ${TARGET_HOURS_MAX} horas, en pasos de 0,5`);
+  }
+  if ('moduleTargetHours' in p && p.moduleTargetHours !== null) {
+    const e = moduleHoursError(p.moduleTargetHours);
+    if (e) err('moduleTargetHours', 'INVALID_MODULE_HOURS', `moduleTargetHours ${e}`);
   }
   if ('designPreferences' in p && p.designPreferences !== null) checkDesignPreferences(p.designPreferences, errors);
   if ('productionBudgetUsd' in p && p.productionBudgetUsd !== null && !isValidProductionBudgetUsd(p.productionBudgetUsd)) {
@@ -582,6 +615,8 @@ export function normalizePedagogicalProfile(
     ...((q as any).hoursModel ? { hoursModel: canonicalHoursModel((q as any).hoursModel) as HoursModelOverride } : {}),
     // r79: solo si se definió (sin presupuesto: bytes y sha de siempre).
     ...(typeof (q as any).productionBudgetUsd === 'number' ? { productionBudgetUsd: (q as any).productionBudgetUsd } : {}),
+    // r109 M4: solo si algún módulo tiene horas propias (sin ellas: bytes y sha de siempre).
+    ...(Array.isArray((q as any).moduleTargetHours) && canonicalModuleHours((q as any).moduleTargetHours) ? { moduleTargetHours: canonicalModuleHours((q as any).moduleTargetHours) as (number | null)[] } : {}),
   };
 }
 

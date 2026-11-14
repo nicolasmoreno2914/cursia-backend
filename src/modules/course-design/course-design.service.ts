@@ -13,6 +13,8 @@ import { documentlessLinkPlanFor, planningOverlay, syncAcademicOutcomesFromProfi
 import { isDocumentlessContext } from '../academic-context/profile-outcomes';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { isValidTargetHours } from '../study-time/target-hours';
+import { hasModuleHours, normalizeModuleHours } from '../study-time/module-hours';
+import { moduleHoursDetail } from '../academic-context/requirements/requirements-box';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
 import { approachFromMethodology } from '../academic-context/context-design';
 import { clearDesignPins, loadDesignPins, loadProposedHours, setProposedHours } from './design-pins';
@@ -94,7 +96,12 @@ export class CourseDesignService {
     );
     // r109 M3b: «Como el documento» va APARTE; `recommended` es la recomendación de siempre (un cliente anterior no cambia).
     const docRec = documentShapeRecommendation(academic ? academic.context : null, auth.required);
+    // r109 M4: horas por módulo (lo que dicen los requisitos y lo que el docente ya guardó). Sin ellas la clave no existe.
+    const reqMh = moduleHoursDetail(auth.applicable);
+    const savedProfile = await loadCurrentPedagogicalProfile(this.dataSource, courseId).catch(missingProfilesTable);
+    const savedMh: (number | null)[] | null = savedProfile && Array.isArray((savedProfile.profile as any).moduleTargetHours) && hasModuleHours((savedProfile.profile as any).moduleTargetHours) ? (savedProfile.profile as any).moduleTargetHours : null;
     return {
+      ...(reqMh || savedMh ? { moduleHours: { saved: savedMh, suggested: reqMh ? reqMh.hours : null, suggestedOrigins: reqMh ? reqMh.origins : null } } : {}),
       providersCalled: 0,
       contextVersion: academic ? academic.version : null,
       hasDocumentContents: contents.length > 0,
@@ -269,6 +276,33 @@ export class CourseDesignService {
         hoursRequirement = hr;
         proposal = null;
       }
+    }
+
+    // r109 M4 · horas por módulo. Autoridad: lo que el docente escribió (Estructura / Ajustar) > la caja de requisitos > el
+    // documento > Cursia (sin horas por módulo, el reparto de siempre). Sin nada de eso la clave no existe.
+    if (adjust.moduleTargetHours !== undefined && adjust.moduleTargetHours !== null) {
+      const arr = adjust.moduleTargetHours;
+      if (!Array.isArray(arr) || arr.some((h) => h !== null && !(typeof h === 'number' && Number.isFinite(h) && h > 0 && h <= 500))) {
+        throw new BadRequestException('moduleTargetHours debe ser una lista de horas por módulo (números de 0,5 a 500, o null si el módulo no tiene horas propias).');
+      }
+    }
+    const reqModuleHours = moduleHoursDetail(auth.applicable);
+    const moduleHoursNotes: string[] = [];
+    if (adjust.moduleTargetHours === null) delete base.moduleTargetHours; // volver a lo que dicen los requisitos
+    else if (Array.isArray(adjust.moduleTargetHours)) {
+      const n = normalizeModuleHours(adjust.moduleTargetHours, adjust.moduleTargetHours.length);
+      moduleHoursNotes.push(...n.notes);
+      if (hasModuleHours(n.hours)) base.moduleTargetHours = n.hours; else delete base.moduleTargetHours;
+    }
+    if (!hasModuleHours(base.moduleTargetHours) && reqModuleHours) {
+      const n = normalizeModuleHours(reqModuleHours.hours, reqModuleHours.hours.length);
+      moduleHoursNotes.push(...n.notes);
+      base.moduleTargetHours = n.hours;
+    }
+    // Todos los módulos con horas y sin total propio: el total es la suma de los módulos (nunca una meta que ya no cuadra).
+    if (hasModuleHours(base.moduleTargetHours) && hoursSource === 'proposed' && !(base.moduleTargetHours as (number | null)[]).some((h) => h === null)) {
+      const sum = (base.moduleTargetHours as number[]).reduce((a, h) => a + h, 0);
+      if (isValidTargetHours(sum)) base.targetHours = sum;
     }
 
     // r79 · «Presupuesto de producción del curso (USD)» (solo con DYNAMIC_BUDGET_FIT): se escribe en el perfil SOLO si
@@ -476,6 +510,7 @@ export class CourseDesignService {
         growth: await this.designGrowth(courseId, previewConstraints),
         status: dist.status, targetHours: dist.targetHours, estimatedHours: dist.estimatedHours, toleranceHours: dist.toleranceHours, baseHours: dist.baseHours,
         counts: dist.counts, manifestErrors: dist.materialized ? dist.materialized.manifestErrors : [{ code: 'NOT_MATERIALIZED' }],
+        ...(dist.moduleHours ? { moduleHours: dist.moduleHours } : {}),
         alignment: dist.materialized ? (dist.materialized as any).alignment : null,
         approach: profile.primaryApproach ? { id: profile.primaryApproach, label: approachDef ? approachDef.label : profile.primaryApproach } : null,
         policyKind: dist.policy ? dist.policy.kind : null, audiovisual: prefs.audiovisual || null, pinnedChapters,
@@ -528,6 +563,21 @@ export class CourseDesignService {
         ? { id: profile.primaryApproach, label: approachDef ? approachDef.label : profile.primaryApproach, source: approachSource,
           reasons: approachSource === 'recommended' && suggestion ? suggestion.reasons : [] }
         : null,
+      // r109 M4: solo con horas por módulo (propias o de los requisitos); sin ellas la clave no existe.
+      ...(() => {
+        const vals: (number | null)[] | null = Array.isArray((profile as any).moduleTargetHours) ? (profile as any).moduleTargetHours : null;
+        if (!vals && !reqModuleHours) return {};
+        const count = dist ? dist.modules.length : Math.max(vals ? vals.length : 0, reqModuleHours ? reqModuleHours.hours.length : 0);
+        const values = Array.from({ length: count }, (_, i) => (vals && typeof vals[i] === 'number' ? (vals[i] as number) : null));
+        const origins = values.map((v, i) => (v === null ? null : reqModuleHours && reqModuleHours.hours[i] === v ? reqModuleHours.origins[i] : 'teacher'));
+        return { moduleHours: {
+          active: values.some((v) => v !== null), values, origins,
+          suggested: reqModuleHours ? Array.from({ length: count }, (_, i) => reqModuleHours.hours[i] ?? null) : null,
+          suggestedOrigins: reqModuleHours ? Array.from({ length: count }, (_, i) => reqModuleHours.origins[i] ?? null) : null,
+          notes: moduleHoursNotes,
+          result: dist && dist.moduleHours ? dist.moduleHours : null,
+        } };
+      })(),
       hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : hoursSource === 'proposed' ? { reason: `Cursia propuso ${profile.targetHours} h para este curso.` }
         : hoursSource === 'requirement' && hoursRequirement ? { reason: hoursRequirement.required ? `Horas del documento: ${requirementText(hoursRequirement.requirement)}.` : `Horas que sugiere el documento (${requirementText(hoursRequirement.requirement)}); puedes cambiarlas en «Ajustar».` } : {}) },
       preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual, guidedPractice: prefs.guidedPractice || 'auto',
@@ -1345,6 +1395,7 @@ function designForRequirements(
   return {
     modules: dist.modules.map((m) => ({
       examEnabled: m.examEnabled,
+      ...(dist.moduleHours ? (() => { const e = dist.moduleHours.modules.find((x) => x.moduleId === m.id); return e ? { hours: e.estimatedHours } : {}; })() : {}),
       ...(m.practiceRemovedByTeacher ? { practiceRemovedByTeacher: true } : {}),
       chapters: m.chapters.map((c) => ({
         kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, activityEnabled: c.activityEnabled, activityPinned: !!c.activityPinned,

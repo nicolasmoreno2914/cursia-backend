@@ -41,6 +41,7 @@ import type { LearningType } from '../pedagogy/vocabulary';
 import type { ApplicationKind } from './application-kind-tiers';
 import { isTierSelectable } from '../course-shell/application-kinds';
 import { VIDEO_COMPOSITION_VERSION, VIDEO_NEED_BY_LEARNING_TYPE, VideoCompositionResult, VideoNeed, decideVideosByNeed } from './video-composition';
+import { ModuleHoursEntry, ModuleHoursResult, ModuleHoursStatus, MODULE_HOURS_TOLERANCE_PCT, formatHours, hasModuleHours, planModuleHours } from './module-hours';
 import { TOPIC_SPLIT_VERSION, chapterSubtopics, joinList, maxPartsFor, partDescription, partTitle, partitionSubtopics } from './topic-split';
 
 export const DISTRIBUTOR_VERSION = 2 as const;
@@ -212,6 +213,8 @@ export interface DistributionResult {
   /** Horas por componente del diseño propuesto. */
   hoursByComponent: Record<string, number>;
   studyTime: StudyTimeEstimate;
+  /** r109 M4: SOLO con horas por módulo (sin ellas la clave no existe: salida de siempre). */
+  moduleHours?: ModuleHoursResult;
 }
 
 /**
@@ -284,6 +287,16 @@ export interface DistributorInput {
    * Ausente / false = comportamiento de siempre (byte a byte).
    */
   realChapters?: boolean;
+  /**
+   * r109 M4 · horas por módulo (alineadas con los módulos; null = sin horas propias, ese módulo se reparte el resto del total).
+   * Cada módulo se diseña dentro de sus horas (±10 %). Ausente, vacío o todo null = el reparto de siempre (byte a byte).
+   */
+  moduleHours?: (number | null)[] | null;
+  /**
+   * r109 M4 · USO INTERNO del reparto por módulo: el diseño de un grupo de módulos mide solo sus módulos (sin los recursos
+   * del curso: bienvenida, marco, foro y examen final), que se suman una sola vez al final.
+   */
+  moduleScope?: boolean;
 }
 
 export class DistributorError extends Error {
@@ -360,6 +373,16 @@ export interface HoursAlternative {
 }
 
 export function distributeCourseHours(input: DistributorInput): DistributionResult {
+  // r109 M4: con horas por módulo, cada módulo se diseña dentro de las suyas. Sin ellas: el reparto de siempre (byte a byte).
+  if (input && input.moduleScope !== true && hasModuleHours(input.moduleHours) && input.snapshot && Array.isArray(input.snapshot.modules) && input.snapshot.modules.length > 0
+    && input.snapshot.schemaVersion === 2 && isValidTargetHours(input.targetHours)) {
+    const byModule = distributeByModule(input);
+    if (byModule) return byModule;
+  }
+  return distributeWhole(input);
+}
+
+function distributeWhole(input: DistributorInput): DistributionResult {
   const d = distributeCore(input);
   if (d.status !== 'cannot_reach_target' || !input.requirements?.noContentAdditions) return d;
   const rq = input.requirements;
@@ -384,6 +407,208 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     if (reaches) break;
   }
   return alt && alt.added > 0 ? { ...out, hoursAlternative: alt } : out;
+}
+
+// ── r109 M4 · Horas por módulo ─────────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Restricciones de UN grupo de módulos: las del documento que miden todo el curso (prácticas, actividades y Actividades de
+ * Aplicación en total, horas obligatorias) no se pueden repartir módulo a módulo; Verificación las compara después contra el
+ * diseño completo. La mezcla de práctica por módulo se corta con los índices del grupo.
+ */
+function scopeRequirements(rq: DistributorRequirementConstraints | null | undefined, idx: number[]): DistributorRequirementConstraints | null | undefined {
+  if (!rq) return rq;
+  const { practiceTotal: _pt, activitiesTotal: _at, applicationTotal: _ap, hoursBounds: _hb, practiceByModule, ...rest } = rq;
+  void _pt; void _at; void _ap; void _hb;
+  return { ...rest, ...(Array.isArray(practiceByModule) ? { practiceByModule: idx.map((i) => practiceByModule[i] ?? 0) } : {}) };
+}
+
+const STATUS_RANK: Readonly<Record<DistributionStatus, number>> = Object.freeze({ within_tolerance: 0, above_tolerance: 1, minimum_exceeds_target: 2, cannot_reach_target: 3 });
+const r2 = (n: number) => Math.round(n * 100) / 100;
+
+function moduleStatus(target: number, est: number, runStatus: DistributionStatus): ModuleHoursStatus {
+  if (Math.abs(est - target) <= target * MODULE_HOURS_TOLERANCE_PCT + 1e-9) return 'within_tolerance';
+  if (runStatus !== 'within_tolerance') return runStatus;
+  return est > target ? 'above_tolerance' : 'cannot_reach_target';
+}
+
+function moduleExplanation(label: string, chapters: number, target: number, est: number, status: ModuleHoursStatus): string | undefined {
+  const nCh = `${chapters} ${chapters === 1 ? 'capítulo' : 'capítulos'}`;
+  switch (status) {
+    case 'minimum_exceeds_target': {
+      const need = Math.ceil((est / (1 + MODULE_HOURS_TOLERANCE_PCT)) * 2) / 2;
+      return `${label} tiene muy pocas horas para sus ${nCh}: con ${formatHours(target)} h (±10 %) no alcanza ni con la estructura mínima, que toma ${formatHours(est)} h. Sube sus horas a ${formatHours(need)} h o más, o quita capítulos del módulo.`;
+    }
+    case 'cannot_reach_target':
+      return `${label} llega a ${formatHours(est)} h de sus ${formatHours(target)} h (±10 %) con los topes de Cursia (un capítulo no pasa de 4 h y un módulo lleva hasta ${DISTRIBUTOR_RULES.maxContentChaptersPerModule} capítulos de contenido): faltan ${formatHours(target - est)} h. Baja sus horas o agrega capítulos al módulo.`;
+    case 'above_tolerance':
+      return `${label} queda en ${formatHours(est)} h, más que sus ${formatHours(target)} h (±10 %). Revisa los capítulos y las actividades que fijaste en el módulo.`;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Diseña cada módulo dentro de sus propias horas. Los módulos con horas propias se diseñan UNO a UNO (la meta es la suya); los
+ * módulos sin horas (null) se diseñan juntos con lo que queda del total. Los recursos del curso (bienvenida, marco, foro y
+ * examen final) se suman una sola vez. Devuelve null si ningún valor es usable (el reparto de siempre).
+ */
+function distributeByModule(input: DistributorInput): DistributionResult | null {
+  const snapshot = input.snapshot;
+  const timeCfg = input.timeModelConfig ?? DEFAULT_TIME_MODEL_CONFIG;
+  const mods = [...snapshot.modules].sort((a, b) => a.position - b.position);
+  const plan = planModuleHours(input.moduleHours, input.targetHours, mods.length);
+  if (plan.fixed.every((h) => h === null)) return null;
+
+  const groups: { idx: number[]; target: number; source: 'fixed' | 'remainder' }[] = [];
+  plan.fixed.forEach((h, i) => { if (h !== null) groups.push({ idx: [i], target: h, source: 'fixed' }); });
+  const nullIdx = plan.fixed.map((h, i) => (h === null ? i : -1)).filter((i) => i >= 0);
+  if (nullIdx.length) groups.push({ idx: nullIdx, target: plan.remainder, source: 'remainder' });
+
+  const runs = groups.map((g) => {
+    const sub: DistributorInput = {
+      ...input,
+      snapshot: { ...snapshot, modules: g.idx.map((i) => mods[i]) },
+      targetHours: g.target,
+      moduleHours: null,
+      moduleScope: true,
+      // Cada módulo dentro de ±10 % de sus horas (la tolerancia del curso no aplica a un módulo).
+      tolerance: { pct: MODULE_HOURS_TOLERANCE_PCT, minHours: 0 },
+      requirements: scopeRequirements(input.requirements, g.idx),
+    };
+    return { g, r: distributeWhole(sub) };
+  });
+
+  // Recursos del curso (bienvenida, marco, foro y examen final): la diferencia entre medir con y sin ellos un módulo vacío con
+  // tantos capítulos de contenido como tiene el diseño completo (el examen final depende de ese total).
+  const contentTotal = runs.reduce((n, x) => n + x.r.counts.contentChapters, 0);
+  const probeModule = { moduleId: '__r109m4__', intro: false, exam: false, chapters: Array.from({ length: Math.max(1, contentTotal) }, (_, i) => ({ chapterId: `__r109m4c${i}__`, kind: 'content' as const, libro: false, presentation: false, video: false, activity: false, review: false })) };
+  const withFrame = estimateCourseStudyTimeWith({ frame: true, welcomeAudio: true, forum: true, finalExam: snapshot.course.finalExam === true, modules: [probeModule] }, timeCfg);
+  const noFrame = estimateCourseStudyTimeWith({ frame: false, welcomeAudio: false, forum: false, finalExam: false, modules: [probeModule] }, timeCfg);
+  const overhead = {
+    ...withFrame,
+    courseEstimatedMinutes: r2(withFrame.courseEstimatedMinutes - noFrame.courseEstimatedMinutes),
+    byComponent: Object.fromEntries(Object.keys(withFrame.byComponent).map((k) => [k, r2((withFrame.byComponent as Record<string, number>)[k] - (noFrame.byComponent as Record<string, number>)[k])])) as StudyTimeEstimate['byComponent'],
+  };
+  const runOfModule = new Map<string, (typeof runs)[number]>();
+  for (const x of runs) for (const i of x.g.idx) runOfModule.set(mods[i].id, x);
+
+  const entries: ModuleHoursEntry[] = [];
+  const warnings = [...plan.warnings];
+  const proposedModules: ProposedModule[] = [];
+  const estModules: StudyTimeEstimate['modules'] = [];
+  mods.forEach((m, i) => {
+    const x = runOfModule.get(m.id)!;
+    const pm = x.r.modules.find((p) => p.id === m.id)!;
+    const em = x.r.studyTime.modules.find((p) => p.moduleId === m.id)!;
+    proposedModules.push(pm);
+    estModules.push(em);
+    const label = `El módulo ${i + 1} «${m.title}»`;
+    const modEst = em.moduleEstimatedMinutes / 60;
+    if (x.g.source === 'fixed') {
+      const status = moduleStatus(x.g.target, modEst, x.r.status);
+      const explanation = moduleExplanation(label, pm.chapters.length, x.g.target, modEst, status);
+      if (explanation) warnings.push(explanation);
+      entries.push({ moduleId: m.id, title: m.title, index: i + 1, source: 'fixed', targetHours: x.g.target, estimatedHours: r1(modEst), deltaHours: r1(modEst - x.g.target), toleranceHours: r1(x.g.target * MODULE_HOURS_TOLERANCE_PCT), status, chapters: pm.chapters.length, ...(explanation ? { explanation } : {}) });
+    } else {
+      const groupEst = x.r.studyTime.courseEstimatedMinutes / 60;
+      const status = moduleStatus(x.g.target, groupEst, x.r.status);
+      const explanation = moduleExplanation(`Los módulos sin horas propias (${x.g.idx.map((k) => k + 1).join(', ')})`, x.r.counts.chapters, x.g.target, groupEst, status);
+      entries.push({ moduleId: m.id, title: m.title, index: i + 1, source: 'remainder', targetHours: null, estimatedHours: r1(modEst), deltaHours: null, toleranceHours: null, status, chapters: pm.chapters.length, ...(explanation ? { explanation } : {}) });
+    }
+  });
+  // Un solo aviso por el grupo de módulos sin horas.
+  const remGroup = runs.find((x) => x.g.source === 'remainder');
+  if (remGroup) {
+    const e = entries.find((en) => en.source === 'remainder' && en.explanation);
+    if (e && e.explanation) warnings.push(e.explanation);
+  }
+
+  const total = plan.total;
+  const minutes = r2(runs.reduce((n, x) => n + x.r.studyTime.courseEstimatedMinutes, 0) + overhead.courseEstimatedMinutes);
+  const byComponent = Object.fromEntries(Object.keys(overhead.byComponent).map((k) => [k, r2(runs.reduce((n, x) => n + ((x.r.studyTime.byComponent as Record<string, number>)[k] ?? 0), 0) + (overhead.byComponent as Record<string, number>)[k])])) as StudyTimeEstimate['byComponent'];
+  const studyTime: StudyTimeEstimate = {
+    rulesVersion: overhead.rulesVersion,
+    courseEstimatedMinutes: minutes,
+    courseEstimatedHours: r1(minutes / 60),
+    resources: overhead.resources,
+    modules: estModules,
+    byComponent,
+    usesPlannedValues: overhead.usesPlannedValues || runs.some((x) => x.r.studyTime.usesPlannedValues),
+    ...(overhead.configId ? { configId: overhead.configId } : {}),
+  };
+  const generableMinutes = r2(runs.reduce((n, x) => n + x.r.generableHours * 60, 0) + overhead.courseEstimatedMinutes);
+  const all = proposedModules.flatMap((m) => m.chapters);
+  const appMinutes = all.reduce((n, c) => n + (c.applicationMinutes ?? 0), 0);
+  const gpMinutes = all.reduce((n, c) => n + (c.guidedPracticeMinutes ?? 0), 0);
+  const status = entries.reduce<DistributionStatus>((w, e) => (STATUS_RANK[e.status] > STATUS_RANK[w] ? e.status : w), 'within_tolerance');
+  const modIndex = new Map(mods.map((m, i) => [m.id, i] as const));
+  const labelOf = (x: (typeof runs)[number]) => (x.g.source === 'fixed' ? `Módulo ${x.g.idx[0] + 1} «${mods[x.g.idx[0]].title}» (${formatHours(x.g.target)} h)` : `Módulos sin horas propias (${x.g.idx.map((k) => k + 1).join(', ')}; ${formatHours(x.g.target)} h)`);
+  const comps = runs.map((x) => x.r.composition).filter((c): c is NonNullable<DistributionResult['composition']> => !!c);
+  const guided = runs.map((x) => x.r.guidedPracticeFill).filter((c): c is NonNullable<DistributionResult['guidedPracticeFill']> => !!c);
+  const first = runs[0].r;
+  const summary = `Horas por módulo: ${plan.fixed.map((h, i) => `módulo ${i + 1}: ${h === null ? 'el resto' : `${formatHours(h)} h`}`).join(', ')}. Cada módulo se diseña dentro de sus propias horas (±10 %); los recursos del curso (bienvenida, foro y examen final) se suman aparte (${formatHours(overhead.courseEstimatedMinutes / 60)} h).`;
+
+  return {
+    distributorVersion: DISTRIBUTOR_VERSION,
+    dryRun: true,
+    providersCalled: 0,
+    targetHours: total,
+    toleranceHours: r1(plan.fixed.reduce<number>((n, h) => n + (h ?? 0), 0) * MODULE_HOURS_TOLERANCE_PCT + plan.remainder * MODULE_HOURS_TOLERANCE_PCT),
+    status,
+    baseHours: r1(runs.reduce((n, x) => n + x.r.baseHours, 0) + overhead.courseEstimatedMinutes / 60),
+    estimatedHours: r1(minutes / 60),
+    generableHours: r1(generableMinutes / 60),
+    deltaHours: r1(minutes / 60 - total),
+    applicationShare: Math.round((byComponent.application / minutes) * 100) / 100,
+    policy: first.policy,
+    preferences: first.preferences,
+    modules: proposedModules,
+    changes: runs.flatMap((x) => x.r.changes).sort((a, b) => (modIndex.get(a.moduleId) ?? 0) - (modIndex.get(b.moduleId) ?? 0)),
+    recommendations: [...runs.flatMap((x) => x.r.recommendations.map((t) => `${labelOf(x)}: ${t}`)), ...entries.filter((e) => e.explanation && e.source === 'fixed').map((e) => e.explanation as string),
+      ...(remGroup && entries.some((e) => e.source === 'remainder' && e.explanation) ? [entries.find((e) => e.source === 'remainder' && e.explanation)!.explanation as string] : [])],
+    priorityTrace: [summary, ...plan.warnings, ...runs.flatMap((x) => x.r.priorityTrace.map((t) => `${labelOf(x)}: ${t}`))],
+    ...(runs.some((x) => x.r.applicationLimitedByDocument) ? { applicationLimitedByDocument: true } : {}),
+    counts: {
+      modules: proposedModules.length,
+      chapters: all.length,
+      contentChapters: all.filter((c) => c.kind === 'content').length,
+      practiceChapters: all.filter((c) => c.kind === 'practice').length,
+      videoChapters: all.filter((c) => c.videoEnabled).length,
+      activities: all.filter((c) => c.activityEnabled).length,
+      reviews: all.filter((c) => c.review).length,
+      applicationActivities: all.filter((c) => c.applicationMinutes).length,
+      applicationMinutes: appMinutes,
+      ...(gpMinutes > 0 ? { guidedPractices: all.filter((c) => c.guidedPracticeMinutes).length, guidedPracticeMinutes: gpMinutes } : {}),
+      evaluations: proposedModules.filter((m) => m.examEnabled).length + (snapshot.course.finalExam ? 1 : 0),
+    },
+    ...(guided.length ? { guidedPracticeFill: { used: guided.some((g) => g.used), shortfallHours: r1(guided.reduce((n, g) => n + g.shortfallHours, 0)) } } : {}),
+    ...(comps.length ? {
+      composition: {
+        version: comps[0].version,
+        videos: {
+          hoursBudgetVideos: comps.reduce((n, c) => n + c.videos.hoursBudgetVideos, 0),
+          counts: { contentChapters: comps.reduce((n, c) => n + c.videos.counts.contentChapters, 0), videos: comps.reduce((n, c) => n + c.videos.counts.videos, 0), byNeed: comps.reduce((n, c) => n + c.videos.counts.byNeed, 0), optional: comps.reduce((n, c) => n + c.videos.counts.optional, 0), pinned: comps.reduce((n, c) => n + c.videos.counts.pinned, 0) },
+          unmet: comps.flatMap((c) => c.videos.unmet),
+          ...(comps[0].videos.minVideos !== undefined ? { minVideos: comps[0].videos.minVideos } : {}),
+          ...(comps[0].videos.maxVideos !== undefined ? { maxVideos: comps[0].videos.maxVideos } : {}),
+        },
+      },
+    } : {}),
+    hoursByComponent: Object.fromEntries(Object.entries(byComponent).map(([k, v]) => [k, r1((v as number) / 60)])),
+    studyTime,
+    moduleHours: {
+      version: 1,
+      requestedTotalHours: plan.requestedTotal,
+      totalHours: total,
+      totalAdjusted: plan.totalAdjusted,
+      courseOverheadHours: r1(overhead.courseEstimatedMinutes / 60),
+      remainderHours: plan.remainder,
+      toleranceFraction: MODULE_HOURS_TOLERANCE_PCT,
+      modules: entries,
+      warnings,
+    },
+  };
 }
 
 function distributeCore(input: DistributorInput): DistributionResult {
@@ -674,11 +899,13 @@ function distributeCore(input: DistributorInput): DistributionResult {
     }
     return x;
   };
+  // r109 M4: en el diseño de un grupo de módulos (moduleScope) no entran los recursos del curso.
+  const scoped = input.moduleScope === true;
   const toInput = (withApplication: boolean): StudyTimeCourseInput => ({
-    frame: true,
-    welcomeAudio: true,
-    forum: true,
-    finalExam: snapshot.course.finalExam === true,
+    frame: !scoped,
+    welcomeAudio: !scoped,
+    forum: !scoped,
+    finalExam: !scoped && snapshot.course.finalExam === true,
     modules: design.map((m) => ({
       moduleId: m.id,
       intro: true,
@@ -696,7 +923,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
     const hit = estMemo.get(k);
     if (hit) return hit;
     const e = estimateCourseStudyTime({
-      frame: true, welcomeAudio: true, forum: true, finalExam: snapshot.course.finalExam === true,
+      frame: !scoped, welcomeAudio: !scoped, forum: !scoped, finalExam: !scoped && snapshot.course.finalExam === true,
       modules: design.map((m, i) => ({ moduleId: m.id, intro: true, exam: m.examEnabled, chapters: m.chapters.map((c, j) => chapterInput(c, true, keys[i][j])) })),
     });
     estMemo.set(k, e);
@@ -876,7 +1103,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         applicationActivities: all.filter((c) => c.applicationMinutes).length,
         applicationMinutes: appMinutes,
         ...(gpMinutes > 0 ? { guidedPractices: all.filter((c) => c.guidedPracticeMinutes).length, guidedPracticeMinutes: gpMinutes } : {}),
-        evaluations: modules.filter((m) => m.examEnabled).length + (snapshot.course.finalExam ? 1 : 0),
+        evaluations: modules.filter((m) => m.examEnabled).length + (snapshot.course.finalExam && !scoped ? 1 : 0),
       },
       ...(vc ? { composition: { version: VIDEO_COMPOSITION_VERSION, videos: { hoursBudgetVideos: vc.hoursBudgetVideos, counts: { ...vc.counts }, unmet: [...vc.unmet], ...(lpComp!.minVideos !== undefined ? { minVideos: lpComp!.minVideos } : {}), ...(lpComp!.maxVideos !== undefined ? { maxVideos: lpComp!.maxVideos } : {}) } } } : {}),
       hoursByComponent: Object.fromEntries(Object.entries(est.byComponent).map(([k, v]) => [k, r1(v / 60)])),

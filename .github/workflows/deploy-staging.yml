@@ -295,6 +295,12 @@ jobs:
       - name: Check r109 M3c caja de requisitos obligatorios (puro)
         run: node scripts/r109/check-r109-requirements-box.js --ci
 
+      # r109 M4 · horas por módulo: cada módulo se diseña dentro de sus horas (±10 %), un módulo sin horas se reparte el resto,
+      # la suma que pasa del total gana con aviso, un módulo con muy pocas horas da un conflicto explícito, y SIN horas por
+      # módulo el distribuidor es idéntico a origin/staging (golden). Puro, sin red ni base (USD 0).
+      - name: Check r109 M4 horas por módulo (puro)
+        run: node scripts/r109/check-r109-module-hours.js --ci
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

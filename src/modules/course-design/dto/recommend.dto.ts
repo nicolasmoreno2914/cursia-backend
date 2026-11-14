@@ -34,6 +34,13 @@ export class DesignAdjustDto {
   @IsOptional() @IsNumber({ maxDecimalPlaces: 2 }) @Min(1) @Max(5000)
   productionBudgetUsd?: number | null;
 
+  /**
+   * r109 M4 · horas de cada módulo (alineadas con los módulos; null = sin horas propias, ese módulo se reparte el resto).
+   * Múltiplos de 0,5 (otro valor se redondea con aviso). `null` = volver a lo que dicen los requisitos (la caja o el documento).
+   */
+  @IsOptional() @IsArray() @ArrayMaxSize(99)
+  moduleTargetHours?: (number | null)[] | null;
+
   /** Enfoque principal, o 'recommended' (el que recomienda Cursia). */
   @IsOptional() @IsString() @MaxLength(64)
   approach?: string;

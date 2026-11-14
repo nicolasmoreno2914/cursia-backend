@@ -197,6 +197,10 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   const durRows: { label: string; value: string; origin?: DocOrigin }[] = [];
   if (m.duration.targetHours) durRows.push({ label: 'Meta de horas', value: hoursText(m.duration.targetHours.value), origin: o(m.duration.targetHours.origin) });
   durRows.push({ label: 'Horas del diseño', value: `${hoursText(S.totals.hours)} de trabajo del estudiante (estimadas)` });
+  // r109 M4: con horas por módulo, el resumen las dice módulo a módulo (lo pedido y lo que tiene el diseño).
+  if (m.duration.moduleHours) {
+    durRows.push({ label: 'Horas por módulo', value: m.duration.moduleHours.map((e) => `Módulo ${e.n}: ${e.requested === null ? `${n1(e.estimated)} h (el resto del total)` : `${n1(e.estimated)} h de ${n1(e.requested)} h pedidas${e.within ? '' : ' (fuera de lo pedido)'}`}`).join(' · '), origin: o(m.duration.moduleHours.some((e) => e.origin === 'document' && e.requested !== null) && !m.duration.moduleHours.some((e) => e.origin !== 'document' && e.requested !== null) ? 'document' : 'institution') });
+  }
   // Fase 2/3: con una forma elegida en «Estructura», la fila dice también quién la eligió (en lugar de «Organización»).
   if (S.selected) durRows.push({ label: 'Diseño seleccionado', value: `${organization} · ${S.selected.label}`, origin: o(S.origin) });
   else durRows.push({ label: 'Organización', value: organization, origin: o(S.origin) });

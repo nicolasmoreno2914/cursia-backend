@@ -8,3 +8,4 @@ export * from './video-composition';
 export * from './practice-mix';
 export * from './time-model-config';
 export * from './hours-ledger';
+export * from './module-hours';
