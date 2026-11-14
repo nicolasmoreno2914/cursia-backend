@@ -135,3 +135,10 @@ export class RequirementSelectionDto {
   @Matches(/^[A-Za-z0-9]{1,8}$/)
   optionId?: string | null;
 }
+
+/** r109 M3c · PUT /courses/:courseId/academic-context/requirements/box — texto de la caja (vacío = sin caja). El tope lo valida el servicio (BOX_MAX_CHARS). */
+export class RequirementsBoxDto {
+  @IsString()
+  @MaxLength(20000)
+  text: string;
+}

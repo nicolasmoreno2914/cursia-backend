@@ -13,6 +13,7 @@ import type {
   RequirementSelection,
   RequirementsExtraction,
 } from './requirements';
+import { blankSpans, findUnevenStructure } from './uneven-structure';
 
 /**
  * LOOP 8.6A · Extractor de requisitos explícitos. Determinista, local, sin proveedores (USD 0).
@@ -469,7 +470,15 @@ export function subjectHoursRow(text: string): { subject: string; hours: number;
   return { subject: label, hours: Number(h[1]), dash: m[2] === '—' || m[2] === '–' };
 }
 
-export function extractRequirements(lines: SourceLine[], documentId = 'doc'): RequirementsExtraction {
+/**
+ * `declarative` (r109 M3c, la caja «Requisitos obligatorios» del docente): el texto ES la declaración del docente, no un
+ * documento que describe cosas. Una cifra con sustantivo que Cursia modela («28 horas», «4 módulos») es un requisito
+ * aunque no traiga un verbo de obligación. Todo lo demás (alcances, contextos que anulan, topes, citas) es lo mismo.
+ */
+export interface ExtractOptions { declarative?: boolean }
+
+export function extractRequirements(lines: SourceLine[], documentId = 'doc', opts: ExtractOptions = {}): RequirementsExtraction {
+  const declarative = !!opts.declarative;
   const segs = segmentsOf(lines);
   const requirements: DocumentRequirement[] = [];
   const groups: RequirementGroup[] = [];
@@ -496,6 +505,41 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
     requirements.push(req);
     return req;
   };
+
+  // r109 M3c · forma DESIGUAL («4 módulos con 4, 7, 4 y 5 capítulos», un módulo por renglón, con o sin título). Un documento
+  // solo la declara si es realmente desigual (las N × M las lee el lector de siempre, más abajo); la caja del docente
+  // siempre. Los tramos que ocupa se quitan del texto: no se leen otra vez como «capítulos» sueltos.
+  {
+    const eligible = segs.map((sg) => (sg.option || sg.example || sg.informative || (sg.cells && !declarative) ? '' : sg.text));
+    const uneven = findUnevenStructure(eligible, declarative);
+    if (uneven) {
+      const sh = uneven.found.shape;
+      const isUneven = sh.some((n) => n !== sh[0]);
+      const first = segs[uneven.firstSegment];
+      const quote = uneven.spans.map((s) => eligible[s.segment].slice(s.start, s.end).trim()).join(' / ').slice(0, 300);
+      const srcU = { documentId, line: first.line, page: first.page, quote: (first.quote || quote).slice(0, 300) };
+      const mismatch = uneven.found.declaredModules !== null && uneven.found.declaredModules !== sh.length;
+      // Un documento con una cantidad de módulos que no cuadra con lo que lista: no se toca (lo lee el lector de siempre).
+      if ((declarative || isUneven) && (declarative || !mismatch)) {
+        const bySeg = new Map<number, { start: number; end: number }[]>();
+        for (const s of uneven.spans) bySeg.set(s.segment, [...(bySeg.get(s.segment) || []), s]);
+        for (const [i, sp] of bySeg) segs[i].text = blankSpans(segs[i].text, sp);
+        if (uneven.found.moduleExtras) ignored.push({ reason: 'component_hours', quote: 'horas por módulo (próximamente)', line: first.line });
+        if (uneven.found.declaredModules !== null && uneven.found.declaredModules !== sh.length) {
+          ignored.push({ reason: 'inconsistent', quote: `${uneven.found.declaredModules} módulos, pero se listan ${sh.length}: ${quote}`.slice(0, 160), line: first.line });
+        } else {
+          const hasTitles = uneven.found.titles.some((t) => t);
+          const trigger = declarative || RE_REQUIRED.test(strip(eligible[uneven.firstSegment])) || RE_PRESENT.test(strip(eligible[uneven.firstSegment])) || RE_PRESENT_INCLUDE.test(strip(eligible[uneven.firstSegment]));
+          push({
+            kind: 'structure', scope: { level: 'structure' }, mode: 'exact', value: null, shape: [...sh],
+            ...(hasTitles ? { moduleTitles: [...uneven.found.titles] } : {}),
+            obligation: 'required', active: true, status: 'found', confidence: trigger ? 'high' : 'medium',
+            ...(trigger ? {} : { review: ['Forma por módulo sin un verbo de obligación: revisa esta lectura.'] }), source: srcU,
+          });
+        }
+      }
+    }
+  }
 
   let optionRun: { group: RequirementGroup; labels: Set<string> } | null = null;
   let pendingAnaphora: { mentions: Mention[]; seg: Segment; quote: string } | null = null;
@@ -638,6 +682,11 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       let inferred: number | null = null;
       if (inf && /(semanal|por semana|a la semana|cada una|duracion)/.test(m)) inferred = Number(inf[1]) * Number(inf[2]);
 
+      // r109 M3c: en la caja del docente una cifra con su sustantivo ya es una declaración («28 horas», «4 módulos»).
+      if (declarative && !obligation && !inferred && mentions.length) obligation = 'required';
+      // Y lo que el docente escribe en la caja no es una lectura «a medias» de un documento: tiene la autoridad completa
+      // (una recomendación suya — «se recomienda…», «aproximadamente» — sigue siendo recomendación).
+      if (declarative && obligation === 'required') medium = false;
       if (!obligation && !inferred) {
         if (mentions.length) {
           // ¿Lo retoma la oración siguiente («Estos exámenes serán realizados…»)? Se decide al leerla.

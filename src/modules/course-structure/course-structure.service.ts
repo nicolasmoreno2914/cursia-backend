@@ -98,6 +98,8 @@ import {
   writeStructureOrigin,
   liveStructureShape,
 } from './structure-authority';
+import { loadRequirementAuthority } from '../academic-context/requirements/requirement-authority';
+import { boxModuleTitlesFor } from '../academic-context/requirements/requirements-box';
 import { documentContentShape, normalizeShape, proposeShapedStructureFromContext, proposeStructureFromContext, shapeChapterCounts } from '../academic-context/context-design';
 import { contentsFingerprint, writeContentMap } from '../academic-context/content-coverage';
 import { COURSE_FORMATS, readCourseFormat } from '../prebrief/course-formats';
@@ -534,7 +536,13 @@ export class CourseStructureService implements OnModuleInit {
         }
       }
       // Fase 3: con una forma elegida, los contenidos del documento se reparten en ella (cada uno en un solo capítulo).
-      const proposal = shape ? proposeShapedStructureFromContext(academic.context, shape) : proposeStructureFromContext(academic.context);
+      // r109 M3c: con la forma de la caja «Requisitos obligatorios», los módulos llevan los títulos que escribió el docente.
+      let boxTitles: (string | null)[] | null = null;
+      if (shape) {
+        const auth = await loadRequirementAuthority(queryRunner, courseId, academic.context.documents);
+        boxTitles = boxModuleTitlesFor(auth.required, shapeChapterCounts(shape));
+      }
+      const proposal = shape ? proposeShapedStructureFromContext(academic.context, shape, boxTitles ? { moduleTitles: boxTitles } : undefined) : proposeStructureFromContext(academic.context);
       if (!proposal.available) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_STRUCTURE_IN_CONTEXT', message: `NO_STRUCTURE_IN_CONTEXT: ${proposal.reason}` });

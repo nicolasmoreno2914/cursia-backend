@@ -29,6 +29,7 @@ import {
   estimateAdvancedExtraction,
 } from './advanced-extraction';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
+import { applyBoxToView, BOX_MAX_CHARS, writeRequirementsBox } from './requirements/requirements-box';
 import { buildRequirementsView, currentEntry, loadRequirementsState, storeDocumentRequirements, storedEntry, writeSelection } from './requirements/document-requirements';
 import type { ExtractionResult } from './extract/extractor';
 
@@ -192,7 +193,25 @@ export class AcademicContextService {
       throw err;
     });
     const st = await loadRequirementsState(this.dataSource, courseId);
-    return buildRequirementsView(st.entries, st.selection, academic ? academic.context.documents : []);
+    // r109 M3c: la caja «Requisitos obligatorios» del docente va encima de lo que lee el documento.
+    return applyBoxToView(buildRequirementsView(st.entries, st.selection, academic ? academic.context.documents : []), st.box);
+  }
+
+  /**
+   * r109 M3c · PUT /courses/:id/academic-context/requirements/box { text } — la caja «Requisitos obligatorios» del docente.
+   * El texto pasa por el mismo lector determinista de requisitos (sin IA, USD 0); se guarda, se recalculan los requisitos y
+   * se devuelve la vista con lo entendido y lo no entendido. Texto vacío = sin caja (se borra).
+   */
+  async setRequirementsBox(courseId: number, ownerId: string, text: string) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    if (typeof text !== 'string') throw new BadRequestException({ code: 'INVALID_BOX', message: 'INVALID_BOX: el texto de la caja debe ser un texto.' });
+    if (text.length > BOX_MAX_CHARS) throw new BadRequestException({ code: 'BOX_TOO_LONG', message: `BOX_TOO_LONG: la caja admite hasta ${BOX_MAX_CHARS} caracteres (tiene ${text.length}).` });
+    await this.dataSource.transaction(async (m) => {
+      await m.query(`select id from public.courses where id = $1 for update`, [courseId]);
+      await writeRequirementsBox(m, courseId, text);
+    });
+    return this.requirements(courseId, ownerId);
   }
 
   /**

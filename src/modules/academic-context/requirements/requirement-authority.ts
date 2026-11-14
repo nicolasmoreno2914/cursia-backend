@@ -1,5 +1,7 @@
+import { applyBoxToView, BOX_DOCUMENT_ID } from './requirements-box';
 import { buildRequirementsView, currentEntry, loadRequirementsState, RequirementCheck, RequirementsView } from './document-requirements';
 import type { DocumentRequirement } from './requirements';
+import { SHAPE_INPUT_MAX } from '../context-design';
 import { liveStructureShape, readStructureOrigin } from '../../course-structure/structure-authority';
 import { readCourseFormat } from '../../prebrief/course-formats';
 
@@ -161,7 +163,8 @@ export interface RequirementAuthority {
 /** Lo guardado del curso → requisitos que aplican y excepciones (lo mismo para «Cursia recomienda» y «Usar este diseño»). */
 export async function loadRequirementAuthority(q: Q, courseId: number, contextDocs: { sha256: string }[]): Promise<RequirementAuthority> {
   const st = await loadRequirementsState(q, courseId);
-  const view = buildRequirementsView(st.entries, st.selection, contextDocs);
+  // r109 M3c: la caja del docente va encima de lo que lee el documento (sin caja, la misma vista de siempre).
+  const view = applyBoxToView(buildRequirementsView(st.entries, st.selection, contextDocs), st.box);
   const entry = currentEntry(st.entries, contextDocs);
   const applicable = view.items.filter((i) => i.applies);
   // Re-review L86C m-1: siempre se lee (lo que eligió Cursia vale aunque no haya lectura de los documentos actuales).
@@ -657,7 +660,51 @@ export function capabilityProposal(r: DocumentRequirement, hours?: number | null
   return null;
 }
 
+/**
+ * r109 M3c · lo que viene de la caja «Requisitos obligatorios» se dice como del docente, no «del documento». Solo cambia el
+ * texto de los chequeos de esos requisitos (misma severidad, mismos botones y mismas reglas que un requisito del documento).
+ */
+function boxWording(s: string): string {
+  const verb: Record<string, string> = { pide: 'piden', indica: 'indican', establece: 'establecen', recomienda: 'recomiendan', permite: 'permiten', fija: 'fijan' };
+  return s
+    .replace(/\bConflicto con un requisito del documento\b/g, 'Conflicto con tus requisitos obligatorios')
+    .replace(/\bExcepción al requisito del documento\b/g, 'Excepción a tus requisitos obligatorios')
+    .replace(/\bRequisito del documento por revisar\b/g, 'Requisito obligatorio por revisar')
+    .replace(/\bRequisito del documento\b/g, 'Requisito obligatorio')
+    .replace(/\bVolver al requisito del documento\b/g, 'Volver a tus requisitos obligatorios')
+    .replace(/\bun requisito del documento\b/g, 'tus requisitos obligatorios')
+    .replace(/\b([Ee])l documento (pide|indica|establece|recomienda|permite|fija)\b/g, (_m, e, v) => `${e === 'E' ? 'Tus' : 'tus'} requisitos ${verb[v]}`)
+    .replace(/\bdel (?:propio |mismo )?documento\b/g, 'de tus requisitos')
+    .replace(/\b([Ee])l documento\b/g, (_m, e) => (e === 'E' ? 'Tus requisitos' : 'tus requisitos'));
+}
+
 export function requirementVerificationChecks(applicable: DocumentRequirement[], checks: RequirementCheck[], ctx: ConflictContext): RequirementDesignCheck[] {
+  const out = requirementVerificationChecksCore(applicable, checks, ctx);
+  const boxReqs = applicable.filter((r) => r.source && r.source.documentId === BOX_DOCUMENT_ID);
+  if (!boxReqs.length) return out;
+  const boxIds = new Set(boxReqs.map((r) => `requirement:${r.id}`));
+  // r109 M3c: una estructura de la caja fuera de lo que Cursia admite (50 módulos, 30 capítulos de contenido por módulo) es
+  // un conflicto CRÍTICO explícito (bloquea la generación como cualquier requisito que no se puede cumplir), no un silencio.
+  for (const r of boxReqs) {
+    if (r.kind !== 'structure' || !r.shape || !r.shape.length) continue;
+    const reasons: string[] = [];
+    if (r.shape.length > SHAPE_INPUT_MAX.modules) reasons.push(`pides ${r.shape.length} módulos y un curso admite hasta ${SHAPE_INPUT_MAX.modules}`);
+    const bad = r.shape.map((n, i) => ({ n, i })).filter((x) => x.n > SHAPE_INPUT_MAX.chaptersPerModule);
+    if (bad.length) reasons.push(`${bad.map((x) => `el módulo ${x.i + 1} tiene ${x.n} capítulos`).join(', ')} y un módulo admite hasta ${SHAPE_INPUT_MAX.chaptersPerModule}`);
+    if (reasons.length) {
+      out.push({
+        id: `requirement-limits:${r.id}`, area: 'requirements', severity: 'critical',
+        title: `Tus requisitos piden más de lo que Cursia admite: ${requirementText(r)}`,
+        detail: `En la caja de requisitos obligatorios ${reasons.join('; ')}. Cursia no recorta tu estructura por su cuenta: cámbiala en la caja de requisitos.`,
+      });
+    }
+  }
+  return out.map((c) => (boxIds.has(c.id)
+    ? { ...c, title: boxWording(c.title), ...(c.detail ? { detail: boxWording(c.detail) } : {}), ...(c.fix ? { fix: { ...c.fix, label: boxWording(c.fix.label) } } : {}) }
+    : c));
+}
+
+function requirementVerificationChecksCore(applicable: DocumentRequirement[], checks: RequirementCheck[], ctx: ConflictContext): RequirementDesignCheck[] {
   const out: RequirementDesignCheck[] = [];
   const byId = new Map(applicable.map((r) => [r.id, r]));
   const has = (kind: string, et?: string) => applicable.find((r) => r.obligation === 'required' && r.confidence === 'high' && r.kind === kind && (!et || r.evaluationType === et));
