@@ -1,6 +1,8 @@
 import { createHash } from 'crypto';
 import { REQUIREMENTS_EXTRACTOR_VERSION, requirementsFor } from './requirements-extractor';
 import type { DocumentRequirement, RequirementGroup, RequirementsExtraction, RequirementSelection } from './requirements';
+import { parseBox, REQUIREMENTS_BOX_KEY } from './requirements-box';
+import type { BoxView, StoredBox } from './requirements-box';
 
 /**
  * LOOP 8.6B · Requisitos explícitos del documento en MODO LECTURA: se guardan, se muestran y se comparan con el diseño,
@@ -127,10 +129,10 @@ export async function storeDocumentRequirements(q: Q, courseId: number, entry: S
   );
 }
 
-export async function loadRequirementsState(q: Q, courseId: number): Promise<{ entries: StoredRequirementsEntry[]; selection: StoredSelection | null }> {
-  const rows = rowsOf(await q.query(`select metadata -> '${DOCUMENT_REQUIREMENTS_KEY}' as r, metadata -> '${REQUIREMENTS_SELECTION_KEY}' as s from public.courses where id = $1`, [courseId]));
-  if (!rows.length) return { entries: [], selection: null };
-  return { entries: parseEntries(rows[0].r), selection: parseSelection(rows[0].s) };
+export async function loadRequirementsState(q: Q, courseId: number): Promise<{ entries: StoredRequirementsEntry[]; selection: StoredSelection | null; box: StoredBox | null }> {
+  const rows = rowsOf(await q.query(`select metadata -> '${DOCUMENT_REQUIREMENTS_KEY}' as r, metadata -> '${REQUIREMENTS_SELECTION_KEY}' as s, metadata -> '${REQUIREMENTS_BOX_KEY}' as b from public.courses where id = $1`, [courseId]));
+  if (!rows.length) return { entries: [], selection: null, box: null };
+  return { entries: parseEntries(rows[0].r), selection: parseSelection(rows[0].s), box: parseBox(rows[0].b) };
 }
 
 export async function writeSelection(q: Q, courseId: number, sel: StoredSelection): Promise<void> {
@@ -151,6 +153,10 @@ export interface RequirementItem extends DocumentRequirement {
   documentName: string | null;
   /** Aplica a este curso con la alternativa elegida (solo lectura: no cambia el diseño). */
   applies: boolean;
+  /** r109 M3c: viene de la caja «Requisitos obligatorios» del docente (no de un documento). */
+  fromBox?: true;
+  /** r109 M3c: el documento lo decía, pero la caja del docente lo reemplaza (inactivo, con aviso en `review`). */
+  overriddenByBox?: true;
 }
 
 export interface AlternativeGroupView {
@@ -172,6 +178,8 @@ export interface RequirementsView {
   alternatives: AlternativeGroupView[];
   conflicts: RequirementsExtraction['conflicts'];
   ignoredCount: number;
+  /** r109 M3c: la caja del docente (lo entendido, lo no entendido y lo que reemplaza). Ausente si no hay caja. */
+  box?: BoxView;
 }
 
 /** Documentos del contexto académico guardado → entrada vigente (o null). */

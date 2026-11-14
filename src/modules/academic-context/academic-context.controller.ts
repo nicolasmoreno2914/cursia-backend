@@ -3,7 +3,7 @@ import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { AcademicContextService } from './academic-context.service';
-import { ExtractAcademicContextDto, ExtractAdvancedDto, OutcomesDto, ProposalDto, RequirementSelectionDto } from './dto/extract.dto';
+import { ExtractAcademicContextDto, ExtractAdvancedDto, OutcomesDto, ProposalDto, RequirementsBoxDto, RequirementSelectionDto } from './dto/extract.dto';
 import { Access } from '../authz/access.decorator';
 import type { AccessContext } from '../authz/access-context';
 import { RequirePermission } from '../authz/require-permission.decorator';
@@ -66,6 +66,22 @@ export class AcademicContextController {
   @RequirePermission('courses.edit', { course: 'param:courseId' })
   requirementSelection(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: RequirementSelectionDto, @CurrentUser() user: AuthUser, @Access() access: AccessContext) {
     return this.service.setRequirementSelection(courseId, access.effectiveOwnerId, dto.groupId, dto.optionId ?? null);
+  }
+
+  // PUT /api/v1/courses/:courseId/academic-context/requirements/box  body { text } — r109 M3c: la caja «Requisitos obligatorios»
+  // del docente. Mismo lector determinista que un documento (sin IA); devuelve la vista con `box` (lo entendido / no entendido).
+  @Put('requirements/box')
+  @RequirePermission('courses.edit', { course: 'param:courseId' })
+  requirementsBox(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: RequirementsBoxDto, @CurrentUser() user: AuthUser, @Access() access: AccessContext) {
+    return this.service.setRequirementsBox(courseId, access.effectiveOwnerId, dto.text);
+  }
+
+  // GET /api/v1/courses/:courseId/academic-context/requirements/box → { present, ... } la caja guardada y lo que se entendió.
+  @Get('requirements/box')
+  @RequirePermission('courses.view', { course: 'param:courseId' })
+  async getRequirementsBox(@Param('courseId', ParseIntPipe) courseId: number, @CurrentUser() user: AuthUser, @Access() access: AccessContext) {
+    const v = await this.service.requirements(courseId, access.effectiveOwnerId);
+    return v.box ?? { present: false, text: '' };
   }
 
   // GET /api/v1/courses/:courseId/academic-context/design → sugerencias al perfil, estructura propuesta y vínculos.

@@ -7,9 +7,10 @@
 // estructura obligatoria no genera ninguna diferencia (Fase 2.3).
 
 import type { DocumentRequirement } from '../academic-context/requirements/requirements';
+import { BOX_DOCUMENT_ID, boxModuleTitlesFor } from '../academic-context/requirements/requirements-box';
 import { requirementText } from '../academic-context/requirements/requirement-authority';
 import { COURSE_FORMATS, CourseFormatCode } from '../prebrief/course-formats';
-import { isUnevenShape, proposeShapedStructureFromContext, shapeChapterCounts, shapeLabel, SHAPE_INPUT_MAX } from '../academic-context/context-design';
+import { isUnevenShape, normalizeShape, proposeShapedStructureFromContext, shapeChapterCounts, shapeLabel, SHAPE_INPUT_MAX } from '../academic-context/context-design';
 import { documentContents } from '../academic-context/content-coverage';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import type { StructureShape } from '../academic-context/context-design';
@@ -47,6 +48,10 @@ export function structuralRequirements(required: DocumentRequirement[]) {
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
+/** r109 M3c: quién lo establece — la caja «Requisitos obligatorios» del docente o el documento. */
+const fromBox = (r: DocumentRequirement) => !!r.source && r.source.documentId === BOX_DOCUMENT_ID;
+const establishes = (r: DocumentRequirement) => (fromBox(r) ? 'Tus requisitos establecen' : 'El documento establece');
+
 /**
  * Diferencias entre lo que establece el documento y la forma elegida (y, si es un formato, sus horas). Vacío = la forma
  * cumple lo que el documento exige (o el documento no exige una forma).
@@ -58,19 +63,19 @@ export function shapeDifferences(required: DocumentRequirement[], shape: Structu
   const counts = shapeChapterCounts(shape);
   const uneven = isUnevenShape(shape);
   for (const r of s.modules) {
-    if (!meets(r, shape.modules)) out.push({ kind: 'modules', text: `El documento establece ${requirementText(r)} y has seleccionado ${plural(shape.modules, 'módulo', 'módulos')}.` });
+    if (!meets(r, shape.modules)) out.push({ kind: 'modules', text: `${establishes(r)} ${requirementText(r)} y has seleccionado ${plural(shape.modules, 'módulo', 'módulos')}.` });
   }
   for (const r of s.chapters) {
     if (!uneven) {
-      if (!meets(r, shape.chaptersPerModule)) out.push({ kind: 'chapters', text: `El documento establece ${requirementText(r)} y has seleccionado ${plural(shape.chaptersPerModule, 'capítulo de contenido', 'capítulos de contenido')} por módulo.` });
+      if (!meets(r, shape.chaptersPerModule)) out.push({ kind: 'chapters', text: `${establishes(r)} ${requirementText(r)} y has seleccionado ${plural(shape.chaptersPerModule, 'capítulo de contenido', 'capítulos de contenido')} por módulo.` });
     } else {
       const bad = counts.map((n, i) => ({ n, i })).filter((x) => !meets(r, x.n));
-      if (bad.length) out.push({ kind: 'chapters', text: `El documento establece ${requirementText(r)} y has seleccionado ${shapeLabel(shape, { content: true })}: ${bad.length === 1 ? `el módulo ${bad[0].i + 1} no cumple` : `los módulos ${bad.map((x) => x.i + 1).join(', ')} no cumplen`}.` });
+      if (bad.length) out.push({ kind: 'chapters', text: `${establishes(r)} ${requirementText(r)} y has seleccionado ${shapeLabel(shape, { content: true })}: ${bad.length === 1 ? `el módulo ${bad[0].i + 1} no cumple` : `los módulos ${bad.map((x) => x.i + 1).join(', ')} no cumplen`}.` });
     }
   }
   for (const r of s.structure) {
     const ok = r.shape!.length === shape.modules && r.shape!.every((n, i) => n === counts[i]);
-    if (!ok) out.push({ kind: 'structure', text: `El documento establece ${requirementText(r)} y has seleccionado ${shapeLabel(shape)}.` });
+    if (!ok) out.push({ kind: 'structure', text: `${establishes(r)} ${requirementText(r)} y has seleccionado ${shapeLabel(shape)}.` });
   }
   const f = formatCode ? COURSE_FORMATS[formatCode] : null;
   if (f) {
@@ -81,13 +86,19 @@ export function shapeDifferences(required: DocumentRequirement[], shape: Structu
       const inRange = r.mode === 'exact' ? v >= f.hoursMin && v <= f.hoursMax
         : r.mode === 'range' ? (r.valueMax ?? v) >= f.hoursMin && v <= f.hoursMax
           : meets(r, f.targetHours);
-      if (!inRange) out.push({ kind: 'hours', text: `El documento establece ${requirementText(r)} y el ${f.label} es de ${f.hoursMin}–${f.hoursMax} horas.` });
+      if (!inRange) out.push({ kind: 'hours', text: `${establishes(r)} ${requirementText(r)} y el ${f.label} es de ${f.hoursMin}–${f.hoursMax} horas.` });
     }
   }
   return out;
 }
 
-export interface ShapeRecommendation extends StructureShape { reason: string }
+export interface ShapeRecommendation extends StructureShape {
+  reason: string;
+  /** r109 M3c: la forma sale de la caja «Requisitos obligatorios» del docente («Viene de tus requisitos»). Ausente = como siempre. */
+  origin?: 'teacher_box';
+  /** r109 M3c: títulos de los módulos que escribió el docente (null = no dio título). */
+  moduleTitles?: (string | null)[];
+}
 
 /** «4 / 5 / 4 / 4». */
 export function shapeSlashes(counts: number[]): string {
@@ -107,10 +118,28 @@ export function recommendShape(required: DocumentRequirement[], documentShape: n
     const r = rs.find((x) => x.mode === 'exact' && typeof x.value === 'number');
     return r ? (r.value as number) : null;
   };
+  // r109 M3c: una estructura DESIGUAL escrita en la caja del docente es la forma recomendada tal cual (una desigual que
+  // solo dice el documento sigue sin recomendarse: la recomienda «Como el documento», si cumple). Si se sale de los topes
+  // de entrada no se recomienda (la verificación lo dice como conflicto crítico).
+  const un = s.structure.find((r) => fromBox(r) && r.shape!.some((n) => n !== r.shape![0]));
+  const unShape = un ? normalizeShape({ moduleChapters: un.shape }) : null;
+  if (un && unShape && unShape.moduleChapters) {
+    const mine = fromBox(un);
+    return {
+      ...unShape, reason: mine ? 'Es la estructura que escribiste en tus requisitos obligatorios.' : 'Es la estructura que exige el documento.',
+      ...(mine ? { origin: 'teacher_box' as const, ...(un.moduleTitles && un.moduleTitles.some((t) => t) ? { moduleTitles: [...un.moduleTitles] } : {}) } : {}),
+    };
+  }
   const st = s.structure.find((r) => r.shape!.every((n) => n === r.shape![0]));
   const reqModules = fixed(s.modules) ?? (st ? st.shape!.length : null);
   const reqChapters = fixed(s.chapters) ?? (st ? st.shape![0] : null);
-  if (reqModules && reqChapters) return { modules: reqModules, chaptersPerModule: reqChapters, reason: 'Es la estructura que exige el documento.' };
+  if (reqModules && reqChapters) {
+    // r109 M3c: si lo fijó la caja del docente, se dice («tus requisitos»); un documento: el texto de siempre.
+    const mine = [...s.structure, ...s.modules, ...s.chapters].some(fromBox);
+    const tit = mine && st && st.moduleTitles && st.moduleTitles.some((t) => t) ? { moduleTitles: [...st.moduleTitles] } : {};
+    return mine ? { modules: reqModules, chaptersPerModule: reqChapters, reason: 'Es la estructura que escribiste en tus requisitos obligatorios.', origin: 'teacher_box', ...tit }
+      : { modules: reqModules, chaptersPerModule: reqChapters, reason: 'Es la estructura que exige el documento.' };
+  }
   if (documentShape && documentShape.length) {
     // Hacia abajo: nunca más capítulos que contenidos (Cursia no inventa capítulos de «profundización» al recomendar).
     const modules = reqModules ?? documentShape.length;
@@ -184,7 +213,9 @@ export function structurePreviewOf(context: AcademicContextV1 | null, required: 
   // r109 M3b: «4 módulos (4, 5, 4, 4 capítulos de contenido)» solo en la forma desigual (N × M: la respuesta de siempre).
   const label = shape.moduleChapters ? { label: shapeLabel(shape, { content: true }) } : {};
   if (!context || !contents.length) return { providersCalled: 0, shape, ...label, differences, plan: null, coverage: null, notes: [] as string[] };
-  const p = proposeShapedStructureFromContext(context, shape);
+  // r109 M3c: con la forma de la caja del docente, los módulos llevan los títulos que escribió.
+  const titles = boxModuleTitlesFor(required, shapeChapterCounts(shape));
+  const p = proposeShapedStructureFromContext(context, shape, titles ? { moduleTitles: titles } : undefined);
   const assigned = p.modules.flatMap((m) => m.chapters.flatMap((c) => c.sourceContentIds));
   return {
     providersCalled: 0, shape, ...label, differences, notes: p.notes,

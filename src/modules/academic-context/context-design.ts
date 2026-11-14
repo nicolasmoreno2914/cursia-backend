@@ -503,7 +503,7 @@ function expandBySubtopics(items: ShapedItem[], want: number): ShapedItem[] {
   });
 }
 
-export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape: StructureShape, opts?: { realChapters?: boolean }): ContextStructureProposal {
+export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape: StructureShape, opts?: { realChapters?: boolean; moduleTitles?: (string | null)[] }): ContextStructureProposal {
   const notes: string[] = [];
   const units = ctx.units.filter((u) => u.contents.length > 0);
   if (!isValidShape(shape) || !units.length) {
@@ -555,7 +555,9 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
     const spanned = [...new Map(group.map((x) => [x.u.id, x.u])).values()];
     const dominant = spanned.map((u) => ({ u, n: group.filter((x) => x.u === u).length })).sort((a, b) => b.n - a.n)[0];
     const t = dominant ? titleAndRest(dominant.u.title) : { title: `Módulo ${mi + 1}`, rest: null };
-    const moduleTitle = uniqueTitle(t.title, `M${mi + 1}`);
+    // r109 M3c: el título que el docente escribió en la caja «Requisitos obligatorios» manda sobre el de la unidad.
+    const given = opts?.moduleTitles?.[mi];
+    const moduleTitle = uniqueTitle(given ? given.slice(0, STRUCTURE_TITLE_MAX) : t.title, `M${mi + 1}`);
     const unitLinks = [...new Set(spanned.flatMap((u) => u.outcomeIds))];
     let skipped = 0;
     const chapters = splitEven(group, counts[mi]).map((g, ci): ContextChapterProposal | null => {

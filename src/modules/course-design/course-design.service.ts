@@ -383,7 +383,7 @@ export class CourseDesignService {
     // LOOP 8.6B/8.6C · requisitos del documento frente a ESTE diseño: cumplimiento, excepciones del docente y conflictos.
     let reqChecks: RequirementCheck[] = [];
     let requirementChecks: ReturnType<typeof requirementVerificationChecks> = [];
-    if (auth.view.state === 'current' && dist) {
+    if ((auth.view.state === 'current' || (auth.view.state === 'stale' && !!auth.view.box)) && dist) {
       const origin = await readStructureOrigin(this.dataSource, courseId);
       const [cnt] = await this.dataSource.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]);
       // Review piloto I5: misma regla que las restricciones (la forma de la estructura, no cualquier edición).

@@ -292,6 +292,12 @@ jobs:
       - name: Check r109 M3b estructura desigual desde el documento (puro)
         run: node scripts/r109/check-r109-uneven-shape.js --ci
 
+      # r109 M3c · caja «Requisitos obligatorios» del docente: el lector entiende la forma desigual (4 / 7 / 4 / 5, con
+      # títulos), la caja manda sobre el documento (con aviso), lo entendido y lo no entendido, structure-options y la
+      # verificación (topes críticos); sin caja, igual que origin/staging. Puro, sin red ni base (USD 0).
+      - name: Check r109 M3c caja de requisitos obligatorios (puro)
+        run: node scripts/r109/check-r109-requirements-box.js --ci
+
       # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
       - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
         env:
